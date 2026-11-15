@@ -29,6 +29,19 @@ type MeshKey struct {
 // 数据,不上线——Extensions 由服务端产生与消费,SPEC §10.2)。
 const extMeshDeviceID = "mesh_device_id"
 
+// extKeyFingerprint 是认证 Permissions 中携带客户端公钥指纹的扩展键
+// ("SHA256:xxx")。会话台账登记/踢出/拉黑都以指纹为公共身份口径。
+const extKeyFingerprint = "key_fingerprint"
+
+// BlockQuery 是一次准入黑名单查询:命中公钥指纹(如 "SHA256:xxx",gossh
+// FingerprintSHA256 口径)或 mesh device_id(尾注释标签,可空)之一即拒绝。
+// 与白名单判定同序发生在 publicKeyCallback:黑名单优先于白名单(同一把钥
+// 两边都挂=拉黑)。
+type BlockQuery struct {
+	Fingerprint string
+	DeviceID    string
+}
+
 // RunConfig 是服务运行期配置,由配置层 EffectiveSSHIngress 翻转而来
 // (authorized_keys 行经 gossh.ParseAuthorizedKey 解析为 gossh.PublicKey)。
 // 构造后视为不可变:配置变更由装配层(Reconcile)重建 Server 实例,
@@ -43,6 +56,12 @@ type RunConfig struct {
 	AuthorizedKeys []gossh.PublicKey
 	// MeshKeys 是形态②凭证(mesh_authorized_keys):公钥 + 尾注释 device_id。
 	MeshKeys []MeshKey
+
+	// Blocked 是准入拒绝名单活视图(customer.ssh_ingress.blocked_keys /
+	// blocked_device_ids):认证期读时求值,变更即时生效不重启服务——
+	// ForwardGate 同款闭包纪律(若纳入 runIdentity 比对,拉黑会被
+	// 「凭证未变」短路冻结在旧实例里)。nil = 无黑名单,全放行(不比对)。
+	Blocked func(BlockQuery) bool
 
 	// LocalNodeID 返回本机节点标识。装配层仍注入(AgentService.currentDeviceID);
 	// mesh-exit 形态自 D2 起不再消费(旧帧协议的 AppendHop 防环随帧协议删除,

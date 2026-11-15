@@ -280,6 +280,11 @@ func (s *Server) serverConfig(signer gossh.Signer) *gossh.ServerConfig {
 // device_id 标签(extMeshDeviceID,尾注释为空回落指纹前 16 字符);命中
 // AuthorizedKeys→bare;都不命中→拒并计入限速。成功认证清零限速。
 //
+// 黑名单(Blocked 活视图)优先于白名单:命中 mesh 凭证后先查
+// blocked_keys 指纹/blocked_device_ids 标签,命中即拒(计入限速——黑名单
+// 客户端的重试不应免于退避);bare 命中后查指纹黑名单。黑名单拒与未知钥
+// 拒的对外表现一致(认证失败),审计靠 Debug 日志的 blocked 标记。
+//
 // 比较用解析后的公钥身份(key.Marshal() 字节,编码含类型与公钥体),
 // 不比较 authorized_keys 文本行——同键多行/textual variants 无法借此
 // 区分形态(spec §4 同键歧义;配置层 Validate 的逐字节重复键拦截是
@@ -287,20 +292,38 @@ func (s *Server) serverConfig(signer gossh.Signer) *gossh.ServerConfig {
 // 可达)→mesh 优先:运行期保守取向,注释即约定。
 func (s *Server) publicKeyCallback(meta gossh.ConnMetadata, key gossh.PublicKey) (*gossh.Permissions, error) {
 	ip := remoteIP(meta.RemoteAddr())
+	fp := gossh.FingerprintSHA256(key)
 	if mk, ok := meshKeyFor(key, s.rc.MeshKeys); ok {
+		deviceID := meshDeviceIDLabel(mk)
+		if s.blockedNow(BlockQuery{Fingerprint: fp, DeviceID: deviceID}) {
+			s.limiter.Fail(ip)
+			logger.Debug(fmt.Sprintf("SSH ingress blocked mesh key %s (device %q) for %q from %s",
+				fp, deviceID, meta.User(), ip))
+			return nil, fmt.Errorf("key blocked for %q", meta.User())
+		}
 		s.limiter.Reset(ip)
 		return &gossh.Permissions{Extensions: map[string]string{
-			extIngressForm:  FormMesh,
-			extMeshDeviceID: meshDeviceIDLabel(mk),
+			extIngressForm:    FormMesh,
+			extMeshDeviceID:   deviceID,
+			extKeyFingerprint: fp,
 		}}, nil
 	}
 	if keyInList(key, s.rc.AuthorizedKeys) {
+		if s.blockedNow(BlockQuery{Fingerprint: fp}) {
+			s.limiter.Fail(ip)
+			logger.Debug(fmt.Sprintf("SSH ingress blocked bare key %s for %q from %s",
+				fp, meta.User(), ip))
+			return nil, fmt.Errorf("key blocked for %q", meta.User())
+		}
 		s.limiter.Reset(ip)
-		return &gossh.Permissions{Extensions: map[string]string{extIngressForm: FormBare}}, nil
+		return &gossh.Permissions{Extensions: map[string]string{
+			extIngressForm:    FormBare,
+			extKeyFingerprint: fp,
+		}}, nil
 	}
 	s.limiter.Fail(ip)
 	logger.Debug(fmt.Sprintf("SSH ingress rejected unknown key %s for %q from %s",
-		gossh.FingerprintSHA256(key), meta.User(), ip))
+		fp, meta.User(), ip))
 	return nil, fmt.Errorf("unknown public key for %q", meta.User())
 }
 
@@ -392,7 +415,16 @@ func (s *Server) ServeConn(conn net.Conn) {
 	s.handleConn(ctx, conn, s.serverConfig(signer))
 }
 
-// handleConn 承载一条 TCP 连接:限速检查→SSH 握手→全局请求应答→通道收敛循环。
+// blockedNow 黑名单活视图求值：Blocked nil = 无黑名单（不比对）。认证期
+// 每次连接读时求值——装配层传读全局配置的闭包，拉黑/解封即时生效。
+func (s *Server) blockedNow(q BlockQuery) bool {
+	if s.rc.Blocked == nil {
+		return false
+	}
+	return s.rc.Blocked(q)
+}
+
+// handleConn 承载一条 TCP 连接：限速检查→SSH 握手→全局请求应答→通道收敛循环。
 func (s *Server) handleConn(ctx context.Context, conn net.Conn, cfg *gossh.ServerConfig) {
 	defer s.wg.Done()
 	defer func() {
@@ -443,15 +475,16 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, cfg *gossh.Serve
 	defer sconn.Close()
 
 	logger.Debug(fmt.Sprintf("SSH ingress connection from %s authenticated as %q", ip, sconn.User()))
-	// 会话台账登记（观测面，不参与决策）：form/deviceID 取认证 Permissions
-	// ——与 serveChannels 的观测面同源同值。nil perms（防御分支）按 unknown
-	// 落账，通道矩阵会拒绝其通道，但连接在线事实如实展示。
-	form, deviceID := "", ""
+	// 会话台账登记（观测面，不参与决策）：form/deviceID/fingerprint 取认证
+	// Permissions——与 serveChannels 的观测面同源同值。nil perms（防御分支）
+	// 按未知落账，通道矩阵会拒绝其通道，但连接在线事实如实展示。
+	form, deviceID, fingerprint := "", "", ""
 	if perms := sconn.Permissions; perms != nil {
 		form = perms.Extensions[extIngressForm]
 		deviceID = perms.Extensions[extMeshDeviceID]
+		fingerprint = perms.Extensions[extKeyFingerprint]
 	}
-	sess := s.sessions.register(sconn, form, deviceID)
+	sess := s.sessions.register(sconn, form, deviceID, fingerprint, s.blockedNow, sconn)
 	defer sess.close()
 
 	go serveGlobalRequests(reqs)
@@ -539,6 +572,20 @@ func (s *Server) ActiveSessions() []Session {
 // ClosedSessions 返回已关闭接入历史快照（新→旧，环形 300 条）。nil 安全。
 func (s *Server) ClosedSessions() []Session {
 	return s.sessions.ClosedSessions()
+}
+
+// Kick 按公钥指纹踢出一条在线接入连接（管理动作）：置 Kicked 标记、断开
+// 底层 SSH 连接，拆除路径自动落关闭历史（Kicked=true）。目标不在线返回
+// false。nil 安全。
+func (s *Server) Kick(fingerprint string) bool {
+	if s == nil {
+		return false
+	}
+	kicked := s.sessions.Kick(fingerprint)
+	if kicked {
+		logger.Info(fmt.Sprintf("SSH ingress session kicked by operator: %s", fingerprint))
+	}
+	return kicked
 }
 
 // observeForm 记录最近一次通道携带的入口形态,供测试观测

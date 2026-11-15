@@ -2147,3 +2147,57 @@ func TestEffectiveSSHIngress(t *testing.T) {
 		t.Fatalf("explicit Port = %d, want 2222 preserved", got.Port)
 	}
 }
+
+// 黑名单字段:Validate 拒绝非指纹格式的 blocked_fingerprints 与空
+// blocked_device_ids;合法黑名单不报错且经 EffectiveSSHIngress 归一保留。
+func TestSSHIngressBlocklistValidateAndNormalize(t *testing.T) {
+	enabled := true
+	keyLine := generateAuthorizedKeyLine(t)
+	mk := func(si *SSHIngressConfig) *Config {
+		return &Config{Core: &CoreConfig{APIServer: "https://api.aliang.one"}, Customer: &CustomerConfig{SSHIngress: si}}
+	}
+
+	badFP := mk(&SSHIngressConfig{
+		Enable:              &enabled,
+		AuthorizedKeys:      []string{keyLine},
+		BlockedFingerprints: []string{"not-a-fingerprint"},
+	})
+	if err := badFP.Validate(); err == nil || !strings.Contains(err.Error(), "blocked_fingerprints[0] must be a SHA256 fingerprint") {
+		t.Fatalf("Validate() = %v, want fingerprint format error", err)
+	}
+
+	badID := mk(&SSHIngressConfig{
+		Enable:           &enabled,
+		AuthorizedKeys:   []string{keyLine},
+		BlockedDeviceIDs: []string{"  "},
+	})
+	if err := badID.Validate(); err == nil || !strings.Contains(err.Error(), "blocked_device_ids[0] cannot be empty") {
+		t.Fatalf("Validate() = %v, want empty device_id error", err)
+	}
+
+	emptyFP := mk(&SSHIngressConfig{
+		Enable:              &enabled,
+		AuthorizedKeys:      []string{keyLine},
+		BlockedFingerprints: []string{"  "},
+	})
+	if err := emptyFP.Validate(); err == nil || !strings.Contains(err.Error(), "blocked_fingerprints[0] cannot be empty") {
+		t.Fatalf("Validate() = %v, want empty fingerprint error", err)
+	}
+
+	good := mk(&SSHIngressConfig{
+		Enable:              &enabled,
+		AuthorizedKeys:      []string{keyLine},
+		BlockedFingerprints: []string{" SHA256:abc123 "},
+		BlockedDeviceIDs:    []string{" dev-win "},
+	})
+	if err := good.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+	got := good.EffectiveSSHIngress()
+	if len(got.BlockedFingerprints) != 1 || got.BlockedFingerprints[0] != "SHA256:abc123" {
+		t.Fatalf("BlockedFingerprints = %#v, want [SHA256:abc123]", got.BlockedFingerprints)
+	}
+	if len(got.BlockedDeviceIDs) != 1 || got.BlockedDeviceIDs[0] != "dev-win" {
+		t.Fatalf("BlockedDeviceIDs = %#v, want [dev-win]", got.BlockedDeviceIDs)
+	}
+}

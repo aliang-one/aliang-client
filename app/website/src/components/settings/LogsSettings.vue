@@ -186,6 +186,31 @@
                 <div class="flex shrink-0 items-center gap-2 text-xs">
                   <span class="rounded-full bg-white px-2 py-0.5 text-[11px] font-medium text-slate-500 shadow-sm ring-1 ring-slate-200 dark:bg-slate-950 dark:text-slate-400 dark:ring-slate-800">{{ row.formLabel }}</span>
                   <span class="text-slate-400">{{ row.duration }}</span>
+                  <button
+                    v-if="row.manageable"
+                    type="button"
+                    class="rounded-lg px-2 py-1 font-medium text-slate-500 transition hover:bg-slate-200/70 hover:text-slate-700 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+                    :data-ingress-kick="row.title"
+                    @click="kickIngressSession(row)"
+                  >
+                    {{ t('status_ingressKick') }}
+                  </button>
+                  <button
+                    v-if="row.manageable && !row.blocked"
+                    type="button"
+                    class="rounded-lg px-2 py-1 font-medium text-red-500 transition hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-500/10 dark:hover:text-red-300"
+                    :data-ingress-block="row.title"
+                    @click="blockIngressRow(row)"
+                  >
+                    {{ t('status_ingressBlock') }}
+                  </button>
+                  <span
+                    v-else-if="row.blocked"
+                    class="rounded-full bg-red-100 px-2 py-0.5 text-[11px] font-medium text-red-600 dark:bg-red-500/15 dark:text-red-300"
+                    data-ingress-blocked-badge
+                  >
+                    {{ t('status_ingressBlockedBadge') }}
+                  </span>
                 </div>
               </div>
             </div>
@@ -197,16 +222,42 @@
             </div>
 
             <!-- 最近断开的接入（环形历史前几条）：排查「刚掉线谁」 -->
-            <div v-if="ingressRunning && ingressClosedRows.length" class="mt-4 border-t border-slate-100 pt-3 dark:border-slate-800/60" data-ingress-closed-list>
-              <p class="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{{ t('status_ingressClosedTitle') }}</p>
-              <div class="mt-2 grid gap-1.5">
-                <div
-                  v-for="row in ingressClosedRows"
-                  :key="row.key"
-                  class="flex items-center justify-between gap-3 text-xs text-slate-500 dark:text-slate-400"
-                >
-                  <span class="min-w-0 truncate">{{ row.title }} <span class="text-slate-400">· {{ row.formLabel }}</span></span>
-                  <span class="shrink-0 text-slate-400">{{ row.closedAgo }}</span>
+            <div v-if="ingressRunning && (ingressClosedRows.length || ingressBlockedRows.length)" class="mt-4 border-t border-slate-100 pt-3 dark:border-slate-800/60">
+              <div v-if="ingressClosedRows.length" data-ingress-closed-list>
+                <p class="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{{ t('status_ingressClosedTitle') }}</p>
+                <div class="mt-2 grid gap-1.5">
+                  <div
+                    v-for="row in ingressClosedRows"
+                    :key="row.key"
+                    class="flex items-center justify-between gap-3 text-xs text-slate-500 dark:text-slate-400"
+                  >
+                    <span class="min-w-0 truncate">{{ row.title }} <span class="text-slate-400">· {{ row.formLabel }}</span><span v-if="row.kicked" class="ml-1 text-red-400">· {{ t('status_ingressKickedBadge') }}</span></span>
+                    <span class="shrink-0 text-slate-400">{{ row.closedAgo }}</span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 拒绝名单（配置维度）：条目可解封 -->
+              <div v-if="ingressBlockedRows.length" class="mt-3" data-ingress-blocked-list>
+                <p class="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{{ t('status_ingressBlockedTitle') }}</p>
+                <div class="mt-2 grid gap-1.5">
+                  <div
+                    v-for="row in ingressBlockedRows"
+                    :key="row.key"
+                    class="flex items-center justify-between gap-3 text-xs"
+                  >
+                    <span class="min-w-0 truncate text-slate-500 dark:text-slate-400">
+                      {{ row.title }}<span class="text-slate-400"> · {{ row.kindLabel }}</span>
+                    </span>
+                    <button
+                      type="button"
+                      class="shrink-0 rounded-lg px-2 py-0.5 font-medium text-slate-500 transition hover:bg-slate-200/70 hover:text-slate-700 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+                      :data-ingress-unblock="row.title"
+                      @click="unblockIngressRow(row)"
+                    >
+                      {{ t('status_ingressUnblock') }}
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -441,7 +492,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useI18n } from '../../i18n';
-import { getIngressSessions, getStatusConnections, getStatusSummary } from '../../services/statusApi';
+import { blockIngressSession, getIngressSessions, getStatusConnections, getStatusSummary, kickIngressSession as kickSessionApi, unblockIngressSession } from '../../services/statusApi';
 
 const { t } = useI18n();
 
@@ -501,22 +552,53 @@ const closedConnections = computed(() => Array.isArray(connectionsData.value?.cl
 const ingressRunning = computed(() => Boolean(ingressData.value?.ok));
 const ingressActiveRaw = computed(() => Array.isArray(ingressData.value?.active) ? ingressData.value.active : []);
 const ingressClosedRaw = computed(() => Array.isArray(ingressData.value?.closed) ? ingressData.value.closed : []);
+const ingressBlocks = computed(() => {
+  const blocks = ingressData.value?.blocks;
+  return {
+    fingerprints: Array.isArray(blocks?.fingerprints) ? blocks.fingerprints : [],
+    deviceIds: Array.isArray(blocks?.device_ids) ? blocks.device_ids : []
+  };
+});
 const formLabel = (form) => form === 'mesh' ? t('status_ingressFormMesh') : t('status_ingressFormBare');
+const sessionTitle = (sess) => sess.form === 'mesh' && sess.device_id ? sess.device_id : (sess.source_ip || '--');
 const ingressActiveRows = computed(() => ingressActiveRaw.value.map((sess, i) => ({
   key: `${sess.source_ip}-${sess.auth_at_unix}-${i}`,
-  title: sess.form === 'mesh' && sess.device_id ? sess.device_id : (sess.source_ip || '--'),
+  title: sessionTitle(sess),
   subtitle: sess.form === 'mesh' && sess.device_id
     ? t('status_ingressMeshSubtitle', { ip: sess.source_ip || '--' })
     : (sess.user ? t('status_ingressUserSubtitle', { user: sess.user }) : ''),
   formLabel: formLabel(sess.form),
-  duration: formatDurationMillis(sess.duration_millis)
+  duration: formatDurationMillis(sess.duration_millis),
+  fingerprint: sess.fingerprint || '',
+  deviceId: sess.form === 'mesh' ? (sess.device_id || '') : '',
+  blocked: Boolean(sess.fingerprint && ingressBlocks.value.fingerprints.includes(sess.fingerprint))
+    || Boolean(sess.device_id && ingressBlocks.value.deviceIds.includes(sess.device_id)),
+  manageable: Boolean(sess.fingerprint)
 })));
 const ingressClosedRows = computed(() => ingressClosedRaw.value.slice(0, 5).map((sess, i) => ({
   key: `${sess.source_ip}-${sess.closed_at_unix}-${i}`,
-  title: sess.form === 'mesh' && sess.device_id ? sess.device_id : (sess.source_ip || '--'),
+  title: sessionTitle(sess),
   formLabel: formLabel(sess.form),
+  kicked: Boolean(sess.kicked),
   closedAgo: formatClosedAt(sess.closed_at_unix)
 })));
+// 拒绝名单行（配置维度）：指纹条目 + device_id 条目，各自可解封。
+const ingressBlockedRows = computed(() => [
+  ...ingressBlocks.value.fingerprints.map((fp, i) => ({
+    key: `fp-${fp}-${i}`,
+    title: fp,
+    kindLabel: t('status_ingressBlockedFpSuffix'),
+    fingerprint: fp,
+    deviceId: ''
+  })),
+  ...ingressBlocks.value.deviceIds.map((id, i) => ({
+    key: `id-${id}-${i}`,
+    title: id,
+    kindLabel: formLabel('mesh'),
+    fingerprint: '',
+    deviceId: id
+  }))
+]);
 const connectionRows = computed(() => connectionsTab.value === 'active' ? activeConnectionRows.value : closedConnectionRows.value);
 const activeConnectionRows = computed(() => activeConnections.value.map((conn) => ({
   id: conn.id,
@@ -858,6 +940,51 @@ async function loadIngressSessions() {
     ingressData.value = envelope?.data || { ok: false, active: [], closed: [] };
   } catch {
     // 辅助面板同款静默降级，下个轮询周期自愈
+  }
+}
+
+// —— 接入客户端管理动作（踢出 / 拉黑 / 解封）——
+// 破坏性动作走 window.confirm（仓库既有惯例）；结果反馈用同款轻量 alert。
+// 操作成功后立即刷新台账——被踢/被拉黑行在下一个界面帧就消失或带上标记。
+
+async function kickIngressSession(row) {
+  if (!row?.fingerprint) {
+    window.alert(t('status_ingressManageErrNoIdentity'));
+    return;
+  }
+  if (!window.confirm(t('status_ingressKickConfirm', { name: row.title }))) return;
+  try {
+    await kickSessionApi(row.fingerprint);
+    await loadIngressSessions();
+  } catch (error) {
+    window.alert(t('status_ingressActionFailed', { reason: error?.message || error }));
+  }
+}
+
+async function blockIngressRow(row) {
+  if (!row?.fingerprint && !row?.deviceId) {
+    window.alert(t('status_ingressManageErrNoIdentity'));
+    return;
+  }
+  if (!window.confirm(t('status_ingressBlockConfirm', { name: row.title }))) return;
+  try {
+    await blockIngressSession({ fingerprint: row.fingerprint, deviceId: row.deviceId });
+    window.alert(t('status_ingressBlockDone', { name: row.title }));
+    await loadIngressSessions();
+  } catch (error) {
+    window.alert(t('status_ingressActionFailed', { reason: error?.message || error }));
+  }
+}
+
+async function unblockIngressRow(row) {
+  if (!row?.fingerprint && !row?.deviceId) return;
+  if (!window.confirm(t('status_ingressUnblockConfirm', { name: row.title }))) return;
+  try {
+    await unblockIngressSession({ fingerprint: row.fingerprint, deviceId: row.deviceId });
+    window.alert(t('status_ingressUnblockDone', { name: row.title }));
+    await loadIngressSessions();
+  } catch (error) {
+    window.alert(t('status_ingressActionFailed', { reason: error?.message || error }));
   }
 }
 

@@ -1077,11 +1077,23 @@ const SSHIngressDefaultPort uint16 = 56442
 // 双密钥准入:authorized_keys=人用凭证(裸流 direct-tcpip 形态);
 // mesh_authorized_keys=节点互连凭证(mesh-exit channel(ExtraData)形态)。
 // 禁密码。端口默认 56442。
+// 拒绝名单(blocked_fingerprints/blocked_device_ids)是准入之上的黑名单:
+// 公钥指纹(SHA256,gossh.FingerprintSHA256 口径,与会话台账展示的
+// fingerprint 同源)与 mesh device_id 标签双维度,命中即认证期拒——黑名单
+// 优先于白名单,同一把钥两边都挂=拉黑。运行面经活闭包消费(ForwardGate
+// 同款):变更即时生效,不重启服务、不断在线连接(补拦走踢出)。
 type SSHIngressConfig struct {
 	Enable             *bool    `json:"enable,omitempty"` // 三态:nil=false
 	Port               uint16   `json:"port,omitempty"`
 	AuthorizedKeys     []string `json:"authorized_keys,omitempty"`
 	MeshAuthorizedKeys []string `json:"mesh_authorized_keys,omitempty"`
+	// BlockedFingerprints 是被拒公钥指纹列表("SHA256:xxx")。按指纹而非
+	// 公钥行存储:管理动作(会话列表拉黑)手里只有指纹,指纹也是台账/指纹
+	// API 的公共身份口径;持钥者可自行 ssh-keygen -lf 换算。
+	BlockedFingerprints []string `json:"blocked_fingerprints,omitempty"`
+	// BlockedDeviceIDs 是被拒 mesh 节点标签列表(尾注释 device_id 精确匹配)。
+	// 标签可改名/重复,凭证级拉黑请用指纹;本字段服务「按名字拉黑」的轻量场景。
+	BlockedDeviceIDs []string `json:"blocked_device_ids,omitempty"`
 }
 
 // IsEnabled 返回 SSH 入口是否开启。与 PeerMCP 的三态指针同族,但默认反向:
@@ -1113,6 +1125,23 @@ func (c *SSHIngressConfig) Validate() error {
 	}
 	if err := validateSSHIngressKeyLines("mesh_authorized_keys", c.MeshAuthorizedKeys); err != nil {
 		return err
+	}
+	// 黑名单校验:空条目从严(与 validateSSHIngressKeyLines 同款——保存通道
+	// 该报错,不悄悄落库);指纹须带 "SHA256:" 前缀且指纹体非空(格式校验,
+	// 不验证真实存在);device_id 非空即可(标签是任意尾注释)。
+	for i, fp := range c.BlockedFingerprints {
+		line := strings.TrimSpace(fp)
+		if line == "" {
+			return fmt.Errorf("ssh_ingress.blocked_fingerprints[%d] cannot be empty", i)
+		}
+		if !strings.HasPrefix(line, "SHA256:") || len(strings.TrimSpace(line[7:])) == 0 {
+			return fmt.Errorf("ssh_ingress.blocked_fingerprints[%d] must be a SHA256 fingerprint like \"SHA256:...\" (ssh-keygen -lf or the sessions list)", i)
+		}
+	}
+	for i, id := range c.BlockedDeviceIDs {
+		if strings.TrimSpace(id) == "" {
+			return fmt.Errorf("ssh_ingress.blocked_device_ids[%d] cannot be empty", i)
+		}
 	}
 	meshSeen := make(map[string]struct{}, len(c.MeshAuthorizedKeys))
 	for _, key := range c.MeshAuthorizedKeys {
@@ -1157,10 +1186,12 @@ func (c *Config) EffectiveSSHIngress() *SSHIngressConfig {
 	}
 	enable := true
 	cfg := SSHIngressConfig{
-		Enable:             &enable,
-		Port:               src.Port,
-		AuthorizedKeys:     normalizeSSHIngressKeyLines(src.AuthorizedKeys),
-		MeshAuthorizedKeys: normalizeSSHIngressKeyLines(src.MeshAuthorizedKeys),
+		Enable:              &enable,
+		Port:                src.Port,
+		AuthorizedKeys:      normalizeSSHIngressKeyLines(src.AuthorizedKeys),
+		MeshAuthorizedKeys:  normalizeSSHIngressKeyLines(src.MeshAuthorizedKeys),
+		BlockedFingerprints: normalizeSSHIngressStringList(src.BlockedFingerprints),
+		BlockedDeviceIDs:    normalizeSSHIngressStringList(src.BlockedDeviceIDs),
 	}
 	if cfg.Port == 0 {
 		cfg.Port = SSHIngressDefaultPort
@@ -1179,6 +1210,20 @@ func normalizeSSHIngressKeyLines(lines []string) []string {
 		normalized = append(normalized, line)
 	}
 	return normalized
+}
+
+// normalizeSSHIngressStringList 字符串列表归一(TrimSpace 剔空,保序不去重
+// ——与 key 行列表同策略,重复条目无害)。服务 blocked_device_ids。
+func normalizeSSHIngressStringList(items []string) []string {
+	out := make([]string, 0, len(items))
+	for _, raw := range items {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
 }
 
 // agentCoreSubagentMaxParallelDefault 是并行子 agent 并发闸的默认值（2026-11-10

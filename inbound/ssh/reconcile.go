@@ -227,3 +227,15 @@ func SessionsSnapshotOf() (SessionsSnapshot, bool) {
 		Closed: srv.ClosedSessions(),
 	}, true
 }
+
+// KickSession 按公钥指纹踢出当前 reconcile 实例的一条在线接入连接（管理
+// 动作）。返回 kicked=是否确实断开（目标不在线/入口未运行时 false）。
+func KickSession(fingerprint string) bool {
+	reconcileMu.Lock()
+	srv := reconcileSrv
+	reconcileMu.Unlock()
+	if srv == nil {
+		return false
+	}
+	return srv.Kick(fingerprint)
+}

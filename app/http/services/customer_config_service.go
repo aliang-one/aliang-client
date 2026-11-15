@@ -373,6 +373,34 @@ func buildSSHIngressRunConfig(effective *config.SSHIngressConfig) *sshin.RunConf
 		}
 		return cfg.Customer.Mesh.EffectiveForwardEnabled()
 	}
+	// 黑名单活视图(构造见 RunConfig 组装处注释):认证期读全局配置,
+	// blocked_fingerprints(指纹精确匹配)与 blocked_device_ids(mesh 标签
+	// 精确匹配)任一命中即拒。TrimSpace 对齐 Effective 归一口径。
+	blocked := func(q sshin.BlockQuery) bool {
+		cfg := config.GetGlobalConfig()
+		if cfg == nil || cfg.Customer == nil || cfg.Customer.SSHIngress == nil {
+			return false
+		}
+		si := cfg.Customer.SSHIngress
+		if len(si.BlockedFingerprints) == 0 && len(si.BlockedDeviceIDs) == 0 {
+			return false
+		}
+		if q.Fingerprint != "" {
+			for _, fp := range si.BlockedFingerprints {
+				if strings.TrimSpace(fp) == q.Fingerprint {
+					return true
+				}
+			}
+		}
+		if q.DeviceID != "" {
+			for _, id := range si.BlockedDeviceIDs {
+				if strings.TrimSpace(id) == q.DeviceID {
+					return true
+				}
+			}
+		}
+		return false
+	}
 	return &sshin.RunConfig{
 		// 专用口哨兵映射(spec §6.4 修订):0 与旧默认 56442 一律=跟随统一口
 		// (RunConfig.Port=0,不自持监听);其他显式端口才开常驻专用口。存量
@@ -382,6 +410,9 @@ func buildSSHIngressRunConfig(effective *config.SSHIngressConfig) *sshin.RunConf
 		MeshKeys:       meshKeys,
 		// ForwardGate 恒注入(读全局活值,nil 链=fail-closed,见上注释)。
 		ForwardGate: gate,
+		// Blocked 黑名单活视图(构造见上):认证期读全局配置,拉黑/解封即时
+		// 生效不重启——闭包纪律同 ForwardGate。
+		Blocked: blocked,
 	}
 }
 

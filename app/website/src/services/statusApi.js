@@ -45,6 +45,27 @@ export async function getIngressSessions() {
   return request('/api/status/ingress');
 }
 
+// 踢出一条在线接入连接（按公钥指纹）。返回 data: { kicked, fingerprint }。
+export async function kickIngressSession(fingerprint) {
+  return request('/api/status/ingress/kick', { method: 'POST', body: JSON.stringify({ fingerprint }) });
+}
+
+// 加入拒绝名单（指纹或 mesh 标签；默认同时断开在线连接，noKick 只拉黑）。
+export async function blockIngressSession({ fingerprint, deviceId, noKick } = {}) {
+  return request('/api/status/ingress/block', {
+    method: 'POST',
+    body: JSON.stringify({ fingerprint: fingerprint || '', device_id: deviceId || '', no_kick: Boolean(noKick) })
+  });
+}
+
+// 移出拒绝名单。
+export async function unblockIngressSession({ fingerprint, deviceId } = {}) {
+  return request('/api/status/ingress/unblock', {
+    method: 'POST',
+    body: JSON.stringify({ fingerprint: fingerprint || '', device_id: deviceId || '' })
+  });
+}
+
 // SSH 出站「测试连接」：POST 当前表单凭据做一次现场探测（服务端不落盘）。
 // 返回 data: { ok, stage, error, latency_millis, host_key_fingerprint }。
 export async function testSshConnection(payload) {

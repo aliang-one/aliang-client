@@ -22,15 +22,17 @@ const sessionHistoryCap = 300
 // 写点：握手成功后的登记点一次性写入身份字段；LastSeen/Channels 由通道
 // 生命周期续期；ClosedAt/Duration 在拆除点落定。读侧拿拷贝。
 type Session struct {
-	SourceIP string `json:"source_ip"`       // 客户端来源 IP（连接层 RemoteAddr）
-	User     string `json:"user"`            // 客户端自报的 SSH 用户名（审计参考）
-	Form     string `json:"form"`            // 凭证形态：bare=人用凭证 / mesh=组网节点
-	DeviceID string `json:"device_id"`       // mesh 形态的对端节点标识（bare 恒空）
-	AuthAt   int64  `json:"auth_at_unix"`    // 认证成功时刻（Unix 秒）
-	LastSeen int64  `json:"last_seen_unix"`  // 最近一次通道活动时刻（Unix 秒）
-	Channels int64  `json:"active_channels"` // 当前打开的通道数
-	Duration int64  `json:"duration_millis"` // 在线时=至今；已关闭=关闭-认证（毫秒）
-	ClosedAt int64  `json:"closed_at_unix"`  // 拆除时刻（Unix 秒）；0=仍在线
+	SourceIP    string `json:"source_ip"`       // 客户端来源 IP（连接层 RemoteAddr）
+	User        string `json:"user"`            // 客户端自报的 SSH 用户名（审计参考）
+	Form        string `json:"form"`            // 凭证形态：bare=人用凭证 / mesh=组网节点
+	DeviceID    string `json:"device_id"`       // mesh 形态的对端节点标识（bare 恒空）
+	Fingerprint string `json:"fingerprint"`     // 客户端公钥 SHA256 指纹（"SHA256:xxx"，踢出/拉黑的公共身份）
+	AuthAt      int64  `json:"auth_at_unix"`    // 认证成功时刻（Unix 秒）
+	LastSeen    int64  `json:"last_seen_unix"`  // 最近一次通道活动时刻（Unix 秒）
+	Channels    int64  `json:"active_channels"` // 当前打开的通道数
+	Duration    int64  `json:"duration_millis"` // 在线时=至今；已关闭=关闭-认证（毫秒）
+	ClosedAt    int64  `json:"closed_at_unix"`  // 拆除时刻（Unix 秒）；0=仍在线
+	Kicked      bool   `json:"kicked"`          // 被管理端踢出/黑名单补拦而断（true 时非自然掉线）
 }
 
 // sshSession 是台账里的可变运行态实体：store 回指登记它的台账（句柄方法
@@ -38,7 +40,9 @@ type Session struct {
 // 方法安全——测试替身可直接构造 sshSession{} 使用。
 type sshSession struct {
 	Session
-	store *sessionStore
+	store   *sessionStore
+	blockFn func(BlockQuery) bool // 活视图黑名单查询（Server.blockedNow）；nil=不判
+	sshConn gossh.Conn            // 底层 SSH 连接（登记时写入；踢出/替换时关闭）
 }
 
 // sessionStore 是一个入口 Server 的进程内会话台账。全部读写走 st.mu；
@@ -54,23 +58,43 @@ func newSessionStore() *sessionStore {
 }
 
 // register 登记一条已认证连接并返回会话句柄。meta 取握手元数据（User/
-// RemoteAddr），form/deviceID 取认证 Permissions（与 serveChannels 的
-// 观测面同源同值）。
-func (st *sessionStore) register(meta gossh.ConnMetadata, form, deviceID string) *sshSession {
+// RemoteAddr），form/deviceID/fingerprint 取认证 Permissions（与
+// serveChannels 的观测面同源同值）。conns 是底层 SSH 连接（踢出/同节点
+// 替换时关闭它——关闭解除 serveChannels 阻塞，走 defer sess.close() 的
+// 正常拆除路径落关闭历史）。blockFn 是黑名单活视图（Server.blockedNow）。
+//
+// 同一 mesh 节点（同 device_id）重连而旧连接未断时替换旧会话：旧连接关闭
+// （Kicked=true，客户端表现为连接被断；防同节点双连接的路由抖动）。
+func (st *sessionStore) register(meta gossh.ConnMetadata, form, deviceID, fingerprint string, blockFn func(BlockQuery) bool, conns gossh.Conn) *sshSession {
 	if st == nil {
 		return nil
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	now := time.Now().Unix()
+	if form == FormMesh && deviceID != "" {
+		for old := range st.active {
+			s := st.active[old]
+			if s.Form == FormMesh && s.DeviceID == deviceID {
+				s.Kicked = true
+				s.markClosedLocked(now)
+				if old.sshConn != nil {
+					_ = old.sshConn.Close()
+				}
+				delete(st.active, old)
+				break // device_id 唯一（公钥层已防重复），替换一处即止
+			}
+		}
+	}
 	sess := &sshSession{Session: Session{
-		SourceIP: remoteIP(meta.RemoteAddr()),
-		User:     meta.User(),
-		Form:     form,
-		DeviceID: deviceID,
-		AuthAt:   now,
-		LastSeen: now,
-	}, store: st}
+		SourceIP:    remoteIP(meta.RemoteAddr()),
+		User:        meta.User(),
+		Form:        form,
+		DeviceID:    deviceID,
+		Fingerprint: fingerprint,
+		AuthAt:      now,
+		LastSeen:    now,
+	}, store: st, blockFn: blockFn, sshConn: conns}
 	st.active[sess] = sess
 	return sess
 }
@@ -113,21 +137,57 @@ func (sess *sshSession) close() {
 	}
 	st := sess.store
 	st.mu.Lock()
-	s, ok := st.active[sess]
-	if ok {
+	if s, ok := st.active[sess]; ok {
 		delete(st.active, sess)
-		s.ClosedAt = time.Now().Unix()
-		s.Duration = (s.ClosedAt - s.AuthAt) * 1000 // 秒→毫秒
-		if s.Duration < 0 {
-			s.Duration = 0
-		}
-		s.Channels = 0
-		st.closed = append([]Session{s.Session}, st.closed...)
-		if len(st.closed) > sessionHistoryCap {
-			st.closed = st.closed[:sessionHistoryCap]
-		}
+		s.markClosedLocked(time.Now().Unix())
 	}
 	st.mu.Unlock()
+}
+
+// markClosedLocked 落关闭终态并转入环形历史头。调用方须持 st.mu；会话须
+// 已从在线表移除（或由调用方随后移除）。Kicked 已被置位的（踢出/替换路径
+// 预标记）保持不变——自然掉线不会覆盖踢出标记。
+func (s *sshSession) markClosedLocked(now int64) {
+	s.ClosedAt = now
+	s.Duration = (now - s.AuthAt) * 1000 // 秒→毫秒
+	if s.Duration < 0 {
+		s.Duration = 0
+	}
+	s.Channels = 0
+	s.store.closed = append([]Session{s.Session}, s.store.closed...)
+	if len(s.store.closed) > sessionHistoryCap {
+		s.store.closed = s.store.closed[:sessionHistoryCap]
+	}
+}
+
+// Kick 管理端踢出：置 Kicked 标记、落关闭历史并断开底层 SSH 连接（通道
+// goroutine 随之解除阻塞走正常拆除路径）。目标须在线（按 fingerprint 精确
+// 匹配；空指纹不操作）。返回是否确实断开了一条在线会话。
+func (st *sessionStore) Kick(fingerprint string) bool {
+	if st == nil || fingerprint == "" {
+		return false
+	}
+	st.mu.Lock()
+	var victim *sshSession
+	for s := range st.active {
+		if s.Fingerprint == fingerprint {
+			victim = s
+			break
+		}
+	}
+	if victim == nil {
+		st.mu.Unlock()
+		return false
+	}
+	victim.Kicked = true
+	victim.markClosedLocked(time.Now().Unix())
+	conn := victim.sshConn
+	delete(st.active, victim)
+	st.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
+	return true
 }
 
 // liveDurationMillis 在线时长快照：在线=至今；已关闭=拆除-认证。

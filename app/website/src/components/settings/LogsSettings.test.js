@@ -7,7 +7,10 @@ vi.mock('../../i18n', () => ({ useI18n: () => ({ t: (k, p) => k }) }));
 vi.mock('../../services/statusApi', () => ({
   getStatusSummary: vi.fn(),
   getStatusConnections: vi.fn(),
-  getIngressSessions: vi.fn()
+  getIngressSessions: vi.fn(),
+  kickIngressSession: vi.fn(),
+  blockIngressSession: vi.fn(),
+  unblockIngressSession: vi.fn()
 }));
 
 import { getIngressSessions, getStatusConnections, getStatusSummary } from '../../services/statusApi';
@@ -275,5 +278,115 @@ describe('状态页接入客户端卡', () => {
     const el = mountStatus();
     await flush();
     expect(el.textContent).toContain('status_ingressNotRunning');
+  });
+});
+
+// —— 接入客户端管理动作（踢出 / 拉黑 / 解封）——
+import { blockIngressSession, kickIngressSession, unblockIngressSession } from '../../services/statusApi';
+
+// mock 需补齐三个动作函数（上方 vi.mock 工厂是静态对象）。
+beforeEach(() => {
+  kickIngressSession.mockReset();
+  blockIngressSession.mockReset();
+  unblockIngressSession.mockReset();
+});
+
+const fpSession = (overrides = {}) => meshSession({ fingerprint: 'SHA256:fp-win', ...overrides });
+
+describe('状态页接入客户端管理动作', () => {
+  it('在线行渲染踢出/拉黑按钮,已拉黑行显示徽标且无拉黑按钮', async () => {
+    const el = mountStatus({
+      ingress: {
+        ok: true,
+        active: [fpSession(), fpSession({ fingerprint: 'SHA256:fp-bare', form: 'bare', device_id: '' })],
+        closed: [],
+        blocks: { fingerprints: ['SHA256:fp-win'], device_ids: [] }
+      }
+    });
+    await flush();
+
+    const kickBtns = el.querySelectorAll('[data-ingress-kick]');
+    expect(kickBtns.length).toBe(2);
+    const blockBtns = el.querySelectorAll('[data-ingress-block]');
+    expect(blockBtns.length).toBe(1); // fp-win 已拉黑,只剩 bare 行可拉黑
+    expect(el.querySelector('[data-ingress-blocked-badge]')).toBeTruthy();
+  });
+
+  it('确认后调用踢出接口并刷新台账', async () => {
+    window.confirm = vi.fn(() => true);
+    kickIngressSession.mockResolvedValue({ data: { kicked: true } });
+    const el = mountStatus({
+      ingress: { ok: true, active: [fpSession()], closed: [], blocks: { fingerprints: [], device_ids: [] } }
+    });
+    await flush();
+
+    el.querySelector('[data-ingress-kick]').click();
+    await flush();
+    expect(kickIngressSession).toHaveBeenCalledWith('SHA256:fp-win');
+    // 操作后刷新台账（调用次数 2：挂载 1 次 + 刷新 1 次）
+    expect(getIngressSessions.mock.calls.length).toBe(2);
+  });
+
+  it('确认取消则不调接口', async () => {
+    window.confirm = vi.fn(() => false);
+    const el = mountStatus({
+      ingress: { ok: true, active: [fpSession()], closed: [], blocks: { fingerprints: [], device_ids: [] } }
+    });
+    await flush();
+
+    el.querySelector('[data-ingress-kick]').click();
+    await flush();
+    expect(kickIngressSession).not.toHaveBeenCalled();
+  });
+
+  it('拉黑动作带指纹,成功后提示并刷新', async () => {
+    window.confirm = vi.fn(() => true);
+    window.alert = vi.fn();
+    blockIngressSession.mockResolvedValue({ data: { blocked: true } });
+    const el = mountStatus({
+      ingress: { ok: true, active: [fpSession()], closed: [], blocks: { fingerprints: [], device_ids: [] } }
+    });
+    await flush();
+
+    el.querySelector('[data-ingress-block]').click();
+    await flush();
+    expect(blockIngressSession).toHaveBeenCalledWith({ fingerprint: 'SHA256:fp-win', deviceId: 'dev-win' });
+    expect(window.alert).toHaveBeenCalled();
+    expect(getIngressSessions.mock.calls.length).toBe(2);
+  });
+
+  it('拒绝名单区渲染条目并可解封', async () => {
+    window.confirm = vi.fn(() => true);
+    window.alert = vi.fn();
+    unblockIngressSession.mockResolvedValue({ data: { blocked: false } });
+    const el = mountStatus({
+      ingress: {
+        ok: true,
+        active: [],
+        closed: [],
+        blocks: { fingerprints: ['SHA256:abc'], device_ids: ['dev-old'] }
+      }
+    });
+    await flush();
+
+    const list = el.querySelector('[data-ingress-blocked-list]');
+    expect(list).toBeTruthy();
+    expect(list.textContent).toContain('SHA256:abc');
+    expect(list.textContent).toContain('dev-old');
+
+    const unblockBtns = el.querySelectorAll('[data-ingress-unblock]');
+    expect(unblockBtns.length).toBe(2);
+    unblockBtns[1].click();
+    await flush();
+    expect(unblockIngressSession).toHaveBeenCalledWith({ fingerprint: '', deviceId: 'dev-old' });
+  });
+
+  it('无指纹会话不渲染管理按钮（旧会话兜底）', async () => {
+    const el = mountStatus({
+      ingress: { ok: true, active: [fpSession({ fingerprint: '' })], closed: [], blocks: { fingerprints: [], device_ids: [] } }
+    });
+    await flush();
+    expect(el.querySelector('[data-ingress-kick]')).toBeNull();
+    expect(el.querySelector('[data-ingress-block]')).toBeNull();
   });
 });
