@@ -730,9 +730,21 @@ func (h *TCPConnectionHandler) handleTLS(
 	return h.resolveTLSRoute(sessionCtx, connectCtx, originConn, metadata, route, wrapped, mitmedSNI)
 }
 
-// dialDirect dials a direct connection to the target using tun dialer
+// dialDirect dials a direct connection to the target using tun dialer.
+// DstIP 无效时回退用 HostName 拨号(net.Dialer 自带解析):SSH 入口的
+// direct-tcpip 注入刻意不设 DstIP(inbound/ssh/channel.go——注释口径
+// 「管线在隧道期拨号时重试解析」),inbound/http 对不可解析域名的
+// CONNECT 同样留空;此前空 DstIP 经 String() 得到 "invalid IP" 直接
+// 秒败,SSH 隧道内全部直连流量失联。HostName 也为空则无从拨号,显式报错。
 func (h *TCPConnectionHandler) dialDirect(ctx context.Context, metadata *M.Metadata) (net.Conn, error) {
-	addr := net.JoinHostPort(metadata.DstIP.String(), fmt.Sprintf("%d", metadata.DstPort))
+	host := metadata.DstIP.String()
+	if !metadata.DstIP.IsValid() {
+		if metadata.HostName == "" {
+			return nil, fmt.Errorf("dial direct: no destination (invalid IP and empty hostname)")
+		}
+		host = metadata.HostName
+	}
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", metadata.DstPort))
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		logger.Debug(fmt.Sprintf("Dial failed: %v", err))
