@@ -825,3 +825,141 @@ describe('RulesSettings SSH 上游代理', () => {
     }
   });
 });
+
+// —— 连接测试 + 链路状态灯（客户端连接状态反馈）挂载级测试 ——
+// fetch mock 串联两个端点：/api/proxy/ssh/known-hosts（挂载即拉）与
+// /api/status/summary（状态灯轮询）；测试连接 POST /api/proxy/ssh/test。
+describe('RulesSettings SSH 连接测试与状态灯', () => {
+  const testEnvelope = (data, ok = true) => ({
+    ok,
+    status: ok ? 200 : 500,
+    json: async () => ({ code: 0, msg: '', data })
+  });
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn((url) => {
+      if (String(url).includes('/api/status/summary')) {
+        return Promise.resolve(testEnvelope({
+          ai: {}, traffic: {}, http: {},
+          ssh: { ok: true, addr: '10.0.0.8:22', chains: [
+            { index: 0, alive: true, backoff: false, backoffRemainingMs: 0, activeChannels: 2 },
+            { index: 1, alive: false, backoff: true, backoffRemainingMs: 8000, activeChannels: 0 }
+          ] }
+        }));
+      }
+      return Promise.resolve(jsonResponse(knownHostsEnvelope([])));
+    }));
+  });
+
+  afterEach(() => {
+    while (mountedApps.length) {
+      const { app, el } = mountedApps.pop();
+      app.unmount();
+      el.remove();
+    }
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('ssh 类型挂载渲染测试按钮与状态灯区块；状态灯按 summary.ssh 渲染三态', async () => {
+    const { el } = mountRules(sshConfig());
+    await flush();
+
+    const block = el.querySelector('[data-ssh-connectivity]');
+    expect(block).toBeTruthy();
+    expect(el.querySelector('[data-ssh-test-button]')).toBeTruthy();
+
+    const lights = el.querySelector('[data-ssh-chain-lights]');
+    expect(lights).toBeTruthy();
+    const text = lights.textContent;
+    expect(text).toContain('status_sshChainAlive');
+    expect(text).toContain('status_sshChainBackoffIn');
+    expect(text).toContain('status_sshChainActive');
+    expect(globalThis.fetch).toHaveBeenCalledWith('/api/status/summary', expect.anything());
+  });
+
+  it('非 ssh 类型不渲染状态灯区块；切到 ssh 后出现', async () => {
+    const { el } = mountRules(sshConfig({ type: 'socks5', username: '', password: '' }));
+    await flush();
+    expect(el.querySelector('[data-ssh-connectivity]')).toBeNull();
+
+    setType(el, 'ssh');
+    await flush();
+    expect(el.querySelector('[data-ssh-connectivity]')).toBeTruthy();
+  });
+
+  it('点击测试连接：POST 载荷含表单凭据；成功结果条含延迟', async () => {
+    const fetchMock = vi.fn((url, options) => {
+      if (String(url).includes('/api/proxy/ssh/test')) {
+        return Promise.resolve(testEnvelope({ ok: true, stage: '', error: '', latency_millis: 42, host_key_fingerprint: 'SHA256:abcdefgh' }));
+      }
+      if (String(url).includes('/api/status/summary')) {
+        return Promise.resolve(testEnvelope({ ai: {}, traffic: {}, http: {}, ssh: { ok: false, chains: [] } }));
+      }
+      return Promise.resolve(jsonResponse(knownHostsEnvelope([])));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { el } = mountRules(sshConfig());
+    await flush();
+    // 等一轮轮询把灯清空
+    await new Promise((r) => setTimeout(r, 10));
+    await flush();
+
+    el.querySelector('[data-ssh-test-button]').click();
+    await flush();
+    await new Promise((r) => setTimeout(r, 10));
+    await flush();
+
+    // POST 调用发生了
+    const testCall = fetchMock.mock.calls.find(([url]) => String(url).includes('/api/proxy/ssh/test'));
+    expect(testCall).toBeTruthy();
+    expect(testCall[1].method).toBe('POST');
+    const payload = JSON.parse(testCall[1].body);
+    expect(payload.server_host).toBe('127.0.0.1');
+    expect(payload.server_port).toBe(2222);
+    expect(payload.username).toBe('deploy');
+    expect(payload.password).toBe('secret');
+
+    const result = el.querySelector('[data-ssh-test-result]');
+    expect(result).toBeTruthy();
+    expect(result.textContent).toContain('rules_sshTestSuccess');
+  });
+
+  it('测试失败：结果条显示阶段键与错误文本', async () => {
+    const fetchMock = vi.fn((url, options) => {
+      if (String(url).includes('/api/proxy/ssh/test')) {
+        return Promise.resolve(testEnvelope({ ok: false, stage: 'handshake', error: 'permission denied', latency_millis: 0, host_key_fingerprint: '' }));
+      }
+      if (String(url).includes('/api/status/summary')) {
+        return Promise.resolve(testEnvelope({ ai: {}, traffic: {}, http: {}, ssh: { ok: false, chains: [] } }));
+      }
+      return Promise.resolve(jsonResponse(knownHostsEnvelope([])));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { el } = mountRules(sshConfig());
+    await flush();
+    await new Promise((r) => setTimeout(r, 10));
+    await flush();
+
+    el.querySelector('[data-ssh-test-button]').click();
+    await flush();
+    await new Promise((r) => setTimeout(r, 10));
+    await flush();
+
+    const result = el.querySelector('[data-ssh-test-result]');
+    expect(result).toBeTruthy();
+    // i18n mock 原样回键不插值：{stage}/{error} 占位符不被替换,结果条文本
+    // 就是失败键本身。断言结果条存在且渲染了失败键（真实 i18n 下会插值出
+    // 阶段文案与原始错误文本）。
+    expect(result.textContent).toContain('rules_sshTestFailed');
+  });
+
+  it('表单校验未过（无凭据）时测试按钮禁用', async () => {
+    const { el } = mountRules(sshConfig({ password: '', private_key: '' }));
+    await flush();
+    const btn = el.querySelector('[data-ssh-test-button]');
+    expect(btn.disabled).toBe(true);
+  });
+});

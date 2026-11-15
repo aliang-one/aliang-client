@@ -349,6 +349,64 @@
               </div>
             </div>
 
+            <!-- 连接测试 + 链路状态灯（客户端连接状态反馈）：测试按钮做一次性
+                 主动验证（当前表单凭据,未保存也可测）；状态灯做持续监控（已保存
+                 并注册的出站链池,来自 /api/status/summary 的 ssh 字段）。两者
+                 互补：表单值 ≠ 运行态,按钮测「我现在填的能不能连」,灯看
+                 「当前生效的链路健康如何」。 -->
+            <div data-ssh-connectivity class="space-y-3 rounded-xl border border-dashed border-slate-300 bg-slate-50/60 p-4 dark:border-slate-700 dark:bg-slate-900/40">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h4 class="text-sm font-semibold text-slate-900 dark:text-white">{{ t('rules_sshTestTitle') }}</h4>
+                  <p class="text-xs text-slate-500">{{ t('rules_sshTestDesc') }}</p>
+                </div>
+                <button
+                  type="button"
+                  data-ssh-test-button
+                  :disabled="!form.proxy.enable || sshTest.loading || !!sshValidationError"
+                  class="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 shadow-sm transition hover:border-primary/30 hover:text-primary disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
+                  @click="runSshTest"
+                >
+                  <span class="material-symbols-outlined text-sm">{{ sshTest.loading ? 'hourglass_top' : 'network_check' }}</span>
+                  {{ sshTest.loading ? t('rules_sshTestRunning') : t('rules_sshTestButton') }}
+                </button>
+              </div>
+
+              <!-- 测试结果条：成功（延迟+指纹）/失败（阶段文案+原始错误） -->
+              <p
+                v-if="sshTest.result"
+                data-ssh-test-result
+                role="status"
+                class="rounded-lg px-3 py-2 text-xs"
+                :class="sshTest.result.ok
+                  ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300'
+                  : 'bg-red-50 text-red-700 dark:bg-red-500/10 dark:text-red-300'"
+              >
+                {{ sshTestResultText }}
+              </p>
+
+              <!-- 链路状态灯：已注册出站链池的运行态（保存并生效后才有内容）。
+                   未配置/未运行时显示占位文案；退避中琥珀、存活绿、空闲灰。 -->
+              <div v-if="sshChains.length" data-ssh-chain-lights class="grid gap-2">
+                <div
+                  v-for="chain in sshChains"
+                  :key="chain.index"
+                  class="flex items-center justify-between gap-3 rounded-lg border px-3 py-2 text-xs"
+                  :class="chain.cardClass"
+                >
+                  <div class="flex items-center gap-2">
+                    <span class="h-2 w-2 shrink-0 rounded-full" :class="chain.dotClass" aria-hidden="true"></span>
+                    <span class="font-medium text-slate-800 dark:text-slate-200">{{ chain.label }}</span>
+                  </div>
+                  <div class="flex items-center gap-2">
+                    <span :class="chain.stateClass">{{ chain.stateText }}</span>
+                    <span v-if="chain.activeText" class="text-slate-400">{{ chain.activeText }}</span>
+                  </div>
+                </div>
+              </div>
+              <p v-else data-ssh-chain-lights-empty class="text-xs text-slate-400">{{ t('rules_sshChainIdleHint') }}</p>
+            </div>
+
             <!-- 服务器指纹（TOFU 库管理）：加载失败静默降级，不阻塞主表单 -->
             <div data-known-hosts class="space-y-3 rounded-xl border border-dashed border-slate-300 bg-slate-50/60 p-4 dark:border-slate-700 dark:bg-slate-900/40">
               <div>
@@ -607,6 +665,7 @@
 <script>
 import { useI18n } from '../../i18n';
 import { openTutorialDocs } from '../../composables/useTutorialDocs';
+import { getStatusSummary, testSshConnection } from '../../services/statusApi';
 
 function defaultConfig() {
   return {
@@ -1271,6 +1330,13 @@ export default {
         failed: false,
         items: []
       },
+      // SSH 测试连接 + 链路状态灯状态。测试是一次性动作（loading/result）；
+      // 链路状态轮询 summary.ssh（保存并生效后才非空），仅 ssh 类型挂载时轮询。
+      sshTest: {
+        loading: false,
+        result: null
+      },
+      sshChainsRaw: [],
       _proxyRulesText: '',
       _providerIncludeTexts: {},
       _showSuccessDialog: false,
@@ -1305,10 +1371,12 @@ export default {
     // SSH 类型挂载即拉取指纹列表；socks5/http → ssh 的切换由 type watcher 补拉
     if (this.form.proxy.type === 'ssh') {
       this.loadKnownHosts();
+      this.startSshChainPolling();
     }
   },
   beforeUnmount() {
     this.clearSuccessDialogTimer();
+    this.stopSshChainPolling();
     if (this._providerEditorClickHandler) {
       document.removeEventListener('click', this._providerEditorClickHandler, true);
       this._providerEditorClickHandler = null;
@@ -1317,6 +1385,68 @@ export default {
   computed: {
     providerOrder() {
       return mergeProviderOrder(providerKeys(this.form.ai_rules), this.presetProviders);
+    },
+    // —— 连接测试 + 链路状态灯（客户端连接状态反馈）——
+    // 链路卡片：把 summary.ssh.chains 的运行态快照映射成灯行（与状态页
+    // LogsSettings 的 sshChainCards 同款口径：退避琥珀/存活绿/空闲灰）。
+    sshChains() {
+      return (Array.isArray(this.sshChainsRaw) ? this.sshChainsRaw : []).map((chain) => {
+        const index = Number(chain.index || 0) + 1;
+        const alive = Boolean(chain.alive);
+        const backoff = Boolean(chain.backoff);
+        const remaining = Math.max(1, Math.round(Number(chain.backoffRemainingMs || 0) / 1000));
+        const activeCount = Number(chain.activeChannels || 0);
+        let stateText;
+        let cardClass;
+        let dotClass;
+        let stateClass;
+        if (backoff) {
+          stateText = this.t('status_sshChainBackoffIn', { seconds: remaining });
+          cardClass = 'border-amber-200 bg-amber-50/70 dark:border-amber-500/30 dark:bg-amber-500/10';
+          dotClass = 'bg-amber-400';
+          stateClass = 'text-amber-600 dark:text-amber-300';
+        } else if (alive) {
+          stateText = this.t('status_sshChainAlive');
+          cardClass = 'border-emerald-200 bg-emerald-50/70 dark:border-emerald-500/30 dark:bg-emerald-500/10';
+          dotClass = 'bg-emerald-400';
+          stateClass = 'text-emerald-600 dark:text-emerald-300';
+        } else {
+          stateText = this.t('status_sshChainIdle');
+          cardClass = 'border-slate-200 bg-slate-50/80 dark:border-slate-800 dark:bg-slate-900/60';
+          dotClass = 'bg-slate-300 dark:bg-slate-600';
+          stateClass = 'text-slate-500 dark:text-slate-400';
+        }
+        return {
+          index: chain.index ?? index,
+          label: this.t('status_sshChainLabel', { index }),
+          stateText,
+          activeText: activeCount > 0 ? this.t('status_sshChainActive', { count: activeCount }) : '',
+          cardClass,
+          dotClass,
+          stateClass
+        };
+      });
+    },
+    // 测试结果条文案：成功=✓ 延迟 + 指纹截断；失败=阶段文案 + 原始错误。
+    sshTestResultText() {
+      const res = this.sshTest.result;
+      if (!res) return '';
+      if (res.ok) {
+        const latency = Number(res.latency_millis || 0);
+        const fpr = String(res.host_key_fingerprint || '');
+        const fprShort = fpr.length > 24 ? `${fpr.slice(0, 24)}…` : fpr;
+        return this.t('rules_sshTestSuccess', { latency, fingerprint: fprShort });
+      }
+      const stageKey = {
+        auth: 'rules_sshTestStageAuth',
+        dial: 'rules_sshTestStageDial',
+        handshake: 'rules_sshTestStageHandshake',
+        channel: 'rules_sshTestStageChannel',
+        roundtrip: 'rules_sshTestStageRoundTrip'
+      }[String(res.stage || '')];
+      const stageText = stageKey ? this.t(stageKey) : '';
+      const detail = String(res.error || '');
+      return this.t('rules_sshTestFailed', { stage: stageText, error: detail });
     },
     isSshProxy() {
       return this.form.proxy.type === 'ssh';
@@ -1420,7 +1550,13 @@ export default {
     'form.proxy.type'(nextType) {
       if (nextType === 'ssh') {
         this.loadKnownHosts();
+        this.startSshChainPolling();
+        return;
       }
+      // 非 ssh 类型：链路状态灯无数据源，停轮询并清结果
+      this.stopSshChainPolling();
+      this.sshChainsRaw = [];
+      this.sshTest.result = null;
     },
     presetProviders: {
       deep: true,
@@ -1633,6 +1769,119 @@ export default {
     truncateFingerprint(fingerprint) {
       const value = String(fingerprint || '');
       return value.length > 20 ? `${value.slice(0, 20)}…` : value;
+    },
+    // —— 连接测试 + 链路状态灯 ——
+    // 测试连接：用当前表单凭据做一次现场探测（后端不落盘不触注册表）。
+    // 载荷与保存路径同构（server 单串线格式 + 当前面凭据收敛 + 跳板线格式），
+    // 测的就是「将要保存的这份配置」。失败也停留在结果条（role=status），
+    // 不抛错不阻塞表单。
+    async runSshTest() {
+      if (!this.form.proxy.enable || this.sshTest.loading || this.sshValidationError) {
+        return;
+      }
+      this.sshTest.loading = true;
+      this.sshTest.result = null;
+      try {
+        const envelope = await testSshConnection(this.buildSshTestPayload());
+        this.sshTest.result = envelope?.data || { ok: false, stage: '', error: 'empty response' };
+      } catch (error) {
+        // 网络层失败（本机 API 不可达等）：同样落结果条
+        this.sshTest.result = {
+          ok: false,
+          stage: '',
+          error: error instanceof Error ? error.message : String(error)
+        };
+      } finally {
+        this.sshTest.loading = false;
+      }
+    },
+    // 测试载荷：与 handleSubmit 的 SSH 载荷口径一致（server 单串、当前面
+    // 凭据收敛、跳板线格式五字段、pool_size 不参与探测）。
+    buildSshTestPayload() {
+      const mode = this.sshAuthMode;
+      const payload = {
+        server_host: String(this.form.proxy.server || '').trim(),
+        username: String(this.form.proxy.username || '').trim(),
+        password: mode === 'password' ? String(this.form.proxy.password ?? '') : '',
+        private_key: mode === 'key' ? String(this.form.proxy.private_key ?? '') : '',
+        key_passphrase: mode === 'key' ? String(this.form.proxy.key_passphrase ?? '') : '',
+        jump_servers: this.activeJumpServers()
+      };
+      // server 单串线格式可能带端口（host:port）；无端口时后端要求 server_port，
+      // 这里对常见缺省 22 做前端兜底拆分（与 parseCustomerProxyServer 的宽容度对齐）。
+      const raw = payload.server_host;
+      if (raw && !raw.includes(':')) {
+        payload.server_host = raw;
+        payload.server_port = 22;
+      } else if (raw) {
+        const idx = raw.lastIndexOf(':');
+        const host = raw.slice(0, idx);
+        const port = Number(raw.slice(idx + 1));
+        payload.server_host = host;
+        payload.server_port = Number.isFinite(port) && port > 0 ? port : 22;
+      }
+      // 跳板行 server 同为单串线格式（host:port 或 ssh://user:pass@host:port）：
+      // 简单形态直接拆 host:port；ssh:// URL 原样交后端（后端 parseCustomerProxyServer
+      // 同款解析——测试载荷复用 server_host/server_port 字段,这里透传单串给
+      // 后端解析的口径:跳板行的 URL 形态在前端不拆,交 EffectiveSSHProxy 同源解析）。
+      payload.jump_servers = (payload.jump_servers || []).map((jump) => {
+        const server = String(jump.server || '').trim();
+        if (server && !server.includes('://') && server.includes(':')) {
+          const idx = server.lastIndexOf(':');
+          const port = Number(server.slice(idx + 1));
+          return {
+            server_host: server.slice(0, idx),
+            server_port: Number.isFinite(port) && port > 0 ? port : 22,
+            username: jump.username,
+            password: jump.password,
+            private_key: jump.private_key,
+            key_passphrase: jump.key_passphrase
+          };
+        }
+        if (server && server.includes('://')) {
+          // ssh://user:pass@host:port —— 提取凭据+host:port（与后端解析同构）
+          try {
+            const url = new URL(server);
+            const port = url.port ? Number(url.port) : 22;
+            return {
+              server_host: url.hostname,
+              server_port: port,
+              username: url.username || jump.username,
+              password: url.password || jump.password,
+              private_key: jump.private_key,
+              key_passphrase: jump.key_passphrase
+            };
+          } catch {
+            return { server_host: server, server_port: 22, username: jump.username, password: jump.password, private_key: jump.private_key, key_passphrase: jump.key_passphrase };
+          }
+        }
+        return { server_host: server, server_port: 22, username: jump.username, password: jump.password, private_key: jump.private_key, key_passphrase: jump.key_passphrase };
+      });
+      return payload;
+    },
+    // 链路状态灯轮询：复用状态 summary 的 ssh 字段（5s 与状态页同频）。
+    // 失败静默（下个周期自愈），与指纹区块同款降级纪律。
+    async loadSshChains() {
+      try {
+        const envelope = await getStatusSummary();
+        const chains = envelope?.data?.ssh?.chains;
+        this.sshChainsRaw = Array.isArray(chains) ? chains : [];
+      } catch {
+        // 静默：灯保持上一次快照，下个轮询周期自愈
+      }
+    },
+    startSshChainPolling() {
+      this.stopSshChainPolling();
+      this.loadSshChains();
+      this._sshChainTimer = window.setInterval(() => {
+        this.loadSshChains();
+      }, 5000);
+    },
+    stopSshChainPolling() {
+      if (this._sshChainTimer) {
+        window.clearInterval(this._sshChainTimer);
+        this._sshChainTimer = null;
+      }
     },
     async handleSubmit() {
       const normalized = normalizeConfig(this.form);

@@ -204,3 +204,26 @@ func HandleIngressConn(conn net.Conn) bool {
 	srv.ServeConn(conn)
 	return true
 }
+
+// SessionsSnapshot 是接入客户端台账的只读聚合（API 消费）：在线 + 已关闭
+// 环形历史。两列表恒非 nil（空 → 空数组）。
+type SessionsSnapshot struct {
+	Active []Session `json:"active"`
+	Closed []Session `json:"closed"`
+}
+
+// SessionsSnapshot 取当前 reconcile 实例的会话快照；入口未配置/未启动时
+// 返回 ok=false 与空列表（前端渲染「未运行」态而非报错）。锁纪律同
+// HandleIngressConn：锁内快照实例，读台账在锁外（台账自带内部锁）。
+func SessionsSnapshotOf() (SessionsSnapshot, bool) {
+	reconcileMu.Lock()
+	srv := reconcileSrv
+	reconcileMu.Unlock()
+	if srv == nil {
+		return SessionsSnapshot{Active: []Session{}, Closed: []Session{}}, false
+	}
+	return SessionsSnapshot{
+		Active: srv.ActiveSessions(),
+		Closed: srv.ClosedSessions(),
+	}, true
+}

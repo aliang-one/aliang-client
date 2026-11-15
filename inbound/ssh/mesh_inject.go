@@ -38,8 +38,9 @@ type meshExitTarget struct {
 // handleMeshExitChannel 是 mesh form 的 channel 分派:ExtraData cap →
 // payload 解析 → ForwardGate fail-closed 门禁(SPEC §10.1 决策 #14)全部
 // 在 Accept 前完成(Reject reason 回给 A 侧 OpenChannel);Accept 后按 t
-// 分流(dns→代解析不进管线;tcp→注入管线)。
-func handleMeshExitChannel(ctx context.Context, newCh gossh.NewChannel, extra []byte, rc RunConfig, meshDeviceID string, connRemote net.Addr) {
+// 分流(dns→代解析不进管线;tcp→注入管线)。sess 为本连接的会话台账句柄
+// （可 nil）：注入协程期间保持活跃通道计数，协程退出归还。
+func handleMeshExitChannel(ctx context.Context, newCh gossh.NewChannel, extra []byte, rc RunConfig, meshDeviceID string, connRemote net.Addr, sess *sshSession) {
 	reject := func(msg string) {
 		logger.Debug(fmt.Sprintf("SSH ingress mesh-exit rejected (%s) from %s", msg, meshDeviceID))
 		_ = newCh.Reject(gossh.Prohibited, msg)
@@ -82,10 +83,16 @@ func handleMeshExitChannel(ctx context.Context, newCh gossh.NewChannel, extra []
 	if tgt.T == "dns" {
 		// 缝值(解析器/交换窗口)在分派点(与调用方同 goroutine,同步段)
 		// 快照传入:注入协程内不触碰包级 var,与测试的覆写/还原严格免竞态。
-		go serveMeshDNSExit(ch, meshDNSResolveTimeout, meshDNSResolver)
+		go func() {
+			defer sess.closeChannel()
+			serveMeshDNSExit(ch, meshDNSResolveTimeout, meshDNSResolver)
+		}()
 		return
 	}
-	go injectMeshExitStream(ctx, ch, connRemote, tgt, meshDeviceID)
+	go func() {
+		defer sess.closeChannel()
+		injectMeshExitStream(ctx, ch, connRemote, tgt, meshDeviceID)
+	}()
 }
 
 // injectMeshExitStream 把 mesh-exit TCP 流注入本机入站管线(SPEC §4.1 注入

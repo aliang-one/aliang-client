@@ -213,6 +213,10 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	// routes.go(缺任一侧=404 透传,2026-10-21 教训)。
 	sshIngressKeygenHandler := handlers.NewSSHIngressKeygenHandler()
 	mux.HandleFunc("/api/proxy/ssh-ingress/keygen", sshIngressKeygenHandler.HandleKeygen)
+	// SSH 出站「测试连接」(客户端连接状态反馈):POST 无状态现场探测,凭据
+	// 不落盘。无状态,两进程各持等价。双注册另一处 routes.go(缺任一侧=404
+	// 透传,2026-10-21 教训;/api/proxy 前缀 parity 护栏覆盖)。
+	mux.HandleFunc("/api/proxy/ssh/test", handlers.HandleSSHTest)
 }
 
 func loopbackOnly(next http.Handler) http.Handler {

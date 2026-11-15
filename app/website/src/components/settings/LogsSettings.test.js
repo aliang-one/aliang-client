@@ -6,10 +6,11 @@ import { createApp, defineComponent, h } from 'vue';
 vi.mock('../../i18n', () => ({ useI18n: () => ({ t: (k, p) => k }) }));
 vi.mock('../../services/statusApi', () => ({
   getStatusSummary: vi.fn(),
-  getStatusConnections: vi.fn()
+  getStatusConnections: vi.fn(),
+  getIngressSessions: vi.fn()
 }));
 
-import { getStatusConnections, getStatusSummary } from '../../services/statusApi';
+import { getIngressSessions, getStatusConnections, getStatusSummary } from '../../services/statusApi';
 import LogsSettings from './LogsSettings.vue';
 
 const flush = async (rounds = 8) => {
@@ -31,6 +32,7 @@ beforeEach(() => {
   vi.stubGlobal('clearInterval', (...args) => originalClearInterval(...args));
   getStatusSummary.mockReset();
   getStatusConnections.mockReset();
+  getIngressSessions.mockReset();
 });
 
 afterEach(() => {
@@ -43,9 +45,10 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function mountStatus({ summary, connections } = {}) {
+function mountStatus({ summary, connections, ingress } = {}) {
   getStatusSummary.mockResolvedValue({ data: summary || { ai: {}, traffic: {}, http: {} } });
   getStatusConnections.mockResolvedValue({ data: connections || { active: [], closed: [] } });
+  getIngressSessions.mockResolvedValue({ data: ingress || { ok: false, active: [], closed: [] } });
 
   const el = document.createElement('div');
   document.body.appendChild(el);
@@ -187,5 +190,90 @@ describe('状态页 SSH 出口链路卡', () => {
     });
     await flush();
     expect(el.textContent).toContain('status_sshNotConfigured');
+  });
+});
+
+// —— 接入客户端台账卡（服务端视角「谁连进来了」）——
+const meshSession = (overrides = {}) => ({
+  source_ip: '172.16.0.196',
+  user: 'deploy',
+  form: 'mesh',
+  device_id: 'dev-win',
+  auth_at_unix: Math.floor(Date.now() / 1000) - 300,
+  last_seen_unix: Math.floor(Date.now() / 1000),
+  active_channels: 2,
+  duration_millis: 300000,
+  closed_at_unix: 0,
+  ...overrides
+});
+
+const bareSession = (overrides = {}) => meshSession({
+  form: 'bare',
+  device_id: '',
+  active_channels: 0,
+  ...overrides
+});
+
+describe('状态页接入客户端卡', () => {
+  it('入口未运行时渲染「未运行」占位且无在线徽标', async () => {
+    const el = mountStatus({ ingress: { ok: false, active: [], closed: [] } });
+    await flush();
+    expect(el.querySelector('[data-ingress-online-badge]')).toBeNull();
+    expect(el.textContent).toContain('status_ingressNotRunning');
+    expect(el.querySelector('[data-ingress-active-list]')).toBeNull();
+  });
+
+  it('在线客户端列表：mesh 显示 device_id+来源,bare 显示 IP+用户,徽标计数', async () => {
+    const el = mountStatus({
+      ingress: { ok: true, active: [meshSession(), bareSession()], closed: [] }
+    });
+    await flush();
+
+    const badge = el.querySelector('[data-ingress-online-badge]');
+    expect(badge).toBeTruthy();
+    // i18n mock 原样回键（不插值）,断言徽标键被消费即可
+    expect(badge.textContent).toContain('status_ingressOnlineBadge');
+
+    const list = el.querySelector('[data-ingress-active-list]');
+    expect(list).toBeTruthy();
+    const text = list.textContent;
+    // mesh：主标题是 device_id,副标题键被消费（i18n mock 原样回键,插值参数
+    // 来源 IP 以参数形态传入,断言其出现在模板插值前的字面量里不可行——
+    // 副标题断言键、主标题断言真实数据值）
+    expect(text).toContain('dev-win');
+    expect(text).toContain('status_ingressMeshSubtitle');
+    // bare：主标题是 IP,副标题用户键被消费
+    expect(text).toContain('172.16.0.196');
+    expect(text).toContain('status_ingressUserSubtitle');
+    // 形态徽标走 i18n mock
+    expect(text).toContain('status_ingressFormMesh');
+    expect(text).toContain('status_ingressFormBare');
+    // 两行（mesh+bare）
+    expect(list.children.length).toBe(2);
+  });
+
+  it('最近断开列表渲染来源与时间,且不占在线徽标', async () => {
+    const el = mountStatus({
+      ingress: {
+        ok: true,
+        active: [],
+        closed: [meshSession({ closed_at_unix: Math.floor(Date.now() / 1000) - 60 })]
+      }
+    });
+    await flush();
+
+    expect(el.querySelector('[data-ingress-active-list]')).toBeNull();
+    expect(el.textContent).toContain('status_ingressEmpty');
+    const closed = el.querySelector('[data-ingress-closed-list]');
+    expect(closed).toBeTruthy();
+    expect(closed.textContent).toContain('dev-win');
+    expect(closed.textContent).toContain('status_ingressFormMesh');
+  });
+
+  it('接口失败时静默降级为未运行态,不报错', async () => {
+    getIngressSessions.mockRejectedValue(new Error('boom'));
+    const el = mountStatus();
+    await flush();
+    expect(el.textContent).toContain('status_ingressNotRunning');
   });
 });

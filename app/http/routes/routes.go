@@ -255,6 +255,13 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/stats/http/preset-domains", h.HTTPStats.HandleGetPresetDomains, http.MethodGet)
 	register("/api/status/summary", h.Status.HandleGetSummary, http.MethodGet)
 	register("/api/status/connections", h.Status.HandleGetConnections, http.MethodGet)
+	// 接入客户端台账（服务端「谁连进来了」）：GET 只读，数据源 inbound/ssh
+	// 进程级 reconcile 实例的会话台账；入口未启动返回 ok=false + 空表。
+	register("/api/status/ingress", handlers.HandleIngressSessions, http.MethodGet)
+	// SSH 出站「测试连接」：POST 无状态现场探测（凭据只活在请求里,不落盘
+	// 不触碰注册表）；双注册另一处 agentruntime server.go registerAgentRoutes
+	// （缺任一侧=404 透传,2026-10-21 教训;/api/proxy 前缀 parity 护栏覆盖）。
+	register("/api/proxy/ssh/test", handlers.HandleSSHTest, http.MethodPost)
 
 	register("/api/chat/completions", h.Chat.HandleCompletions, http.MethodPost)
 

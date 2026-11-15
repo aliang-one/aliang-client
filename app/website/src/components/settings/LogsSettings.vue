@@ -138,6 +138,84 @@
         <div class="grid gap-4 xl:grid-cols-[1.15fr_0.85fr]">
           <article
             class="rounded-2xl border border-slate-200/70 bg-white/90 p-4 shadow-[0_18px_40px_rgba(15,23,42,0.07)] backdrop-blur dark:border-slate-800/80 dark:bg-slate-950/70"
+            data-pane="ingress-sessions"
+          >
+            <div class="flex items-start justify-between gap-3">
+              <div>
+                <h3 class="text-base font-semibold text-slate-950 dark:text-white">
+                  {{ t('status_ingressTitle') }}
+                </h3>
+                <p class="mt-1 text-sm leading-6 text-slate-500 dark:text-slate-400">
+                  {{ t('status_ingressDesc') }}
+                </p>
+              </div>
+              <span
+                v-if="ingressRunning"
+                class="shrink-0 rounded-full px-3 py-1 text-xs font-medium"
+                :class="ingressActiveRows.length
+                  ? 'bg-emerald-600 text-white dark:bg-emerald-400 dark:text-slate-950'
+                  : 'bg-slate-200 text-slate-600 dark:bg-slate-800 dark:text-slate-300'"
+                data-ingress-online-badge
+              >
+                {{ t('status_ingressOnlineBadge', { count: ingressActiveRows.length }) }}
+              </span>
+            </div>
+
+            <div
+              v-if="!ingressRunning"
+              class="mt-4 rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-6 text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-900/60 dark:text-slate-400"
+            >
+              {{ t('status_ingressNotRunning') }}
+            </div>
+            <div v-else-if="ingressActiveRows.length" class="mt-4 grid gap-2" data-ingress-active-list>
+              <div
+                v-for="row in ingressActiveRows"
+                :key="row.key"
+                class="flex items-center justify-between gap-3 rounded-xl border px-3 py-2.5 text-sm"
+                :class="row.form === 'mesh'
+                  ? 'border-emerald-200 bg-emerald-50/70 dark:border-emerald-500/30 dark:bg-emerald-500/10'
+                  : 'border-slate-200 bg-slate-50/80 dark:border-slate-800 dark:bg-slate-900/60'"
+              >
+                <div class="flex min-w-0 items-center gap-2.5">
+                  <span class="h-2 w-2 shrink-0 rounded-full bg-emerald-400" aria-hidden="true"></span>
+                  <div class="min-w-0">
+                    <div class="truncate font-medium text-slate-900 dark:text-slate-100">{{ row.title }}</div>
+                    <div class="truncate text-xs text-slate-400">{{ row.subtitle }}</div>
+                  </div>
+                </div>
+                <div class="flex shrink-0 items-center gap-2 text-xs">
+                  <span class="rounded-full bg-white px-2 py-0.5 text-[11px] font-medium text-slate-500 shadow-sm ring-1 ring-slate-200 dark:bg-slate-950 dark:text-slate-400 dark:ring-slate-800">{{ row.formLabel }}</span>
+                  <span class="text-slate-400">{{ row.duration }}</span>
+                </div>
+              </div>
+            </div>
+            <div
+              v-else
+              class="mt-4 rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-6 text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-900/60 dark:text-slate-400"
+            >
+              {{ t('status_ingressEmpty') }}
+            </div>
+
+            <!-- 最近断开的接入（环形历史前几条）：排查「刚掉线谁」 -->
+            <div v-if="ingressRunning && ingressClosedRows.length" class="mt-4 border-t border-slate-100 pt-3 dark:border-slate-800/60" data-ingress-closed-list>
+              <p class="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{{ t('status_ingressClosedTitle') }}</p>
+              <div class="mt-2 grid gap-1.5">
+                <div
+                  v-for="row in ingressClosedRows"
+                  :key="row.key"
+                  class="flex items-center justify-between gap-3 text-xs text-slate-500 dark:text-slate-400"
+                >
+                  <span class="min-w-0 truncate">{{ row.title }} <span class="text-slate-400">· {{ row.formLabel }}</span></span>
+                  <span class="shrink-0 text-slate-400">{{ row.closedAgo }}</span>
+                </div>
+              </div>
+            </div>
+          </article>
+        </div>
+
+        <div class="grid gap-4 xl:grid-cols-[1.15fr_0.85fr]">
+          <article
+            class="rounded-2xl border border-slate-200/70 bg-white/90 p-4 shadow-[0_18px_40px_rgba(15,23,42,0.07)] backdrop-blur dark:border-slate-800/80 dark:bg-slate-950/70"
             data-pane="connection-records"
           >
             <div class="flex items-start justify-between gap-3">
@@ -363,7 +441,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useI18n } from '../../i18n';
-import { getStatusConnections, getStatusSummary } from '../../services/statusApi';
+import { getIngressSessions, getStatusConnections, getStatusSummary } from '../../services/statusApi';
 
 const { t } = useI18n();
 
@@ -381,6 +459,8 @@ const LOG_LEVEL_OPTIONS = [
 const entries = ref([]);
 const statusSummary = ref({ ai: {}, traffic: {}, http: {} });
 const connectionsData = ref({ active: [], closed: [] });
+// 接入客户端台账（服务端视角：谁经 SSH 入口连进来）
+const ingressData = ref({ ok: false, active: [], closed: [] });
 const connectionsTab = ref('active');
 const selectedLevel = ref('all');
 const autoScroll = ref(true);
@@ -416,6 +496,27 @@ const httpStats = computed(() => statusSummary.value?.http || {});
 const sshStatus = computed(() => statusSummary.value?.ssh || { ok: false, chains: [] });
 const activeConnections = computed(() => Array.isArray(connectionsData.value?.active) ? connectionsData.value.active : []);
 const closedConnections = computed(() => Array.isArray(connectionsData.value?.closed) ? connectionsData.value.closed : []);
+
+// —— 接入客户端台账（服务端「谁连进来了」）——
+const ingressRunning = computed(() => Boolean(ingressData.value?.ok));
+const ingressActiveRaw = computed(() => Array.isArray(ingressData.value?.active) ? ingressData.value.active : []);
+const ingressClosedRaw = computed(() => Array.isArray(ingressData.value?.closed) ? ingressData.value.closed : []);
+const formLabel = (form) => form === 'mesh' ? t('status_ingressFormMesh') : t('status_ingressFormBare');
+const ingressActiveRows = computed(() => ingressActiveRaw.value.map((sess, i) => ({
+  key: `${sess.source_ip}-${sess.auth_at_unix}-${i}`,
+  title: sess.form === 'mesh' && sess.device_id ? sess.device_id : (sess.source_ip || '--'),
+  subtitle: sess.form === 'mesh' && sess.device_id
+    ? t('status_ingressMeshSubtitle', { ip: sess.source_ip || '--' })
+    : (sess.user ? t('status_ingressUserSubtitle', { user: sess.user }) : ''),
+  formLabel: formLabel(sess.form),
+  duration: formatDurationMillis(sess.duration_millis)
+})));
+const ingressClosedRows = computed(() => ingressClosedRaw.value.slice(0, 5).map((sess, i) => ({
+  key: `${sess.source_ip}-${sess.closed_at_unix}-${i}`,
+  title: sess.form === 'mesh' && sess.device_id ? sess.device_id : (sess.source_ip || '--'),
+  formLabel: formLabel(sess.form),
+  closedAgo: formatClosedAt(sess.closed_at_unix)
+})));
 const connectionRows = computed(() => connectionsTab.value === 'active' ? activeConnectionRows.value : closedConnectionRows.value);
 const activeConnectionRows = computed(() => activeConnections.value.map((conn) => ({
   id: conn.id,
@@ -751,6 +852,15 @@ async function loadConnections() {
   }
 }
 
+async function loadIngressSessions() {
+  try {
+    const envelope = await getIngressSessions();
+    ingressData.value = envelope?.data || { ok: false, active: [], closed: [] };
+  } catch {
+    // 辅助面板同款静默降级，下个轮询周期自愈
+  }
+}
+
 async function loadLogs() {
   if (!logsExpanded.value) {
     return;
@@ -851,6 +961,7 @@ function startStatusPolling() {
   statusPollTimer = window.setInterval(() => {
     loadStatus();
     loadConnections();
+    loadIngressSessions();
   }, 5000);
 }
 
@@ -908,7 +1019,7 @@ watch(logsExpanded, (expanded) => {
 });
 
 onMounted(async () => {
-  await Promise.all([loadStatus(), loadConnections()]);
+  await Promise.all([loadStatus(), loadConnections(), loadIngressSessions()]);
   startStatusPolling();
 });
 

@@ -39,3 +39,14 @@ export async function getStatusSummary() {
 export async function getStatusConnections() {
   return request('/api/status/connections');
 }
+
+// 接入客户端台账（服务端视角「谁经 SSH 入口连进来」）：在线 + 关闭历史。
+export async function getIngressSessions() {
+  return request('/api/status/ingress');
+}
+
+// SSH 出站「测试连接」：POST 当前表单凭据做一次现场探测（服务端不落盘）。
+// 返回 data: { ok, stage, error, latency_millis, host_key_fingerprint }。
+export async function testSshConnection(payload) {
+  return request('/api/proxy/ssh/test', { method: 'POST', body: JSON.stringify(payload) });
+}

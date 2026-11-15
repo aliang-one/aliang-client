@@ -100,7 +100,8 @@ func driveServeChannels(t *testing.T, s *Server, perms *gossh.Permissions, nc *f
 	chans := make(chan gossh.NewChannel, 1)
 	chans <- nc
 	close(chans)
-	s.serveChannels(context.Background(), chans, perms, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40001})
+	// sess=nil：台账句柄各方法 nil 安全，既有断言不依赖台账。
+	s.serveChannels(context.Background(), chans, perms, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40001}, nil)
 }
 
 // waitInjected 等待注入协程把 Metadata 送进管线桩(accept 后异步,有界等待)。

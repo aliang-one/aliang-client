@@ -55,6 +55,7 @@ type Server struct {
 	running  bool
 	listener net.Listener // 专用口监听(Port>0 时起;0=跟随统一口,为 nil)
 	conns    map[net.Conn]struct{}
+	sessions *sessionStore   // 接入客户端台账（API 消费；nil 时各方法安全）
 	rootCtx  context.Context // Start 建立的根取消链:注入连接的停机兜底
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup // accept 循环 + 每连接 goroutine
@@ -79,6 +80,7 @@ func NewServer(rc RunConfig, hostKeyPath string) *Server {
 		hostKeyPath: hostKeyPath,
 		limiter:     newAuthLimiter(),
 		conns:       make(map[net.Conn]struct{}),
+		sessions:    newSessionStore(),
 	}
 }
 
@@ -441,9 +443,20 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, cfg *gossh.Serve
 	defer sconn.Close()
 
 	logger.Debug(fmt.Sprintf("SSH ingress connection from %s authenticated as %q", ip, sconn.User()))
+	// 会话台账登记（观测面，不参与决策）：form/deviceID 取认证 Permissions
+	// ——与 serveChannels 的观测面同源同值。nil perms（防御分支）按 unknown
+	// 落账，通道矩阵会拒绝其通道，但连接在线事实如实展示。
+	form, deviceID := "", ""
+	if perms := sconn.Permissions; perms != nil {
+		form = perms.Extensions[extIngressForm]
+		deviceID = perms.Extensions[extMeshDeviceID]
+	}
+	sess := s.sessions.register(sconn, form, deviceID)
+	defer sess.close()
+
 	go serveGlobalRequests(reqs)
 	// v0.48 的 ServerConn.Permissions 是字段(认证回调返回值的落点)。
-	s.serveChannels(connCtx, chans, sconn.Permissions, conn.RemoteAddr())
+	s.serveChannels(connCtx, chans, sconn.Permissions, conn.RemoteAddr(), sess)
 }
 
 // serveGlobalRequests 应答连接级全局请求:keepalive@openssh.com 放行,
@@ -468,8 +481,9 @@ func serveGlobalRequests(reqs <-chan *gossh.Request) {
 // handleMeshExitChannel,SPEC §4);未知 form 全拒(UnknownChannelType——
 // 认证层只产出 bare/mesh,此为防御分支,含 perms 未就绪的 nil 场景)。
 // 观测面在拒绝判定之前:被拒通道同样留下 form/deviceID 审计痕迹
-// (TestMeshExitMatrix 钉住先读 form 再 Reject 的次序)。
-func (s *Server) serveChannels(ctx context.Context, chans <-chan gossh.NewChannel, perms *gossh.Permissions, remote net.Addr) {
+// (TestMeshExitMatrix 钉住先读 form 再 Reject 的次序)。sess 是本连接的
+// 会话台账句柄（可为 nil，见 sessions.go）——通道开/关续期活跃计数。
+func (s *Server) serveChannels(ctx context.Context, chans <-chan gossh.NewChannel, perms *gossh.Permissions, remote net.Addr, sess *sshSession) {
 	for newCh := range chans {
 		form, meshDeviceID := "", ""
 		if perms != nil {
@@ -502,11 +516,29 @@ func (s *Server) serveChannels(ctx context.Context, chans <-chan gossh.NewChanne
 				continue
 			}
 			go gossh.DiscardRequests(chReqs)
-			injectDirectTCPIP(ctx, ch, remote, newCh.ExtraData())
+			sess.openChannel()
+			go func() {
+				defer sess.closeChannel()
+				// 同步调用 injectBareStream(非 injectDirectTCPIP——后者内部
+				// 再起 goroutine 立即返回,会让计数秒减):它阻塞至连接结束,
+				// 自带 defer ch.Close(),正好包住台账的活跃窗口。
+				injectBareStream(ctx, ch, remote, newCh.ExtraData())
+			}()
 		case FormMesh:
-			handleMeshExitChannel(ctx, newCh, newCh.ExtraData(), s.rc, meshDeviceID, remote)
+			sess.openChannel()
+			handleMeshExitChannel(ctx, newCh, newCh.ExtraData(), s.rc, meshDeviceID, remote, sess)
 		}
 	}
+}
+
+// ActiveSessions 返回在线接入客户端快照（新→旧）。API 消费；nil 安全。
+func (s *Server) ActiveSessions() []Session {
+	return s.sessions.ActiveSessions()
+}
+
+// ClosedSessions 返回已关闭接入历史快照（新→旧，环形 300 条）。nil 安全。
+func (s *Server) ClosedSessions() []Session {
+	return s.sessions.ClosedSessions()
 }
 
 // observeForm 记录最近一次通道携带的入口形态,供测试观测
