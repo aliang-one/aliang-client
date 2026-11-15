@@ -127,13 +127,13 @@ func TestAgentCoreMCPBridgeExecute(t *testing.T) {
 		}
 		return "结果:" + args["q"].(string), false
 	})
-	var journaled []string
+	var journaled [][]string // [tool|summary, isErr, result]
 	bridge := &agentCoreMCPBridge{
 		holder:  newAgentCoreMCPSessionHolder(session, func() { _ = session.Close() }, agentCoreMCPRawServer{}, nil),
 		rawTool: "lookup", name: "mcp__test-srv__lookup",
 		description: "测试工具",
 		schema:      map[string]interface{}{"type": "object"},
-		onCall:      func(tool, summary string, isErr bool) { journaled = append(journaled, tool+"|"+summary) },
+		onCall:      func(tool, summary string, isErr bool, result string) { journaled = append(journaled, []string{tool + "|" + summary, fmt.Sprintf("%v", isErr), result}) },
 	}
 	res := bridge.Execute(context.Background(), map[string]interface{}{"q": "hi"}, nil)
 	if res.IsError || !strings.Contains(res.Content, "结果:hi") {
@@ -143,8 +143,13 @@ func TestAgentCoreMCPBridgeExecute(t *testing.T) {
 	if !res.IsError || !strings.Contains(res.Content, "查无此人") {
 		t.Fatalf("IsError 语义错误: %+v", res)
 	}
-	if len(journaled) != 2 || !strings.HasPrefix(journaled[0], "mcp__test-srv__lookup|") {
+	if len(journaled) != 2 || !strings.HasPrefix(journaled[0][0], "mcp__test-srv__lookup|") {
 		t.Fatalf("journal 回调缺失: %v", journaled)
+	}
+	// 失败调用的输出原文必须透传进 journal 回调（取证缺口 2026-11-15：
+	// 打转守卫杀掉的回合里失败文本全空，事后只能靠人工复现补证据）。
+	if journaled[0][1] != "false" || journaled[1][1] != "true" || journaled[1][2] != "查无此人" {
+		t.Fatalf("isErr/result 透传错误: %v", journaled)
 	}
 }
 
@@ -157,7 +162,7 @@ func TestAgentCoreMCPBridgeRecoversPanic(t *testing.T) {
 		rawTool: "evil", name: "mcp__s__evil",
 	}
 	// onCall 里故意 panic：Execute 必须兜住不炸整轮（纵深防御）。
-	bridge.onCall = func(string, string, bool) { panic("journal boom") }
+	bridge.onCall = func(string, string, bool, string) { panic("journal boom") }
 	res := bridge.Execute(context.Background(), map[string]interface{}{}, nil)
 	if res.IsError {
 		t.Fatalf("onCall panic 不应影响已成功的调用结果: %+v", res)
@@ -364,7 +369,7 @@ func TestAgentCoreMCPBridgeRecoversOuterPanic(t *testing.T) {
 	var journaled []bool
 	// session 置 nil：CallTool 里解引用 nil 必 panic，打的是外层兜底路径。
 	bridge := &agentCoreMCPBridge{holder: newAgentCoreMCPSessionHolder(nil, nil, agentCoreMCPRawServer{}, nil), rawTool: "x", name: "mcp__s__x",
-		onCall: func(tool, summary string, isErr bool) { journaled = append(journaled, isErr) }}
+		onCall: func(tool, summary string, isErr bool, result string) { journaled = append(journaled, isErr) }}
 	res := bridge.Execute(context.Background(), map[string]interface{}{}, nil)
 	if !res.IsError || !strings.Contains(res.Content, "MCP 工具执行崩溃") {
 		t.Fatalf("外层 panic 应定向报错: %+v", res)
@@ -602,7 +607,7 @@ func TestAgentCoreMCPBridgeTransportError(t *testing.T) {
 				return nil, nil, fmt.Errorf("dial 拒绝")
 			}),
 		rawTool: "t", name: "mcp__s__t",
-		onCall: func(tool, summary string, isErr bool) { isErrs = append(isErrs, isErr) }}
+		onCall: func(tool, summary string, isErr bool, result string) { isErrs = append(isErrs, isErr) }}
 	if err := session.Close(); err != nil {
 		t.Fatalf("Close 失败: %v", err)
 	}

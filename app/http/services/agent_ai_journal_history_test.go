@@ -45,7 +45,7 @@ func TestReadAgentCoreJournalHistory(t *testing.T) {
 	j.ensureSessionHeader("s-hist", "/proj", "glm-5.3", "", "2026-10-28T00:00:00Z", "phone", nil, nil, "")
 	j.appendUser("s-hist", "m1", "第一问", "2026-10-28T00:01:00Z")
 	j.appendAssistant("s-hist", "a1", "第一答", "2026-10-28T00:02:00Z")
-	j.appendTool("s-hist", "Bash", "ls", false) // 工具行：轨迹不是消息，解析器必须跳过
+	j.appendTool("s-hist", "Bash", "ls", false, "") // 工具行：轨迹不是消息，解析器必须跳过
 	j.appendUser("s-hist", "m2", "第二问", "2026-10-28T00:03:00Z")
 	j.appendEnd("s-hist", "success", "")
 	// 残行容忍：上一进程可能死在写一半（写侧只在新写入时补换行封口，残行
@@ -549,7 +549,7 @@ func TestCreateRestoresJournalHistoryWithoutTranscript(t *testing.T) {
 	m.coreJournal.ensureSessionHeader("s-g2", "/proj", "glm-5.3", "", now, "dashboard", nil, nil, "")
 	m.coreJournal.appendUser("s-g2", "m1", "第一问", now)
 	m.coreJournal.appendAssistant("s-g2", "a1", "第一答", now)
-	m.coreJournal.appendTool("s-g2", "Bash", "ls", false) // 工具行:轨迹不是消息
+	m.coreJournal.appendTool("s-g2", "Bash", "ls", false, "") // 工具行:轨迹不是消息
 	m.coreJournal.appendAssistantTurn("s-g2", "q-1", 1, "第一回合答复", "thinking 不进历史", "end_turn", nil)
 
 	up, srv := newAgentCoreUpstream(t, agentCoreTextTurn("第二", "答"))

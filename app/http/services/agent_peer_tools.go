@@ -998,7 +998,7 @@ type agentCorePeerToolBridge struct {
 	description string
 	schema      map[string]interface{}
 	execute     func(ctx context.Context, input map[string]interface{}) (string, bool)
-	journal     func(tool, summary string, isErr bool)
+	journal     func(tool, summary string, isErr bool, result string)
 	// hint 覆盖内核默认单工具窗口（agentcore.TimeoutHint）。peer_exec 的
 	// 内部 clamp 上限 600s + 30s 网络宽限（agentPeerToolTimeoutMs=630s），
 	// 而内核默认窗口 600s——不 hint 的话满档超时请求会在窗口边缘被内核
@@ -1021,7 +1021,7 @@ func (b *agentCorePeerToolBridge) Execute(ctx context.Context, input map[string]
 		// rune 安全截断（共享 inventory 侧 truncateAgentText），防多字节字符
 		// 被字节切开。
 		summary := truncateAgentText(strings.ReplaceAll(out, "\n", " "), 200)
-		b.journal(b.name, summary, isErr)
+		b.journal(b.name, summary, isErr, out)
 	}
 	return agentcore.ToolResult{Content: out, IsError: isErr}
 }
@@ -1049,11 +1049,11 @@ func (m *agentAIManager) agentCorePeerTools(run agentAIRun) []agentcore.Tool {
 	if !config.GetGlobalConfig().EffectivePeerMCPAgentCoreEnabled() {
 		return nil
 	}
-	journal := func(tool, summary string, isErr bool) {
+	journal := func(tool, summary string, isErr bool, result string) {
 		if m == nil || m.coreJournal == nil || strings.TrimSpace(run.sessionID) == "" {
 			return
 		}
-		m.coreJournal.appendTool(run.sessionID, tool, summary, isErr)
+		m.coreJournal.appendTool(run.sessionID, tool, summary, isErr, result)
 	}
 	return []agentcore.Tool{
 		&agentCorePeerToolBridge{

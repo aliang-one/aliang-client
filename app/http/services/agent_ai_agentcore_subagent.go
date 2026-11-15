@@ -208,7 +208,7 @@ type agentCoreSubagentBridge struct {
 	peerTools func() []agentcore.Tool
 	// onToolCall：journal 回调——Task 调用本身与（经装饰器的）子 run 内置工具
 	// 调用都会触发；nil=不记。
-	onToolCall func(tool, summary string, isErr bool)
+	onToolCall func(tool, summary string, isErr bool, result string)
 	// contextWindow：主 run 的上下文窗口。子 run 与主 run 用同一模型、同一
 	// 上游配额，窗口必须一致——否则子 run 按 200k 兜底压缩，大窗口会话里
 	// 子 agent 反而先撞 prompt too long。
@@ -425,11 +425,11 @@ func (m *agentCoreSubagentMirror) appendTurnLine(taskID string, turn int, text, 
 // 桥 Execute 的 toolHook 在 tracked 分支用它替代原 b.onToolCall——同一工具
 // 调用只落一行（带关联键），读侧按 task_id 聚合，不与主会话工具混流。
 // taskID 空串（未 tracked）守卫兜底。
-func (m *agentCoreSubagentMirror) appendToolLine(taskID, tool, summary string, isErr bool) {
+func (m *agentCoreSubagentMirror) appendToolLine(taskID, tool, summary string, isErr bool, result string) {
 	if m == nil || m.journal == nil || taskID == "" {
 		return
 	}
-	m.journal.appendSubagentTool(m.sessionID, taskID, tool, summary, isErr)
+	m.journal.appendSubagentTool(m.sessionID, taskID, tool, summary, isErr, result)
 }
 
 // emitRecord 与内核帧同构：JSON+换行（宿主按行读），session_id 由
@@ -510,7 +510,7 @@ func agentCoreSubagentModel(defModel, mainModel string) string {
 // 内核内置名生效，与 MCP 既有先例一致）；**不含任何子 agent 桥（depth=1
 // 结构保证）**。toolHook 非 nil 时内置工具经装饰器回调（journal+状态镜像
 // 组合钩子，由 Execute 组装）；nil=不装饰。
-func (b *agentCoreSubagentBridge) subRegistry(mcpTools []agentcore.Tool, toolHook func(tool, summary string, isErr bool)) *agentcore.Registry {
+func (b *agentCoreSubagentBridge) subRegistry(mcpTools []agentcore.Tool, toolHook func(tool, summary string, isErr bool, result string)) *agentcore.Registry {
 	base := agentcore.DefaultRegistry()
 	registry := agentcore.NewRegistry()
 	kernelDefs := base.Defs()
@@ -549,7 +549,7 @@ func (b *agentCoreSubagentBridge) subRegistry(mcpTools []agentcore.Tool, toolHoo
 // （子 run 内置工具的轨迹；MCP 桥自带 onCall 不需要装饰）。
 type agentCoreJournalToolDecorator struct {
 	inner  agentcore.Tool
-	onCall func(tool, summary string, isErr bool)
+	onCall func(tool, summary string, isErr bool, result string)
 }
 
 func (d *agentCoreJournalToolDecorator) Name() string        { return d.inner.Name() }
@@ -562,22 +562,22 @@ func (d *agentCoreJournalToolDecorator) Execute(ctx context.Context, input map[s
 	defer func() {
 		if rec := recover(); rec != nil {
 			result = agentcore.ToolResult{Content: fmt.Sprintf("工具执行崩溃（已兜底）: %v", rec), IsError: true}
-			safeOnToolCall(d.onCall, d.inner.Name(), summary, true)
+			safeOnToolCall(d.onCall, d.inner.Name(), summary, true, result.Content)
 		}
 	}()
 	res := d.inner.Execute(ctx, input, env)
-	safeOnToolCall(d.onCall, d.inner.Name(), summary, res.IsError)
+	safeOnToolCall(d.onCall, d.inner.Name(), summary, res.IsError, res.Content)
 	return res
 }
 
 // safeOnToolCall journal 回调的 panic 不许二次炸、也不许搅了已定的工具结果
 // （与 MCP 桥 safeOnCall 同款兜底）；Task 行与装饰器路径统一走它。
-func safeOnToolCall(onCall func(tool, summary string, isErr bool), tool, summary string, isErr bool) {
+func safeOnToolCall(onCall func(tool, summary string, isErr bool, result string), tool, summary string, isErr bool, result string) {
 	if onCall == nil {
 		return
 	}
 	defer func() { _ = recover() }()
-	onCall(tool, summary, isErr)
+	onCall(tool, summary, isErr, result)
 }
 
 // Execute：递归子 run。ctx 继承（内核单工具窗口由 TimeoutHint 覆盖为
@@ -682,10 +682,10 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 			b.mirror.finish(b.name, subTaskID, phase, text, time.Since(startedAt), totalTokens)
 		}()
 	}
-	var toolHook func(tool, summary string, isErr bool)
+	var toolHook func(tool, summary string, isErr bool, result string)
 	if tracked {
-		toolHook = func(tool, summary string, isErr bool) {
-			b.mirror.appendToolLine(subTaskID, tool, summary, isErr)
+		toolHook = func(tool, summary string, isErr bool, result string) {
+			b.mirror.appendToolLine(subTaskID, tool, summary, isErr, result)
 			n := int(toolUses.Add(1))
 			b.mirror.progress(subTaskID, fmt.Sprintf("工具 #%d: %s", n, tool), tool, n)
 		}
@@ -776,7 +776,7 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 	// Task 调用本身也记 tool 行（spec §7：Task 调用与子 run 内部调用都记）。
 	// 时序：这行在子 run 结束后才落（完成时刻），子 run 内部工具行（装饰器）
 	// 在先——与 MCP 桥同一机制，journal 里父行永远后于子行。
-	safeOnToolCall(b.onToolCall, b.name, summarizeAgentCoreMCPInput(map[string]interface{}{"task": task}), isErr)
+	safeOnToolCall(b.onToolCall, b.name, summarizeAgentCoreMCPInput(map[string]interface{}{"task": task}), isErr, text)
 	return agentcore.ToolResult{Content: truncateAgentCoreMCPOutput(text), IsError: isErr}
 }
 
@@ -920,8 +920,8 @@ func (m *agentAIManager) agentCoreSubagentTaskTool(run agentAIRun,
 	if len(defs) == 0 {
 		return nil
 	}
-	onToolCall := func(tool, summary string, isErr bool) {
-		m.coreJournal.appendTool(run.sessionID, tool, summary, isErr)
+	onToolCall := func(tool, summary string, isErr bool, result string) {
+		m.coreJournal.appendTool(run.sessionID, tool, summary, isErr, result)
 	}
 	// 审批串行由调用方保证：传入的 approve 必须已过 agentCoreApprovalGate
 	// （runAgentCore 对 kernelApprove 统一 wrap）——主层（含对桥工具本身的

@@ -116,7 +116,7 @@ func TestAgentCoreSubagentMirrorLifecycle(t *testing.T) {
 		approve: func(ctx context.Context, call agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error) {
 			return agentcore.ApprovalResponse{Approved: true}, nil
 		},
-		onToolCall: func(tool, summary string, isErr bool) {},
+		onToolCall: func(tool, summary string, isErr bool, result string) {},
 		mirror:     mirror,
 	}
 	res := bridge.Execute(context.Background(), map[string]interface{}{"task": "调研加密解密"}, nil)
@@ -208,7 +208,7 @@ func TestAgentCoreSubagentMirrorProgressCarriesToolUses(t *testing.T) {
 		approve: func(ctx context.Context, call agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error) {
 			return agentcore.ApprovalResponse{Approved: true}, nil
 		},
-		onToolCall: func(tool, summary string, isErr bool) {},
+		onToolCall: func(tool, summary string, isErr bool, result string) {},
 		mirror:     mirror,
 	}
 	if res := bridge.Execute(context.Background(), map[string]interface{}{"task": "干活"}, nil); res.IsError {
@@ -383,7 +383,7 @@ func TestAgentCoreSubagentMirrorJournalsLifecycle(t *testing.T) {
 		approve: func(ctx context.Context, call agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error) {
 			return agentcore.ApprovalResponse{Approved: true}, nil
 		},
-		onToolCall: func(tool, summary string, isErr bool) {},
+		onToolCall: func(tool, summary string, isErr bool, result string) {},
 		mirror:     mirror,
 	}
 	if res := bridge.Execute(context.Background(), map[string]interface{}{"task": "调研加密解密"}, nil); res.IsError {
