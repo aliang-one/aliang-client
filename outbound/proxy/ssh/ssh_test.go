@@ -189,6 +189,31 @@ func TestSSHPoolSizeClamp(t *testing.T) {
 	}
 }
 
+// TestSSHJumpCount 钉 JumpCount 透传语义:直连出口(无跳板)=0,一跳/两跳
+// 原样返回跳数——状态页路径行(「经 N 跳跳板」)以此为准。
+func TestSSHJumpCount(t *testing.T) {
+	final := NodeFromAddrPort("127.0.0.1", 22, "fu", "fp", "", "")
+	jump := NodeFromAddrPort("127.0.0.1", 2222, "ju", "jp", "", "")
+
+	for _, tc := range []struct {
+		jumps []NodeConfig
+		want  int
+	}{
+		{nil, 0},
+		{[]NodeConfig{jump}, 1},
+		{[]NodeConfig{jump, jump}, 2},
+	} {
+		p, err := New(final, 1, tc.jumps, t.TempDir())
+		if err != nil {
+			t.Fatalf("New(jumps=%d): %v", len(tc.jumps), err)
+		}
+		if got := p.JumpCount(); got != tc.want {
+			t.Fatalf("JumpCount=%d, want %d", got, tc.want)
+		}
+		_ = p.Close()
+	}
+}
+
 // TestSSHReconnectAfterChainDeath 断链重建(池=1):拨通回显后杀死底层链,
 // 再次 DialContext 必须重建新链并回显成功——client 指针更换即重建证据。
 func TestSSHReconnectAfterChainDeath(t *testing.T) {

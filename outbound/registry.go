@@ -304,10 +304,14 @@ func (r *Registry) GetHardcodedDefault() (proxy.Proxy, error) {
 
 // SSHChainStatus 是状态页 SSH 出口链路状态的聚合视图：ok=false 表示当前
 // 没有已注册的 SSH 出口（未配置客户代理或非 SSH 类型），chains 为空。
+// Addr 是出口终点(链的最终跳),Jumps 是跳板跳数——池内 chains 是同一
+// 路径的 N 条并行连接,不是 N 条不同路径,前端据此避免「配置了一条下一条
+// 却显示多条链路」的误读。
 type SSHChainStatus struct {
-	OK     bool                  `json:"ok"`
-	Addr   string                `json:"addr,omitempty"`
-	Chains []sshout.ChainStatus  `json:"chains"`
+	OK     bool                 `json:"ok"`
+	Addr   string               `json:"addr,omitempty"`
+	Jumps  int                  `json:"jumps,omitempty"`
+	Chains []sshout.ChainStatus `json:"chains"`
 }
 
 // SSHChainStatus 返回已注册 SSH 出口的链路运行态。注册表中没有 SSH 实例
@@ -324,6 +328,7 @@ func (r *Registry) SSHChainStatus() SSHChainStatus {
 	return SSHChainStatus{
 		OK:     true,
 		Addr:   ssh.Addr(),
+		Jumps:  ssh.JumpCount(),
 		Chains: ssh.Status(),
 	}
 }

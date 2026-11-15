@@ -38,8 +38,9 @@ const KnownHostsFileName = "known_hosts"
 type SSH struct {
 	*proxy.Base
 
-	pool   *pool
-	closed atomic.Bool
+	pool      *pool
+	closed    atomic.Bool
+	jumpCount int // 跳板跳数(0=直连出口);状态页路径行消费
 }
 
 // New 组装 SSH 出口;不连网(首次拨号懒建)。fail-fast:终点与全部跳板的
@@ -77,7 +78,8 @@ func New(final NodeConfig, poolSize int, jumps []NodeConfig, hostsDir string) (*
 
 	d := newChainDialer(final, jumps, hosts)
 	s := &SSH{
-		Base: &proxy.Base{Address: final.hostPort(), Protocol: proto.SSH},
+		Base:      &proxy.Base{Address: final.hostPort(), Protocol: proto.SSH},
+		jumpCount: len(jumps),
 	}
 	s.pool = newPool(poolSize, func(int) func(ctx context.Context) (*cascadeClient, error) {
 		return d.dialChain
@@ -188,6 +190,13 @@ func (s *SSH) DialUDP(*M.Metadata) (net.PacketConn, error) {
 // Alive 全为 false；实例终态如实反映，不做特殊化。
 func (s *SSH) Status() []ChainStatus {
 	return s.pool.Status()
+}
+
+// JumpCount 返回跳板跳数(0=直连出口)。状态页路径行据此标注「经 N 级
+// 跳板中转」——池内每条链都是同一路径(跳板→终点)的并行连接,出口地址由
+// Addr 给出,两者合起来才是完整路径口径。
+func (s *SSH) JumpCount() int {
+	return s.jumpCount
 }
 
 // Close 断开全部链(pool.close 级联关全部跳)并终结本实例:其后

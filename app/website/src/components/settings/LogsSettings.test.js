@@ -158,6 +158,7 @@ describe('状态页 SSH 出口链路卡', () => {
     });
     await flush();
     expect(el.querySelector('[data-ssh-chains]')).toBeNull();
+    expect(el.querySelector('[data-ssh-path]')).toBeNull();
     expect(el.textContent).toContain('status_sshNotConfigured');
   });
 
@@ -185,6 +186,76 @@ describe('状态页 SSH 出口链路卡', () => {
     expect(text).toContain('status_sshChainBackoffIn');
     expect(text).toContain('status_sshChainIdle');
     expect(text).toContain('status_sshChainActive');
+  });
+
+  it('路径行钉出出口终点与并行连接数,防止「一条配置多条链」误读', async () => {
+    const el = mountStatus({
+      summary: {
+        ai: {}, traffic: {}, http: {},
+        ssh: {
+          ok: true,
+          addr: '172.16.0.123:56432',
+          jumps: 0,
+          chains: [
+            { index: 0, alive: true, backoff: false, backoffRemainingMs: 0, activeChannels: 16 },
+            { index: 1, alive: true, backoff: false, backoffRemainingMs: 0, activeChannels: 17 },
+            { index: 2, alive: true, backoff: false, backoffRemainingMs: 0, activeChannels: 16 }
+          ]
+        }
+      }
+    });
+    await flush();
+
+    const path = el.querySelector('[data-ssh-path]');
+    expect(path).toBeTruthy();
+    const text = path.textContent;
+    expect(text).toContain('status_sshPathFinal');
+    expect(text).toContain('status_sshPathConnections');
+    // jumps=0(直连出口)不渲染跳板段。
+    expect(text).not.toContain('status_sshPathJumps');
+  });
+
+  it('配置了跳板时路径行追加「经 N 跳跳板」', async () => {
+    const el = mountStatus({
+      summary: {
+        ai: {}, traffic: {}, http: {},
+        ssh: {
+          ok: true,
+          addr: 'exit.example.com:22',
+          jumps: 1,
+          chains: [
+            { index: 0, alive: true, backoff: false, backoffRemainingMs: 0, activeChannels: 0 }
+          ]
+        }
+      }
+    });
+    await flush();
+
+    const path = el.querySelector('[data-ssh-path]');
+    expect(path).toBeTruthy();
+    expect(path.textContent).toContain('status_sshPathJumps');
+  });
+
+  it('单条连接(pool_size=1)时文案用中性「1 条连接」不称并行', async () => {
+    const el = mountStatus({
+      summary: {
+        ai: {}, traffic: {}, http: {},
+        ssh: {
+          ok: true,
+          addr: '172.16.0.123:56432',
+          chains: [
+            { index: 0, alive: true, backoff: false, backoffRemainingMs: 0, activeChannels: 5 }
+          ]
+        }
+      }
+    });
+    await flush();
+
+    const path = el.querySelector('[data-ssh-path]');
+    expect(path).toBeTruthy();
+    const text = path.textContent;
+    expect(text).toContain('status_sshPathConnectionOne');
+    expect(text).not.toContain('status_sshPathConnections');
   });
 
   it('summary 无 ssh 字段(旧后端)时按未配置渲染不报错', async () => {

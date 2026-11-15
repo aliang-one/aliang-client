@@ -950,7 +950,7 @@ export default {
   rules_sshTestStageHandshake: '（握手/认证失败）',
   rules_sshTestStageChannel: '（转发通道被拒绝）',
   rules_sshTestStageRoundTrip: '（通道数据不通）',
-  rules_sshChainIdleHint: '保存并启用配置后，这里会显示各条链路的实时连接状态。',
+  rules_sshChainIdleHint: '保存并启用配置后，这里会显示出口路径各条并行连接的实时状态。',
 
   // —— SSH 入口服务面（Task 8）：开关／指纹／双公钥文案 ——
   sshIngress_title: 'SSH 入口',
@@ -1106,11 +1106,12 @@ export default {
   status_cardTotalTraffic: '累计流量',
   status_cardTotalTrafficDesc: 'HTTP 统计累计的上传与下载总量。',
   status_sshTitle: 'SSH 出口链路',
-  status_sshDesc: '配置的一条出口路径会建立多条并行连接(负载分担,单条退避时其余继续接流量),下方逐条显示实时健康。',
+  status_sshDesc: '配置的一条出口路径会建立多条并行连接（负载分担，单条退避时其余继续接流量），下方逐条显示实时健康。',
   status_sshNotConfigured: '未配置 SSH 出口代理。',
   status_sshPathFinal: '出口 {addr}',
-  status_sshPathJumps: '经 {count} 跳跳板',
+  status_sshPathJumps: '{count} 级跳板中转',
   status_sshPathConnections: '{count} 条并行连接',
+  status_sshPathConnectionOne: '1 条连接',
   // 接入客户端台账（服务端视角：谁经 SSH 入口连进来）
   status_ingressTitle: '接入客户端',
   status_ingressDesc: '通过本机 SSH 入口接入的客户端（设备）实时状态。',
@@ -1121,7 +1122,6 @@ export default {
   status_ingressFormBare: '人用凭证',
   status_ingressFormMesh: '组网节点',
   status_ingressMeshSubtitle: '来自 {ip}',
-  status_ingressUserSubtitle: '用户 {user}',
   status_ingressUserSubtitle: '用户 {user}',
   status_ingressKick: '踢出',
   status_ingressBlock: '踢出并拉黑',

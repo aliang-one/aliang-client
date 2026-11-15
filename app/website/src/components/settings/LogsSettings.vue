@@ -354,7 +354,19 @@
             <div v-if="!sshStatus.ok" class="mt-4 rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-6 text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-900/60 dark:text-slate-400">
               {{ t('status_sshNotConfigured') }}
             </div>
-            <div v-else class="mt-4 grid gap-2" data-ssh-chains>
+            <template v-else>
+              <div class="mt-4 flex items-center justify-between gap-3 rounded-xl border border-slate-200/70 bg-slate-50/80 px-3 py-2 text-sm dark:border-slate-800/80 dark:bg-slate-900/60" data-ssh-path>
+                <span class="font-medium text-slate-900 dark:text-slate-100">
+                  {{ t('status_sshPathFinal', { addr: sshStatus.addr || '--' }) }}
+                  <span v-if="Number(sshStatus.jumps) > 0" class="text-slate-500 dark:text-slate-400">
+                    {{ t('status_sshPathJumps', { count: sshStatus.jumps }) }}
+                  </span>
+                </span>
+                <span v-if="sshChainCount > 0" class="text-xs text-slate-400">
+                  {{ sshChainCount === 1 ? t('status_sshPathConnectionOne') : t('status_sshPathConnections', { count: sshChainCount }) }}
+                </span>
+              </div>
+              <div class="grid gap-2" data-ssh-chains>
               <div
                 v-for="chain in sshChainCards"
                 :key="chain.key"
@@ -370,7 +382,8 @@
                   <span v-if="chain.activeText" class="text-slate-400">{{ chain.activeText }}</span>
                 </div>
               </div>
-            </div>
+              </div>
+            </template>
           </article>
         </div>
       </section>
@@ -545,6 +558,10 @@ const aiSummary = computed(() => statusSummary.value?.ai || {});
 const trafficStats = computed(() => statusSummary.value?.traffic || {});
 const httpStats = computed(() => statusSummary.value?.http || {});
 const sshStatus = computed(() => statusSummary.value?.ssh || { ok: false, chains: [] });
+// 路径口径:出口终点 + 跳板跳数。池里的多条「链」是同一路径的并行连接,
+// 不是多条不同路径——这里一次性把路径钉在卡片头部,防止「配置了一条
+// 下一条却显示多条链路」的误读。
+const sshChainCount = computed(() => (Array.isArray(sshStatus.value?.chains) ? sshStatus.value.chains.length : 0));
 const activeConnections = computed(() => Array.isArray(connectionsData.value?.active) ? connectionsData.value.active : []);
 const closedConnections = computed(() => Array.isArray(connectionsData.value?.closed) ? connectionsData.value.closed : []);
 

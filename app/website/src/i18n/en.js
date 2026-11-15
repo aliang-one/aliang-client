@@ -951,7 +951,7 @@ export default {
   rules_sshTestStageHandshake: ' (handshake/auth failed)',
   rules_sshTestStageChannel: ' (forwarding channel rejected)',
   rules_sshTestStageRoundTrip: ' (channel data path broken)',
-  rules_sshChainIdleHint: 'Save and enable the configuration to see live status for each chain here.',
+  rules_sshChainIdleHint: 'Save and enable the configuration to see live status of each parallel connection here.',
 
   // -- SSH ingress service (Task 8): toggle / fingerprint / dual key lists --
   sshIngress_title: 'SSH Ingress',
@@ -1103,8 +1103,9 @@ export default {
   status_sshDesc: 'One configured egress path is served by several parallel connections (load sharing; remaining ones carry traffic while one backs off). Health is shown per connection.',
   status_sshNotConfigured: 'No SSH egress proxy configured.',
   status_sshPathFinal: 'Egress {addr}',
-  status_sshPathJumps: 'via {count} jump hop(s)',
+  status_sshPathJumps: '{count}-hop jump chain',
   status_sshPathConnections: '{count} parallel connections',
+  status_sshPathConnectionOne: '1 connection',
   // Ingress client sessions (server-side view: who connected in via SSH ingress)
   status_ingressTitle: 'Connected clients',
   status_ingressDesc: 'Live status of clients (devices) connected through this node\'s SSH ingress.',
@@ -1115,7 +1116,6 @@ export default {
   status_ingressFormBare: 'human key',
   status_ingressFormMesh: 'mesh node',
   status_ingressMeshSubtitle: 'from {ip}',
-  status_ingressUserSubtitle: 'user {user}',
   status_ingressUserSubtitle: 'user {user}',
   status_ingressKick: 'Kick',
   status_ingressBlock: 'Kick & Block',
