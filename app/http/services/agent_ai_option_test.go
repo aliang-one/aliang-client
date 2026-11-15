@@ -36,6 +36,37 @@ func TestExtractAgentAIOptionBlocksIgnoresMalformedAndEmpty(t *testing.T) {
 	}
 }
 
+// 2026-11-15 本机 journal 实锤(GLM 偶发退化,4/34≈12%):黏行开头 + 闭合围栏
+// 缺失,JSON 完整写到 } 就收尾(一次被字面 "..." 顶替闭合行)。原正则要求精确
+// 闭合 → ai.option 卡不触发,手机/网页端双向全断。
+func TestExtractAgentAIOptionBlocksToleratesMissingClosingFence(t *testing.T) {
+	// 退化形态一:JSON 到文本末尾,无闭合行(黏行开头)。
+	output := "排查完成，修复路径你来定：```aliang-options\n" +
+		`{"v":2,"title":"选择修复方案","options":[{"id":"full-fix","label":"全自动修复"}],"allow_custom":true,"multi":false}`
+	got := extractAgentAIOptionBlocks(output)
+	if len(got) != 1 {
+		t.Fatalf("blocks = %d, want 1", len(got))
+	}
+	if got[0].Title != "选择修复方案" || got[0].Options[0].ID != "full-fix" {
+		t.Fatalf("parsed = %+v", got[0])
+	}
+
+	// 退化形态二:JSON 后跟字面省略号(...)顶替了闭合行 → 按括号配平截出。
+	output = "你来定：```aliang-options\n" + `{"options":[{"id":"a","label":"方案A"}]}` + "..."
+	got = extractAgentAIOptionBlocks(output)
+	if len(got) != 1 || got[0].Options[0].ID != "a" {
+		t.Fatalf("ellipsis form blocks = %+v, want 1 with id=a", got)
+	}
+}
+
+// 闭合缺失且整体不可解析:维持旧行为不产卡(不得误吞成假阳性卡)。
+func TestExtractAgentAIOptionBlocksUnclosedGarbageDropped(t *testing.T) {
+	output := "你来定：```aliang-options\nnot-json-at-all"
+	if got := extractAgentAIOptionBlocks(output); len(got) != 0 {
+		t.Fatalf("unclosed garbage blocks = %d, want 0", len(got))
+	}
+}
+
 func TestBuildAgentAIOptionFollowup(t *testing.T) {
 	req := &agentAIOptionRequest{Title: "x", Options: []agentAIOptionChoice{
 		{ID: "a", Label: "方案A"},
