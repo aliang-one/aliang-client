@@ -901,6 +901,9 @@ func normalizeAgentAIOptionRequest(req *agentAIOptionRequest) {
 // extractAgentAIOptionBlocks 扫描 assistant 完整输出，提取所有 aliang-options 块。
 // 无效 JSON 或 options 为空的块丢弃（JSON 解析失败不再静默：打 Warn 日志，
 // 否则模型写坏围栏=用户什么都看不到且无迹可查）。
+// 闭合围栏缺失的退化形态（GLM 偶发漏闭合行，2026-11-15 本机 journal 实锤
+// 4/34≈12%：黏行开头 + JSON 写到 } 就收尾，一次被字面 "..." 顶替闭合行）
+// 走 extractUnclosedAgentAIOptionBlocks 兜底。
 func extractAgentAIOptionBlocks(output string) []agentAIOptionRequest {
 	matches := aliangOptionsBlockRe.FindAllStringSubmatch(output, -1)
 	out := make([]agentAIOptionRequest, 0, len(matches))
@@ -916,7 +919,79 @@ func extractAgentAIOptionBlocks(output string) []agentAIOptionRequest {
 		}
 		out = append(out, req)
 	}
+	out = append(out, extractUnclosedAgentAIOptionBlocks(output)...)
 	return out
+}
+
+// aliangOptionsBalancedJSONPrefix 括号配平截取 s 中首个完整 JSON 对象
+// （字符串感知：引号内的花括号/转义不参与配平）。截不出返回 false。
+func aliangOptionsBalancedJSONPrefix(s string) (string, bool) {
+	start := strings.IndexByte(s, '{')
+	if start < 0 {
+		return "", false
+	}
+	depth := 0
+	inStr, esc := false, false
+	for i := start; i < len(s); i++ {
+		ch := s[i]
+		if inStr {
+			switch {
+			case esc:
+				esc = false
+			case ch == '\\':
+				esc = true
+			case ch == '"':
+				inStr = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inStr = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1], true
+			}
+		}
+	}
+	return "", false
+}
+
+// extractUnclosedAgentAIOptionBlocks 兜底提取闭合缺失的退化围栏。只有开标签
+// 之后不再出现任何闭合行（\n```）的块才走这里——有闭合行的歧义形态（标签后
+// 跟正文又接普通代码块）保持旧行为丢弃，避免把无关正文误吞成卡。合法性由
+// json.Unmarshal + normalize 把关，闭合行不是真闸门。
+func extractUnclosedAgentAIOptionBlocks(output string) []agentAIOptionRequest {
+	const tag = "```aliang-options"
+	var out []agentAIOptionRequest
+	rest := output
+	for {
+		idx := strings.Index(rest, tag)
+		if idx < 0 {
+			return out
+		}
+		rest = rest[idx+len(tag):]
+		if strings.Contains(rest, "\n```") {
+			continue
+		}
+		body, ok := aliangOptionsBalancedJSONPrefix(rest)
+		if !ok {
+			return out
+		}
+		var req agentAIOptionRequest
+		if err := json.Unmarshal([]byte(body), &req); err != nil {
+			logger.Warn(fmt.Sprintf("[ai.option] unclosed aliang-options block dropped: bad JSON (%d bytes): %v", len(body), err))
+			return out
+		}
+		normalizeAgentAIOptionRequest(&req)
+		if len(req.Options) > 0 {
+			out = append(out, req)
+		}
+		return out
+	}
 }
 
 // buildAgentAIOptionFollowup 把用户的选择拼成下一轮的 user prompt。
@@ -1262,7 +1337,7 @@ const (
 // agentcore(拼进 system)两路注入；codex 不注入（走原生 requestUserInput 映射）。
 // v2 契约：新增 header/summary/response/previews 全部可选；围栏换行格式是硬规则
 // （JSON 粘着标签行/收尾行会被提取正则静默丢弃），必须向模型言明。
-const agentAIOptionSystemPrompt = `When you have multiple viable approaches/options and the best choice depends on user preference, you MUST let the user choose instead of deciding for them. Present them as a fenced code block with language tag aliang-options, formatted exactly: the tag line contains ONLY the three backticks followed by aliang-options and ends with a newline, the next line is exactly one JSON object and nothing else, and the closing three backticks are alone on their own line — a JSON glued to the tag line or to the closing fence, or prose right after the JSON, is silently discarded. JSON shape: {"v":2,"title":string,"header":string,"summary":string,"options":[{"id":string,"label":string,"description":string,"response":string,"previews":[string]}],"allow_custom":bool,"multi":bool}. Only "title" and "options" are required; every other field is optional — omit anything you don't need. Rules: "id" is a short stable ASCII slug (letters, digits, hyphen, underscore; max 48 chars; unique per option); never reuse the label as the id. "label" is what the user reads — plain text only, no markdown syntax and no backticks (emoji/kaomoji are fine), aim under 60 chars. "description" is one short sentence. "response" (write only when it helps) is the receipt text returned as the user's answer when that option is picked — phrase it as a confirmation of that choice. "previews" (write only when it helps, e.g. commands or a short code sketch) is up to 8 one-line strings shown under the option. "header" is a category tag of 16 chars or fewer shown above the title. "summary" is one or two sentences of context. Maximum 8 options. Set "multi":true only when the user should pick several options at once — their picks are sent back together as one answer. Set "allow_custom":true when a free-text answer makes sense. After the fence, stop and wait for the user's choice in the next message; do not proceed on assumption and do not list the options again as prose.`
+const agentAIOptionSystemPrompt = `When you have multiple viable approaches/options and the best choice depends on user preference, you MUST let the user choose instead of deciding for them. Present them as a fenced code block with language tag aliang-options, formatted exactly: the tag line contains ONLY the three backticks followed by aliang-options and ends with a newline (never append the tag to the end of a sentence line — it must start on its own line), the next line is exactly one JSON object and nothing else, and the closing three backticks are alone on their own line and must always be emitted (never omit them and never substitute an ellipsis) — a JSON glued to the tag line or to the closing fence, or prose right after the JSON, is silently discarded. JSON shape: {"v":2,"title":string,"header":string,"summary":string,"options":[{"id":string,"label":string,"description":string,"response":string,"previews":[string]}],"allow_custom":bool,"multi":bool}. Only "title" and "options" are required; every other field is optional — omit anything you don't need. Rules: "id" is a short stable ASCII slug (letters, digits, hyphen, underscore; max 48 chars; unique per option); never reuse the label as the id. "label" is what the user reads — plain text only, no markdown syntax and no backticks (emoji/kaomoji are fine), aim under 60 chars. "description" is one short sentence. "response" (write only when it helps) is the receipt text returned as the user's answer when that option is picked — phrase it as a confirmation of that choice. "previews" (write only when it helps, e.g. commands or a short code sketch) is up to 8 one-line strings shown under the option. "header" is a category tag of 16 chars or fewer shown above the title. "summary" is one or two sentences of context. Maximum 8 options. Set "multi":true only when the user should pick several options at once — their picks are sent back together as one answer. Set "allow_custom":true when a free-text answer makes sense. After the fence, stop and wait for the user's choice in the next message; do not proceed on assumption and do not list the options again as prose.`
 
 func newAgentAIManager() *agentAIManager {
 	m := &agentAIManager{

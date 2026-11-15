@@ -59,3 +59,37 @@ describe('stripAliangOptions', () => {
     expect(stripAliangOptions('hello ')).toBe('hello');
   });
 });
+
+// 2026-11-15 本机 journal 实锤(GLM 偶发退化,4/34≈12%):黏行开头 + 闭合围栏
+// 缺失,JSON 完整写到 } 就收尾(一次被字面 "..." 顶替闭合行)。原实现三道闸
+// (后端提取/前端提取/前端剔除)全要求精确闭合 → 卡不出 + 裸 JSON 露在气泡里。
+describe('退化形态容错:闭合围栏缺失', () => {
+  it('JSON 到文本末尾仍提取出卡(黏行开头形态)', () => {
+    const src = '排查完成，修复路径你来定：```aliang-options\n'
+      + '{"v":2,"title":"选择修复方案","options":[{"id":"a","label":"方案A"}],"allow_custom":true,"multi":false}';
+    const blocks = extractAliangOptions(src);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].title).toBe('选择修复方案');
+    expect(blocks[0].options[0].id).toBe('a');
+  });
+  it('JSON 后跟字面省略号:按括号配平截出 JSON', () => {
+    const src = '你来定：```aliang-options\n{"options":[{"id":"a","label":"A"}]}...';
+    expect(extractAliangOptions(src)).toHaveLength(1);
+  });
+  it('剔除只吞围栏+JSON,其后正文保留', () => {
+    const src = '前言\n```aliang-options\n{"options":[{"id":"a","label":"A"}]}\n好的，等你选择';
+    const stripped = stripAliangOptions(src);
+    expect(stripped).not.toContain('aliang-options');
+    expect(stripped).toContain('好的，等你选择');
+  });
+  it('闭合缺失且整体不可解析:维持旧行为,不产卡不吞文', () => {
+    const src = '你来定：```aliang-options\nnot-json-at-all';
+    expect(extractAliangOptions(src)).toHaveLength(0);
+    expect(stripAliangOptions(src)).toContain('not-json-at-all');
+  });
+  it('闭合在场时行为逐字节不变(回归钉死)', () => {
+    const closed = '前言\n```aliang-options\n{"options":[{"id":"a","label":"A"}]}\n```\n后记';
+    expect(extractAliangOptions(closed)).toHaveLength(1);
+    expect(stripAliangOptions(closed)).toBe('前言\n\n后记');
+  });
+});

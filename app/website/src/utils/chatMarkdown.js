@@ -60,16 +60,69 @@ export function normalizeCjkMarkdown(src) {
   }).join('\n');
 }
 
-// matchAll 克隆正则/replace 自归零 lastIndex,勿改用共享 lastIndex 的 exec() 循环
-const aliangOptionsRe = /```aliang-options\s*\n([\s\S]*?)\n```/g;
+// 括号配平截取 s 中首个完整 JSON 对象(字符串感知,跳过引号内花括号/转义)。
+// 截不出(未配平/无花括号)返回 null。
+function aliangBalancedJSONObject(s) {
+  const start = s.indexOf('{');
+  if (start === -1) return null;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) {
+      if (esc) { esc = false; }
+      else if (ch === '\\') { esc = true; }
+      else if (ch === '"') { inStr = false; }
+      continue;
+    }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return s.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+// 扫描全部 aliang-options 围栏跨度 [{start,end,body}]。
+// 闭合在场时语义与旧正则逐字节一致(opener 后首个 \n``` 收口);闭合缺失
+// (模型退化形态:GLM 偶发漏闭合行,2026-11-15 本机 journal 实锤 4/34≈12%)
+// 时兜底:取标签后剩余文本按括号配平截出 JSON——卡的合法性本就由 JSON.parse
+// + options 非空校验把关,闭合行不是真闸门。标签后没有任何闭合行时不存在
+// 后续闭合围栏,扫描随之终止;截不出 JSON(纯垃圾)不产跨度:不产卡、原文保留
+// (维持旧行为,半截代码块由 ChatMarkdown enhance 兜底隐藏)。
+function scanAliangOptionSpans(src) {
+  const spans = [];
+  const openRe = /```aliang-options\s*\n/g;
+  let m;
+  while ((m = openRe.exec(src)) !== null) {
+    const start = m.index;
+    const bodyStart = start + m[0].length;
+    const closeAt = src.indexOf('\n```', bodyStart);
+    if (closeAt !== -1) {
+      const end = closeAt + '\n```'.length;
+      spans.push({ start, end, body: src.slice(bodyStart, closeAt) });
+      openRe.lastIndex = end;
+      continue;
+    }
+    const rest = src.slice(bodyStart);
+    const json = aliangBalancedJSONObject(rest);
+    if (json === null) break;
+    spans.push({ start, end: bodyStart + json.length, body: json });
+    break;
+  }
+  return spans;
+}
 
 // 提取 ```aliang-options 围栏(供静态卡渲染/防双份对账);坏 JSON 块跳过。
 export function extractAliangOptions(src) {
   const out = [];
   if (typeof src !== 'string') return out;
-  for (const m of src.matchAll(aliangOptionsRe)) {
+  for (const span of scanAliangOptionSpans(src)) {
     try {
-      const parsed = JSON.parse(m[1]);
+      const parsed = JSON.parse(span.body);
       if (parsed && typeof parsed === 'object' && Array.isArray(parsed.options) && parsed.options.length) {
         out.push(parsed);
       }
@@ -82,9 +135,18 @@ export function extractAliangOptions(src) {
 }
 
 // 从原文剔除 aliang-options 围栏(交互卡在场时正文不再重复渲染)。
+// 按扫描跨度切除:剔除范围与提取严格同源,退化形态(闭合缺失)同样剔到 JSON
+// 末尾,其后的正文保留。
 export function stripAliangOptions(src) {
   if (typeof src !== 'string') return '';
-  return src.replace(aliangOptionsRe, '').trim();
+  let out = '';
+  let last = 0;
+  for (const span of scanAliangOptionSpans(src)) {
+    out += src.slice(last, span.start);
+    last = span.end;
+  }
+  out += src.slice(last);
+  return out.trim();
 }
 
 // 渲染+消毒一步到位;任何异常回退为转义纯文本(流式半截内容永不白屏)。
