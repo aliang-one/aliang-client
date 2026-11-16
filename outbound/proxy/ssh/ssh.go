@@ -40,7 +40,8 @@ type SSH struct {
 
 	pool      *pool
 	closed    atomic.Bool
-	jumpCount int // 跳板跳数(0=直连出口);状态页路径行消费
+	jumpCount int      // 跳板跳数(0=直连出口);状态页路径行消费
+	jumpAddrs []string // 跳板地址(路径序,hostPort 形态);拓扑画布节点消费
 }
 
 // New 组装 SSH 出口;不连网(首次拨号懒建)。fail-fast:终点与全部跳板的
@@ -77,9 +78,14 @@ func New(final NodeConfig, poolSize int, jumps []NodeConfig, hostsDir string) (*
 	}
 
 	d := newChainDialer(final, jumps, hosts)
+	jumpAddrs := make([]string, 0, len(jumps))
+	for _, j := range jumps {
+		jumpAddrs = append(jumpAddrs, j.hostPort())
+	}
 	s := &SSH{
 		Base:      &proxy.Base{Address: final.hostPort(), Protocol: proto.SSH},
 		jumpCount: len(jumps),
+		jumpAddrs: jumpAddrs,
 	}
 	s.pool = newPool(poolSize, func(int) func(ctx context.Context) (*cascadeClient, error) {
 		return d.dialChain
@@ -197,6 +203,17 @@ func (s *SSH) Status() []ChainStatus {
 // Addr 给出,两者合起来才是完整路径口径。
 func (s *SSH) JumpCount() int {
 	return s.jumpCount
+}
+
+// JumpAddrs 返回跳板地址(路径序,host:port)。返回副本,调用方改写不伤
+// 实例内部;无跳板返回 nil(omitempty 序列化直接省键)。
+func (s *SSH) JumpAddrs() []string {
+	if len(s.jumpAddrs) == 0 {
+		return nil
+	}
+	out := make([]string, len(s.jumpAddrs))
+	copy(out, s.jumpAddrs)
+	return out
 }
 
 // Close 断开全部链(pool.close 级联关全部跳)并终结本实例:其后

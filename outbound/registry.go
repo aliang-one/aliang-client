@@ -308,10 +308,11 @@ func (r *Registry) GetHardcodedDefault() (proxy.Proxy, error) {
 // 路径的 N 条并行连接,不是 N 条不同路径,前端据此避免「配置了一条下一条
 // 却显示多条链路」的误读。
 type SSHChainStatus struct {
-	OK     bool                 `json:"ok"`
-	Addr   string               `json:"addr,omitempty"`
-	Jumps  int                  `json:"jumps,omitempty"`
-	Chains []sshout.ChainStatus `json:"chains"`
+	OK        bool                 `json:"ok"`
+	Addr      string               `json:"addr,omitempty"`
+	Jumps     int                  `json:"jumps,omitempty"`
+	JumpAddrs []string             `json:"jump_addrs,omitempty"`
+	Chains    []sshout.ChainStatus `json:"chains"`
 }
 
 // SSHChainStatus 返回已注册 SSH 出口的链路运行态。注册表中没有 SSH 实例
@@ -326,10 +327,11 @@ func (r *Registry) SSHChainStatus() SSHChainStatus {
 		return SSHChainStatus{OK: false, Chains: []sshout.ChainStatus{}}
 	}
 	return SSHChainStatus{
-		OK:     true,
-		Addr:   ssh.Addr(),
-		Jumps:  ssh.JumpCount(),
-		Chains: ssh.Status(),
+		OK:        true,
+		Addr:      ssh.Addr(),
+		Jumps:     ssh.JumpCount(),
+		JumpAddrs: ssh.JumpAddrs(),
+		Chains:    ssh.Status(),
 	}
 }
 

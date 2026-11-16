@@ -214,6 +214,42 @@ func TestSSHJumpCount(t *testing.T) {
 	}
 }
 
+// TestSSHJumpAddrs 钉跳板地址透出:路径序 host:port、副本隔离、无跳板=nil。
+func TestSSHJumpAddrs(t *testing.T) {
+	final := NodeFromAddrPort("127.0.0.1", 22, "fu", "fp", "", "")
+	jump1 := NodeFromAddrPort("127.0.0.1", 2222, "ju", "jp", "", "")
+	jump2 := NodeFromAddrPort("127.0.0.1", 2223, "ju2", "jp2", "", "")
+
+	p, err := New(final, 1, nil, t.TempDir())
+	if err != nil {
+		t.Fatalf("New(direct): %v", err)
+	}
+	if got := p.JumpAddrs(); got != nil {
+		t.Fatalf("JumpAddrs(direct)=%v, want nil", got)
+	}
+	_ = p.Close()
+
+	p, err = New(final, 1, []NodeConfig{jump1, jump2}, t.TempDir())
+	if err != nil {
+		t.Fatalf("New(2 jumps): %v", err)
+	}
+	defer func() { _ = p.Close() }()
+	got := p.JumpAddrs()
+	want := []string{"127.0.0.1:2222", "127.0.0.1:2223"}
+	if len(got) != len(want) {
+		t.Fatalf("JumpAddrs=%v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("JumpAddrs[%d]=%s, want %s", i, got[i], want[i])
+		}
+	}
+	got[0] = "tampered"
+	if p.JumpAddrs()[0] != want[0] {
+		t.Fatalf("JumpAddrs 未做副本隔离")
+	}
+}
+
 // TestSSHReconnectAfterChainDeath 断链重建(池=1):拨通回显后杀死底层链,
 // 再次 DialContext 必须重建新链并回显成功——client 指针更换即重建证据。
 func TestSSHReconnectAfterChainDeath(t *testing.T) {

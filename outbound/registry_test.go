@@ -1,7 +1,9 @@
 package outbound
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -272,4 +274,30 @@ func TestRegistryRefreshCustomerProxy_SSHWithJumps(t *testing.T) {
 
 func boolPtr(value bool) *bool {
 	return &value
+}
+
+// TestSSHChainStatusWireShape 钉 wire 形态:零值省键(addr/jumps/jump_addrs
+// 均 omitempty)、配置态齐键——补 2026-11-15 遗留账「Jumps wire 无 Go 断言」。
+func TestSSHChainStatusWireShape(t *testing.T) {
+	empty, err := json.Marshal(SSHChainStatus{OK: false, Chains: []sshout.ChainStatus{}})
+	if err != nil {
+		t.Fatalf("marshal empty: %v", err)
+	}
+	for _, key := range []string{"addr", "jumps", "jump_addrs"} {
+		if bytes.Contains(empty, []byte(`"`+key+`"`)) {
+			t.Fatalf("零值应省略 %s: %s", key, empty)
+		}
+	}
+	full, err := json.Marshal(SSHChainStatus{
+		OK: true, Addr: "h:22", Jumps: 2,
+		JumpAddrs: []string{"a:1", "b:2"}, Chains: []sshout.ChainStatus{},
+	})
+	if err != nil {
+		t.Fatalf("marshal full: %v", err)
+	}
+	for _, key := range []string{`"addr":"h:22"`, `"jumps":2`, `"jump_addrs":["a:1","b:2"]`, `"chains"`} {
+		if !bytes.Contains(full, []byte(key)) {
+			t.Fatalf("配置态缺 %s: %s", key, full)
+		}
+	}
 }
