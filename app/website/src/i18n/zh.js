@@ -1113,6 +1113,9 @@ export default {
   status_sshPathJumps: '{count} 级跳板中转',
   status_sshPathConnections: '{count} 条并行连接',
   status_sshPathConnectionOne: '1 条连接',
+  status_sshNodeLocal: '本机',
+  status_sshNodeJump: '跳板 {index}',
+  status_sshNodeExit: '出口',
   // 接入客户端台账（服务端视角：谁经 SSH 入口连进来）
   status_ingressTitle: '接入客户端',
   status_ingressDesc: '通过本机 SSH 入口接入的客户端（设备）实时状态。',

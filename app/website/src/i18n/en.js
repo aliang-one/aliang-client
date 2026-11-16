@@ -1107,6 +1107,9 @@ export default {
   status_sshPathJumps: '{count}-hop jump chain',
   status_sshPathConnections: '{count} parallel connections',
   status_sshPathConnectionOne: '1 connection',
+  status_sshNodeLocal: 'This device',
+  status_sshNodeJump: 'Jump {index}',
+  status_sshNodeExit: 'Exit',
   // Ingress client sessions (server-side view: who connected in via SSH ingress)
   status_ingressTitle: 'Connected clients',
   status_ingressDesc: 'Live status of clients (devices) connected through this node\'s SSH ingress.',
