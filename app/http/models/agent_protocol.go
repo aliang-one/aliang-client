@@ -138,6 +138,11 @@ const (
 	// transfer.receive 的 direct_candidates，任何失败 A 静默落回 COS。
 	AgentEventPeerLanListen       = "peer.lan.listen"        // server→B(源设备): 拉起一次性临时文件 listener
 	AgentEventPeerLanListenResult = "peer.lan.listen.result" // B→server: 绑定结果(addr+fingerprint)或失败原因
+	// 上传腿 LAN 直连(角色互换):A(目标设备)拉起一次性收件 listener,B(源设备)
+	// 直推文件——省掉 B→COS 的全量上行广域网段。凭据模型与 peer.lan.listen
+	// 完全同构(token 单用途短时 + 现签证书指纹钉扎)。
+	AgentEventPeerLanPushListen       = "peer.lan.push.listen"       // server→A(目标设备): 拉起一次性收件 listener
+	AgentEventPeerLanPushListenResult = "peer.lan.push.listen.result" // A→server: 绑定结果(addr+fingerprint)或失败原因
 )
 
 // mesh UDP 打洞（plan 2026-11-12-mesh-udp-punch）：punch 信令帧族，走平台 WS
@@ -361,7 +366,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				// 设备间互传（spec 2026-10-25-device-file-transfer-design）：upload/receive 走 enabled-device 门禁，
 				// cancel 豁免（照 file.upload.cancel 先例——中途被禁用的设备仍须能收尾）。
 				// size_bytes/sha256 登记时可为 0/空，设备在 transfer.result 里回填真实值（流式打包无法先验）。
-				{Type: AgentEventTransferUpload, Required: []string{"type", "request_id", "transfer_id", "filename", "source_path", "upload"}, Optional: []string{"size_bytes", "sha256", "max_bytes", "is_directory_archive", "source"}, Emits: []string{AgentEventTransferProgress, AgentEventTransferResult}},
+				{Type: AgentEventTransferUpload, Required: []string{"type", "request_id", "transfer_id", "filename", "source_path", "upload"}, Optional: []string{"size_bytes", "sha256", "max_bytes", "is_directory_archive", "source", "direct_upload_candidates"}, Emits: []string{AgentEventTransferProgress, AgentEventTransferResult}},
 				{Type: AgentEventTransferReceive, Required: []string{"type", "request_id", "transfer_id", "filename", "size_bytes", "sha256", "get_url"}, Optional: []string{"is_directory_archive", "target_dir", "object_etag", "max_bytes", "source", "direct_candidates"}, Emits: []string{AgentEventTransferProgress, AgentEventTransferResult}},
 				{Type: AgentEventTransferCancel, Required: []string{"type", "transfer_id"}, Emits: []string{AgentEventTransferResult}},
 				{Type: AgentEventGitStatus, Required: []string{"type", "request_id", "cwd"}, Emits: []string{AgentEventGitStatusResult, AgentEventGitStatusError}},
@@ -389,6 +394,11 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				// B 绑定成功立即回 result（addr+fingerprint），服务过程异步单连接。
 				{Type: AgentEventPeerLanListen, Required: []string{"type", "request_id", "transfer_id", "token", "source_path", "size_bytes"}, Optional: []string{"sha256", "advertise_ip", "ttl_seconds"}, Emits: []string{AgentEventPeerLanListenResult}},
 				{Type: AgentEventPeerLanListenResult, Required: []string{"type", "request_id", "ok"}, Optional: []string{"addr", "fingerprint", "fail_reason"}},
+				// 上传腿 LAN 直连(P1-4,角色互换):A(目标设备)拉一次性收件
+				// listener,B 直推。filename/target_dir 供 A 落盘(收件围栏同款),
+				// max_bytes 是 A 侧越限闸;绑定回包与 peer.lan.listen 同形。
+				{Type: AgentEventPeerLanPushListen, Required: []string{"type", "request_id", "transfer_id", "token", "filename"}, Optional: []string{"target_dir", "max_bytes", "advertise_ip", "ttl_seconds"}, Emits: []string{AgentEventPeerLanPushListenResult}},
+				{Type: AgentEventPeerLanPushListenResult, Required: []string{"type", "request_id", "ok"}, Optional: []string{"addr", "fingerprint", "fail_reason"}},
 				// mesh UDP 打洞（plan 2026-11-12-mesh-udp-punch §帧契约）：punch
 				// 信令三帧，照 peer.lan 先例整族就近登记。session 由 A 经服务端
 				// 发起（ttl_seconds 必填——一次性 listener 的存活上限）；result 回

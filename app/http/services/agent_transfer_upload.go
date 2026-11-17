@@ -192,6 +192,39 @@ func (s *AgentService) handleAgentTransferUpload(msg map[string]interface{}, wri
 	logger.Info(fmt.Sprintf("[TRANSFER] upload begin transfer_id=%s source=%s dir_archive=%t part_size=%d parts_first=%d",
 		ident.TransferID, sourcePath, ident.IsDirectoryArchive, plan.partSize, len(plan.parts)))
 
+	// 上传腿 LAN 直连(P1-4,角色互换):候选在手先试 B→A 直推,成功则整段
+	// 跳过 COS 上传(省全量上行广域网段),一行 via=lan_push 的 result 直接
+	// 终态 done。任何失败静默落回 COS 常规上传,失败阶段经 lan_fail_stage
+	// 回带(接收腿同款语义);「现链路零改动」——无候选/归档/总量未知一律
+	// 直接走 COS。
+	if pushCand := parseAgentLanPushCandidates(msg); pushCand != nil && !ident.IsDirectoryArchive {
+		if info, statErr := os.Stat(sourcePath); statErr == nil && !info.IsDir() {
+			size, sha, finalPath, pushErr := attemptAgentTransferLANPush(ctx, ident, pushCand, sourcePath, info.Size(), writeJSON)
+			if pushErr == nil {
+				logger.Info(fmt.Sprintf("[TRANSFER] lan push complete transfer_id=%s bytes=%d path=%s", ident.TransferID, size, finalPath))
+				payload := agentTransferResultPayload(ident.RequestID, ident.TransferID, true)
+				payload["via"] = "lan_push"
+				payload["size_bytes"] = size
+				payload["sha256"] = sha
+				if finalPath != "" {
+					payload["path"] = finalPath
+				}
+				if err := writeJSON(payload); err != nil {
+					logger.Warn(fmt.Sprintf("[TRANSFER] upload result write failed transfer_id=%s err=%v", ident.TransferID, err))
+				}
+				return
+			}
+			if errors.Is(pushErr, errAgentTransferLanSkip) {
+				logger.Info(fmt.Sprintf("[TRANSFER] lan push skipped transfer_id=%s: %v", ident.TransferID, pushErr))
+			} else {
+				stage := classifyAgentLanFailStage(pushErr)
+				logger.Info(fmt.Sprintf("[TRANSFER] lan push failed transfer_id=%s stage=%s err=%v — falling back to COS",
+					ident.TransferID, stage, pushErr))
+				ident.LanPushFailStage = stage
+			}
+		}
+	}
+
 	startAgentTransferUpload(ctx, s, ident, plan, sourcePath, writeJSON)
 }
 
@@ -276,6 +309,12 @@ func startAgentTransferUpload(ctx context.Context, s *AgentService, ident agentT
 	payload["etags"] = etags
 	payload["size_bytes"] = uploaded
 	payload["sha256"] = hex.EncodeToString(hasher.Sum(nil))
+	// 上传腿直连失败后的 COS 兜底:失败阶段回带(接收腿同款),服务端据此落
+	// push_failed 审计;成功路径的 via 由 lan_push 分支自行携带。
+	if ident.LanPushFailStage != "" {
+		payload["via"] = "cos"
+		payload["lan_fail_stage"] = ident.LanPushFailStage
+	}
 	if err := writeJSON(payload); err != nil {
 		// 写帧失败必须记日志（server 会对账/重驱），不许静默吞错。
 		logger.Warn(fmt.Sprintf("[TRANSFER] upload result write failed transfer_id=%s err=%v", ident.TransferID, err))

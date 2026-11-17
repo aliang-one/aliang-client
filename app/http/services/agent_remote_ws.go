@@ -860,6 +860,19 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 		s.setRemoteConnectionState(true, "online", "")
 		logger.Info(fmt.Sprintf("[AGENT-PEER-LAN] listen_result at unexpected peer request_id=%s",
 			remoteString(msg, "request_id")))
+	case models.AgentEventPeerLanPushListen:
+		// 上传腿 LAN 直连(P1-4,角色互换):A(目标设备)拉一次性收件 listener,
+		// B 直推文件省掉 COS 上行段。绑定回包不等服务过程,经 safeGo 离线化
+		// (peer.lan.listen 同款);enabled-device 门禁与 peer.lan 同族——被禁用
+		// 设备不得为他人提供收件面。
+		s.setRemoteConnectionState(true, "online", "")
+		safeGo("peer_lan_push_listen", func() { s.handleAgentPeerLanPushListen(msg, writeJSON) })
+	case models.AgentEventPeerLanPushListenResult:
+		// A→server 的绑定回包经通用 RPC resolve(request_id 匹配)消费;到达
+		// 其他侧属异常路径——静默消费防 default 臂 unsupported 噪声。
+		s.setRemoteConnectionState(true, "online", "")
+		logger.Info(fmt.Sprintf("[AGENT-PEER-LAN-PUSH] push_listen_result at unexpected peer request_id=%s",
+			remoteString(msg, "request_id")))
 	case models.AgentEventPeerPunchSession:
 		// mesh UDP 打洞（Task 10）B 端信令：绑物理口 socket+STUN 判型+起
 		// QUIC listener 是秒级动作（STUN 探测上限数秒），result 在绑定完成
@@ -1135,6 +1148,7 @@ func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 		// 设备不得为他人提供打洞数据面。
 		models.AgentEventPeerExecRequest,
 		models.AgentEventPeerLanListen,
+		models.AgentEventPeerLanPushListen,
 		models.AgentEventPeerPunchSession,
 		models.AgentEventPeerPunchCandidates:
 		return true
