@@ -375,10 +375,10 @@
               </div>
             </div>
 
-            <!-- 连接测试 + 链路状态灯（客户端连接状态反馈）：测试按钮做一次性
-                 主动验证（当前表单凭据,未保存也可测）；状态灯做持续监控（已保存
+            <!-- 连接测试 + 链路拓扑画布（客户端连接状态反馈）：测试按钮做一次性
+                 主动验证（当前表单凭据,未保存也可测）；拓扑画布做持续监控（已保存
                  并注册的出站链池,来自 /api/status/summary 的 ssh 字段）。两者
-                 互补：表单值 ≠ 运行态,按钮测「我现在填的能不能连」,灯看
+                 互补：表单值 ≠ 运行态,按钮测「我现在填的能不能连」,画布看
                  「当前生效的链路健康如何」。 -->
             <div data-ssh-connectivity class="space-y-3 rounded-xl border border-dashed border-slate-300 bg-slate-50/60 p-4 dark:border-slate-700 dark:bg-slate-900/40">
               <div class="flex flex-wrap items-center justify-between gap-2">
@@ -411,26 +411,9 @@
                 {{ sshTestResultText }}
               </p>
 
-              <!-- 链路状态灯：已注册出站链池的运行态（保存并生效后才有内容）。
-                   未配置/未运行时显示占位文案；退避中琥珀、存活绿、空闲灰。 -->
-              <div v-if="sshChains.length" data-ssh-chain-lights class="grid gap-2">
-                <div
-                  v-for="chain in sshChains"
-                  :key="chain.index"
-                  class="flex items-center justify-between gap-3 rounded-lg border px-3 py-2 text-xs"
-                  :class="chain.cardClass"
-                >
-                  <div class="flex items-center gap-2">
-                    <span class="h-2 w-2 shrink-0 rounded-full" :class="chain.dotClass" aria-hidden="true"></span>
-                    <span class="font-medium text-slate-800 dark:text-slate-200">{{ chain.label }}</span>
-                  </div>
-                  <div class="flex items-center gap-2">
-                    <span :class="chain.stateClass">{{ chain.stateText }}</span>
-                    <span v-if="chain.activeText" class="text-slate-400">{{ chain.activeText }}</span>
-                  </div>
-                </div>
-              </div>
-              <p v-else data-ssh-chain-lights-empty class="text-xs text-slate-400">{{ t('rules_sshChainIdleHint') }}</p>
+              <!-- 链路拓扑画布：吃 summary.ssh 整体快照；未配置/未运行/瞬空
+                   的空态由组件内自渲染（SshChainCanvas 单份泳道推导）。 -->
+              <SshChainCanvas :ssh="sshStatusRaw" />
             </div>
 
             <!-- 服务器指纹（TOFU 库管理）：加载失败静默降级，不阻塞主表单 -->
@@ -693,6 +676,7 @@ import { useI18n } from '../../i18n';
 import { openTutorialDocs } from '../../composables/useTutorialDocs';
 import { showErrorDialog } from '../../composables/useErrorDialog';
 import { getStatusSummary, testSshConnection } from '../../services/statusApi';
+import SshChainCanvas from './SshChainCanvas.vue';
 
 function defaultConfig() {
   return {
@@ -1303,6 +1287,9 @@ const SUCCESS_RING_CIRCUMFERENCE = 2 * Math.PI * SUCCESS_RING_RADIUS;
 
 export default {
   name: 'RulesSettings',
+  components: {
+    SshChainCanvas
+  },
   setup() {
     const { t } = useI18n();
     // HIGH#5：打开语法文档（usage-guide 12.1 规则格式）。openTutorialDocs 是模块级
@@ -1357,13 +1344,13 @@ export default {
         failed: false,
         items: []
       },
-      // SSH 测试连接 + 链路状态灯状态。测试是一次性动作（loading/result）；
-      // 链路状态轮询 summary.ssh（保存并生效后才非空），仅 ssh 类型挂载时轮询。
+      // SSH 测试连接 + 链路拓扑画布状态。测试是一次性动作（loading/result）；
+      // 画布吃 summary.ssh 整体快照（保存并生效后才非空），仅 ssh 类型挂载时轮询。
       sshTest: {
         loading: false,
         result: null
       },
-      sshChainsRaw: [],
+      sshStatusRaw: null,
       _proxyRulesText: '',
       _providerIncludeTexts: {},
       _showSuccessDialog: false,
@@ -1413,47 +1400,8 @@ export default {
     providerOrder() {
       return mergeProviderOrder(providerKeys(this.form.ai_rules), this.presetProviders);
     },
-    // —— 连接测试 + 链路状态灯（客户端连接状态反馈）——
-    // 链路卡片：把 summary.ssh.chains 的运行态快照映射成灯行（与状态页
-    // LogsSettings 的 sshChainCards 同款口径：退避琥珀/存活绿/空闲灰）。
-    sshChains() {
-      return (Array.isArray(this.sshChainsRaw) ? this.sshChainsRaw : []).map((chain) => {
-        const index = Number(chain.index || 0) + 1;
-        const alive = Boolean(chain.alive);
-        const backoff = Boolean(chain.backoff);
-        const remaining = Math.max(1, Math.round(Number(chain.backoffRemainingMs || 0) / 1000));
-        const activeCount = Number(chain.activeChannels || 0);
-        let stateText;
-        let cardClass;
-        let dotClass;
-        let stateClass;
-        if (backoff) {
-          stateText = this.t('status_sshChainBackoffIn', { seconds: remaining });
-          cardClass = 'border-amber-200 bg-amber-50/70 dark:border-amber-500/30 dark:bg-amber-500/10';
-          dotClass = 'bg-amber-400';
-          stateClass = 'text-amber-600 dark:text-amber-300';
-        } else if (alive) {
-          stateText = this.t('status_sshChainAlive');
-          cardClass = 'border-emerald-200 bg-emerald-50/70 dark:border-emerald-500/30 dark:bg-emerald-500/10';
-          dotClass = 'bg-emerald-400';
-          stateClass = 'text-emerald-600 dark:text-emerald-300';
-        } else {
-          stateText = this.t('status_sshChainIdle');
-          cardClass = 'border-slate-200 bg-slate-50/80 dark:border-slate-800 dark:bg-slate-900/60';
-          dotClass = 'bg-slate-300 dark:bg-slate-600';
-          stateClass = 'text-slate-500 dark:text-slate-400';
-        }
-        return {
-          index: chain.index ?? index,
-          label: this.t('status_sshChainLabel', { index }),
-          stateText,
-          activeText: activeCount > 0 ? this.t('status_sshChainActive', { count: activeCount }) : '',
-          cardClass,
-          dotClass,
-          stateClass
-        };
-      });
-    },
+    // —— 连接测试 + 链路拓扑画布（客户端连接状态反馈）——
+    // 泳道/节点推导已收敛入 SshChainCanvas（spec §5.2 单份推导），此处只留轮询喂快照。
     // 测试结果条文案：成功=✓ 延迟 + 指纹截断；失败=阶段文案 + 原始错误。
     sshTestResultText() {
       const res = this.sshTest.result;
@@ -1591,9 +1539,9 @@ export default {
         this.startSshChainPolling();
         return;
       }
-      // 非 ssh 类型：链路状态灯无数据源，停轮询并清结果
+      // 非 ssh 类型：链路画布无数据源，停轮询并清结果
       this.stopSshChainPolling();
-      this.sshChainsRaw = [];
+      this.sshStatusRaw = null;
       this.sshTest.result = null;
     },
     presetProviders: {
@@ -1808,7 +1756,7 @@ export default {
       const value = String(fingerprint || '');
       return value.length > 20 ? `${value.slice(0, 20)}…` : value;
     },
-    // —— 连接测试 + 链路状态灯 ——
+    // —— 连接测试 + 链路拓扑画布 ——
     // 测试连接：用当前表单凭据做一次现场探测（后端不落盘不触注册表）。
     // 载荷与保存路径同构（server 单串线格式 + 当前面凭据收敛 + 跳板线格式），
     // 测的就是「将要保存的这份配置」。失败也停留在结果条（role=status），
@@ -1898,15 +1846,14 @@ export default {
       });
       return payload;
     },
-    // 链路状态灯轮询：复用状态 summary 的 ssh 字段（5s 与状态页同频）。
+    // 链路画布轮询：复用状态 summary 的 ssh 整体快照（5s 与状态页同频）。
     // 失败静默（下个周期自愈），与指纹区块同款降级纪律。
     async loadSshChains() {
       try {
         const envelope = await getStatusSummary();
-        const chains = envelope?.data?.ssh?.chains;
-        this.sshChainsRaw = Array.isArray(chains) ? chains : [];
+        this.sshStatusRaw = envelope?.data?.ssh ?? null;
       } catch {
-        // 静默：灯保持上一次快照，下个轮询周期自愈
+        // 静默：画布保持上一次快照，下个轮询周期自愈
       }
     },
     startSshChainPolling() {

@@ -1112,10 +1112,9 @@ export default {
   status_sshTitle: 'SSH 出口链路',
   status_sshDesc: '配置的一条出口路径会建立多条并行连接（负载分担，单条退避时其余继续接流量），下方逐条显示实时健康。',
   status_sshNotConfigured: '未配置 SSH 出口代理。',
-  status_sshPathFinal: '出口 {addr}',
-  status_sshPathJumps: '{count} 级跳板中转',
-  status_sshPathConnections: '{count} 条并行连接',
-  status_sshPathConnectionOne: '1 条连接',
+  status_sshNodeLocal: '本机',
+  status_sshNodeJump: '跳板 {index}',
+  status_sshNodeExit: '出口',
   // 接入客户端台账（服务端视角：谁经 SSH 入口连进来）
   status_ingressTitle: '接入客户端',
   status_ingressDesc: '通过本机 SSH 入口接入的客户端（设备）实时状态。',

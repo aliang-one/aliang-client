@@ -1,7 +1,9 @@
 package outbound
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -254,6 +256,16 @@ func TestRegistryRefreshCustomerProxy_SSHWithJumps(t *testing.T) {
 		t.Fatalf("ssh proxy proto = %s, want %s", got, proto.SSH)
 	}
 
+	// 钉 registry.go SSHChainStatus 的 JumpAddrs 透传行:wire 必须带出
+	// jump_addrs(拓扑画布泳道标签消费该键)——删透传行此断言即红。
+	wire, err := json.Marshal(registry.SSHChainStatus())
+	if err != nil {
+		t.Fatalf("marshal SSHChainStatus: %v", err)
+	}
+	if !bytes.Contains(wire, []byte(`"jump_addrs":["10.0.0.1:2201"]`)) {
+		t.Fatalf("SSHChainStatus wire 缺 jump_addrs 透传: %s", wire)
+	}
+
 	// 类型切换也要把 ssh 条目清掉:UnregisterCustomerProxies 的 ssh delete
 	// 不只在显式调用时生效,刷新路径同样经过它。
 	switchCfg := &config.Config{Customer: &config.CustomerConfig{
@@ -272,4 +284,30 @@ func TestRegistryRefreshCustomerProxy_SSHWithJumps(t *testing.T) {
 
 func boolPtr(value bool) *bool {
 	return &value
+}
+
+// TestSSHChainStatusWireShape 钉 wire 形态:零值省键(addr/jumps/jump_addrs
+// 均 omitempty)、配置态齐键——补 2026-11-15 遗留账「Jumps wire 无 Go 断言」。
+func TestSSHChainStatusWireShape(t *testing.T) {
+	empty, err := json.Marshal(SSHChainStatus{OK: false, Chains: []sshout.ChainStatus{}})
+	if err != nil {
+		t.Fatalf("marshal empty: %v", err)
+	}
+	for _, key := range []string{"addr", "jumps", "jump_addrs"} {
+		if bytes.Contains(empty, []byte(`"`+key+`"`)) {
+			t.Fatalf("零值应省略 %s: %s", key, empty)
+		}
+	}
+	full, err := json.Marshal(SSHChainStatus{
+		OK: true, Addr: "h:22", Jumps: 2,
+		JumpAddrs: []string{"a:1", "b:2"}, Chains: []sshout.ChainStatus{},
+	})
+	if err != nil {
+		t.Fatalf("marshal full: %v", err)
+	}
+	for _, key := range []string{`"addr":"h:22"`, `"jumps":2`, `"jump_addrs":["a:1","b:2"]`, `"chains"`} {
+		if !bytes.Contains(full, []byte(key)) {
+			t.Fatalf("配置态缺 %s: %s", key, full)
+		}
+	}
 }
