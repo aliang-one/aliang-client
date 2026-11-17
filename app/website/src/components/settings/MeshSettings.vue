@@ -270,6 +270,58 @@
       </div>
     </section>
 
+    <!-- —— LAN 发现(任务 10b 打通):beacon 候选一键入表。离线可用(UDP 广播,
+         不经平台);addr=来源 IP+mesh 口,cert_fingerprint=对端 ssh_ingress
+         host key 指纹——指纹空=对端未配 SSH 入口,不可钉扎(按钮禁用,诚实
+         降级);已配置 device_id 只读展示。添加=push 表单行,随「保存」带出
+         (整份 canonical 铁律,不单独发请求)。 -->
+    <section class="space-y-3" data-mesh-lan-discovery>
+      <div class="flex items-center justify-between">
+        <div>
+          <h4 class="text-sm font-semibold text-slate-900 dark:text-white">{{ t('mesh_lanDiscoveryTitle') }}</h4>
+          <p class="text-xs text-slate-500">{{ t('mesh_lanDiscoveryHint') }}</p>
+        </div>
+        <button
+          class="inline-flex min-h-9 items-center gap-1 rounded border border-slate-300 px-3 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-60 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+          data-mesh-lan-refresh
+          type="button"
+          :disabled="lanPeersLoading"
+          @click="loadLanPeers"
+        >
+          <span class="material-symbols-outlined text-sm">refresh</span>
+          {{ t('mesh_lanDiscoveryRefresh') }}
+        </button>
+      </div>
+      <p v-if="!lanPeerRows.length" class="text-xs text-slate-400" data-mesh-lan-empty>{{ t('mesh_lanDiscoveryEmpty') }}</p>
+      <div v-else class="space-y-2">
+        <div
+          v-for="row in lanPeerRows"
+          :key="row.device_id"
+          class="flex flex-col gap-2 rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-800 md:flex-row md:items-center md:justify-between"
+          :data-mesh-lan-row="row.device_id"
+        >
+          <div class="min-w-0">
+            <p class="truncate font-mono text-xs text-slate-800 dark:text-slate-200">{{ row.device_id }}</p>
+            <p class="truncate font-mono text-xs text-slate-500">{{ row.addr || t('mesh_lanDiscoveryNoAddr') }}</p>
+            <p class="truncate text-[11px]" :class="row.pinnable ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-400'">
+              {{ row.pinnable ? t('mesh_lanDiscoveryPinnable') : t('mesh_lanDiscoveryUnpinned') }}
+            </p>
+          </div>
+          <span v-if="row.configured" class="text-xs font-medium text-slate-400" data-mesh-lan-configured>{{ t('mesh_lanDiscoveryConfigured') }}</span>
+          <button
+            v-else
+            class="inline-flex min-h-9 items-center justify-center rounded bg-primary px-3 text-xs font-medium text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
+            :data-mesh-lan-add="row.device_id"
+            type="button"
+            :disabled="!row.pinnable || !row.addr || saving"
+            @click="addLanPeer(row)"
+          >
+            {{ t('mesh_lanDiscoveryAdd') }}
+          </button>
+        </div>
+      </div>
+    </section>
+
     <!-- —— 节点身份密钥（G3/SPEC §13.3.4）:私钥 textarea 容 PEM 多行 + 口令密码框,
          autocomplete off 防浏览器记忆凭据（RulesSettings proxy 私钥同款手法）。
          表单不强校验——后端保存期拒绝（peers 非空时 private_key 必填等）经卡片
@@ -323,7 +375,7 @@
 </template>
 
 <script>
-import { getAgentStatus, getMeshStatus } from '../../services/agentApi';
+import { getAgentStatus, getMeshStatus, getMeshLanPeers } from '../../services/agentApi';
 import { useI18n } from '../../i18n';
 import { showErrorDialog } from '../../composables/useErrorDialog';
 import {
@@ -381,13 +433,30 @@ export default {
       dragging: null,
       // 「一并开启 SSH 入口」意图标志（G4/SPEC §10.3）:确认后才落,随下次
       // 整体保存带出 ssh_ingress.enable=true——不静默改写,不单独发请求
-      sshIngressEnableIntent: false
+      sshIngressEnableIntent: false,
+      // LAN 发现候选(任务 10b 打通):getMeshLanPeers 只读拉取,失败静默空表
+      // (发现是增益面,失败不打断卡片其余功能)。
+      lanPeers: [],
+      lanPeersLoading: false
     };
   },
   computed: {
     // 保存态 mesh（状态条只认已落盘的兜底,不信表单未保存的编辑值）
     configMesh() {
       return normalizeMeshConfig(this.config?.mesh);
+    },
+    // LAN 发现候选富化(任务 10b 打通):device_id 命中已配置 peers=已配置;
+    // pinnable=指纹在场(对端 ssh_ingress 已配),不可钉扎候选只展示不供添加。
+    lanPeerRows() {
+      const configured = new Set(this.configMesh.peers.map((peer) => peer.device_id));
+      return this.lanPeers.map((peer) => ({
+        device_id: peer?.device_id || '',
+        addr: peer?.addr || '',
+        cert_fingerprint: peer?.cert_fingerprint || '',
+        last_seen_unix: peer?.last_seen_unix || 0,
+        configured: configured.has(peer?.device_id),
+        pinnable: Boolean(peer?.cert_fingerprint)
+      }));
     },
     // 状态条状态机:降级 > 加载 > 未配置 > 离线(兜底/无兜底) > 在线。
     // 「未装配」优先于离线——peers 空+不转发+无兜底时没有 mesh 可言,
@@ -614,6 +683,7 @@ export default {
   mounted() {
     this.loadRuntime();
     this.loadMeshStatus();
+    this.loadLanPeers();
     this.restoreNodePositions();
     // 全局 pointermove/up:拖拽跨出节点矩形仍跟手;卸载时移除（避免泄漏）
     this.boundPointerMove = (event) => this.onDragMove(event);
@@ -780,6 +850,38 @@ export default {
         this.statusLoading = false;
       }
     },
+    // —— LAN 发现候选(GET /api/mesh/lan_peers,任务 10b 打通)——
+    // 只读拉取,失败静默空表(发现是增益面,不打断卡片其余功能);addr/
+    // cert_fingerprint 由 agent 侧 beacon 提供 (来源 IP+报文端口/本机 ssh
+    // 入口 host key 指纹),指纹空=对端未配 SSH 入口,不可钉扎(诚实降级)。
+    async loadLanPeers() {
+      this.lanPeersLoading = true;
+      try {
+        const body = await getMeshLanPeers();
+        this.lanPeers = Array.isArray(body?.peers) ? body.peers : [];
+      } catch {
+        this.lanPeers = [];
+      } finally {
+        this.lanPeersLoading = false;
+      }
+    },
+    // LAN 候选一键入表(任务 10b 打通):push 进 form.peerRows,随下次整体
+    // 保存带出(整份 canonical 铁律——不单独发请求);host_key 直填对端指纹
+    // (钉扎即用户显式动作,no-TOFU 延续)。已配置/不可钉扎的候选按钮不可点。
+    addLanPeer(row) {
+      if (!row || row.configured || !row.pinnable || !row.addr) {
+        return;
+      }
+      if (this.form.peerRows.some((peer) => peer.device_id === row.device_id)) {
+        return;
+      }
+      this.form.peerRows.push({
+        device_id: row.device_id,
+        lan_addrs: [row.addr],
+        host_key: row.cert_fingerprint
+      });
+    },
+
     // 提交载荷:整配置透传 + mesh 覆盖（ModelMappingSettings/SshIngressSettings
     // 同款）。恒产出显式布尔（normalizeMeshConfig 三态→显式,防保存 200 但
     // 永不落盘）;peers/max_hops/开关等未编辑字段经归一化规整透传（Task 3

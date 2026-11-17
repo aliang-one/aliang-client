@@ -250,7 +250,7 @@ func TestBeaconCapacityEviction(t *testing.T) {
 		if err != nil {
 			t.Fatalf("marshal: %v", err)
 		}
-		b.ingest(data, now)
+		b.ingest(data, now, "192.0.2.50")
 	}
 	cands := b.Candidates()
 	if len(cands) != beaconMaxCandidates {

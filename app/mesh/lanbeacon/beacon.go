@@ -1,13 +1,14 @@
 // Package lanbeacon 实现 mesh LAN 发现数据面(design「LAN 发现(实施期
 // 修正)」节/plan Task 10):UDP 全局广播自描述(device_id + mesh 监听端口
-// + 证书指纹占位 + 时间戳),离线(无平台信令)可用,供仪表盘离线模式点选
+// + host key 指纹 + 时间戳),离线(无平台信令)可用,供仪表盘离线模式点选
 // 后手填 customer.mesh.peers。
 //
-// 范围(56fd7d1 controller 裁决后的一期口径):只做发现数据面——LAN 载体
-// 现为明文 + relay 帧头门禁(Task 6 已落地);cert_fingerprint 字段保留占位、
-// 本期恒空串,relay TLS 化(自签证书+指纹钉扎)单列为追加任务 10b,届时
-// 填充本字段。候选列表与 Mesh.Peers 配置不做自动同步(点选后手填,前端
-// Task 14 职责)。
+// 范围(任务 10b 落地后的口径):发现数据面 + 安全钉扎原料——cert_fingerprint
+// 携带本机 ssh_ingress host key 的 SHA256 指纹(装配层注入读取函数,未配置
+// ssh_ingress 时恒空=「发现结果不可转为拨号凭据」的诚实态);候选捕获 UDP
+// 来源 IP 组成可拨 addr。发现结果与 Mesh.Peers 配置仍不做自动同步——addr
+// 增补(装配层)只在候选指纹与 peer 已钉扎 host key 精确相等时采纳,身份
+// 绑定真闸在 SSH 握手的 host key 核验(钉扎 fail-closed)。
 //
 // 报文与时间契约:payload JSON snake_case;ts 为 unix 秒,仅用于超龄判定
 // (>45s 丢弃,容忍对端时钟小幅超前)与对外展示;去重按 device_id,TTL
@@ -45,8 +46,9 @@ const (
 	beaconReadLimit = 512
 )
 
-// beaconPayload 广播报文。CertFingerprint 本期恒空(任务 10b 落 TLS 后填充),
-// 字段保留以固定线上报文形状,避免后续加字段造成新旧舰队互不识别。
+// beaconPayload 广播报文。CertFingerprint=本机 ssh_ingress host key 指纹
+// (SHA256:…,装配层注入读取函数;ssh_ingress 未配置=空串,候选诚实降级
+// 为「仅展示不可钉扎」),字段名保留历史形状避免新旧舰队互不识别。
 type beaconPayload struct {
 	DeviceID        string `json:"device_id"`
 	MeshPort        int    `json:"mesh_port"`
@@ -55,10 +57,13 @@ type beaconPayload struct {
 }
 
 // LanPeerCandidate 一条 LAN 候选;GET /api/mesh/lan_peers 的 data.peers[]
-// 与此同形(snake_case)。
+// 与此同形(snake_case)。Addr=UDP 来源 IP + 报文 mesh_port 组成的可拨地址
+// (广播源端口是临时口,拨号端口恒取报文内 mesh_port);空=来源地址缺失
+// (理论上仅测试直调 ingest 才会发生)。
 type LanPeerCandidate struct {
 	DeviceID        string `json:"device_id"`
 	MeshPort        int    `json:"mesh_port"`
+	Addr            string `json:"addr"`
 	CertFingerprint string `json:"cert_fingerprint"`
 	LastSeenUnix    int64  `json:"last_seen_unix"`
 }
@@ -95,6 +100,34 @@ type Beacon struct {
 	// 权限/无外发接口)下每 3s 一条会刷屏,恢复成功时复位。
 	bcastErrLogged bool
 	candidates     map[string]*lanCandidate
+	// fingerprintFn 广播指纹源(装配层注入,任务 10b):返回本机 ssh_ingress
+	// host key 的 SHA256 指纹(「SHA256:…」)或空串。读盘级成本,广播周期
+	// 3s 调用一次;nil = 恒空(诚实降级)。SetFingerprintProvider 须在 Start
+	// 前(Set 后字段写入与 broadcastLoop 读并发,由 b.mu 保护读取侧)。
+	fingerprintFn func() string
+}
+
+// SetFingerprintProvider 注入广播指纹源(任务 10b)。nil=清除(恒空)。
+func (b *Beacon) SetFingerprintProvider(fn func() string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.fingerprintFn = fn
+}
+
+// InjectCandidateForTests 测试缝:绕过 UDP 时序直插候选(跨包测试用,
+// beacon_test.go 同包直调 ingest)。sourceIP 与生产 readLoop 同语义——
+// addr 由来源 IP+mesh_port 组成。
+func (b *Beacon) InjectCandidateForTests(deviceID string, meshPort int, sourceIP, fingerprint string, ts time.Time) {
+	data, err := json.Marshal(beaconPayload{
+		DeviceID:        deviceID,
+		MeshPort:        meshPort,
+		CertFingerprint: fingerprint,
+		TS:              ts.Unix(),
+	})
+	if err != nil {
+		return
+	}
+	b.ingest(data, ts, sourceIP)
 }
 
 // NewBeacon 构造信标。meshPort 为本机 relay 常驻 LAN 监听口端口(Task 6
@@ -217,18 +250,33 @@ func (b *Beacon) broadcastLoop(ctx context.Context) {
 	}
 }
 
+// assemblePayload 广播载荷装配(锁内读字段、锁外调 provider)——broadcastOnce
+// 与测试缝共用同一取值路径,防双写漂移。
+func (b *Beacon) assemblePayload() beaconPayload {
+	b.mu.Lock()
+	selfID, meshPort, fingerprintFn := b.selfID, b.meshPort, b.fingerprintFn
+	b.mu.Unlock()
+	// 指纹读取(读盘)在锁外:3s 周期一次,失败/慢读不得拖住 Candidates 读侧。
+	fingerprint := ""
+	if fingerprintFn != nil {
+		fingerprint = fingerprintFn()
+	}
+	return beaconPayload{
+		DeviceID:        selfID,
+		MeshPort:        meshPort,
+		CertFingerprint: fingerprint,
+		TS:              time.Now().Unix(),
+	}
+}
+
 func (b *Beacon) broadcastOnce() {
 	b.mu.Lock()
-	send, selfID, meshPort, port := b.sendConn, b.selfID, b.meshPort, b.port
+	send, port := b.sendConn, b.port
 	b.mu.Unlock()
 	if send == nil {
 		return
 	}
-	payload, err := json.Marshal(beaconPayload{
-		DeviceID: selfID,
-		MeshPort: meshPort,
-		TS:       time.Now().Unix(),
-	})
+	payload, err := json.Marshal(b.assemblePayload())
 	if err != nil {
 		return // 纯内值序列化,不可达
 	}
@@ -249,20 +297,27 @@ func (b *Beacon) broadcastOnce() {
 func (b *Beacon) readLoop(conn *net.UDPConn) {
 	buf := make([]byte, beaconReadLimit)
 	for {
-		n, _, err := conn.ReadFromUDP(buf)
+		n, sender, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			return // Stop 关闭 conn 是唯一退出路径
 		}
 		if n <= 0 || n >= len(buf) {
 			continue // 满缓冲=被截断的超限报文,按畸形丢弃
 		}
-		b.ingest(buf[:n], time.Now())
+		// 来源 IP 是候选可拨地址的唯一可信来源(报文内无地址字段,自报可伪造
+		// 到任意主机);源端口是广播临时口,拨号端口恒取报文内 mesh_port。
+		senderIP := ""
+		if sender != nil && sender.IP != nil {
+			senderIP = sender.IP.String()
+		}
+		b.ingest(buf[:n], time.Now(), senderIP)
 	}
 }
 
 // ingest 一条到达报文的入候选判定:非 JSON/缺字段/ts 超龄/自身广播 →
-// 丢弃;通过则刷新或新建候选。测试直接调用以钉判定逻辑,不经 UDP。
-func (b *Beacon) ingest(data []byte, now time.Time) {
+// 丢弃;通过则刷新或新建候选(Addr=senderIP+报文 mesh_port)。测试直接调用
+// 以钉判定逻辑,不经 UDP。
+func (b *Beacon) ingest(data []byte, now time.Time, senderIP string) {
 	var p beaconPayload
 	if err := json.Unmarshal(data, &p); err != nil {
 		return
@@ -282,11 +337,16 @@ func (b *Beacon) ingest(data []byte, now time.Time) {
 	if age > int64(b.maxAge/time.Second) {
 		return
 	}
+	addr := ""
+	if senderIP != "" {
+		addr = net.JoinHostPort(senderIP, fmt.Sprintf("%d", p.MeshPort))
+	}
 	b.pruneLocked(now)
 	entry := lanCandidate{
 		LanPeerCandidate: LanPeerCandidate{
 			DeviceID:        p.DeviceID,
 			MeshPort:        p.MeshPort,
+			Addr:            addr,
 			CertFingerprint: p.CertFingerprint,
 			LastSeenUnix:    p.TS,
 		},

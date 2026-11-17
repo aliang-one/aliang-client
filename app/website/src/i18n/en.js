@@ -1049,6 +1049,16 @@ export default {
   // -- Key inputs (SPEC §13.3.4/§13.3.6): peer-row host_key / fallback host_key /
   //    node identity private key + passphrase; must pair with zh.js or keys fall back to raw names --
   mesh_peersTitle: 'Peer credentials',
+  // LAN discovery (task 10b): beacon candidates one-click add
+  mesh_lanDiscoveryTitle: 'Discovered on LAN',
+  mesh_lanDiscoveryHint: 'Devices broadcasting on the same LAN appear here (works offline). Click Save after adding; the fingerprint comes from the peer\'s SSH ingress key, so adding also pins it.',
+  mesh_lanDiscoveryRefresh: 'Refresh',
+  mesh_lanDiscoveryEmpty: 'No LAN devices discovered yet. Make sure both sides have mesh enabled and are on the same network; peers without SSH ingress cannot be pinned here.',
+  mesh_lanDiscoveryAdd: 'Add',
+  mesh_lanDiscoveryConfigured: 'Configured',
+  mesh_lanDiscoveryPinnable: 'Pinnable (peer SSH ingress on)',
+  mesh_lanDiscoveryUnpinned: 'Peer SSH ingress is off — cannot pin yet',
+  mesh_lanDiscoveryNoAddr: 'Source address unknown',
   mesh_peerHostKey: 'Peer device fingerprint',
   mesh_peerHostKeyPlaceholder: 'e.g. SHA256:AbCdEf… or an authorized_keys line',
   mesh_peerHostKeyHint: 'Confirms you\'re reaching that exact device, not an impostor. Copy the fingerprint from the peer\'s dashboard (SSH ingress card) and paste it here. Required — saving with it empty will be rejected.',

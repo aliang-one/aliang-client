@@ -28,11 +28,15 @@ package tunnel
 import (
 	"context"
 	"log"
+	"net"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"aliang.one/nursorgate/app/mesh/lanbeacon"
+	"aliang.one/nursorgate/common/cache"
+	sshin "aliang.one/nursorgate/inbound/ssh"
 	tuntun "aliang.one/nursorgate/inbound/tun/tunnel"
 	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
 	"aliang.one/nursorgate/processor/config"
@@ -80,6 +84,11 @@ func (m *Manager) egressPeer() meshproxy.Dialer {
 		if addr = strings.TrimSpace(addr); addr != "" {
 			lanAddrs = append(lanAddrs, addr)
 		}
+	}
+	// 任务 10b 打通半:手填为空时从 beacon 候选增补(指纹与钉扎精确相等才
+	// 采纳;三闸语义见 augmentLANAddrsFromBeacon)。手填非空则原样返回。
+	if len(lanAddrs) == 0 {
+		lanAddrs = augmentLANAddrsFromBeacon(deviceID, strings.TrimSpace(peer.HostKey))
 	}
 	spec := meshproxy.PeerSpec{
 		DeviceID: deviceID,
@@ -143,6 +152,10 @@ func (m *Manager) meshDNSForwardPeer() meshproxy.Dialer {
 		if addr = strings.TrimSpace(addr); addr != "" {
 			addrs = append(addrs, addr)
 		}
+	}
+	// 任务 10b 打通半(与 egressPeer 同闸):手填为空时 beacon 增补。
+	if len(addrs) == 0 {
+		addrs = augmentLANAddrsFromBeacon(deviceID, strings.TrimSpace(entry.HostKey))
 	}
 	spec := meshproxy.PeerSpec{
 		DeviceID: deviceID,
@@ -262,6 +275,11 @@ func meshLANDesired(deviceID func() string) bool {
 func startMeshLANLocked(deviceID func() string) {
 	selfID := strings.TrimSpace(deviceID())
 	beacon := lanbeacon.NewBeacon(selfID, config.DefaultHTTPProxyPort, meshLAN.beaconPort)
+	// 任务 10b:广播指纹源=本机 ssh_ingress host key 的 SHA256 指纹(读盘,
+	// 不触发生成——生成职责单一归 ingress Server.Start;未配置/缺文件=空串,
+	// 候选诚实降级为「仅展示不可钉扎」)。core 进程同体持有 beacon 与 SSH
+	// 入口,读盘路径双进程无歧义。
+	beacon.SetFingerprintProvider(ingressHostKeyFingerprint)
 	if berr := beacon.Start(context.Background()); berr != nil {
 		log.Printf("[MESH-LAN] assembly start failed (candidates unavailable, will retry): %v", berr)
 		return
@@ -270,6 +288,59 @@ func startMeshLANLocked(deviceID func() string) {
 	meshLAN.beacon = beacon
 	meshLAN.running = true
 	log.Printf("[MESH-LAN] assembly started (carrier=%d beacon_port=%d)", config.DefaultHTTPProxyPort, meshLAN.beaconPort)
+}
+
+// ingressHostKeyFingerprint 读本机 ssh_ingress host key 的 SHA256 指纹
+// (只读,不生成、不写盘——双进程并发命中缺失文件时不得各自换钥,见
+// sshin.ReadHostKeyInfo 注释)。ssh_ingress 未配置/文件缺失 → 空串(beacon
+// 指纹诚实降级,候选不供钉扎)。
+func ingressHostKeyFingerprint() string {
+	dir, err := cache.GetCacheSubdir("ssh")
+	if err != nil {
+		return ""
+	}
+	info, err := sshin.ReadHostKeyInfo(filepath.Join(dir, sshin.IngressHostKeyFileName))
+	if err != nil {
+		return ""
+	}
+	return info.Fingerprint
+}
+
+// augmentLANAddrsFromBeacon 任务 10b 打通半:「beacon 候选→本地决策→直连」
+// 的 addr 增补。语义三闸:
+//  1. 用户手填恒权威:配置已有 LANAddrs → 原样返回(发现只补空白,不覆盖)。
+//  2. 指纹精确匹配才采纳:候选 CertFingerprint 必须与 peer 已钉扎 HostKey
+//     完全相等(「SHA256:…」形态)——钉扎是用户显式动作(手填/一键添加),
+//     beacon 只是 addr 来源;指纹不符/候选无指纹/peer 未钉扎 → 一律不采纳
+//     (no-TOFU 延续:发现永不喂给未钉扎 peer)。
+//  3. 真闸在握手:beacon 是明文 UDP,攻击者可重播伪造「device_id+addr+
+//     对端指纹」三元组——指纹匹配只是路由提示过滤,身份绑定由 SSH 握手的
+//     host key 核验兜底(持不了对端私钥即握手必败,fail-closed)。
+// 回环地址剔除(候选来自同机回环时不可作 peer 拨号地址);返回 nil = 无增补。
+func augmentLANAddrsFromBeacon(deviceID, pinnedHostKey string) []string {
+	if strings.TrimSpace(pinnedHostKey) == "" || !strings.HasPrefix(pinnedHostKey, "SHA256:") {
+		return nil // 未钉扎/钉扎形态不符:发现永不喂给不可核验的 peer
+	}
+	beacon := lanbeacon.Default()
+	if beacon == nil {
+		return nil
+	}
+	addrs := make([]string, 0, 2)
+	for _, cand := range beacon.Candidates() {
+		if cand.DeviceID != deviceID || cand.Addr == "" || cand.CertFingerprint != pinnedHostKey {
+			continue
+		}
+		if host, _, err := net.SplitHostPort(cand.Addr); err == nil {
+			if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+				continue
+			}
+		}
+		addrs = append(addrs, cand.Addr)
+	}
+	if len(addrs) == 0 {
+		return nil // 无增补(nil 语义,调用方保留原状)
+	}
+	return addrs
 }
 
 // teardownMeshLANLocked 收摊(meshLAN.mu 保护):beacon 先 Stop 再清 Default。

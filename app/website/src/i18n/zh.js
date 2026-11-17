@@ -1048,6 +1048,16 @@ export default {
   // -- 密钥输入位（SPEC §13.3.4/§13.3.6）：peer 行 host_key/兜底行 host_key/
   //    节点身份私钥+口令；en.js 同段须成对，漏键会回落显示 key 名 --
   mesh_peersTitle: '节点对凭据',
+  // LAN 发现(任务 10b 打通):beacon 候选一键入表
+  mesh_lanDiscoveryTitle: '局域网发现',
+  mesh_lanDiscoveryHint: '同一局域网内开着组网广播的设备会出现在这里（离线可用）。添加后按「保存」生效；指纹来自对方设备的 SSH 入口密钥，添加即完成钉扎。',
+  mesh_lanDiscoveryRefresh: '刷新',
+  mesh_lanDiscoveryEmpty: '暂未发现局域网设备。确认双方已开启组网且在同一网络；对方未开启 SSH 入口时无法在此钉扎。',
+  mesh_lanDiscoveryAdd: '添加',
+  mesh_lanDiscoveryConfigured: '已配置',
+  mesh_lanDiscoveryPinnable: '可钉扎（对方已开启 SSH 入口）',
+  mesh_lanDiscoveryUnpinned: '对方未开启 SSH 入口，暂不可钉扎',
+  mesh_lanDiscoveryNoAddr: '来源地址未知',
   mesh_peerHostKey: '对方设备指纹',
   mesh_peerHostKeyPlaceholder: '如 SHA256:AbCdEf… 或 authorized_keys 行',
   mesh_peerHostKeyHint: '用来确认连到的是对方那台设备、防止被冒充。从对方仪表盘的「SSH 入口」卡片复制指纹粘贴到这里；必填——留空保存会被拒。',
