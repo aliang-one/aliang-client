@@ -31,7 +31,7 @@
           <rect
             :x="node.x"
             y="16"
-            width="130"
+            :width="node.width"
             height="52"
             rx="10"
             fill="#f8fafc"
@@ -102,18 +102,20 @@ export default {
     },
     nodeLayout() {
       const count = this.nodes.length;
-      const width = 130;
+      const maxWidth = 130;
       const margin = 20;
+      // 盒宽随节点数收缩(间距 - 8px 保底缝),≥3 跳板不再重叠;count 恒 ≥2(本机+出口),无除零
+      const width = Math.min(maxWidth, Math.floor((640 - margin * 2 - maxWidth) / (count - 1)) - 8);
       const span = 640 - margin * 2 - width;
       return this.nodes.map((node, i) => {
-        const x = count === 1 ? margin : margin + (span * i) / (count - 1);
-        return { ...node, x, cx: x + width / 2 };
+        const x = margin + (span * i) / (count - 1);
+        return { ...node, x, width, cx: x + width / 2 };
       });
     },
     edges() {
       return this.nodeLayout.slice(1).map((node, i) => {
         const prev = this.nodeLayout[i];
-        return { x1: prev.x + 130, x2: node.x };
+        return { x1: prev.x + prev.width, x2: node.x };
       });
     },
     // 泳道推导:逐字搬迁自 RulesSettings.vue sshChains()(后续任务删除页级副本,
