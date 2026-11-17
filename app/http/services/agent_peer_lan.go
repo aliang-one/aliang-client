@@ -108,10 +108,11 @@ func parseAgentLanDirectCandidates(msg map[string]interface{}) *agentLanDirectCa
 // B 端:peer.lan.listen → 一次性临时 TLS listener
 // ---------------------------------------------------------------------------
 
-// agentLanListenResultPayload 组 peer.lan.listen.result 帧。
-func agentLanListenResultPayload(requestID string, ok bool, addr, fingerprint, failReason string) map[string]interface{} {
+// agentLanListenResultPayload 组 peer.lan.listen.result / peer.lan.push.listen.result
+// 帧(两族同形,frameType 区分)。
+func agentLanListenResultPayload(frameType, requestID string, ok bool, addr, fingerprint, failReason string) map[string]interface{} {
 	payload := map[string]interface{}{
-		"type":       models.AgentEventPeerLanListenResult,
+		"type":       frameType,
 		"request_id": requestID,
 		"ok":         ok,
 	}
@@ -250,7 +251,7 @@ func (s *AgentService) handleAgentPeerLanListen(msg map[string]interface{}, writ
 		return
 	}
 	fail := func(reason string) {
-		_ = writeJSON(agentLanListenResultPayload(requestID, false, "", "", reason))
+		_ = writeJSON(agentLanListenResultPayload(models.AgentEventPeerLanListenResult, requestID, false, "", "", reason))
 	}
 
 	transferID := remoteString(msg, "transfer_id")
@@ -319,11 +320,376 @@ func (s *AgentService) handleAgentPeerLanListen(msg map[string]interface{}, writ
 		agentLanServeOnce(conn, tlsCert, token, transferID, filePath, stat.Size())
 	}()
 
-	_ = writeJSON(agentLanListenResultPayload(requestID, true, addr, fingerprint, ""))
+	_ = writeJSON(agentLanListenResultPayload(models.AgentEventPeerLanListenResult, requestID, true, addr, fingerprint, ""))
 }
 
 // ---------------------------------------------------------------------------
-// A 端:direct_candidates[lan_direct] 直连接收
+// 上传腿 LAN 直连(P1-4,角色互换):A(目标设备)跑一次性收件 listener,
+// B(源设备)直推文件。省掉 B→COS 的全量上行广域网段——同 LAN 传 5GB
+// 不再「上行广域网→COS→再 LAN 下载」,而是 B→A 一跳。
+//
+// 协议(B 拨号方视角,三行 JSON + 裸字节流):
+//   B→A  line1  {"token","transfer_id","size_bytes"}   (hello+声明大小)
+//   A→B  line1  {"ok":true}                             (token 过,准备收)
+//   B→A  字节流  恰好 size_bytes 字节
+//   A→B  line2  {"ok":true,"sha256","size_bytes","path"}(收毕 ACK:A 算的
+//                sha/实收字节/最终落盘路径)——B 与自算 sha/size 比对,一致
+//                才向服务端回 via=lan_push 的 result,一行帧直接终态 done,
+//                COS 上传整段跳过(行进 done 前 multipart 由服务端 Abort 清
+//                空)。任何不一致/中断:A 删 partial 回 ok:false,B 落回
+//                COS 常规上传(lan_fail_stage 回带失败阶段)。端到端真值由
+//                「A 所算 sha == B 所算 sha」双端核对,无需 COS 仲裁。
+//
+// 归档排除与接收腿同款理由(zip 总量未知,A 的 size 闸与 sha 预核无从做起)。
+// ---------------------------------------------------------------------------
+
+// parseAgentLanPushCandidates 从 transfer.upload 帧提取第一个合法
+// direct_upload_candidates[lan_push] 条目;无/畸形 → nil(纯 COS,现链路零改动)。
+func parseAgentLanPushCandidates(msg map[string]interface{}) *agentLanDirectCandidate {
+	raw, ok := msg["direct_upload_candidates"].([]interface{})
+	if !ok {
+		return nil
+	}
+	for _, item := range raw {
+		entry, ok := item.(map[string]interface{})
+		if !ok || remoteString(entry, "type") != "lan_push" {
+			continue
+		}
+		addr := remoteString(entry, "addr")
+		token := remoteString(entry, "token")
+		fingerprint := remoteString(entry, "fingerprint")
+		if addr == "" || token == "" || len(token) > 128 || len(fingerprint) != 64 {
+			continue
+		}
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil || net.ParseIP(host) == nil || net.ParseIP(host).To4() == nil {
+			continue
+		}
+		if portNum, err := net.LookupPort("tcp", port); err != nil || portNum <= 0 {
+			continue
+		}
+		return &agentLanDirectCandidate{Addr: addr, Token: token, Fingerprint: strings.ToLower(fingerprint)}
+	}
+	return nil
+}
+
+// agentLanPushServeOnce 是 A 端收件 listener 的服务体:恰好处理一条连接。
+// 协议见本节头注释。收件围栏/落盘/marker 全部复用接收链的既有件(landing
+// fence / .partial 命名 / 重名不覆盖 / done marker);收满 size_bytes 才 ACK,
+// 任何失败:删 partial、回 ok:false、静默断开。
+func (s *AgentService) agentLanPushServeOnce(conn net.Conn, tlsCert tls.Certificate, expectedToken, expectedTransferID, filename, targetDir string, maxBytes int64, writeJSON func(interface{}) error) {
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(agentLanHandshakeTimeout))
+	tlsConn := tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{tlsCert}})
+	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+		logger.Info(fmt.Sprintf("[AGENT-PEER-LAN-PUSH] handshake failed: %v", err))
+		return
+	}
+	reader := bufio.NewReader(io.LimitReader(tlsConn, agentLanHeadlineLimit))
+	line, err := reader.ReadBytes('\n')
+	if err != nil || len(line) > agentLanHeadlineLimit {
+		logger.Info("[AGENT-PEER-LAN-PUSH] headline read failed or oversized")
+		return
+	}
+	var hello struct {
+		Token      string `json:"token"`
+		TransferID string `json:"transfer_id"`
+		SizeBytes  int64  `json:"size_bytes"`
+	}
+	if err := json.Unmarshal(line, &hello); err != nil {
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(hello.Token), []byte(expectedToken)) != 1 ||
+		hello.TransferID != expectedTransferID {
+		logger.Info("[AGENT-PEER-LAN-PUSH] token/transfer_id mismatch, dropping")
+		return
+	}
+	if hello.SizeBytes < 0 || (maxBytes > 0 && hello.SizeBytes > maxBytes) {
+		// 声明大小越限:拒绝收流(虚报 size 的对端兜底),回 ok:false。
+		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"too_large"}`), '\n'))
+		logger.Info(fmt.Sprintf("[AGENT-PEER-LAN-PUSH] declared size %d exceeds max_bytes %d", hello.SizeBytes, maxBytes))
+		return
+	}
+
+	// 单收槽:与 COS 接收链同族并发闸(收满即关摊,槽语义与 receive 相同)。
+	// 取消经 B 侧断流自然收敛(conn deadline + 流中断即失败),不挂 ctx 闸。
+	slotCancel := func() {}
+	ok, duplicate := transferReceiveSlot().acquire(expectedTransferID, slotCancel)
+	if !ok {
+		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"receiver_busy"}`), '\n'))
+		logger.Info(fmt.Sprintf("[AGENT-PEER-LAN-PUSH] receive slot busy transfer_id=%s duplicate=%t", expectedTransferID, duplicate))
+		return
+	}
+	defer transferReceiveSlot().release(expectedTransferID)
+
+	// 落盘三件套(接收链同款):inbox 收件根 + target_dir 围栏 + .partial 命名。
+	inbox, err := agentTransferInboxDir()
+	if err != nil {
+		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"internal"}`), '\n'))
+		return
+	}
+	safeName, err := sanitizeTransferFileName(filename)
+	if err != nil {
+		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"bad_filename"}`), '\n'))
+		return
+	}
+	landDir, err := agentTransferLandingDir(inbox, targetDir)
+	if err != nil {
+		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"fence_escape"}`), '\n'))
+		return
+	}
+	if err := os.MkdirAll(landDir, 0o755); err != nil {
+		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"internal"}`), '\n'))
+		return
+	}
+	partialPath := agentTransferPartialPath(inbox, expectedTransferID, safeName)
+	partial, err := os.OpenFile(partialPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"internal"}`), '\n'))
+		return
+	}
+
+	// token 过、槽到手、落盘就位:回 ok 放 B 开流,传输宽限盖 conn deadline。
+	_, _ = tlsConn.Write(append([]byte(`{"ok":true}`), '\n'))
+	conn.SetDeadline(time.Now().Add(agentLanServeGrace))
+
+	hasher := sha256.New()
+	throttle := newAgentTransferThrottle(hello.SizeBytes)
+	var received int64
+	body := &progressReader{
+		r: tlsConn,
+		n: &received,
+		onRead: func() {
+			if throttle.shouldEmit(atomic.LoadInt64(&received), time.Now()) {
+				_ = writeJSON(agentTransferProgressPayload("", expectedTransferID, agentTransferDirectionReceive, atomic.LoadInt64(&received), hello.SizeBytes, 0))
+			}
+		},
+	}
+	// 定长读恰好 hello.SizeBytes 字节:B 发完不关流(在等 ACK),按字节数框定
+	// 是唯一可靠的流终结语义;提前 EOF(CopyN 返回 EOF)即截断失败。声明大小
+	// 已过 maxBytes 闸,无需再套 LimitReader。
+	written, copyErr := io.CopyN(io.MultiWriter(partial, hasher), body, hello.SizeBytes)
+	if errors.Is(copyErr, io.EOF) {
+		copyErr = io.ErrUnexpectedEOF
+	}
+	closePartial := func() {
+		_ = partial.Close()
+		if cleanupErr := os.Remove(partialPath); cleanupErr != nil && !os.IsNotExist(cleanupErr) {
+			logger.Warn(fmt.Sprintf("[AGENT-PEER-LAN-PUSH] partial cleanup failed transfer_id=%s err=%v", expectedTransferID, cleanupErr))
+		}
+	}
+	if copyErr != nil {
+		// 中断/截断:内容不可信,删 partial,不 ACK(对端按 connect/mid_transfer 落 COS)。
+		closePartial()
+		logger.Info(fmt.Sprintf("[AGENT-PEER-LAN-PUSH] stream failed transfer_id=%s written=%d want=%d err=%v", expectedTransferID, written, hello.SizeBytes, copyErr))
+		return
+	}
+	_ = partial.Close()
+
+	// 收满声明大小:rename 重名不覆盖 → done marker → ACK 带 sha/size/path。
+	finalPath := agentTransferFinalPath(landDir, safeName)
+	if err := os.Rename(partialPath, finalPath); err != nil {
+		_ = os.Remove(partialPath)
+		logger.Info(fmt.Sprintf("[AGENT-PEER-LAN-PUSH] rename failed transfer_id=%s err=%v", expectedTransferID, err))
+		return
+	}
+	_ = os.Chmod(finalPath, 0o644)
+	sum := hex.EncodeToString(hasher.Sum(nil))
+	_ = writeAgentTransferMarker(&agentTransferMarker{
+		TransferID: expectedTransferID,
+		State:      transferMarkerStateDone,
+		Path:       finalPath,
+		SizeBytes:  written,
+		SHA256:     sum,
+	})
+	ack, _ := json.Marshal(map[string]interface{}{
+		"ok":         true,
+		"sha256":     sum,
+		"size_bytes": written,
+		"path":       finalPath,
+	})
+	if _, err := tlsConn.Write(append(ack, '\n')); err != nil {
+		logger.Warn(fmt.Sprintf("[AGENT-PEER-LAN-PUSH] ack write failed transfer_id=%s err=%v", expectedTransferID, err))
+		return
+	}
+	logger.Info(fmt.Sprintf("[AGENT-PEER-LAN-PUSH] received transfer_id=%s path=%s bytes=%d sha=%s", expectedTransferID, finalPath, written, sum[:16]))
+}
+
+// handleAgentPeerLanPushListen 是 A 端(目标设备)帧入口(server→A,WS 显式臂
+// safeGo 调度,enabled-device 门禁与 peer.lan.listen 同族)。立即回 result 帧
+// (listener 绑定成功即回,服务过程异步),server 侧 RPC 围栏只等绑定。
+func (s *AgentService) handleAgentPeerLanPushListen(msg map[string]interface{}, writeJSON func(interface{}) error) {
+	requestID := remoteString(msg, "request_id")
+	if requestID == "" {
+		logger.Warn("[AGENT-PEER-LAN-PUSH] listen request dropped reason=missing_request_id")
+		return
+	}
+	fail := func(reason string) {
+		_ = writeJSON(agentLanListenResultPayload(models.AgentEventPeerLanPushListenResult, requestID, false, "", "", reason))
+	}
+
+	transferID := remoteString(msg, "transfer_id")
+	if !validAgentTransferID(transferID) {
+		fail("bad_transfer_id")
+		return
+	}
+	token := remoteString(msg, "token")
+	if token == "" || len(token) > 128 {
+		fail("bad_token")
+		return
+	}
+	filename := remoteString(msg, "filename")
+	if filename == "" {
+		fail("missing_filename")
+		return
+	}
+	if _, err := sanitizeTransferFileName(filename); err != nil {
+		fail("bad_filename")
+		return
+	}
+	targetDir := remoteString(msg, "target_dir")
+	maxBytes := agentTransferInt64(msg, "max_bytes")
+	ttlSeconds := agentTransferInt64(msg, "ttl_seconds")
+	if ttlSeconds <= 0 || ttlSeconds > 30 {
+		ttlSeconds = 30
+	}
+
+	tlsCert, fingerprint, err := generateAgentLanCertificate()
+	if err != nil {
+		fail("cert_generate_failed")
+		return
+	}
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		fail("listen_failed")
+		return
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	addr := agentLanAdvertiseAddr(remoteString(msg, "advertise_ip"), port)
+	if addr == "" {
+		_ = listener.Close()
+		fail("no_lan_address")
+		return
+	}
+	if tcpListener, ok := listener.(*net.TCPListener); ok {
+		_ = tcpListener.SetDeadline(time.Now().Add(time.Duration(ttlSeconds) * time.Second))
+	}
+
+	logger.Info(fmt.Sprintf("[AGENT-PEER-LAN-PUSH] listening addr=%s transfer_id=%s ttl=%ds", addr, transferID, ttlSeconds))
+	go func() {
+		conn, acceptErr := listener.Accept()
+		_ = listener.Close()
+		if acceptErr != nil {
+			logger.Info(fmt.Sprintf("[AGENT-PEER-LAN-PUSH] accept window closed transfer_id=%s err=%v", transferID, acceptErr))
+			return
+		}
+		s.agentLanPushServeOnce(conn, tlsCert, token, transferID, filename, targetDir, maxBytes, writeJSON)
+	}()
+
+	_ = writeJSON(agentLanListenResultPayload(models.AgentEventPeerLanPushListenResult, requestID, true, addr, fingerprint, ""))
+}
+
+// attemptAgentTransferLANPush 是 B 端(源设备)的直推腿:拨 A 的收件 listener、
+// 钉扎指纹、声明大小、流文件、核 ACK。成功返回 (size, sha, path, nil)——
+// size/sha 与自算一致已由本函数核过,path 是 A 侧最终落盘路径。任何失败返回
+// 非 nil error,由调用方落回 COS 常规上传——本函数绝不部分成功。
+func attemptAgentTransferLANPush(ctx context.Context, ident agentTransferIdentity, cand *agentLanDirectCandidate, sourcePath string, totalSize int64, writeJSON func(interface{}) error) (int64, string, string, error) {
+	if totalSize <= 0 {
+		// 归档(zip 流式打包总量未知)与 stat 不到的源:直推腿不参与。
+		return 0, "", "", fmt.Errorf("%w: unknown source size", errAgentTransferLanSkip)
+	}
+	dialer := net.Dialer{Timeout: agentLanDialTimeout}
+	rawConn, err := dialer.DialContext(ctx, "tcp", cand.Addr)
+	if err != nil {
+		return 0, "", "", fmt.Errorf("lan dial %s failed: %w", cand.Addr, err)
+	}
+	defer rawConn.Close()
+
+	tlsConn := tls.Client(rawConn, &tls.Config{
+		InsecureSkipVerify:    true, // 自签生态:校验走 VerifyPeerCertificate 指纹钉扎
+		VerifyPeerCertificate: agentLanTLSFingerprintVerifier(cand.Fingerprint),
+	})
+	// 握手 + 双行交换共用 5s 围栏;开流后放开(ctx 取消仍是总闸)。
+	rawConn.SetDeadline(time.Now().Add(agentLanHandshakeTimeout))
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return 0, "", "", fmt.Errorf("lan tls handshake failed: %w", err)
+	}
+	hello, _ := json.Marshal(map[string]interface{}{
+		"token":       cand.Token,
+		"transfer_id": ident.TransferID,
+		"size_bytes":  totalSize,
+	})
+	if _, err := tlsConn.Write(append(hello, '\n')); err != nil {
+		return 0, "", "", fmt.Errorf("lan hello write failed: %w", err)
+	}
+	reader := bufio.NewReader(io.LimitReader(tlsConn, agentLanHeadlineLimit))
+	line, err := reader.ReadBytes('\n')
+	if err != nil {
+		return 0, "", "", fmt.Errorf("lan headline read failed: %w", err)
+	}
+	var ready struct {
+		Ok     bool   `json:"ok"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(line, &ready); err != nil || !ready.Ok {
+		return 0, "", "", fmt.Errorf("lan peer refused handshake (reason=%s)", ready.Reason)
+	}
+	// 开流:传输宽限。ctx 取消(transfer.cancel / 进程退出)仍即时生效。
+	rawConn.SetDeadline(time.Now().Add(agentLanServeGrace))
+	src, err := os.Open(sourcePath)
+	if err != nil {
+		return 0, "", "", err
+	}
+	defer src.Close()
+
+	hasher := sha256.New()
+	throttle := newAgentTransferThrottle(totalSize)
+	var sent int64
+	body := &progressReader{
+		r: src,
+		n: &sent,
+		onRead: func() {
+			if throttle.shouldEmit(atomic.LoadInt64(&sent), time.Now()) {
+				_ = writeJSON(agentTransferProgressPayload(ident.RequestID, ident.TransferID, agentTransferDirectionUpload, atomic.LoadInt64(&sent), totalSize, 0))
+			}
+		},
+	}
+	written, copyErr := io.Copy(io.MultiWriter(tlsConn, hasher), io.LimitReader(body, totalSize))
+	if copyErr != nil {
+		return 0, "", "", fmt.Errorf("lan stream failed after %d bytes: %w", written, copyErr)
+	}
+	if written != totalSize {
+		return 0, "", "", fmt.Errorf("lan push truncated: sent %d, declared %d", written, totalSize)
+	}
+	sum := hex.EncodeToString(hasher.Sum(nil))
+
+	// ACK 围栏:A 收满核 sha 后回最终行;给足宽限(A 的 rename/marker 在 ACK 前)。
+	rawConn.SetDeadline(time.Now().Add(agentLanServeGrace))
+	ackLine, err := reader.ReadBytes('\n')
+	if err != nil || len(ackLine) > agentLanHeadlineLimit {
+		return 0, "", "", fmt.Errorf("lan ack read failed: %w", err)
+	}
+	var ack struct {
+		Ok        bool   `json:"ok"`
+		SHA256    string `json:"sha256"`
+		SizeBytes int64  `json:"size_bytes"`
+		Path      string `json:"path"`
+	}
+	if err := json.Unmarshal(ackLine, &ack); err != nil || !ack.Ok {
+		return 0, "", "", errors.New("lan peer refused ack")
+	}
+	if ack.SizeBytes != totalSize {
+		return 0, "", "", fmt.Errorf("lan ack size mismatch: peer %d, local %d: %w", ack.SizeBytes, totalSize, errAgentTransferSizeMismatch)
+	}
+	if !strings.EqualFold(strings.TrimSpace(ack.SHA256), sum) {
+		return 0, "", "", fmt.Errorf("%w: peer %s want %s", errAgentTransferShaMismatch, ack.SHA256, sum)
+	}
+	_ = writeJSON(agentTransferProgressPayload(ident.RequestID, ident.TransferID, agentTransferDirectionUpload, totalSize, totalSize, 0))
+	return totalSize, sum, ack.Path, nil
+}
+
+// ---------------------------------------------------------------------------
+// A 端(接收腿):direct_candidates[lan_direct] 直连接收
 // ---------------------------------------------------------------------------
 
 var errAgentTransferLanSkip = errors.New("lan direct skipped")

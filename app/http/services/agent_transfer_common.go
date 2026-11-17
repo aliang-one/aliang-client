@@ -361,6 +361,9 @@ type agentTransferIdentity struct {
 	SHA256             string
 	MaxBytes           int64
 	IsDirectoryArchive bool
+	// LanPushFailStage 上传腿直连失败后的兜底阶段(P1-4):COS 兜底成功时随
+	// result 回带(via=cos + lan_fail_stage),服务端据此落 push_failed 审计。
+	LanPushFailStage string
 }
 
 func parseAgentTransferIdentity(msg map[string]interface{}) agentTransferIdentity {
