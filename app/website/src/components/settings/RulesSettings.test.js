@@ -515,6 +515,8 @@ describe('RulesSettings SSH 上游代理', () => {
     expect(el.querySelector('[data-ssh-auth-password]')).toBeTruthy();
     expect(el.querySelector('[data-ssh-auth-key]')).toBeNull();
     expect(el.querySelector('[data-field="proxyPassword"]')).toBeTruthy();
+    // 用户名归属密码面:密码面内自带用户名输入(共享网格已收走)
+    expect(el.querySelector('[data-ssh-auth-password] [data-field="proxyUsername"]')).toBeTruthy();
     expect(el.querySelector('[data-field="proxyPrivateKey"]')).toBeNull();
     expect(el.querySelector('[data-field="proxyKeyPassphrase"]')).toBeNull();
     expect(el.querySelector('[data-field="proxyPoolSize"]')).toBeTruthy();
@@ -531,6 +533,8 @@ describe('RulesSettings SSH 上游代理', () => {
     expect(el.querySelector('[data-ssh-auth-key]')).toBeTruthy();
     expect(el.querySelector('[data-field="proxyPrivateKey"]').value).toBe('PEM');
     expect(el.querySelector('[data-field="proxyPassword"]')).toBeNull();
+    // 私钥面把用户名输入整个收走(连接身份拨号侧兜底本机名)
+    expect(el.querySelector('[data-field="proxyUsername"]')).toBeNull();
 
     // 切到密码面：私钥面板隐藏，密码框回填存量值
     el.querySelector('[data-ssh-auth-tab-password]').click();
@@ -573,6 +577,50 @@ describe('RulesSettings SSH 上游代理', () => {
     submitForm(el);
     await flush();
     expect(saved).toHaveLength(1);
+  });
+
+  it('校验：私钥面用户名留空不拦截（拨号侧兜底本机名），提交载荷用户名置空', async () => {
+    const { el, saved } = mountRules(sshConfig({ username: '', password: '' }));
+    await flush();
+    // 切到私钥面并填私钥:无用户名输入也不报用户名文案
+    el.querySelector('[data-ssh-auth-tab-key]').click();
+    await flush();
+    expect(el.querySelector('[data-field="proxyUsername"]')).toBeNull();
+    setField(el, 'proxyPrivateKey', '-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n');
+    await flush();
+    expect(el.textContent).not.toContain('rules_sshValidationErrorUsername');
+    expect(el.textContent).not.toContain('rules_sshValidationErrorAuth');
+
+    submitForm(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    expect(saved[0].proxy.username).toBe('');
+    expect(saved[0].proxy.private_key).toContain('BEGIN OPENSSH PRIVATE KEY');
+    expect(saved[0].proxy.password).toBe('');
+  });
+
+  it('私钥面显示兜底身份提示；socks5 存量用户名经 ssh 私钥面保存不丢失', async () => {
+    // 提示文案只在私钥面出现
+    const { el, saved } = mountRules(sshConfig({ type: 'socks5', username: 'alice', password: 'pw' }));
+    await flush();
+    expect(el.querySelector('[data-ssh-auth-key-username-hint]')).toBeNull();
+
+    setType(el, 'ssh');
+    await flush();
+    // 默认密码面(无私钥配置) → 提示不出现;切私钥面出现
+    expect(el.querySelector('[data-ssh-auth-key-username-hint]')).toBeNull();
+    el.querySelector('[data-ssh-auth-tab-key]').click();
+    await flush();
+    expect(el.querySelector('[data-ssh-auth-key-username-hint]')).toBeTruthy();
+
+    // socks5 存量 username 经私钥面保存保留:共享字段置零会清掉其他协议凭据
+    setField(el, 'proxyPrivateKey', '-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n');
+    submitForm(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    expect(saved[0].proxy.username).toBe('alice');
+    expect(saved[0].proxy.type).toBe('ssh');
+    expect(saved[0].proxy.password).toBe('');
   });
 
   it('校验：跳板行缺 username 或认证时拦截（文案带序号），补齐后放行', async () => {
@@ -665,6 +713,8 @@ describe('RulesSettings SSH 上游代理', () => {
     expect(saved[0].proxy.private_key).toBe('-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n');
     expect(saved[0].proxy.key_passphrase).toBe('pp');
     expect(saved[0].proxy.password).toBe('');
+    // username 是三协议共享字段:私钥面不显示但值保留,置零会外溢清掉 socks5/http 凭据
+    expect(saved[0].proxy.username).toBe('deploy');
     expect(saved[0].proxy.pool_size).toBe(5);
     expect(saved[0].proxy.type).toBe('ssh');
 
@@ -924,6 +974,41 @@ describe('RulesSettings SSH 连接测试与状态灯', () => {
     const result = el.querySelector('[data-ssh-test-result]');
     expect(result).toBeTruthy();
     expect(result.textContent).toContain('rules_sshTestSuccess');
+  });
+
+  it('点击测试连接：私钥面载荷 username 随表单透传（空值才由拨号侧兜底）', async () => {
+    const fetchMock = vi.fn((url) => {
+      if (String(url).includes('/api/proxy/ssh/test')) {
+        return Promise.resolve(testEnvelope({ ok: true, stage: '', error: '', latency_millis: 42, host_key_fingerprint: 'SHA256:abcdefgh' }));
+      }
+      if (String(url).includes('/api/status/summary')) {
+        return Promise.resolve(testEnvelope({ ai: {}, traffic: {}, http: {}, ssh: { ok: false, chains: [] } }));
+      }
+      return Promise.resolve(jsonResponse(knownHostsEnvelope([])));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { el } = mountRules(sshConfig());
+    await flush();
+    await new Promise((r) => setTimeout(r, 10));
+    await flush();
+
+    el.querySelector('[data-ssh-auth-tab-key]').click();
+    await flush();
+    setField(el, 'proxyPrivateKey', '-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n');
+    // 填私钥后先等一帧:按钮的 disabled 绑定要到下一次 patch 才解除
+    await flush();
+    el.querySelector('[data-ssh-test-button]').click();
+    await flush();
+    await new Promise((r) => setTimeout(r, 10));
+    await flush();
+
+    const testCall = fetchMock.mock.calls.find(([url]) => String(url).includes('/api/proxy/ssh/test'));
+    expect(testCall).toBeTruthy();
+    const payload = JSON.parse(testCall[1].body);
+    expect(payload.username).toBe('deploy');
+    expect(payload.private_key).toContain('BEGIN OPENSSH PRIVATE KEY');
+    expect(payload.password).toBe('');
   });
 
   it('测试失败：结果条显示阶段键与错误文本', async () => {

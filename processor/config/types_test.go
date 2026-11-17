@@ -1643,6 +1643,21 @@ func TestSSHProxyConfigValidate(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			// 私钥登录可省用户名:Validate 放行,拨号侧 NodeFromAddrPort 兜底本机名
+			// (密码路径缺用户名仍被上面 missing username 用例拦)。
+			name:    "private key without username passes",
+			config:  &SSHProxyConfig{Server: "1.2.3.4", ServerPort: 22, PrivateKey: "key"},
+			wantErr: false,
+		},
+		{
+			// password+私钥并存的空用户名混合态拒绝:authMethods 密码前置,放行会把
+			// 保存的密码以兜底身份(从未选定)先发到远端。
+			name:    "empty username with password and private key rejected",
+			config:  &SSHProxyConfig{Server: "1.2.3.4", ServerPort: 22, Password: "pw", PrivateKey: "key"},
+			wantErr: true,
+			errMsg:  "ssh proxy requires username",
+		},
+		{
 			name:    "missing server_host",
 			config:  &SSHProxyConfig{ServerPort: 22, Password: "pw"},
 			wantErr: true,

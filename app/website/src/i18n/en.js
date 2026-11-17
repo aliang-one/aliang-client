@@ -932,6 +932,7 @@ export default {
   // SSH auth mode tabs: password / private key are mutually exclusive credentials
   rules_sshAuthModePassword: 'Password login',
   rules_sshAuthModeKey: 'Private key login',
+  rules_sshAuthKeyUsernameHint: 'Private key login needs no username — when none is set, connections automatically use this machine\'s hostname.',
   rules_knownHostsTitle: 'Server fingerprints',
   rules_knownHostsDesc: 'SSH host fingerprints recorded on first connect (TOFU); remove a stale fingerprint after the host changes to re-verify it.',
   rules_knownHostsEmpty: 'No server fingerprints recorded yet.',

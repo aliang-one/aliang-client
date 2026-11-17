@@ -58,9 +58,15 @@ func handleSSHTestPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 基本完整性（详细校验归前端提示层与保存路径的 Validate）：字段缺失
-	// 直接 400，不打到网络层。
-	if req.Server == "" || req.ServerPort == 0 || req.Username == "" {
-		common.Error(w, common.CodeBadRequest, "server_host, server_port and username are required", nil)
+	// 直接 400，不打到网络层。用户名仅纯私钥路径可省——带 password 必须
+	// 显式用户名（与 SSHProxyConfig.Validate 同口径，混合态不放行）。文案
+	// 分开报，避免把私钥路径的用户引向一个不存在的用户名输入框。
+	if req.Server == "" || req.ServerPort == 0 {
+		common.Error(w, common.CodeBadRequest, "server_host and server_port are required", nil)
+		return
+	}
+	if req.Username == "" && (req.PrivateKey == "" || req.Password != "") {
+		common.Error(w, common.CodeBadRequest, "username is required for password auth", nil)
 		return
 	}
 	if req.Password == "" && req.PrivateKey == "" {

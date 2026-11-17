@@ -96,7 +96,8 @@
               <p v-if="serverError" class="text-xs text-red-500">{{ serverError }}</p>
             </label>
 
-            <label class="space-y-2 md:col-start-1">
+            <!-- SSH 时共享网格不再放用户名:密码面自带用户名,私钥面整字段收走 -->
+            <label v-if="!isSshProxy" class="space-y-2 md:col-start-1">
               <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyUsername') }}</span>
               <input
                 v-model.trim="form.proxy.username"
@@ -104,13 +105,14 @@
                 :disabled="!form.proxy.enable"
                 autocomplete="username"
                 class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                :placeholder="isSshProxy ? t('rules_proxyUsernamePlaceholderSsh') : t('rules_proxyUsernamePlaceholder')"
+                :placeholder="t('rules_proxyUsernamePlaceholder')"
                 type="text"
                 @keydown.enter.prevent
               />
             </label>
 
-            <!-- 密码输入仅 socks5/http 走共享网格；SSH 的密码收进下方「认证方式」tab（与私钥二选一） -->
+            <!-- 用户名与密码同族:仅 socks5/http 走共享网格;SSH 的用户名收进「密码登录」
+                 面(私钥面不显示,拨号侧 NodeFromAddrPort 用本机名兜底) -->
             <label v-if="!isSshProxy" class="space-y-2">
               <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyPassword') }}</span>
               <input
@@ -132,7 +134,9 @@
 
             <!-- 认证方式 tab：密码/私钥二选一。切换仅改显示面，两侧已填的值都保留在表单
                  状态里不丢；提交载荷只带当前 tab 侧凭据、另一侧显式置零（父层对空串凭据
-                 字段显式发空串让后端 deep-merge 清旧值）。 -->
+                 字段显式发空串让后端 deep-merge 清旧值）。用户名输入只出现在密码面：
+                 私钥面把输入收走但不置零该字段——它与 socks5/http 共享，存量值继续生效，
+                 空值由拨号侧兜底本机名。 -->
             <div data-ssh-auth-tabs role="tablist" class="inline-flex rounded-lg border border-slate-200 bg-slate-100 p-1 dark:border-slate-700 dark:bg-slate-900">
               <button
                 type="button"
@@ -167,22 +171,42 @@
             </div>
 
             <!-- 密码登录面板 -->
-            <label v-if="sshAuthMode === 'password'" data-ssh-auth-password class="block space-y-2">
-              <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyPassword') }}</span>
-              <input
-                v-model="form.proxy.password"
-                data-field="proxyPassword"
-                :disabled="!form.proxy.enable"
-                autocomplete="current-password"
-                class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                :placeholder="t('rules_proxyPasswordPlaceholderSsh')"
-                type="password"
-                @keydown.enter.prevent
-              />
-            </label>
+            <!-- 密码登录面板:用户名 + 密码。用户名归属此面——私钥面把整个用户名输入
+                 收走,连接身份由拨号侧统一兜底本机名(SSHProxyConfig.Validate 已放行
+                 私钥+空用户名)。div 包两个独立 label,避免单 label 套双输入。 -->
+            <div v-if="sshAuthMode === 'password'" data-ssh-auth-password class="grid gap-4 md:grid-cols-2">
+              <label class="space-y-2">
+                <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyUsername') }}</span>
+                <input
+                  v-model.trim="form.proxy.username"
+                  data-field="proxyUsername"
+                  :disabled="!form.proxy.enable"
+                  autocomplete="username"
+                  class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                  :placeholder="t('rules_proxyUsernamePlaceholderSsh')"
+                  type="text"
+                  @keydown.enter.prevent
+                />
+              </label>
 
-            <!-- 私钥登录面板：私钥 + 口令 -->
+              <label class="space-y-2">
+                <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyPassword') }}</span>
+                <input
+                  v-model="form.proxy.password"
+                  data-field="proxyPassword"
+                  :disabled="!form.proxy.enable"
+                  autocomplete="current-password"
+                  class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                  :placeholder="t('rules_proxyPasswordPlaceholderSsh')"
+                  type="password"
+                  @keydown.enter.prevent
+                />
+              </label>
+            </div>
+
+            <!-- 私钥登录面板:仅私钥 + 口令(用户名输入收走;空值连接时拨号侧兜底本机名) -->
             <div v-else data-ssh-auth-key class="space-y-4">
+              <p data-ssh-auth-key-username-hint class="text-xs text-slate-500 dark:text-slate-400">{{ t('rules_sshAuthKeyUsernameHint') }}</p>
               <label class="block space-y-2">
                 <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyPrivateKey') }}</span>
                 <textarea
@@ -1481,7 +1505,9 @@ export default {
     // 先经 activeJumpServers 过滤（UI 空行不参与校验也不进载荷）。
     sshValidationError() {
       if (!this.form.proxy.enable || this.form.proxy.type !== 'ssh') return '';
-      if (!String(this.form.proxy.username || '').trim()) return this.t('rules_sshValidationErrorUsername');
+      // 用户名仅密码面必填:私钥面不显示该输入,空值由拨号侧兜底本机名
+      // (后端 SSHProxyConfig.Validate 同口径:仅纯私钥路径放行空用户名)。
+      if (this.sshAuthMode !== 'key' && !String(this.form.proxy.username || '').trim()) return this.t('rules_sshValidationErrorUsername');
       if (!this.sshAuthHasCredential) return this.t('rules_sshValidationErrorAuth');
       const jumps = this.activeJumpServers();
       for (let i = 0; i < jumps.length; i++) {
@@ -1801,6 +1827,7 @@ export default {
       const mode = this.sshAuthMode;
       const payload = {
         server_host: String(this.form.proxy.server || '').trim(),
+        // 与真实拨号同口径:username 随表单值透传(私钥面空值时拨号侧兜底本机名)
         username: String(this.form.proxy.username || '').trim(),
         password: mode === 'password' ? String(this.form.proxy.password ?? '') : '',
         private_key: mode === 'key' ? String(this.form.proxy.private_key ?? '') : '',
@@ -1907,6 +1934,9 @@ export default {
         normalized.proxy.jump_servers = this.activeJumpServers();
         normalized.proxy.pool_size = Number(normalized.proxy.pool_size) || 0;
         if (this.sshAuthMode === 'key') {
+          // 私钥面只收敛密码侧;username 不置零——它与 socks5/http 共享同一字段,
+          // 置零会外溢清掉其他协议的凭据(类型切换「值保留」契约)。存量值继续生效,
+          // 空值由拨号侧 NodeFromAddrPort 兜底本机名(合规化)。
           normalized.proxy.password = '';
         } else {
           normalized.proxy.private_key = '';
