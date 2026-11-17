@@ -40,7 +40,22 @@ const (
 	// claudeImageCompressMinBytes 以下不再尝试压缩：小图的收益抵不上重编码
 	// 带来的画质损失与 CPU。
 	claudeImageCompressMinBytes = 256 * 1024
+	// claudeImageMaxPixels 是解码前的像素总数闸门。解码器按图片头声明的尺寸
+	// 分配内存：一张几百 KB 的 PNG 可以声明 40000×40000，没有这道闸就是按
+	// 声明值直接 NewRGBA——数 GB 分配，OOM 杀掉整个 agent 进程（审计
+	// 2026-11-17 P0→P1）。64MP≈8192×8192，远超任何合法照片/截图。
+	claudeImageMaxPixels = 64_000_000
 )
+
+// claudeImageDeclaredPixels 只读图片头（不触发像素分配），返回声明的宽高。
+// ok=false 表示头读不出来——那种输入 image.Decode 同样会失败，交给原路径。
+func claudeImageDeclaredPixels(raw []byte) (w, h int, ok bool) {
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		return 0, 0, false
+	}
+	return cfg.Width, cfg.Height, true
+}
 
 // compressImageForModel 尝试把一张图片压小，返回（可能替换过的）字节与 media type。
 //
@@ -50,6 +65,15 @@ func compressImageForModel(raw []byte, mediaType string) (out []byte, outMediaTy
 	case "image/gif", "image/webp":
 		// GIF 可能是动图（重编码会丢帧），WebP 标准库没有解码器。原样透传。
 		return raw, mediaType, ""
+	}
+
+	// 解码前先只读头，按声明尺寸设闸——超限原样透传（下游 base64 体积闸兜底）。
+	// 解码器按图片头声明的尺寸分配内存：几百 KB 的 PNG 可以声明 40000×40000，
+	// 没有这道闸就是数 GB 分配直接杀进程（审计 2026-11-17）。
+	if w, h, ok := claudeImageDeclaredPixels(raw); ok {
+		if int64(w)*int64(h) > claudeImageMaxPixels {
+			return raw, mediaType, ""
+		}
 	}
 
 	src, format, err := image.Decode(bytes.NewReader(raw))

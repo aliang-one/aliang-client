@@ -40,10 +40,12 @@ func (m *agentAIManager) rememberPendingSubagentTerminal(payload map[string]inte
 		m.pendingSubagentOrder = append(m.pendingSubagentOrder, key)
 	}
 	m.pendingSubagentTerminals[key] = payload
+	m.pendingSubagentStamp[key]++
 	for len(m.pendingSubagentOrder) > agentAIPendingSubagentCap {
 		oldest := m.pendingSubagentOrder[0]
 		m.pendingSubagentOrder = m.pendingSubagentOrder[1:]
 		delete(m.pendingSubagentTerminals, oldest)
+		delete(m.pendingSubagentStamp, oldest)
 	}
 }
 
@@ -57,21 +59,30 @@ func (m *agentAIManager) replayPendingSubagentTerminals(write agentTerminalWrite
 	keys := make([]string, len(m.pendingSubagentOrder))
 	copy(keys, m.pendingSubagentOrder)
 	values := make([]map[string]interface{}, 0, len(keys))
+	stamps := make(map[string]uint64, len(keys))
 	for _, key := range keys {
 		if payload, ok := m.pendingSubagentTerminals[key]; ok {
 			values = append(values, payload)
+			stamps[key] = m.pendingSubagentStamp[key]
 		}
 	}
 	m.mu.Unlock()
 	for _, payload := range values {
 		if err := write(payload); err == nil {
 			m.mu.Lock()
+			// 清账按「快照时的戳 == 现在的戳」判定（2026-11-17 审计 P2）：
+			// 旧实现按 key 无条件删——重放窗口内同键被新终态覆盖时，成功旧帧
+			// 的清账动作会把较新终态连带删掉且永不上行。戳不一致=已有新帧，
+			// 保留归新帧所有。
 			key := agentAIPendingSubagentKey(payload)
-			delete(m.pendingSubagentTerminals, key)
-			for i, k := range m.pendingSubagentOrder {
-				if k == key {
-					m.pendingSubagentOrder = append(m.pendingSubagentOrder[:i], m.pendingSubagentOrder[i+1:]...)
-					break
+			if m.pendingSubagentStamp[key] == stamps[key] {
+				delete(m.pendingSubagentTerminals, key)
+				delete(m.pendingSubagentStamp, key)
+				for i, k := range m.pendingSubagentOrder {
+					if k == key {
+						m.pendingSubagentOrder = append(m.pendingSubagentOrder[:i], m.pendingSubagentOrder[i+1:]...)
+						break
+					}
 				}
 			}
 			m.mu.Unlock()

@@ -11,7 +11,11 @@ package services
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
+
+	"aliang.one/nursorgate/app/http/models"
 )
 
 func subagentFrame(phase string) map[string]interface{} {
@@ -138,5 +142,59 @@ func TestAgentAISubagentFrameTerminalPredicate(t *testing.T) {
 	}
 	if agentAISubagentFrameTerminal(map[string]interface{}{"type": "ai.task", "phase": "completed"}) {
 		t.Fatal("非 ai.subagent 帧不得命中")
+	}
+}
+
+// TestReplayKeepsNewerTerminalOverwrittenMidReplay（2026-11-17 审计 P2）：
+// 旧实现清账按 key 无条件删——重放窗口内同键被新终态覆盖时，成功旧帧的清账
+// 动作把较新终态连带删掉且永不上行。锁死：写出的旧帧清不掉新帧。
+func TestReplayKeepsNewerTerminalOverwrittenMidReplay(t *testing.T) {
+	m := newAgentAIManager()
+	var mu sync.Mutex
+	var sent []map[string]interface{}
+	gate := make(chan struct{})
+	entered := make(chan struct{})
+	var enteredOnce sync.Once
+	write := agentTerminalWriter(func(v interface{}) error {
+		enteredOnce.Do(func() { close(entered) }) // 已进 write：快照已取、清账未跑
+		<-gate                                    // 卡住写侧：保证「快照→写成功→清账」窗口可以注入新终态
+		mu.Lock()
+		sent = append(sent, v.(map[string]interface{}))
+		mu.Unlock()
+		return nil
+	})
+	terminal := func(phase string) map[string]interface{} {
+		return map[string]interface{}{
+			"type": models.AgentEventAISubagent, "session_id": "sess-r", "task_id": "task-r", "phase": phase,
+		}
+	}
+	m.rememberPendingSubagentTerminal(terminal("failed")) // 旧终态
+	done := make(chan struct{})
+	go func() {
+		// 与写侧串行化：先让 replay 取快照并卡在 write。
+		m.replayPendingSubagentTerminals(write)
+		close(done)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("replay 未进入写侧")
+	}
+	// 写侧卡着、清账未跑：此刻同键落下新终态。
+	m.rememberPendingSubagentTerminal(terminal("completed"))
+	close(gate) // 放行：旧帧写成功 → 清账
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("replay goroutine 未结束")
+	}
+	m.mu.Lock()
+	payload, kept := m.pendingSubagentTerminals["sess-r|task-r"]
+	m.mu.Unlock()
+	if !kept {
+		t.Fatal("新终态不得被成功旧帧的清账连带删除")
+	}
+	if payload["phase"] != "completed" {
+		t.Fatalf("保留的应是新终态, got %v", payload["phase"])
 	}
 }

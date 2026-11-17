@@ -1383,7 +1383,10 @@ func (r *runner) executeOne(ctx context.Context, tu ContentBlock) (result ToolRe
 		if rec == nil {
 			return
 		}
-		r.cfg.Logf("agentcore: 工具执行 panic 已拦截 tool=%s id=%s: %v\n%s", tu.Name, tu.ID, rec, debug.Stack())
+		// 必须走 nil 安全的 r.logf：cfg.Logf 是文档明许的可选出口（loop.go:218-223），
+		// 兜底里裸调 nil 函数值会抛出替换原 panic 的新 panic 继续外逃——安全网
+		// 反转成进程杀手（审计 2026-11-17 P1，实证复现）。
+		r.logf("agentcore: 工具执行 panic 已拦截 tool=%s id=%s: %v\n%s", tu.Name, tu.ID, rec, debug.Stack())
 		result = ErrorResult("工具执行发生内部错误（进程已拦截，未受影响），本轮工具未执行: %v", rec)
 	}()
 	return r.executeOneInner(ctx, tu)

@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -678,5 +679,149 @@ func TestDispatchLocalAISnapshotAlwaysCarriesPendingApprovals(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("未收到快照")
+	}
+}
+
+// TestSubscribeAISocketCapEvictsOldestKeepsActiveRun：订阅超限逐最旧而非全清
+// （审计 2026-11-17 P1——全清会连坐在飞 run 与详情页订阅，started/delta 无重
+// 放通道）。活跃 run 的订阅必须存活。
+func TestSubscribeAISocketCapEvictsOldestKeepsActiveRun(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	sock := m.registerAISocket("remote", func(interface{}) error { return nil })
+	if sock == nil {
+		t.Fatal("socket 未注册")
+	}
+	m.mu.Lock()
+	m.sessions["sess-active"] = &agentAISession{activeRunID: "run-a"}
+	m.mu.Unlock()
+	for i := 0; i < agentAISocketSubCap; i++ {
+		m.subscribeAISocket(sock.id, fmt.Sprintf("sess-%02d", i))
+	}
+	m.subscribeAISocket(sock.id, "sess-active") // 第 65 个：触发逐出
+
+	sock.mu.Lock()
+	defer sock.mu.Unlock()
+	if _, ok := sock.subs["sess-active"]; !ok {
+		t.Fatal("cap 逐出后新订阅必须成功")
+	}
+	if _, ok := sock.subs["sess-00"]; ok {
+		t.Fatal("最旧非活跃订阅应被逐出（旧全清策略会连坐清光）")
+	}
+	if _, ok := sock.subs["sess-01"]; !ok {
+		t.Fatal("次旧订阅应保留")
+	}
+	if len(sock.subs) != agentAISocketSubCap {
+		t.Fatalf("订阅数 = %d, want %d", len(sock.subs), agentAISocketSubCap)
+	}
+}
+
+// TestSubscribeAISocketCapAllActiveFallbackTerminates：满表全是活跃 run 的极端
+// 场景（cap=64 不现实，纯防御）：轮转一圈后兜底逐最旧，必须可终止不死循环。
+func TestSubscribeAISocketCapAllActiveFallbackTerminates(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	sock := m.registerAISocket("remote", func(interface{}) error { return nil })
+	if sock == nil {
+		t.Fatal("socket 未注册")
+	}
+	for i := 0; i < agentAISocketSubCap; i++ {
+		id := fmt.Sprintf("sess-a%02d", i)
+		m.mu.Lock()
+		m.sessions[id] = &agentAISession{activeRunID: "run-" + id}
+		m.mu.Unlock()
+		m.subscribeAISocket(sock.id, id)
+	}
+	m.subscribeAISocket(sock.id, "sess-tail")
+
+	sock.mu.Lock()
+	defer sock.mu.Unlock()
+	if _, ok := sock.subs["sess-a00"]; ok {
+		t.Fatal("全活跃兜底应逐出最旧")
+	}
+	if _, ok := sock.subs["sess-a01"]; !ok {
+		t.Fatal("次旧订阅应保留")
+	}
+	if _, ok := sock.subs["sess-tail"]; !ok {
+		t.Fatal("新订阅应成功")
+	}
+}
+
+// TestPumpDeathSalvagesQueuedSubagentTerminals：pump 临终打捞（审计 2026-11-17
+// P2——「入队成功但 pump 随后死亡」窗口里终态帧静默丢、绕过断线暂存）。三条死
+// 亡路径之一（写失败）：手上的帧+队列残留一并交回，子 agent 终态帧进暂存，其余
+// 帧按旧行为丢弃。
+func TestPumpDeathSalvagesQueuedSubagentTerminals(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	release := make(chan struct{})
+	sock := m.registerAISocket("local", func(interface{}) error {
+		<-release // 卡住 pump：保证三条帧全部入队后再统一死亡
+		return errors.New("dead wire")
+	})
+	if sock == nil {
+		t.Fatal("socket 未注册")
+	}
+	term := func(task string) map[string]interface{} {
+		return map[string]interface{}{
+			"type": models.AgentEventAISubagent, "session_id": "sess-x", "task_id": task, "phase": "completed",
+		}
+	}
+	sock.enqueue(term("task-1"))
+	sock.enqueue(map[string]interface{}{"type": models.AgentEventAIDelta, "session_id": "sess-x"})
+	sock.enqueue(term("task-2"))
+	close(release) // 放行：write 失败 → pump 死亡 → deliverUnsent 打捞
+
+	waitUntilFor(t, 3*time.Second, func() bool {
+		return m.pendingSubagentTerminalCount() == 2
+	})
+	m.mu.Lock()
+	_, ok1 := m.pendingSubagentTerminals["sess-x|task-1"]
+	_, ok2 := m.pendingSubagentTerminals["sess-x|task-2"]
+	m.mu.Unlock()
+	if !ok1 || !ok2 {
+		t.Fatal("pump 死亡时应暂存两帧子 agent 终态")
+	}
+}
+
+// TestSubscribeAndEnqueueSnapshotBehavior：订阅+快照入队合一临界区的行为面
+// （2026-11-17 审计 P2 序修复）——socket 在册时快照走 pump 不走直写且订阅生效；
+// socket 缺席（半订阅极端）回落直写，只读握手语义不变。
+func TestSubscribeAndEnqueueSnapshotBehavior(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	var mu sync.Mutex
+	var got []interface{}
+	sock := m.registerAISocket("remote", func(v interface{}) error {
+		mu.Lock()
+		got = append(got, v)
+		mu.Unlock()
+		return nil
+	})
+	if sock == nil {
+		t.Fatal("socket 未注册")
+	}
+	payload := map[string]interface{}{"type": "ai.session.snapshot", "session_id": "sess-snap"}
+	m.subscribeAndEnqueueSnapshot(sock.id, "sess-snap", payload, func(interface{}) error {
+		t.Error("socket 在册时快照不应回落直写")
+		return nil
+	})
+	waitUntilFor(t, time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(got) == 1
+	})
+	if !sock.subscribed("sess-snap") {
+		t.Fatal("合一方法应完成订阅")
+	}
+
+	// socket 缺席：回落直写。
+	direct := 0
+	m.subscribeAndEnqueueSnapshot("nonexistent-sock", "sess-2", payload, func(interface{}) error {
+		mu.Lock()
+		direct++
+		mu.Unlock()
+		return nil
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	if direct != 1 {
+		t.Fatalf("缺席 socket 应回落直写一次, got %d", direct)
 	}
 }

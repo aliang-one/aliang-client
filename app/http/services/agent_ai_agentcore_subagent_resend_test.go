@@ -144,3 +144,30 @@ func TestRegistryMarkTerminalUnsentGuards(t *testing.T) {
 		t.Fatalf("终态行置位失败: %v", got)
 	}
 }
+
+// TestMirrorFinishUsageSurvivesResend（2026-11-17 审计 P2）：registry.finish
+// 返回 map 值拷贝——旧实现只改拷贝，注册表那份恒为 0，补发帧里
+// total_tokens/duration_ms 键恒缺。现在 enrichUsage 先写回注册表，补发帧必须
+// 与首帧同形带上 usage。
+func TestMirrorFinishUsageSurvivesResend(t *testing.T) {
+	dead := &deadPipeEmit{}
+	mirror := newMirrorForTest(t, dead.emit)
+
+	taskID, tracked := mirror.start("researcher", "调研", "任务")
+	if !tracked || taskID == "" {
+		t.Fatalf("start 未追踪: %q %v", taskID, tracked)
+	}
+	mirror.finish("researcher", taskID, "completed", "done", 10*time.Millisecond, 165)
+
+	drained := mirror.registry.drainUnsentTerminals()
+	if len(drained) != 1 {
+		t.Fatalf("drainUnsentTerminals = %d 条, want 1", len(drained))
+	}
+	payload := agentAISubagentPayload("s1", drained[0])
+	if payload["total_tokens"] != int64(165) {
+		t.Fatalf("补发帧丢 total_tokens: %v", payload["total_tokens"])
+	}
+	if payload["duration_ms"] != int64(10) {
+		t.Fatalf("补发帧丢 duration_ms: %v", payload["duration_ms"])
+	}
+}

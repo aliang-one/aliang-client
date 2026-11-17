@@ -378,16 +378,18 @@ func (m *agentCoreSubagentMirror) finish(bridgeName, taskID, phase, summary stri
 	if m == nil || taskID == "" {
 		return
 	}
+	// 测量粒度下限：极快子 run（本地回环可亚毫秒）取整后为 0，payload
+	// builder 对 0 值省键——手机端就看不到耗时字段了，标 1ms 兜底。
+	ms := duration.Milliseconds()
+	if ms < 1 {
+		ms = 1
+	}
+	// 先把 usage 写回注册表再 finish（2026-11-17 审计 P2）：finish 返回的是
+	// map 值拷贝，旧实现只改拷贝，注册表那份恒为 0——drainUnsentTerminals
+	// 补发的终态帧里 total_tokens/duration_ms 恒缺。写回后拷贝与注册表同步。
+	m.registry.enrichUsage(taskID, totalTokens, ms)
 	record, ok := m.registry.finish(taskID, phase, truncateAgentText(summary, 200), time.Now())
 	if ok {
-		record.TotalTokens = totalTokens
-		// 测量粒度下限：极快子 run（本地回环可亚毫秒）取整后为 0，payload
-		// builder 对 0 值省键——手机端就看不到耗时字段了，标 1ms 兜底。
-		ms := duration.Milliseconds()
-		if ms < 1 {
-			ms = 1
-		}
-		record.DurationMs = ms
 		if record.EndedAt.IsZero() {
 			record.EndedAt = time.Now()
 		}
@@ -673,8 +675,16 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 			// live interrupted 口径分裂（面板历史卡 vs 实时卡语义不一致）。
 			// 读 subCtx 而不是 ctx（L3）：per-task 停止只 cancel 子 ctx，父 ctx
 			// 仍活着——看 ctx 会把「单独停掉这个子 agent」错标 completed。
+			// 2026-11-17 审计 P2：cancel 落在 Run 成功返回与 defer 读取之间的
+			// 完成窗口时，成果已作为 tool result 交付并被消费——canceled 单独
+			// 不足以判 interrupted，必须叠加「run 确实没跑完」（isErr，取消在
+			// agentcore.Run 里以 err 形态上浮）或「无产出」。有完整报告的成功
+			// 返回恒判 completed，台账与对话不再分裂。
 			phase := "completed"
-			if subCtx.Err() != nil {
+			if subCtx.Err() != nil && isErr {
+				phase = "interrupted"
+			} else if subCtx.Err() != nil && text == "" {
+				// 防御：取消以成功形态返回但零产出——按中断算。
 				phase = "interrupted"
 			} else if isErr {
 				phase = "failed"

@@ -755,10 +755,18 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 		s.ai.replayPendingApprovalRequests(writeJSON)
 	case models.AgentEventAIRunEventAck:
 		s.setRemoteConnectionState(true, "online", "")
-		s.ai.acknowledgePendingTerminal(
-			remoteString(msg, "run_id"),
-			int64(remoteInt(msg, "accepted_seq", 0)),
-		)
+		// 拒收即毒帧（2026-11-17 审计 P2）：服务端拒收具有终局性（重放永远同
+		// 样被拒），seq 防回退守卫会让 rejected(seq=0) 永远留在账上——每 10s
+		// 心跳全量重放、文件无界增长。带明确非 accepted result 的 ack 走强制
+		// 清账止循环；无 result 字段（旧服务器）保持纯 seq 语义。
+		if r := remoteString(msg, "result"); r != "" && r != "accepted" {
+			s.ai.discardPendingTerminal(remoteString(msg, "run_id"), r)
+		} else {
+			s.ai.acknowledgePendingTerminal(
+				remoteString(msg, "run_id"),
+				int64(remoteInt(msg, "accepted_seq", 0)),
+			)
+		}
 	case models.AgentEventGoalRunEventAck:
 		s.setRemoteConnectionState(true, "online", "")
 		if remoteString(msg, "result") == "accepted" {
@@ -766,6 +774,10 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 				remoteString(msg, "goal_run_id"),
 				int64(remoteInt(msg, "accepted_seq", 0)),
 			)
+		} else {
+			// 拒收（PhoneServer aiRun.ts：result=rejected 附 reason，终局性）
+			// ——重放无出路，清账止循环（2026-11-17 审计 P2）。
+			s.ai.discardPendingTerminal(remoteString(msg, "goal_run_id"), remoteString(msg, "result"))
 		}
 	case models.AgentEventDeviceUnbound:
 		logger.Warn("[AGENT-BOOT] remote_connection device_unbound")
@@ -966,8 +978,9 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 			// 里，已入队 delta 会被晚到的全 done 快照整体替换冲掉（吞流根因，
 			// 前端 running 占位保留为兜底）。
 			payload := s.ai.buildSessionSnapshotPayload(sessionID)
-			s.ai.subscribeAISocket(agentAIRemoteSocketID, sessionID)
-			s.ai.enqueueSessionSnapshot(agentAIRemoteSocketID, payload, writeJSON)
+			// 订阅+快照入队同一 m.mu 临界区（2026-11-17 审计：旧序两步锁交接
+			// 之间扇出的 delta 会先于快照入队被快照吞掉）。
+			s.ai.subscribeAndEnqueueSnapshot(agentAIRemoteSocketID, sessionID, payload, writeJSON)
 		} else {
 			s.ai.unsubscribeAISocket(agentAIRemoteSocketID, sessionID)
 		}
@@ -1195,8 +1208,8 @@ func (s *AgentService) DispatchLocalAI(msg map[string]interface{}, writeJSON fun
 			// 语义）：socket 不存在（半订阅）时 enqueueSessionSnapshot 回落
 			// 直写，只读握手语义不变。
 			payload := s.ai.buildSessionSnapshotPayload(sessionID)
-			s.ai.subscribeAISocket(socketID, sessionID)
-			s.ai.enqueueSessionSnapshot(socketID, payload, writeJSON)
+			// 同远端路径：订阅+快照入队同一临界区（2026-11-17 审计）。
+			s.ai.subscribeAndEnqueueSnapshot(socketID, sessionID, payload, writeJSON)
 		} else {
 			s.ai.unsubscribeAISocket(socketID, sessionID)
 		}

@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"aliang.one/nursorgate/common/logger"
 )
 
 const agentAIRunJournalFilename = "ai_run_terminals.json"
@@ -90,6 +92,32 @@ func (m *agentAIManager) acknowledgePendingTerminal(runID string, acceptedSeq in
 	m.mu.Unlock()
 }
 
+// discardPendingTerminal 对明确被服务端拒收的终态账强制清账（2026-11-17 审计
+// P2）：拒收帧重放永远同样被拒，seq 防回退守卫会把它永久留在账上——每 10s 心跳
+// 全量重放、账目文件无界增长。与 acknowledgePendingTerminal 的 seq 语义不同：
+// 这里不看 seq，凭服务端终局裁决清账。拒收本身留日志；终态内容仍在 journal 与
+// identity 台账可查。
+func (m *agentAIManager) discardPendingTerminal(runID, reason string) {
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return
+	}
+	m.mu.Lock()
+	if _, ok := m.pendingTerminals[runID]; ok {
+		delete(m.pendingTerminals, runID)
+		if m.runJournalEnabled {
+			if err := m.persistPendingTerminalsLocked(); err != nil {
+				// 持久化失败时内存清账保留（与 ack 路径同口径：宁重放不可复活）。
+				m.mu.Unlock()
+				logger.Warn(fmt.Sprintf("[ai.run.terminal] 拒收清账持久化失败 run=%s reason=%s err=%v", runID, reason, err))
+				return
+			}
+		}
+	}
+	m.mu.Unlock()
+	logger.Warn(fmt.Sprintf("[ai.run.terminal] 服务端拒收终态帧,清账止循环 run=%s reason=%s", runID, reason))
+}
+
 func (m *agentAIManager) pendingTerminalSnapshot() []map[string]interface{} {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -149,8 +177,11 @@ func (m *agentAIManager) loadPendingTerminals() {
 	m.mu.Unlock()
 }
 
+// agentAIRunJournalPathFn 是 journal 路径的可注入缝（测试用），默认走真实路径。
+var agentAIRunJournalPathFn = agentAIRunJournalPath
+
 func (m *agentAIManager) persistPendingTerminalsLocked() error {
-	path, err := agentAIRunJournalPath()
+	path, err := agentAIRunJournalPathFn()
 	if err != nil {
 		return err
 	}

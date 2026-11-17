@@ -2,6 +2,8 @@ package services
 
 import (
 	"bytes"
+	"encoding/binary"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/gif"
@@ -180,5 +182,53 @@ func TestDownscaleAreaAveragesBox(t *testing.T) {
 	}
 	if dst.Pix[i+3] != 255 {
 		t.Errorf("alpha = %d, want 255", dst.Pix[i+3])
+	}
+}
+
+// hugeHeaderPNG 手工拼一个只含 IHDR 的 PNG 头：声明宽高可以是任意值而文件只有
+// 几十字节。PNG 规范：签名 8 字节 + IHDR chunk（长度4+类型4+数据13+CRC4）。
+func hugeHeaderPNG(t *testing.T, w, h uint32) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	buf.Write([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) // 签名
+	data := make([]byte, 13)
+	binary.BigEndian.PutUint32(data[0:4], w)
+	binary.BigEndian.PutUint32(data[4:8], h)
+	data[8] = 8 // bit depth
+	data[9] = 6 // color type RGBA
+	// 压缩/滤波/隔行保持 0
+	chunk := append([]byte("IHDR"), data...)
+	crc := crc32.ChecksumIEEE(chunk)
+	binary.Write(&buf, binary.BigEndian, uint32(len(data)))
+	buf.Write(chunk)
+	binary.Write(&buf, binary.BigEndian, crc)
+	return buf.Bytes()
+}
+
+// TestClaudeImagePixelCapRejectsAbsurdDeclaredSize：解码闸门。一张几百字节的 PNG
+// 可以声明 40000×40000，解码器按声明值分配数 GB——必须只读头就拦下（审计
+// 2026-11-17 P0→P1）。同时锁死边界：63.2MP 的合法大图不误伤。
+func TestClaudeImagePixelCapRejectsAbsurdDeclaredSize(t *testing.T) {
+	absurd := hugeHeaderPNG(t, 40000, 40000) // 1.6GP
+	w, h, ok := claudeImageDeclaredPixels(absurd)
+	if !ok || w != 40000 || h != 40000 {
+		t.Fatalf("头读取 = (%d,%d,%v), want (40000,40000,true)", w, h, ok)
+	}
+	out, mediaType, note := compressImageForModel(absurd, "image/png")
+	if note != "" || mediaType != "image/png" || !bytes.Equal(out, absurd) {
+		t.Errorf("超限图应原样透传，got note=%q mediaType=%q sameBytes=%v", note, mediaType, bytes.Equal(out, absurd))
+	}
+
+	// 边界内（63.2MP < 64MP）：闸门放行，走正常解码路径（头无 IDAT，解码失败
+	// 也是原样透传——但那走的是「解码失败」而非「闸门拦截」分支）。
+	near := hugeHeaderPNG(t, 7900, 8000)
+	if w, h, ok := claudeImageDeclaredPixels(near); !ok || int64(w)*int64(h) > claudeImageMaxPixels {
+		t.Errorf("63.2MP 不应被闸门拦截: (%d,%d,%v)", w, h, ok)
+	}
+
+	// 常规噪声 PNG：闸门必须放行（否则正常照片全废）。
+	normal := noisePNG(t, 3000, 2000, 0)
+	if w, h, ok := claudeImageDeclaredPixels(normal); !ok || int64(w)*int64(h) > claudeImageMaxPixels {
+		t.Errorf("6MP 常规图不应被闸门拦截: (%d,%d,%v)", w, h, ok)
 	}
 }

@@ -1094,3 +1094,47 @@ func TestJournalHealInterruptedSubagents(t *testing.T) {
 		t.Fatalf("补记后详情读侧应显示 interrupted: %+v", sess.Subagents)
 	}
 }
+
+// TestHealMergeJournalSealsTornTail（2026-11-17 审计 P2）：heal 追加目标此前缺
+// appendLineLocked 同款残行封口——目标带崩溃残尾时第一条并回行粘在残尾上、两条
+// 一起坏掉，且源文件随即被删=损坏固化。锁死：残尾先封口，并回行独立完整。
+func TestHealMergeJournalSealsTornTail(t *testing.T) {
+	j := newAgentCoreJournal(t.TempDir())
+	target := "local-torn-target"
+	source := "ai_import-torn-src"
+
+	head := j.sessionHeaderLine(target, "/p", "model-x", "", "c", "phone", nil, nil, "")
+	os.WriteFile(filepath.Join(j.dir, agentCoreJournalFileName(target)),
+		[]byte(string(head)+`{"kind":"user","x":1}`+"\n"+`{"kind":"torn","partial":`), 0o600)
+
+	srcHead := j.sessionHeaderLine(source, "/p", "model-x", "", "c", "phone", nil, nil, "")
+	os.WriteFile(filepath.Join(j.dir, agentCoreJournalFileName(source)),
+		[]byte(string(srcHead)+`{"kind":"user","n":2}`+"\n"+`{"kind":"user","n":3}`+"\n"), 0o600)
+
+	moved, ok := j.healMergeJournal(source, target)
+	if !ok || moved != 2 {
+		t.Fatalf("healMergeJournal = (%d,%v), want (2,true)", moved, ok)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(j.dir, agentCoreJournalFileName(target)))
+	if err != nil {
+		t.Fatalf("read target: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	// 行序：header, user1, torn（已封口独立成行）, merged1, merged2
+	if len(lines) != 5 {
+		t.Fatalf("行数=%d want 5: %q", len(lines), lines)
+	}
+	for i, ln := range lines {
+		if strings.Contains(ln, `"n":2{"kind":"torn"`) || strings.Contains(ln, `"partial":{"kind":"user"`) {
+			t.Fatalf("残行粘坏（行 %d）: %s", i, ln)
+		}
+	}
+	var v map[string]interface{}
+	if json.Unmarshal([]byte(lines[3]), &v) != nil {
+		t.Fatalf("第一条并回行损坏: %s", lines[3])
+	}
+	if _, err := os.Stat(filepath.Join(j.dir, agentCoreJournalFileName(source))); !os.IsNotExist(err) {
+		t.Fatal("源文件应已删除")
+	}
+}
