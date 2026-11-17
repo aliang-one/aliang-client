@@ -256,6 +256,16 @@ func TestRegistryRefreshCustomerProxy_SSHWithJumps(t *testing.T) {
 		t.Fatalf("ssh proxy proto = %s, want %s", got, proto.SSH)
 	}
 
+	// 钉 registry.go SSHChainStatus 的 JumpAddrs 透传行:wire 必须带出
+	// jump_addrs(拓扑画布泳道标签消费该键)——删透传行此断言即红。
+	wire, err := json.Marshal(registry.SSHChainStatus())
+	if err != nil {
+		t.Fatalf("marshal SSHChainStatus: %v", err)
+	}
+	if !bytes.Contains(wire, []byte(`"jump_addrs":["10.0.0.1:2201"]`)) {
+		t.Fatalf("SSHChainStatus wire 缺 jump_addrs 透传: %s", wire)
+	}
+
 	// 类型切换也要把 ssh 条目清掉:UnregisterCustomerProxies 的 ssh delete
 	// 不只在显式调用时生效,刷新路径同样经过它。
 	switchCfg := &config.Config{Customer: &config.CustomerConfig{
