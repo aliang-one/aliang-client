@@ -199,10 +199,10 @@
                     v-if="row.manageable && !row.blocked"
                     type="button"
                     class="rounded-lg px-2 py-1 font-medium text-red-500 transition hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-500/10 dark:hover:text-red-300"
-                    :data-ingress-block="row.title"
-                    @click="blockIngressRow(row)"
+                    :data-ingress-deny="row.title"
+                    @click="denyIngressRow(row)"
                   >
-                    {{ t('status_ingressBlock') }}
+                    {{ t('status_ingressDeny') }}
                   </button>
                   <span
                     v-else-if="row.blocked"
@@ -960,7 +960,7 @@ async function loadIngressSessions() {
   }
 }
 
-// —— 接入客户端管理动作（踢出 / 拉黑 / 解封）——
+// —— 接入客户端管理动作（踢出 / 拒绝 / 解封）——
 // 破坏性动作走 window.confirm（仓库既有惯例）；结果反馈用同款轻量 alert。
 // 操作成功后立即刷新台账——被踢/被拉黑行在下一个界面帧就消失或带上标记。
 
@@ -978,15 +978,17 @@ async function kickIngressSession(row) {
   }
 }
 
-async function blockIngressRow(row) {
-  if (!row?.fingerprint && !row?.deviceId) {
+// 拒绝 = 踢出 + 拉黑,只认公钥指纹:走拉黑接口的单指纹形态(device_id 不传),
+// 后端默认附带断开在线连接。不外溢到 mesh 设备标签——换一把钥匙即不受此名单约束。
+async function denyIngressRow(row) {
+  if (!row?.fingerprint) {
     window.alert(t('status_ingressManageErrNoIdentity'));
     return;
   }
-  if (!window.confirm(t('status_ingressBlockConfirm', { name: row.title }))) return;
+  if (!window.confirm(t('status_ingressDenyConfirm', { name: row.title }))) return;
   try {
-    await blockIngressSession({ fingerprint: row.fingerprint, deviceId: row.deviceId });
-    window.alert(t('status_ingressBlockDone', { name: row.title }));
+    await blockIngressSession({ fingerprint: row.fingerprint });
+    window.alert(t('status_ingressDenyDone', { name: row.title }));
     await loadIngressSessions();
   } catch (error) {
     window.alert(t('status_ingressActionFailed', { reason: error?.message || error }));
