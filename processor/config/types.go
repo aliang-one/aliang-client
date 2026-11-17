@@ -126,7 +126,11 @@ func (c *SSHProxyConfig) Validate() error {
 	if c.ServerPort == 0 {
 		return fmt.Errorf("server_port is required")
 	}
-	if c.Username == "" {
+	// 用户名仅纯私钥路径可省略(UI 私钥面收走用户名输入,拨号侧 NodeFromAddrPort
+	// 用本机名合规化兜底)。只要带 password 就必须有显式用户名——密码认证是登远端
+	// 真实账号,空用户名必失败;password+私钥并存时若放行空用户名,authMethods 的
+	// 密码前置顺序会把保存的密码以兜底身份(从未选定)先发到远端,故同样拦。
+	if c.Username == "" && (c.PrivateKey == "" || c.Password != "") {
 		return fmt.Errorf("ssh proxy requires username")
 	}
 	if c.Password == "" && c.PrivateKey == "" {

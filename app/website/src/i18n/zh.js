@@ -931,6 +931,7 @@ export default {
   // SSH 认证方式 tab：密码/私钥是互斥的两种凭据
   rules_sshAuthModePassword: '密码登录',
   rules_sshAuthModeKey: '私钥登录',
+  rules_sshAuthKeyUsernameHint: '私钥登录无需填写用户名：未设置过用户名时，连接会自动以本机名作为登录身份。',
   rules_knownHostsTitle: '服务器指纹',
   rules_knownHostsDesc: '首次连接时记录的 SSH 主机指纹（TOFU）；主机更换后删除旧指纹即可重新校验。',
   rules_knownHostsEmpty: '暂无已记录的服务器指纹。',

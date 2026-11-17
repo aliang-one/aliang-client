@@ -25,11 +25,13 @@ type NodeConfig struct {
 }
 
 // NodeFromAddrPort 组装节点(Host+Port 分立,registry 侧来自配置解析)。
+// 用户名经 resolveUsername:私钥登录未填时兜底本机名(生产注册与「测试连接」
+// 两条装配路径都经此入口,行为天然一致)。
 func NodeFromAddrPort(host string, port uint16, user, pass, key, keyPass string) NodeConfig {
 	return NodeConfig{
 		Host:          host,
 		Port:          port,
-		User:          user,
+		User:          resolveUsername(user, key),
 		Password:      pass,
 		PrivateKey:    key,
 		KeyPassphrase: keyPass,
