@@ -841,7 +841,7 @@ describe('RulesSettings SSH 连接测试与状态灯', () => {
       if (String(url).includes('/api/status/summary')) {
         return Promise.resolve(testEnvelope({
           ai: {}, traffic: {}, http: {},
-          ssh: { ok: true, addr: '10.0.0.8:22', chains: [
+          ssh: { ok: true, addr: '10.0.0.8:22', jumps: 1, jump_addrs: ['10.0.0.8-relay:2222'], chains: [
             { index: 0, alive: true, backoff: false, backoffRemainingMs: 0, activeChannels: 2 },
             { index: 1, alive: false, backoff: true, backoffRemainingMs: 8000, activeChannels: 0 }
           ] }
@@ -861,7 +861,7 @@ describe('RulesSettings SSH 连接测试与状态灯', () => {
     vi.restoreAllMocks();
   });
 
-  it('ssh 类型挂载渲染测试按钮与状态灯区块；状态灯按 summary.ssh 渲染三态', async () => {
+  it('ssh 类型挂载渲染测试按钮与拓扑画布；泳道按 summary.ssh 渲染三态且节点链含跳板地址', async () => {
     const { el } = mountRules(sshConfig());
     await flush();
 
@@ -869,12 +869,16 @@ describe('RulesSettings SSH 连接测试与状态灯', () => {
     expect(block).toBeTruthy();
     expect(el.querySelector('[data-ssh-test-button]')).toBeTruthy();
 
-    const lights = el.querySelector('[data-ssh-chain-lights]');
-    expect(lights).toBeTruthy();
-    const text = lights.textContent;
-    expect(text).toContain('status_sshChainAlive');
-    expect(text).toContain('status_sshChainBackoffIn');
-    expect(text).toContain('status_sshChainActive');
+    // 画布锚点经子组件 SshChainCanvas DOM 断言（键形态，i18n mock 原样回键）
+    const canvas = el.querySelector('[data-ssh-chain-canvas]');
+    expect(canvas).toBeTruthy();
+    const lanes = canvas.querySelector('[data-ssh-chain-lanes]').textContent;
+    expect(lanes).toContain('status_sshChainAlive');
+    expect(lanes).toContain('status_sshChainBackoffIn');
+    expect(lanes).toContain('status_sshChainActive');
+    // 节点链吃同一 summary.ssh 整体：跳板地址（jump_addrs）透传到画布 SVG 文本
+    const svgText = canvas.querySelector('[data-ssh-chain-svg]').textContent;
+    expect(svgText).toContain('10.0.0.8-relay:2222');
     expect(globalThis.fetch).toHaveBeenCalledWith('/api/status/summary', expect.anything());
   });
 
