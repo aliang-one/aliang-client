@@ -339,9 +339,10 @@
 </template>
 
 <script setup>
-import { computed, reactive, ref, onMounted, onUnmounted, watch } from 'vue';
+import { computed, reactive, ref, onUnmounted, watch } from 'vue';
 import { useCertStatus } from '../composables/useCertStatus';
 import { showErrorDialog } from '../composables/useErrorDialog';
+import { useEscLayer } from '../composables/useEscStack';
 import { useI18n } from '../i18n';
 
 const API_BASE = '/api';
@@ -790,11 +791,9 @@ function close() {
   emit('update:modelValue', false);
 }
 
-function onKeydown(e) {
-  if (e.key === 'Escape' && props.modelValue && !operationBusy.value) {
-    close();
-  }
-}
+// Esc 关闭走全局层级栈(打开即压层);operationBusy 守卫留在 close 内部——
+// 忙碌时 handler 直接返回、层保持压栈(Esc 被吞,不透传下层,与旧约定一致)
+useEscLayer('cert-management', close, () => props.modelValue);
 
 watch(() => props.modelValue, (val) => {
   if (val) {
@@ -813,14 +812,9 @@ watch(statusError, (next) => {
   }
 }, { immediate: true });
 
-onMounted(() => {
-  document.addEventListener('keydown', onKeydown);
-});
-
 onUnmounted(() => {
   stopReinstallPoll();
   if (feedbackTimer) clearTimeout(feedbackTimer);
-  document.removeEventListener('keydown', onKeydown);
 });
 
 defineExpose({ open, close, startReinstall });

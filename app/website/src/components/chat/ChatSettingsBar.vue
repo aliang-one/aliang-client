@@ -200,6 +200,7 @@
 <script setup>
 import { ref, computed, watch } from 'vue';
 import { useI18n } from '../../i18n';
+import { useEscLayer } from '../../composables/useEscStack';
 import { isComposingEvent } from '../../composables/useAliangChat';
 import {
   isDirectoryLocked,
@@ -246,6 +247,17 @@ const recentProjects = ref([]);
 const recentProjectsLoaded = ref(false);
 // 「更多」面板展开态（纯 UI）：数据与动作在 useAliangChat，这里只管开关。
 const moreSettingsOpen = ref(false);
+
+// ESC 层级栈接入:「更多设置」面板与项目目录弹层各自压层——面板展开时 Esc
+// 先收起面板(返回上一层),再次 Esc 才落到页面返回层回 dashboard;目录弹层
+// 同理(点遮罩关闭与 Esc 关闭动作一致)。面板内输入框的 @keydown.esc.stop
+// inline 取消保留:stop 已阻断冒泡,与栈不冲突。
+useEscLayer('chat-more-settings', () => {
+  moreSettingsOpen.value = false;
+}, () => moreSettingsOpen.value);
+useEscLayer('chat-directory-panel', () => {
+  directoryPanelOpen.value = false;
+}, () => directoryPanelOpen.value);
 
 // 预算草稿双向绑定：值真身在 composable（commit 函数读同源草稿），
 // 经 props 进 / 事件出的 computed 桥（与 activeModel/activeEffort 同构）。

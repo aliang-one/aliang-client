@@ -316,6 +316,7 @@
 // 四栏重组 2026-11-03：代理设置(settings) → Agent(agent,三子 tab) → 状态(log) → 用户(user)。
 // Agent 子组件收拢在 settings/agent/AgentPage.vue；设备级杂项已于 2026-11-05
 // 迁出：运行模式→代理设置首卡，系统状态/文件访问授权→仪表盘侧栏紧凑卡。
+import { computed } from 'vue';
 import RulesSettings from './settings/RulesSettings.vue';
 import SshIngressSettings, { normalizeSSHIngressConfig } from './settings/SshIngressSettings.vue';
 import MeshSettings from './settings/MeshSettings.vue';
@@ -331,6 +332,7 @@ import AgentPage from './settings/agent/AgentPage.vue';
 import SectionHeader from './settings/SectionHeader.vue';
 import { normalizeAgentCoreLLMConfig, applyAgentCoreLLMClearing, normalizeAgentCoreTuning, normalizePeerMCPConfig } from '../utils/agentCoreSettings';
 import { useNavigation } from '../composables/useNavigation';
+import { useEscLayer } from '../composables/useEscStack';
 import { openTutorialDocs } from '../composables/useTutorialDocs';
 import { useAuthStore } from '../stores/auth';
 import { useI18n } from '../i18n';
@@ -618,6 +620,17 @@ export function buildCustomerSavePatch(nextConfig, currentConfig) {
   return buildCustomerConfigPatch(normalizedConfig, currentConfig);
 }
 
+// ── ESC 子 tab 收回层(设计:docs/superpowers/specs/2026-11-18-esc-navigation-design.md)──
+// 代理设置页内子 tab:非默认(ingress)且当前页是 settings 时压收回层——第一次 Esc
+// 收回默认子 tab,第二次 Esc 才走页面返回层回 dashboard。闸门含「当前页是 settings」:
+// 本组件常驻挂载、proxySubTab 跨页保留,不闸会在别的页残留陈旧收回层。
+export const PROXY_SUB_TAB_DEFAULT = 'proxy';
+
+export function proxySubTabEscActive(proxySubTab, currentPage) {
+  if (currentPage !== 'settings') return false;
+  return proxySubTab !== PROXY_SUB_TAB_DEFAULT;
+}
+
 
 export default {
   name: 'SettingsPage',
@@ -715,6 +728,16 @@ export default {
       }
     }
   },
+  created() {
+    // ESC 子 tab 收回层:proxySubTab 是 data 态,经 computed 桥成响应源接 useEscLayer。
+    // 本组件常驻挂载,组件生命周期长于页面切换——闸门(escCollapseActive 含 currentPage
+    // 判断)负责层只在「当前页=设置页 且 子 tab 非默认」时存在。
+    const activeRef = computed(() => proxySubTabEscActive(this.proxySubTab, this.currentPage));
+    useEscLayer('subtab-collapse', () => {
+      this.proxySubTab = PROXY_SUB_TAB_DEFAULT;
+    }, activeRef);
+  },
+
   async mounted() {
     try {
       await Promise.all([
