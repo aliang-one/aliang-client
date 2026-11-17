@@ -101,22 +101,36 @@ func runCoreWithContext(ctx context.Context) error {
 	<-ctx.Done()
 	logger.Info("Received shutdown signal, stopping core daemon...")
 
-	// 5. Stop HTTP server if running
-	httpServer.StopHttpServer()
+	// 5-8 停止链整体封顶:任何一环挂死(TUN teardown、半起 dashboard 抢锁
+	// 等)都不拖住进程退出——svc 路径已有 15s 二道防线,这里让前台/非服务
+	// 运行态同样有界。超时响亮留痕后返回,进程退出即兜底(与强杀等价但
+	// 有日志)。
+	const coreStopDeadline = 10 * time.Second
+	stopDone := make(chan struct{})
+	go func() {
+		defer close(stopDone)
+		// Stop HTTP server if running
+		httpServer.StopHttpServer()
 
-	// 6. Stop proxy if running
-	runService := services.GetSharedRunService()
-	if runService.IsRunning() {
-		runService.StopService()
+		// Stop proxy if running
+		runService := services.GetSharedRunService()
+		if runService.IsRunning() {
+			runService.StopService()
+		}
+
+		// Stop token refresh
+		auth.StopTokenRefresh()
+
+		// Stop IPC server
+		ipcServer.Stop()
+	}()
+	select {
+	case <-stopDone:
+		logger.Info("Core daemon stopped successfully")
+	case <-time.After(coreStopDeadline):
+		writeStartupTrace("core stop deadline (%s) exceeded; exiting with teardown incomplete", coreStopDeadline)
+		logger.Error(fmt.Sprintf("core stop deadline (%s) exceeded; exiting with teardown incomplete", coreStopDeadline))
 	}
-
-	// 7. Stop token refresh
-	auth.StopTokenRefresh()
-
-	// 8. Stop IPC server
-	ipcServer.Stop()
-
-	logger.Info("Core daemon stopped successfully")
 	return nil
 }
 

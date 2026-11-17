@@ -231,12 +231,14 @@ func (hl *httpLogger) newFileWriter() io.Writer {
 	}
 
 	if hl.config.EnableFileRotation {
-		return &lumberjack.Logger{
+		// 与 mainLogger 同款弹性兜底(rotate_resilient.go):aliang_http.log
+		// 同样可能遭遇 Windows 双进程 rename 轮转失败。
+		return newRotateResilientWriter(&lumberjack.Logger{
 			Filename:   hl.config.FileLogPath,
 			MaxSize:    int(hl.config.MaxLogSize / 1024 / 1024),
 			MaxBackups: hl.config.MaxLogBackups,
 			Compress:   true,
-		}
+		}, hl.config.FileLogPath)
 	}
 
 	file, err := os.OpenFile(hl.config.FileLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)

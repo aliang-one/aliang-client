@@ -1,7 +1,6 @@
 package tunnel
 
 import (
-	"context"
 	"fmt"
 	"sync/atomic"
 
@@ -12,10 +11,6 @@ import (
 )
 
 var tunnelTCPConnCounter uint64
-
-func newTCPHandlerContext() context.Context {
-	return context.Background()
-}
 
 // getTCPHandler safely gets the TCP handler, with error recovery
 func getTCPHandler() tcphandler.TCPConnHandler {
@@ -40,7 +35,9 @@ func (t *Tunnel) handleTCPConn(originConn adapter.TCPConn) {
 		DstPort: id.LocalPort,
 	}
 
-	ctx := newTCPHandlerContext()
+	// 拆除代次 ctx:engine.stop 触发 CancelTeardown 后,Relay 的等待经
+	// ctx.Done 立即有界退出(不再依赖对端关闭或半关闭 deadline)。
+	ctx := t.TeardownContext()
 
 	// Use unified TCP handler from processor/tcp
 	handler := getTCPHandler()

@@ -1916,7 +1916,7 @@ func (c *Config) EffectiveHTTPProxy() (*HTTPProxyConfig, error) {
 }
 
 // EffectiveSSHProxy derives the SSH outbound config from customer.proxy.
-// pool_size 解析层保持原值(0 即 0):默认 3 与 1..16 钳位由 ssh.New 承担
+// pool_size 解析层保持原值(0 即 0):默认 1 与 1..16 钳位由 ssh.New 承担
 // (registry 契约)——解析层不偷偷改值,保证配置回显与用户输入一致。
 func (c *Config) EffectiveSSHProxy() (*SSHProxyConfig, error) {
 	if c == nil || c.Customer == nil || c.Customer.Proxy == nil {

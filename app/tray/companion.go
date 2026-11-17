@@ -41,7 +41,10 @@ type CompanionApp struct {
 	isRunning    bool
 	coreReady    bool
 	reconnectSeq int
-	done         chan struct{}
+	// dashReviveGate 驱动 maybeReviveDashboard 的补发节奏(见
+	// companion_dashboard_revive.go)。
+	dashReviveGate dashboardReviveGate
+	done           chan struct{}
 }
 
 // NewCompanionApp creates a new CompanionApp with IPC client.
@@ -151,13 +154,7 @@ func (a *CompanionApp) connectAndStartHTTP() {
 	}
 
 	// Extract port from response
-	if data, ok := resp.Data.(map[string]interface{}); ok {
-		if port, ok := data["port"].(string); ok && port != "" {
-			a.httpURL = "http://127.0.0.1:" + port
-		} else if portNum, ok := data["port"].(float64); ok {
-			a.httpURL = fmt.Sprintf("http://127.0.0.1:%d", int(portNum))
-		}
-	}
+	a.applyDashboardStartResponse(resp)
 
 	a.coreReady = true
 	logger.Debug(fmt.Sprintf("Core connected, HTTP dashboard available at %s", a.httpURL))
@@ -166,6 +163,18 @@ func (a *CompanionApp) connectAndStartHTTP() {
 		logger.Warn(fmt.Sprintf("Failed to start user agent runtime from tray companion: %v", err))
 	} else if err := a.syncAgentAuthFromCore("companion_agent_started"); err != nil {
 		logger.Warn(fmt.Sprintf("Failed to request agent auth sync from core: %v", err))
+	}
+}
+
+// applyDashboardStartResponse 从 start_http 响应刷新本地 dashboard 地址
+// (port 兼容字符串与数值两种线格式;connectAndStartHTTP 与补发路径共用)。
+func (a *CompanionApp) applyDashboardStartResponse(resp *ipc.Response) {
+	if data, ok := resp.Data.(map[string]interface{}); ok {
+		if port, ok := data["port"].(string); ok && port != "" {
+			a.httpURL = "http://127.0.0.1:" + port
+		} else if portNum, ok := data["port"].(float64); ok {
+			a.httpURL = fmt.Sprintf("http://127.0.0.1:%d", int(portNum))
+		}
 	}
 }
 
@@ -317,6 +326,10 @@ func (a *CompanionApp) syncState() {
 		a.handleCoreError("invalid status response")
 		return
 	}
+
+	// core 换代后 dashboard 可能没起(http_enabled=false):冷却门控下补发
+	// start_http(2026-11-16 同族缺口,见 companion_dashboard_revive.go)。
+	a.maybeReviveDashboard(data, time.Now())
 
 	running, _ := data["is_running"].(bool)
 	mode := strings.ToLower(trayResultString(data, "current_mode"))

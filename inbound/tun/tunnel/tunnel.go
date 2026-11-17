@@ -67,6 +67,15 @@ type Tunnel struct {
 	procOnce   sync.Once
 	procCancel context.CancelFunc
 
+	// teardownCtx/teardownCancel 是当前引擎运行期的拆除信号:每条 TCP 连接
+	// 的处理 ctx 挂在它下面,engine.stop 触发 CancelTeardown 后 Relay 的
+	// 等待立即有界退出——不再依赖「对端会先关」与半关闭 deadline(那正是
+	// 2026-11-16 停止链挂死的帮凶之一)。拆完后由下一条连接的 TeardownContext
+	// 惰性重建。
+	teardownMu     sync.Mutex
+	teardownCtx    context.Context
+	teardownCancel context.CancelFunc
+
 	activeTCPConn   atomic.Int64
 	rejectedTCPConn atomic.Int64
 	peakTCPConn     atomic.Int64
@@ -186,8 +195,32 @@ func (t *Tunnel) ProcessAsync() {
 
 // Close closes the Tunnel and releases its resources.
 func (t *Tunnel) Close() {
+	t.CancelTeardown()
 	t.CloseActiveTCPConnections()
 	t.procCancel()
+}
+
+// TeardownContext 返回当前拆除代次的 ctx(惰性创建)。所有 TCP 连接处理
+// 共享同一代:engine.stop 只取消一次即可让全部在途 Relay 感知。
+func (t *Tunnel) TeardownContext() context.Context {
+	t.teardownMu.Lock()
+	defer t.teardownMu.Unlock()
+	if t.teardownCtx == nil {
+		t.teardownCtx, t.teardownCancel = context.WithCancel(context.Background())
+	}
+	return t.teardownCtx
+}
+
+// CancelTeardown 取消当前拆除代次并重置;下一批连接拿到全新 ctx。
+// 重复调用安全(幂等)。
+func (t *Tunnel) CancelTeardown() {
+	t.teardownMu.Lock()
+	defer t.teardownMu.Unlock()
+	if t.teardownCancel != nil {
+		t.teardownCancel()
+	}
+	t.teardownCtx = nil
+	t.teardownCancel = nil
 }
 
 func (t *Tunnel) trackTCPConn(conn adapter.TCPConn) {

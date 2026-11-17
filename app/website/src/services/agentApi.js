@@ -203,3 +203,18 @@ export async function uploadChatAttachment(sessionId, file) {
   }
   return attachment;
 }
+
+// —— 路由 canonical(apply store)读写:唯一事实源为 GET/POST /api/config/routing。
+// 消费方=EgressTargetSettings 卡(规则分流实际出口);载荷必须是 GET 回的整份
+// canonical 原样修改,后端 DisallowUnknownFields 多键即 400,绝不可与 customer
+// 配置对象混入。── (2026-11-16 深度模式 toSocks 孤儿开关事故的 UI 救生通道)
+export async function getRoutingConfig() {
+  return request('/api/config/routing', { method: 'GET' });
+}
+
+export async function saveRoutingConfig(payload) {
+  return request('/api/config/routing', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}

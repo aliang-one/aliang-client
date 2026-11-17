@@ -219,6 +219,9 @@
                   :success-message="customerConfigSuccess"
                   @save="saveCustomerConfig"
                 />
+                <!-- 规则分流实际出口(2026-11-16 toSocks 孤儿开关事故修复):
+                     自管 /api/config/routing 读写链,不进 customer 保存链。 -->
+                <EgressTargetSettings :config="customerConfig" />
                 <ModelMappingSettings
                   :config="customerConfig"
                   :loading="isLoadingCustomerConfig"
@@ -317,6 +320,7 @@ import RulesSettings from './settings/RulesSettings.vue';
 import SshIngressSettings, { normalizeSSHIngressConfig } from './settings/SshIngressSettings.vue';
 import MeshSettings from './settings/MeshSettings.vue';
 import PlatformProxySettings from './settings/PlatformProxySettings.vue';
+import EgressTargetSettings from './settings/EgressTargetSettings.vue';
 import { normalizeMeshConfig } from './settings/MeshSettings.js';
 import UserInfoSettings from './settings/UserInfoSettings.vue';
 import LogsSettings from './settings/LogsSettings.vue';
@@ -622,6 +626,7 @@ export default {
     SshIngressSettings,
     MeshSettings,
     PlatformProxySettings,
+    EgressTargetSettings,
     UserInfoSettings,
     LogsSettings,
     ModelMappingSettings,

@@ -5,12 +5,16 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/setup"
 	"golang.org/x/sys/windows/svc"
 )
+
+// serviceStopDeadline 是 SCM 停止请求后等待 core 优雅退出的兜底上界。
+const serviceStopDeadline = 15 * time.Second
 
 // MaybeRunAsWindowsService detects Windows service context and runs service dispatcher when needed.
 // Returns handled=true when running as a Windows service.
@@ -63,12 +67,25 @@ func (s *aliangWindowsService) Execute(args []string, req <-chan svc.ChangeReque
 			case svc.Stop, svc.Shutdown:
 				status <- svc.Status{State: svc.StopPending, Accepts: accepted}
 				cancel()
-				if err := <-done; err != nil {
-					logger.Error("Windows service core loop exited with error", "error", err)
+				// 停止链封顶:下游任何一环挂死(TUN teardown、IPC 在途
+				// 连接、半起 dashboard 抢锁)都不能让 SCM 永远停在
+				// StopPending——2026-11-16 生产 StopPending>2min 最终靠
+				// taskkill /F 收场。超时 fail-loud 后返回非零,服务管理器
+				// 随即结束进程,与强杀等价但变为有界+有日志;下次启动会
+				// 重新配置路由,wintun 适配器按 GUID 复用可容忍残留。
+				select {
+				case err := <-done:
+					if err != nil {
+						logger.Error("Windows service core loop exited with error", "error", err)
+						return false, 1
+					}
+					status <- svc.Status{State: svc.Stopped}
+					return false, 0
+				case <-time.After(serviceStopDeadline):
+					writeStartupTrace("windows service stop deadline (%s) exceeded; giving up, SCM will terminate the process", serviceStopDeadline)
+					logger.Error(fmt.Sprintf("Windows service stop deadline (%s) exceeded; giving up, SCM will terminate the process", serviceStopDeadline))
 					return false, 1
 				}
-				status <- svc.Status{State: svc.Stopped}
-				return false, 0
 			default:
 			}
 		case err := <-done:
