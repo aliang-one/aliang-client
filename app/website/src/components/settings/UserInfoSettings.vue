@@ -535,6 +535,7 @@ import {
   updateUserCenterProfile
 } from '../../services/userCenterApi';
 import ScanLoginPanel from './ScanLoginPanel.vue';
+import { copyText } from '../../utils/clipboard';
 
 const { t } = useI18n();
 const API_KEY_DOCS_PATH = '/docs/sub2api-apikey-api-reference.md';
@@ -864,14 +865,16 @@ async function copyApiKey(item) {
     return;
   }
 
-  try {
-    await navigator.clipboard.writeText(value);
-    apiKeyCopyFeedback.kind = 'success';
-    apiKeyCopyFeedback.text = t('user_apiKeyCopied');
-  } catch (error) {
+  // http 局域网直连(56431 无 TLS)下 navigator.clipboard 不存在,copyText 退
+  // execCommand 兜底;false 即复制被拒,不把底层异常原文透给用户。
+  const ok = await copyText(value);
+  if (!ok) {
     apiKeyCopyFeedback.kind = 'error';
-    apiKeyCopyFeedback.text = error instanceof Error ? error.message : t('user_apiKeyCopyFailed');
+    apiKeyCopyFeedback.text = t('user_apiKeyCopyFailed');
+    return;
   }
+  apiKeyCopyFeedback.kind = 'success';
+  apiKeyCopyFeedback.text = t('user_apiKeyCopied');
 }
 
 function applyProfile(incoming) {

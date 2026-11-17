@@ -1681,6 +1681,7 @@ export default {
   sync_selectFailed: 'Selection failed: {msg}',
   sync_copied: 'Copied: {name}',
   sync_copyFailed: 'Copy failed: {msg}',
+  sync_copyUnavailable: 'Copy failed.',
   sync_applied: 'Applied: {name}',
   sync_applyFailed: 'Apply failed: {msg}',
   sync_deleted: 'Deleted: {name}',

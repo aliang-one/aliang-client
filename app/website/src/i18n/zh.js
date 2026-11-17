@@ -1679,6 +1679,7 @@ export default {
   sync_selectFailed: '选择失败：{msg}',
   sync_copied: '已复制：{name}',
   sync_copyFailed: '复制失败：{msg}',
+  sync_copyUnavailable: '复制失败。',
   sync_applied: '已应用：{name}',
   sync_applyFailed: '应用失败：{msg}',
   sync_deleted: '已删除：{name}',

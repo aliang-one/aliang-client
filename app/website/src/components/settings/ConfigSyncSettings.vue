@@ -132,6 +132,7 @@ import { json } from '@codemirror/lang-json';
 import { yaml } from '@codemirror/lang-yaml';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { useI18n } from '../../i18n';
+import { copyText } from '../../utils/clipboard';
 
 const { t } = useI18n();
 
@@ -310,8 +311,14 @@ async function toggleSelect(item, selected) {
 }
 
 async function copyContent(item) {
+  // http 局域网直连(56431 无 TLS)下 navigator.clipboard 不存在,copyText 退
+  // execCommand 兜底;复制失败不再把底层异常原文透进 status。
+  const copied = await copyText(item.content || '');
+  if (!copied) {
+    status.value = t('sync_copyUnavailable');
+    return;
+  }
   try {
-    await navigator.clipboard.writeText(item.content || '');
     await request('/software-config/log', {
       method: 'POST',
       body: JSON.stringify({

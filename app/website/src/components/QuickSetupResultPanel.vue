@@ -127,6 +127,7 @@
 <script setup>
 import { computed, onUnmounted, ref } from 'vue';
 import { useI18n } from '../i18n';
+import { copyText } from '../utils/clipboard';
 
 const props = defineProps({
   // 展示名（如 "Codex"）
@@ -163,23 +164,24 @@ const copiedKey = ref('');
 const copyFailedKey = ref('');
 let copiedTimer = null;
 async function copyValue(value, key) {
-  try {
-    await navigator.clipboard.writeText(String(value ?? ''));
+  // http 局域网直连下 navigator.clipboard 不存在,copyText 退 execCommand 兜底,
+  // false 即复制被拒——与 clipboard API 拒绝同走 ✕ 反馈。
+  const ok = await copyText(String(value ?? ''));
+  if (ok) {
     copiedKey.value = key;
     copyFailedKey.value = '';
-  } catch (error) {
+  } else {
     copiedKey.value = '';
     copyFailedKey.value = key;
-  } finally {
-    if (copiedTimer) {
-      window.clearTimeout(copiedTimer);
-    }
-    copiedTimer = window.setTimeout(() => {
-      copiedTimer = null;
-      copiedKey.value = '';
-      copyFailedKey.value = '';
-    }, 1600);
   }
+  if (copiedTimer) {
+    window.clearTimeout(copiedTimer);
+  }
+  copiedTimer = window.setTimeout(() => {
+    copiedTimer = null;
+    copiedKey.value = '';
+    copyFailedKey.value = '';
+  }, 1600);
 }
 onUnmounted(() => {
   if (copiedTimer) {

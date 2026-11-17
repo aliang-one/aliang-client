@@ -132,6 +132,7 @@
 <script setup>
 import { useI18n } from '../../i18n';
 import { canRecall } from '../../utils/chatRecall';
+import { copyText } from '../../utils/clipboard';
 import ChatMarkdown from './ChatMarkdown.vue';
 import ChatAttachmentStrip from './ChatAttachmentStrip.vue';
 
@@ -162,12 +163,13 @@ function systemNoteTestId(note) {
   return 'chat-approval-cancelled-note';
 }
 
-// 复制 user 气泡原文（assistant 正文已有 ChatMarkdown 的复制入口）。剪贴板
-// 不可用（非安全上下文等）静默失败，与 chat_md 的复制行为同口径。
+// 复制 user 气泡原文（assistant 正文已有 ChatMarkdown 的复制入口）。http 局域
+// 网直连下 navigator.clipboard 不存在,copyText 退 execCommand 兜底,与 chat_md
+// 的复制行为真同口径;空文本不动作。
 function copyMessage() {
   const text = props.msg.content || '';
-  if (text && navigator.clipboard?.writeText) {
-    navigator.clipboard.writeText(text).catch(() => {});
+  if (text) {
+    copyText(text);
   }
 }
 
