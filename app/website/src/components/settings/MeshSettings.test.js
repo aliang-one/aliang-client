@@ -449,10 +449,10 @@ const defaultMeshStatus = () => ({
   lan_peers: []
 });
 
-// 两路补充数据的 URL 路由 stub：agentStatus/meshStatus 默认在线+已配置；
-// *Error 模拟拉取失败（信封失败或网络拒绝）。lan_peers 拉取已随出口链路
-// 改造移除（下一跳选项源=配置 peers,不再消费 beacon 候选）。
-function stubApi({ agentStatus, agentStatusError, meshStatus, meshStatusError } = {}) {
+// 三路补充数据的 URL 路由 stub：agentStatus/meshStatus 默认在线+已配置；
+// lan_peers 默认空表(任务 10b 打通恢复消费——候选一键入表);*Error 模拟
+// 拉取失败(信封失败或网络拒绝)。
+function stubApi({ agentStatus, agentStatusError, meshStatus, meshStatusError, lanPeers } = {}) {
   vi.stubGlobal('fetch', vi.fn((path) => {
     if (path === '/api/agent/status') {
       return agentStatusError
@@ -463,6 +463,9 @@ function stubApi({ agentStatus, agentStatusError, meshStatus, meshStatusError } 
       return meshStatusError
         ? Promise.reject(new Error('mesh down'))
         : Promise.resolve(jsonOk(meshStatus ?? defaultMeshStatus()));
+    }
+    if (path === '/api/mesh/lan_peers') {
+      return Promise.resolve(jsonOk({ peers: lanPeers ?? [] }));
     }
     return Promise.reject(new Error(`unexpected fetch: ${path}`));
   }));
@@ -1246,5 +1249,82 @@ describe('MeshSettings 依赖与身份提示（G4）', () => {
     expect(saved[0].ssh_ingress.enable).toBe(false);
     // 父层 patch:ssh_ingress 无 diff
     expect(buildCustomerSavePatch(saved[0], config)?.ssh_ingress).toBeUndefined();
+  });
+});
+
+// —— LAN 发现(任务 10b 打通):beacon 候选一键入表 ————————————————
+// 契约:候选渲染 addr/指纹状态;指纹空=不可钉扎(按钮禁用,诚实降级);
+// 已配置 device_id 只读;添加=push form.peerRows 随保存带出(整份 canonical,
+// 不单独发请求);host_key 直填对端指纹(添加即钉扎)。
+describe('MeshSettings LAN 发现一键入表', () => {
+  const lanCandidates = () => [
+    { device_id: 'dev-lan-x', mesh_port: 56432, addr: '192.168.1.50:56432', cert_fingerprint: 'SHA256:AAAA', last_seen_unix: 100 },
+    { device_id: 'dev-lan-y', mesh_port: 56432, addr: '192.168.1.51:56432', cert_fingerprint: '', last_seen_unix: 90 },
+    { device_id: 'dev-b', mesh_port: 56432, addr: '192.168.1.20:56432', cert_fingerprint: 'SHA256:BBBB', last_seen_unix: 80 }
+  ];
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    while (mountedApps.length) {
+      const { app, el } = mountedApps.pop();
+      app.unmount();
+      el.remove();
+    }
+  });
+
+  it('候选渲染:addr/钉扎状态/已配置态;指纹空按钮禁用', async () => {
+    stubApi({ lanPeers: lanCandidates() });
+    const { el } = mountCard(baseConfig());
+    await flush();
+
+    // 三行都渲染
+    expect(el.querySelectorAll('[data-mesh-lan-discovery] [data-mesh-lan-row]')).toHaveLength(3);
+    // 可钉扎候选:添加按钮可用
+    const addX = el.querySelector('[data-mesh-lan-add="dev-lan-x"]');
+    expect(addX).not.toBeNull();
+    expect(addX.disabled).toBe(false);
+    // 指纹空:按钮禁用(诚实降级,不可钉扎不入表)
+    const addY = el.querySelector('[data-mesh-lan-add="dev-lan-y"]');
+    expect(addY).not.toBeNull();
+    expect(addY.disabled).toBe(true);
+    // 已配置 device_id(dev-b 在 base peers):只读标签,无添加按钮
+    expect(el.querySelector('[data-mesh-lan-configured]')).not.toBeNull();
+    expect(el.querySelector('[data-mesh-lan-add="dev-b"]')).toBeNull();
+  });
+
+  it('添加=push 表单行,随保存带出(host_key=对端指纹,lan_addrs=候选地址)', async () => {
+    stubApi({ lanPeers: lanCandidates() });
+    const { el, saved } = mountCard(baseConfig());
+    await flush();
+
+    el.querySelector('[data-mesh-lan-add="dev-lan-x"]').click();
+    await flush();
+    clickSave(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    const peers = saved[0].mesh.peers;
+    const added = peers.find((peer) => peer.device_id === 'dev-lan-x');
+    expect(added).toBeTruthy();
+    expect(added.lan_addrs).toEqual(['192.168.1.50:56432']);
+    expect(added.host_key).toBe('SHA256:AAAA');
+    // 未点添加的候选不入表
+    expect(peers.find((peer) => peer.device_id === 'dev-lan-y')).toBeUndefined();
+  });
+
+  it('lan_peers 拉取失败 → 静默空表(候选面失败不打断卡片)', async () => {
+    stubApi({ lanPeers: undefined, meshStatusError: false });
+    // 用带参 stub:lan_peers 走 reject
+    vi.stubGlobal('fetch', vi.fn((path) => {
+      if (path === '/api/agent/status') return Promise.resolve(jsonOk({ runtime: { online: true } }));
+      if (path === '/api/mesh/status') return Promise.resolve(jsonOk(defaultMeshStatus()));
+      return Promise.reject(new Error('lan peers down'));
+    }));
+    const { el, saved } = mountCard(baseConfig());
+    await flush();
+    expect(el.querySelector('[data-mesh-lan-empty]')).not.toBeNull();
+    // 其余卡片功能不受影响:保存按钮在、无编辑不误发保存
+    const saveBtn = saveButton(el);
+    expect(saveBtn).not.toBeNull();
+    expect(saved).toHaveLength(0);
   });
 });
