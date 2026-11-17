@@ -157,8 +157,7 @@ describe('状态页 SSH 出口链路卡', () => {
       summary: { ai: {}, traffic: {}, http: {}, ssh: { ok: false, chains: [] } }
     });
     await flush();
-    expect(el.querySelector('[data-ssh-chains]')).toBeNull();
-    expect(el.querySelector('[data-ssh-path]')).toBeNull();
+    expect(el.querySelector('[data-ssh-chain-canvas]')).toBeNull();
     expect(el.textContent).toContain('status_sshNotConfigured');
   });
 
@@ -179,16 +178,16 @@ describe('状态页 SSH 出口链路卡', () => {
     });
     await flush();
 
-    const chains = el.querySelector('[data-ssh-chains]');
-    expect(chains).toBeTruthy();
-    const text = chains.textContent;
-    expect(text).toContain('status_sshChainAlive');
-    expect(text).toContain('status_sshChainBackoffIn');
-    expect(text).toContain('status_sshChainIdle');
-    expect(text).toContain('status_sshChainActive');
+    const canvas = el.querySelector('[data-ssh-chain-canvas]');
+    expect(canvas).toBeTruthy();
+    const lanes = canvas.querySelector('[data-ssh-chain-lanes]').textContent;
+    expect(lanes).toContain('status_sshChainAlive');
+    expect(lanes).toContain('status_sshChainBackoffIn');
+    expect(lanes).toContain('status_sshChainIdle');
+    expect(lanes).toContain('status_sshChainActive');
   });
 
-  it('路径行钉出出口终点与并行连接数,防止「一条配置多条链」误读', async () => {
+  it('画布钉出单条节点链路径,并行连接呈泳道,防止「一条配置多条链」误读', async () => {
     const el = mountStatus({
       summary: {
         ai: {}, traffic: {}, http: {},
@@ -206,16 +205,20 @@ describe('状态页 SSH 出口链路卡', () => {
     });
     await flush();
 
-    const path = el.querySelector('[data-ssh-path]');
-    expect(path).toBeTruthy();
-    const text = path.textContent;
-    expect(text).toContain('status_sshPathFinal');
-    expect(text).toContain('status_sshPathConnections');
-    // jumps=0(直连出口)不渲染跳板段。
-    expect(text).not.toContain('status_sshPathJumps');
+    const canvas = el.querySelector('[data-ssh-chain-canvas]');
+    expect(canvas).toBeTruthy();
+    const svgText = canvas.querySelector('[data-ssh-chain-svg]').textContent;
+    // 节点链只钉一条路径:本机→出口终点(地址透传进 SVG 文本)。
+    expect(svgText).toContain('status_sshNodeLocal');
+    expect(svgText).toContain('172.16.0.123:56432');
+    // jumps=0(直连出口)不渲染跳板节点。
+    expect(svgText).not.toContain('status_sshNodeJump');
+    // 池内多条「链」是同一路径的并行连接,呈 N 条泳道。
+    const laneRows = canvas.querySelectorAll('[data-ssh-chain-lanes] > g');
+    expect(laneRows.length).toBe(3);
   });
 
-  it('配置了跳板时路径行追加「经 N 跳跳板」', async () => {
+  it('配置了跳板时节点链追加跳板节点', async () => {
     const el = mountStatus({
       summary: {
         ai: {}, traffic: {}, http: {},
@@ -231,12 +234,12 @@ describe('状态页 SSH 出口链路卡', () => {
     });
     await flush();
 
-    const path = el.querySelector('[data-ssh-path]');
-    expect(path).toBeTruthy();
-    expect(path.textContent).toContain('status_sshPathJumps');
+    const canvas = el.querySelector('[data-ssh-chain-canvas]');
+    expect(canvas).toBeTruthy();
+    expect(canvas.querySelector('[data-ssh-chain-svg]').textContent).toContain('status_sshNodeJump');
   });
 
-  it('单条连接(pool_size=1)时文案用中性「1 条连接」不称并行', async () => {
+  it('单条连接(pool_size=1)时画布渲染单泳道', async () => {
     const el = mountStatus({
       summary: {
         ai: {}, traffic: {}, http: {},
@@ -251,11 +254,11 @@ describe('状态页 SSH 出口链路卡', () => {
     });
     await flush();
 
-    const path = el.querySelector('[data-ssh-path]');
-    expect(path).toBeTruthy();
-    const text = path.textContent;
-    expect(text).toContain('status_sshPathConnectionOne');
-    expect(text).not.toContain('status_sshPathConnections');
+    const canvas = el.querySelector('[data-ssh-chain-canvas]');
+    expect(canvas).toBeTruthy();
+    const laneRows = canvas.querySelectorAll('[data-ssh-chain-lanes] > g');
+    expect(laneRows.length).toBe(1);
+    expect(laneRows[0].textContent).toContain('status_sshChainLabel');
   });
 
   it('summary 无 ssh 字段(旧后端)时按未配置渲染不报错', async () => {

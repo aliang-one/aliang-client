@@ -355,34 +355,9 @@
               {{ t('status_sshNotConfigured') }}
             </div>
             <template v-else>
-              <div class="mt-4 flex items-center justify-between gap-3 rounded-xl border border-slate-200/70 bg-slate-50/80 px-3 py-2 text-sm dark:border-slate-800/80 dark:bg-slate-900/60" data-ssh-path>
-                <span class="font-medium text-slate-900 dark:text-slate-100">
-                  {{ t('status_sshPathFinal', { addr: sshStatus.addr || '--' }) }}
-                  <span v-if="Number(sshStatus.jumps) > 0" class="text-slate-500 dark:text-slate-400">
-                    {{ t('status_sshPathJumps', { count: sshStatus.jumps }) }}
-                  </span>
-                </span>
-                <span v-if="sshChainCount > 0" class="text-xs text-slate-400">
-                  {{ sshChainCount === 1 ? t('status_sshPathConnectionOne') : t('status_sshPathConnections', { count: sshChainCount }) }}
-                </span>
-              </div>
-              <div class="grid gap-2" data-ssh-chains>
-              <div
-                v-for="chain in sshChainCards"
-                :key="chain.key"
-                class="flex items-center justify-between gap-3 rounded-xl border px-3 py-2.5 text-sm"
-                :class="chain.cardClass"
-              >
-                <div class="flex items-center gap-2.5">
-                  <span class="h-2 w-2 shrink-0 rounded-full" :class="chain.dotClass"></span>
-                  <span class="font-medium text-slate-900 dark:text-slate-100">{{ chain.label }}</span>
-                </div>
-                <div class="flex items-center gap-2 text-xs">
-                  <span :class="chain.stateClass">{{ chain.stateText }}</span>
-                  <span v-if="chain.activeText" class="text-slate-400">{{ chain.activeText }}</span>
-                </div>
-              </div>
-              </div>
+              <!-- 链路拓扑画布:吃 summary.ssh 整体快照;路径行与连接卡并入画布,
+                   泳道/节点推导单份收敛在组件内(spec §5.2),页面只留轮询喂快照。 -->
+              <SshChainCanvas :ssh="sshStatus" class="mt-4" />
             </template>
           </article>
         </div>
@@ -506,6 +481,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useI18n } from '../../i18n';
 import { blockIngressSession, getIngressSessions, getStatusConnections, getStatusSummary, kickIngressSession as kickSessionApi, unblockIngressSession } from '../../services/statusApi';
+import SshChainCanvas from './SshChainCanvas.vue';
 
 const { t } = useI18n();
 
@@ -558,10 +534,6 @@ const aiSummary = computed(() => statusSummary.value?.ai || {});
 const trafficStats = computed(() => statusSummary.value?.traffic || {});
 const httpStats = computed(() => statusSummary.value?.http || {});
 const sshStatus = computed(() => statusSummary.value?.ssh || { ok: false, chains: [] });
-// 路径口径:出口终点 + 跳板跳数。池里的多条「链」是同一路径的并行连接,
-// 不是多条不同路径——这里一次性把路径钉在卡片头部,防止「配置了一条
-// 下一条却显示多条链路」的误读。
-const sshChainCount = computed(() => (Array.isArray(sshStatus.value?.chains) ? sshStatus.value.chains.length : 0));
 const activeConnections = computed(() => Array.isArray(connectionsData.value?.active) ? connectionsData.value.active : []);
 const closedConnections = computed(() => Array.isArray(connectionsData.value?.closed) ? connectionsData.value.closed : []);
 
@@ -635,42 +607,6 @@ const closedConnectionRows = computed(() => closedConnections.value.map((conn) =
   download: Number(conn.downloadTotal || 0),
   endUnix: Number(conn.endUnix || 0)
 })));
-const sshChainCards = computed(() => (Array.isArray(sshStatus.value?.chains) ? sshStatus.value.chains : []).map((chain) => {
-  const index = Number(chain.index || 0) + 1;
-  const alive = Boolean(chain.alive);
-  const backoff = Boolean(chain.backoff);
-  const remaining = Math.max(1, Math.round(Number(chain.backoffRemainingMs || 0) / 1000));
-  const activeCount = Number(chain.activeChannels || 0);
-  let stateText;
-  let cardClass;
-  let dotClass;
-  let stateClass;
-  if (backoff) {
-    stateText = t('status_sshChainBackoffIn', { seconds: remaining });
-    cardClass = 'border-amber-200 bg-amber-50/70 dark:border-amber-500/30 dark:bg-amber-500/10';
-    dotClass = 'bg-amber-400';
-    stateClass = 'text-amber-600 dark:text-amber-300';
-  } else if (alive) {
-    stateText = t('status_sshChainAlive');
-    cardClass = 'border-emerald-200 bg-emerald-50/70 dark:border-emerald-500/30 dark:bg-emerald-500/10';
-    dotClass = 'bg-emerald-400';
-    stateClass = 'text-emerald-600 dark:text-emerald-300';
-  } else {
-    stateText = t('status_sshChainIdle');
-    cardClass = 'border-slate-200 bg-slate-50/80 dark:border-slate-800 dark:bg-slate-900/60';
-    dotClass = 'bg-slate-300 dark:bg-slate-600';
-    stateClass = 'text-slate-500 dark:text-slate-400';
-  }
-  return {
-    key: chain.index ?? index,
-    label: t('status_sshChainLabel', { index }),
-    stateText,
-    activeText: activeCount > 0 ? t('status_sshChainActive', { count: activeCount }) : '',
-    cardClass,
-    dotClass,
-    stateClass
-  };
-}));
 
 function routeLabel(route) {
   if (route === 'RouteToALiang') {
