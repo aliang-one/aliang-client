@@ -267,6 +267,7 @@ describe('状态页 SSH 出口链路卡', () => {
     });
     await flush();
     expect(el.textContent).toContain('status_sshNotConfigured');
+    expect(el.querySelector('[data-ssh-chain-canvas]')).toBeNull();
   });
 });
 

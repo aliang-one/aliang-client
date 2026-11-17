@@ -355,8 +355,8 @@
               {{ t('status_sshNotConfigured') }}
             </div>
             <template v-else>
-              <!-- 链路拓扑画布:吃 summary.ssh 整体快照;路径行与连接卡并入画布,
-                   泳道/节点推导单份收敛在组件内(spec §5.2),页面只留轮询喂快照。 -->
+              <!-- 链路拓扑画布：吃 summary.ssh 整体快照；路径行与连接卡并入画布，
+                   泳道/节点推导单份收敛在组件内(spec §5.2)，页面只留轮询喂快照。 -->
               <SshChainCanvas :ssh="sshStatus" class="mt-4" />
             </template>
           </article>

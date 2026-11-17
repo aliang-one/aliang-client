@@ -826,10 +826,10 @@ describe('RulesSettings SSH 上游代理', () => {
   });
 });
 
-// —— 连接测试 + 链路状态灯（客户端连接状态反馈）挂载级测试 ——
+// —— 连接测试 + 链路拓扑画布（客户端连接状态反馈）挂载级测试 ——
 // fetch mock 串联两个端点：/api/proxy/ssh/known-hosts（挂载即拉）与
-// /api/status/summary（状态灯轮询）；测试连接 POST /api/proxy/ssh/test。
-describe('RulesSettings SSH 连接测试与状态灯', () => {
+// /api/status/summary（拓扑画布轮询）；测试连接 POST /api/proxy/ssh/test。
+describe('RulesSettings SSH 连接测试与拓扑画布', () => {
   const testEnvelope = (data, ok = true) => ({
     ok,
     status: ok ? 200 : 500,
@@ -882,7 +882,7 @@ describe('RulesSettings SSH 连接测试与状态灯', () => {
     expect(globalThis.fetch).toHaveBeenCalledWith('/api/status/summary', expect.anything());
   });
 
-  it('非 ssh 类型不渲染状态灯区块；切到 ssh 后出现', async () => {
+  it('非 ssh 类型不渲染拓扑画布区块；切到 ssh 后出现', async () => {
     const { el } = mountRules(sshConfig({ type: 'socks5', username: '', password: '' }));
     await flush();
     expect(el.querySelector('[data-ssh-connectivity]')).toBeNull();

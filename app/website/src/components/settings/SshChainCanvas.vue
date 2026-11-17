@@ -118,8 +118,8 @@ export default {
         return { x1: prev.x + prev.width, x2: node.x };
       });
     },
-    // 泳道推导:逐字搬迁自 RulesSettings.vue sshChains()(后续任务删除页级副本,
-    // 收敛为组件内单份;见 spec §5.2 状态推导收敛)。
+    // 泳道推导单份实现(原 RulesSettings/LogsSettings 页级副本已删,
+    // 见 spec §5.2 收敛)。
     lanes() {
       const chains = Array.isArray(this.ssh?.chains) ? this.ssh.chains : [];
       return chains.map((chain) => {

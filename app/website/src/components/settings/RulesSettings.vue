@@ -349,10 +349,10 @@
               </div>
             </div>
 
-            <!-- 连接测试 + 链路状态灯（客户端连接状态反馈）：测试按钮做一次性
-                 主动验证（当前表单凭据,未保存也可测）；状态灯做持续监控（已保存
+            <!-- 连接测试 + 链路拓扑画布（客户端连接状态反馈）：测试按钮做一次性
+                 主动验证（当前表单凭据,未保存也可测）；拓扑画布做持续监控（已保存
                  并注册的出站链池,来自 /api/status/summary 的 ssh 字段）。两者
-                 互补：表单值 ≠ 运行态,按钮测「我现在填的能不能连」,灯看
+                 互补：表单值 ≠ 运行态,按钮测「我现在填的能不能连」,画布看
                  「当前生效的链路健康如何」。 -->
             <div data-ssh-connectivity class="space-y-3 rounded-xl border border-dashed border-slate-300 bg-slate-50/60 p-4 dark:border-slate-700 dark:bg-slate-900/40">
               <div class="flex flex-wrap items-center justify-between gap-2">
@@ -1718,7 +1718,7 @@ export default {
       const value = String(fingerprint || '');
       return value.length > 20 ? `${value.slice(0, 20)}…` : value;
     },
-    // —— 连接测试 + 链路状态灯 ——
+    // —— 连接测试 + 链路拓扑画布 ——
     // 测试连接：用当前表单凭据做一次现场探测（后端不落盘不触注册表）。
     // 载荷与保存路径同构（server 单串线格式 + 当前面凭据收敛 + 跳板线格式），
     // 测的就是「将要保存的这份配置」。失败也停留在结果条（role=status），
