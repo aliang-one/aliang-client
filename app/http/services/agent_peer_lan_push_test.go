@@ -382,3 +382,153 @@ func findContractEvent(events []models.AgentProtocolEvent, eventType string) *mo
 	}
 	return nil
 }
+
+// fakePushStallServer 握手放行后永不读流——B 的 io.Copy 必然阻塞在套接字
+// 缓冲满,供取消测试确定性复现「流中途取消」(回环链路太快,真 A 端会先完成)。
+func fakePushStallServer(t *testing.T, release <-chan struct{}) *agentLanDirectCandidate {
+	t.Helper()
+	tlsCert, fingerprint, err := generateAgentLanCertificate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
+		tlsConn := tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{tlsCert}})
+		if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+			return
+		}
+		reader := bufio.NewReader(io.LimitReader(tlsConn, 4<<10))
+		if _, err := reader.ReadBytes('\n'); err != nil { // hello
+			return
+		}
+		_, _ = tlsConn.Write([]byte("{\"ok\":true}\n"))
+		<-release // 永不读流:B 阻塞在套接字缓冲满
+	}()
+	return &agentLanDirectCandidate{
+		Addr:        listener.Addr().String(),
+		Token:       "tok",
+		Fingerprint: fingerprint,
+	}
+}
+
+// P1 评审修:直推腿取消语义。ctx 取消必须真断流(watcher 掐 conn deadline),
+// 失败映射 context.Canceled 且调用方 emit cancelled——绝不「取消后照常完成」。
+func TestAttemptAgentTransferLanPush_CtxCancelMidStream(t *testing.T) {
+	newAgentTransferEnv(t)
+	_ = peerToolsTestEnv(t, nil)
+	release := make(chan struct{})
+	defer close(release)
+	cand := fakePushStallServer(t, release)
+
+	content := make([]byte, 32<<20) // 32MB:远超套接字缓冲,stall 下 io.Copy 必阻塞
+	src := filepath.Join(t.TempDir(), "src.bin")
+	if err := os.WriteFile(src, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ident := agentTransferIdentity{RequestID: "req-cancel-1", TransferID: "tr_cancelst01", Filename: "cancel.bin"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(150 * time.Millisecond) // 流已阻塞,B 悬在 io.Copy
+		cancel()
+	}()
+	_, _, _, err := attemptAgentTransferLANPush(ctx, ident, cand, src, int64(len(content)), func(interface{}) error { return nil })
+	cancel()
+	if err == nil {
+		t.Fatal("cancelled push must fail, got success(取消后照常完成=P1 评审缺陷复现)")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err must wrap context.Canceled, got %v", err)
+	}
+	// A 端不得留成品/半成品(stall 假端不落盘;此处断言 B 侧收口语义)。
+	inbox, err := agentTransferInboxDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := os.ReadDir(inbox)
+	for _, e := range entries {
+		if strings.Contains(e.Name(), "cancel.bin") {
+			t.Fatalf("cancelled transfer must not leave file in inbox: %s", e.Name())
+		}
+	}
+}
+
+// P1 评审修:A 端 slotCancel 真闸——cancelIfActive 掐 conn deadline,serve 流
+// 立即失败、partial 删除、不 ACK。直拨一条裸 TLS 连接模拟 B,读侧在 cancel 后
+// 必然断开。
+func TestAgentPeerLanPushListen_SlotCancelKillsConn(t *testing.T) {
+	newAgentTransferEnv(t)
+	svc := peerToolsTestEnv(t, nil)
+	result, token := lanPushServeTestServer(t, svc, "slotkill.bin", nil)
+	if result["ok"] != true {
+		t.Fatalf("push listen failed: %+v", result)
+	}
+
+	// 模拟 B:真 TLS 拨号 + 钉扎 + hello,读到 ok 后持连接不放。
+	tlsConn := dialPushTestConn(t, result["addr"].(string), result["fingerprint"].(string), token, "tr_lanpusht001", 10)
+	defer tlsConn.Close()
+	reader := bufio.NewReader(tlsConn)
+	if _, err := reader.ReadBytes('\n'); err != nil { // {"ok":true}
+		t.Fatalf("ready line: %v", err)
+	}
+
+	// 槽在 serve goroutine 手里:cancelIfActive 触发 slotCancel → conn deadline。
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if transferReceiveSlot().cancelIfActive("tr_lanpusht001") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// conn 被掐:A 的读循环失败退出并关 conn → B 的后续读收到 EOF/超时。
+	tlsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_, werr := tlsConn.Write(make([]byte, 10))
+	_ = tlsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, rerr := tlsConn.Read(make([]byte, 16))
+	if werr == nil && rerr == nil {
+		t.Fatal("conn must be torn down after slot cancel")
+	}
+	// partial 不得残留
+	inbox, err := agentTransferInboxDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := os.ReadDir(inbox)
+	for _, e := range entries {
+		if strings.Contains(e.Name(), "slotkill.bin") {
+			t.Fatalf("cancelled transfer must not leave partial: %s", e.Name())
+		}
+	}
+}
+
+// dialPushTestConn 模拟 B 端真 TLS 拨号(钉扎+hello),供 A 侧取消测试。
+func dialPushTestConn(t *testing.T, addr, fingerprint, token, transferID string, size int64) *tls.Conn {
+	t.Helper()
+	rawConn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	tlsConn := tls.Client(rawConn, &tls.Config{
+		InsecureSkipVerify:    true,
+		VerifyPeerCertificate: agentLanTLSFingerprintVerifier(fingerprint),
+	})
+	_ = rawConn.SetDeadline(time.Now().Add(10 * time.Second))
+	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+		t.Fatalf("handshake: %v", err)
+	}
+	hello, _ := json.Marshal(map[string]interface{}{"token": token, "transfer_id": transferID, "size_bytes": size})
+	if _, err := tlsConn.Write(append(hello, '\n')); err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+	return tlsConn
+}

@@ -216,6 +216,12 @@ func (s *AgentService) handleAgentTransferUpload(msg map[string]interface{}, wri
 			}
 			if errors.Is(pushErr, errAgentTransferLanSkip) {
 				logger.Info(fmt.Sprintf("[TRANSFER] lan push skipped transfer_id=%s: %v", ident.TransferID, pushErr))
+			} else if ctx.Err() != nil {
+				// 取消落在直推腿(P1 评审修):取消必须完全失效,绝不「落 COS
+				// 重传」——与 COS 腿循环顶的 ctx 检查同语义,显式收口 cancelled
+				// 终态(不二次打包、不静默完成)。
+				_ = emitAgentTransferFailure(writeJSON, ident.RequestID, ident.TransferID, transferErrCancelled, pushErr)
+				return
 			} else {
 				stage := classifyAgentLanFailStage(pushErr)
 				logger.Info(fmt.Sprintf("[TRANSFER] lan push failed transfer_id=%s stage=%s err=%v — falling back to COS",

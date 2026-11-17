@@ -412,8 +412,12 @@ func (s *AgentService) agentLanPushServeOnce(conn net.Conn, tlsCert tls.Certific
 	}
 
 	// 单收槽:与 COS 接收链同族并发闸(收满即关摊,槽语义与 receive 相同)。
-	// 取消经 B 侧断流自然收敛(conn deadline + 流中断即失败),不挂 ctx 闸。
-	slotCancel := func() {}
+	// 取消真闸(P1 评审修):transfer.cancel → cancelIfActive → 本闭包把 conn
+	// deadline 掐到即刻——读流立即超时失败,走下方失败路径删 partial 不 ACK,
+	// 与接收腿「取消必须完全失效」契约对齐(旧空闸让取消后传输照常完成)。
+	slotCancel := func() {
+		_ = conn.SetDeadline(time.Now())
+	}
 	ok, duplicate := transferReceiveSlot().acquire(expectedTransferID, slotCancel)
 	if !ok {
 		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"receiver_busy"}`), '\n'))
@@ -634,8 +638,19 @@ func attemptAgentTransferLANPush(ctx context.Context, ident agentTransferIdentit
 	if err := json.Unmarshal(line, &ready); err != nil || !ready.Ok {
 		return 0, "", "", fmt.Errorf("lan peer refused handshake (reason=%s)", ready.Reason)
 	}
-	// 开流:传输宽限。ctx 取消(transfer.cancel / 进程退出)仍即时生效。
+	// 开流:传输宽限。ctx 取消真闸(P1 评审修):tls 流式读写不感知 ctx,起
+	// watcher 在 ctx.Done 时把 conn deadline 掐到即刻——流/ACK 读立即超时
+	// 失败,取消语义与 COS 腿对齐(映射 cancelled,不静默完成)。
 	rawConn.SetDeadline(time.Now().Add(agentLanServeGrace))
+	stopWatcher := make(chan struct{})
+	defer close(stopWatcher)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = rawConn.SetDeadline(time.Now())
+		case <-stopWatcher:
+		}
+	}()
 	src, err := os.Open(sourcePath)
 	if err != nil {
 		return 0, "", "", err
@@ -656,9 +671,17 @@ func attemptAgentTransferLANPush(ctx context.Context, ident agentTransferIdentit
 	}
 	written, copyErr := io.Copy(io.MultiWriter(tlsConn, hasher), io.LimitReader(body, totalSize))
 	if copyErr != nil {
+		// ctx 取消(transfer.cancel)优先于包装错误:COS 腿同款语义,取消映射
+		// cancelled 终态而非「落 COS 重传」(取消必须完全失效)。
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, "", "", ctxErr
+		}
 		return 0, "", "", fmt.Errorf("lan stream failed after %d bytes: %w", written, copyErr)
 	}
 	if written != totalSize {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, "", "", ctxErr
+		}
 		return 0, "", "", fmt.Errorf("lan push truncated: sent %d, declared %d", written, totalSize)
 	}
 	sum := hex.EncodeToString(hasher.Sum(nil))
@@ -667,6 +690,9 @@ func attemptAgentTransferLANPush(ctx context.Context, ident agentTransferIdentit
 	rawConn.SetDeadline(time.Now().Add(agentLanServeGrace))
 	ackLine, err := reader.ReadBytes('\n')
 	if err != nil || len(ackLine) > agentLanHeadlineLimit {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, "", "", ctxErr
+		}
 		return 0, "", "", fmt.Errorf("lan ack read failed: %w", err)
 	}
 	var ack struct {
