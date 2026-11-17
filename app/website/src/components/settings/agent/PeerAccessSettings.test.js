@@ -7,8 +7,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../../i18n', () => ({ useI18n: () => ({ t: (k) => k }) }));
 
+// 报错反馈统一走全局弹窗(2026-11-17 定案)——门禁卡读/写失败的行内红条已删,
+// 组件改调 showErrorDialog;测试 mock 后断言收到对应组合文案。
+vi.mock('../../../composables/useErrorDialog', () => ({
+  showErrorDialog: vi.fn()
+}));
+
 import { createApp, h } from 'vue';
 import PeerAccessSettings from './PeerAccessSettings.vue';
+import { showErrorDialog } from '../../../composables/useErrorDialog';
 import { getPeerDeviceGates, setPeerDeviceGates } from '../../../services/agentApi';
 
 vi.mock('../../../services/agentApi', () => ({
@@ -57,6 +64,7 @@ function toggleTo(el, testid, checked) {
 beforeEach(() => {
   getPeerDeviceGates.mockReset();
   setPeerDeviceGates.mockReset();
+  vi.mocked(showErrorDialog).mockClear();
 });
 
 describe('PeerAccessSettings 收编卡', () => {
@@ -95,22 +103,25 @@ describe('PeerAccessSettings 收编卡', () => {
     expect(el.querySelector('[data-testid="peer-gates-error"]')).toBeNull();
   });
 
-  it('写失败回显错误并把开关回滚到读值', async () => {
+  it('写失败走全局报错弹窗并把开关回滚到读值', async () => {
     getPeerDeviceGates.mockResolvedValue(gatesData());
     setPeerDeviceGates.mockRejectedValue(new Error('peer api status 403: peer_fetch_not_allowed'));
     const el = mountComp();
     await flush();
     toggleTo(el, 'peer-gate-fetch', true);
     await flush();
-    expect(el.querySelector('[data-testid="peer-gates-error"]').textContent).toContain('peerGates_saveFailed');
+    // 行内红条已删,报错文案改走 showErrorDialog(前缀键+冒号+具体原因)
+    expect(showErrorDialog).toHaveBeenCalledWith('peerGates_saveFailed:peer api status 403: peer_fetch_not_allowed');
+    expect(el.querySelector('[data-testid="peer-gates-error"]')).toBeNull();
     expect(toggleByTestid(el, 'peer-gate-fetch').checked).toBe(false);
   });
 
-  it('读失败显示错误且开关置灰(不拿零值假装读到关)', async () => {
+  it('读失败走全局报错弹窗且开关置灰(不拿零值假装读到关)', async () => {
     getPeerDeviceGates.mockRejectedValue(new Error('self device not found in account device list'));
     const el = mountComp();
     await flush();
-    expect(el.querySelector('[data-testid="peer-gates-error"]').textContent).toContain('peerGates_loadFailed');
+    expect(showErrorDialog).toHaveBeenCalledWith('peerGates_loadFailed:self device not found in account device list');
+    expect(el.querySelector('[data-testid="peer-gates-error"]')).toBeNull();
     expect(toggleByTestid(el, 'peer-gate-exec').disabled).toBe(true);
     expect(toggleByTestid(el, 'peer-gate-fetch').disabled).toBe(true);
   });

@@ -47,10 +47,6 @@
       <span class="material-symbols-outlined mr-2 text-base motion-safe:animate-spin">progress_activity</span>
       {{ t('agent_activity_loading') }}
     </div>
-    <div
-      v-else-if="error"
-      class="mt-5 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300"
-    >{{ error }}</div>
     <div v-else-if="!mergedSessions.length" class="mt-5 flex min-h-28 flex-col items-center justify-center text-center text-slate-400">
       <span class="material-symbols-outlined text-2xl text-slate-300 dark:text-slate-600">history</span>
       <p class="mt-2 text-xs">{{ offline ? t('agent_activity_runtimeOffline') : t('agent_activity_noSessions') }}</p>
@@ -204,6 +200,7 @@
 import { getAgentRuntimeSessions, getAgentSessions, getAgentSessionDetail } from '../../services/agentApi';
 import { isAliangCodeSession } from '../../utils/chatSettings';
 import { useI18n } from '../../i18n';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 
 // 记录页 agent 类型筛选（2026-11-03 设置页四栏重组）：aliangcode 判据与
 // 聊天窗同源（chatSettings.isAliangCodeSession），其余按 tool/provider 名
@@ -358,6 +355,7 @@ export default {
         this.offline = this.sessions.length === 0;
       } catch (_) {
         this.error = this.t('agent_activity_loadFailed');
+        showErrorDialog(this.error);
       } finally {
         this.loading = false;
       }

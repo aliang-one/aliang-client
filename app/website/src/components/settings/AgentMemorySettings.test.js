@@ -12,6 +12,12 @@ vi.mock('../../i18n', () => ({
   useI18n: () => ({ t: (k, params = {}) => (params && Object.keys(params).length ? `${k} ${Object.values(params).join(' ')}` : k) }),
 }));
 
+// 报错反馈统一走全局弹窗(2026-11-17 定案)——组件测试 mock 该模块,断言
+// showErrorDialog 收到对应文案;行内不再渲染错误文本。
+vi.mock('../../composables/useErrorDialog', () => ({
+  showErrorDialog: vi.fn(),
+}));
+
 import { createApp, h } from 'vue';
 import AgentMemorySettings, {
   MEMORY_CONTENT_CAP,
@@ -19,6 +25,7 @@ import AgentMemorySettings, {
   formatMemoryTime,
   memoryChoiceFromConfig,
 } from './AgentMemorySettings.vue';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 
 const projectsData = () => [{ project: 'alpha', count: 2 }];
 const memoriesData = () => [
@@ -82,6 +89,7 @@ function setInput(el, field, value) {
 describe('AgentMemorySettings 记忆管理卡', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(showErrorDialog).mockClear();
     fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
     mockMemoryEndpoints();
@@ -163,7 +171,7 @@ describe('AgentMemorySettings 记忆管理卡', () => {
   });
 
   it('删除 404 信封（条目已被并发删除）静默刷新；非 JSON 404（漏注册）显性报错', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
     const { el } = mountComp();
     await flush();
     const projectCalls = () => fetchMock.mock.calls.filter((call) => call[0] === '/api/agent/memory/projects').length;
@@ -181,10 +189,11 @@ describe('AgentMemorySettings 记忆管理卡', () => {
     buttonByText(el, 'agent_memory_delete').click();
     await flush();
     expect(el.textContent).not.toContain('agent_memory_action_failed');
+    expect(showErrorDialog).not.toHaveBeenCalled();
     expect(projectCalls()).toBeGreaterThan(before404);
 
     // 场景 B：非 JSON 体 404（路由漏注册返回 404 page not found 的配置事故）
-    // ——无信封即无 status，isMissingError 判否，错误横幅显性出现。
+    // ——无信封即无 status，isMissingError 判否，走全局报错弹窗显性出现。
     fetchMock.mockImplementation(async (path, options) => {
       if (options && options.method === 'DELETE') {
         return {
@@ -199,11 +208,12 @@ describe('AgentMemorySettings 记忆管理卡', () => {
     });
     buttonByText(el, 'agent_memory_delete').click();
     await flush();
-    expect(el.textContent).toContain('agent_memory_action_failed');
-    expect(el.textContent).toContain('Request failed with HTTP 404');
+    // 行内不再渲染错误文本;文案进全局弹窗（i18n mock 尾随拼参数）
+    expect(el.textContent).not.toContain('agent_memory_action_failed');
+    expect(showErrorDialog).toHaveBeenCalledWith('agent_memory_action_failed Request failed with HTTP 404');
   });
 
-  it('写通道业务失败信封（code=1）出现错误横幅且弹窗保持打开', async () => {
+  it('写通道业务失败信封（code=1）走全局报错弹窗且新增弹窗保持打开', async () => {
     const { el } = mountComp();
     await flush();
     fetchMock.mockImplementation(async (path) => {
@@ -219,9 +229,10 @@ describe('AgentMemorySettings 记忆管理卡', () => {
     setInput(el, 'memory-content', '会失败的一条');
     buttonByText(el, 'agent_memory_save').click();
     await flush();
-    // 横幅 = 保存失败文案 + 服务端 msg 原文（i18n mock 尾随拼参数）
-    expect(el.textContent).toContain('agent_memory_save_failed 存储器坏了');
-    // 弹窗保持打开，等用户修正后重试
+    // 行内不再渲染错误横幅;保存失败文案 + 服务端 msg 原文进全局弹窗（i18n mock 尾随拼参数）
+    expect(el.textContent).not.toContain('agent_memory_save_failed');
+    expect(showErrorDialog).toHaveBeenCalledWith('agent_memory_save_failed 存储器坏了');
+    // 新增弹窗保持打开，等用户修正后重试
     expect(el.querySelector('[data-field="memory-content"]')).toBeTruthy();
   });
 
@@ -245,8 +256,10 @@ describe('AgentMemorySettings 记忆管理卡', () => {
     await flush();
     const posts = fetchMock.mock.calls.filter((call) => call[1] && call[1].method === 'POST');
     expect(posts).toHaveLength(0);
-    expect(el.textContent).toContain('agent_memory_content_required');
-    // 弹窗保持打开
+    // 空内容校验文案走全局报错弹窗,行内不再渲染
+    expect(el.textContent).not.toContain('agent_memory_content_required');
+    expect(showErrorDialog).toHaveBeenCalledWith('agent_memory_content_required');
+    // 新增弹窗保持打开
     expect(el.querySelector('[data-field="memory-content"]')).toBeTruthy();
 
     // 合法内容：POST 载荷 = {project, content}

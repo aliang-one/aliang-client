@@ -22,24 +22,17 @@
       </button>
     </div>
 
-    <!-- 卡片级警示/错误条：codex 同步失败 / 行动失败（保存/启停/删除） -->
+    <!-- 卡片级琥珀软警示条：codex 同步失败留行内；保存/启停/删除的行动失败
+         与加载失败已改走全局报错弹窗（showErrorDialog 调用点） -->
     <div
       v-if="codexSyncError"
       class="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300"
     >{{ codexSyncError }}</div>
-    <div
-      v-if="actionError"
-      class="mt-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-xs leading-5 text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300"
-    >{{ actionError }}</div>
 
     <div v-if="loading" class="mt-5 flex min-h-24 items-center justify-center text-xs text-slate-500 dark:text-slate-400">
       <span class="material-symbols-outlined mr-2 text-base motion-safe:animate-spin">progress_activity</span>
       {{ t('agent_integrations_loading') }}
     </div>
-    <div
-      v-else-if="loadError"
-      class="mt-5 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300"
-    >{{ loadError }}</div>
 
     <!-- 注册表原文视角：enabled=false 的条目也展示（便于重新启用），不从集成清单派生 -->
     <template v-else>
@@ -188,11 +181,6 @@
           </label>
         </div>
 
-        <div
-          v-if="formError"
-          class="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300"
-        >{{ formError }}</div>
-
         <div class="mt-5 flex justify-end gap-2">
           <button
             type="button"
@@ -213,6 +201,7 @@
 
 <script>
 import { useI18n } from '../../i18n';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 import {
   deleteAliangMCPServer,
   getAgentIntegrations,
@@ -339,6 +328,7 @@ export default {
         this.integrations = Array.isArray(integrations?.mcp_servers) ? integrations.mcp_servers : [];
       } catch (_) {
         this.loadError = this.t('agent_integrations_loadFailed');
+        showErrorDialog(this.loadError);
       } finally {
         this.loading = false;
       }
@@ -376,14 +366,17 @@ export default {
       const name = String(this.form.name || '');
       if (!NAME_RE.test(name) || name.startsWith('aliang-')) {
         this.formError = this.t('agent_mcp_registry_name_invalid');
+        showErrorDialog(this.formError);
         return false;
       }
       if (this.form.type === 'stdio' && !String(this.form.command || '').trim()) {
         this.formError = this.t('agent_mcp_registry_command_required');
+        showErrorDialog(this.formError);
         return false;
       }
       if (this.form.type !== 'stdio' && !String(this.form.url || '').trim()) {
         this.formError = this.t('agent_mcp_registry_url_required');
+        showErrorDialog(this.formError);
         return false;
       }
       return true;
@@ -419,6 +412,7 @@ export default {
         await this.loadAll();
       } catch (err) {
         this.formError = this.t('agent_mcp_registry_save_failed', { error: err?.message || '' });
+        showErrorDialog(this.formError);
       } finally {
         this.saving = false;
       }
@@ -437,6 +431,7 @@ export default {
         }
       } catch (err) {
         this.actionError = this.t('agent_mcp_registry_save_failed', { error: err?.message || '' });
+        showErrorDialog(this.actionError);
       } finally {
         // 失败回滚视觉态 / 成功取服务端真值：两路都重拉。
         await this.loadAll();
@@ -460,6 +455,7 @@ export default {
         // 否则按泛型 404 消息形态（HTTP 404 子串）识别，不做全等匹配。
         if (!this.isMissingError(err)) {
           this.actionError = this.t('agent_mcp_registry_save_failed', { error: err?.message || '' });
+          showErrorDialog(this.actionError);
         }
       } finally {
         await this.loadAll();

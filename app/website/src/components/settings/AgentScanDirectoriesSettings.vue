@@ -53,7 +53,7 @@
       <span class="material-symbols-outlined text-base">save</span>
       {{ t('agent_scan_save') }}
     </button>
-    <p v-if="feedback" class="mt-2 text-[11px]" :class="feedbackType === 'error' ? 'text-rose-600 dark:text-rose-300' : 'text-emerald-600 dark:text-emerald-300'">
+    <p v-if="feedback && feedbackType !== 'error'" class="mt-2 text-[11px]" :class="feedbackType === 'error' ? 'text-rose-600 dark:text-rose-300' : 'text-emerald-600 dark:text-emerald-300'">
       {{ feedback }}
     </p>
   </div>
@@ -62,6 +62,7 @@
 <script>
 import { getAgentScanDirectories, setAgentScanDirectories } from '../../services/agentApi';
 import { useI18n } from '../../i18n';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 
 export default {
   name: 'AgentScanDirectoriesSettings',
@@ -106,6 +107,7 @@ export default {
       } catch (_) {
         this.feedback = this.t('agent_scan_saveFailed');
         this.feedbackType = 'error';
+        showErrorDialog(this.feedback);
       } finally {
         this.saving = false;
       }

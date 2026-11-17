@@ -1,5 +1,6 @@
 import { computed, ref } from 'vue';
 import { dismissSoftwareUpdate, getSoftwareUpdateStatus } from '../services/softwareUpdateApi';
+import { showErrorDialog } from './useErrorDialog';
 
 const softwareUpdateStatus = ref({
   software: '',
@@ -73,6 +74,7 @@ async function refreshSoftwareUpdateStatus({ openModalIfNeeded = true } = {}) {
     return applySoftwareUpdateStatus(envelope?.data, { openModalIfNeeded });
   } catch (error) {
     softwareUpdateError.value = error instanceof Error ? error.message : 'Failed to sync software update status';
+    showErrorDialog(softwareUpdateError.value);
     throw error;
   } finally {
     softwareUpdateLoading.value = false;
@@ -106,6 +108,7 @@ async function closeSoftwareUpdateModal() {
     softwareUpdateModalOpen.value = false;
   } catch (error) {
     softwareUpdateError.value = error instanceof Error ? error.message : 'Failed to dismiss update notice';
+    showErrorDialog(softwareUpdateError.value);
     throw error;
   } finally {
     softwareUpdateDismissPending.value = false;

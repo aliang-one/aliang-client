@@ -90,15 +90,10 @@
       </template>
     </div>
 
-    <!-- apply 诊断行(在父页 error/success 之前,与其可区分):POST 应用注册
-         失败意味着 runtime 侧工具面可能仍是旧状态——即使父页持久化成功
-         (绿色 success)也不能被盖掉,必须单独红显(spec §7 诚实回显)。 -->
-    <div v-if="applyError" class="mt-3 text-xs text-red-600 dark:text-red-400" role="status" data-testid="peer-mcp-apply-error">
-      {{ t('peerMcp_applyFailed') }}:{{ applyError }}
-    </div>
-
-    <div v-if="error" class="mt-3 text-xs text-red-600 dark:text-red-400" role="status">{{ error }}</div>
-    <div v-else-if="successMessage" class="mt-3 text-xs text-emerald-600 dark:text-emerald-400" role="status">{{ successMessage }}</div>
+    <!-- apply 诊断(POST 应用注册失败)与父页 error 均为动作结果类报错,
+         改走全局报错弹窗(2026-11-17 定案,latest-wins)。apply 失败即使父页
+         持久化成功(绿色 success)也单独弹窗不被盖掉——runtime 侧工具面可能
+         仍是旧状态(spec §7 诚实回显),模态优先级高于行内绿条。 -->
 
     <button
       type="button"
@@ -113,6 +108,7 @@
 
 <script>
 import { useI18n } from '../../i18n';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 import { getPeerMCPStatus, setPeerMCPRegistration } from '../../services/agentApi';
 
 // 工具名按 stdio 面展示(本卡是 claude/codex 的入口,以它们实际可见的名字为准)。
@@ -160,6 +156,15 @@ export default {
     };
   },
   watch: {
+    // 父页持久化失败走全局弹窗(2026-11-17 定案);行内红条删除
+    error: {
+      immediate: true,
+      handler(next) {
+        if (next) {
+          showErrorDialog(next);
+        }
+      }
+    },
     config: {
       deep: true,
       handler(nextConfig) {
@@ -245,6 +250,8 @@ export default {
         this.statusAvailable = false;
         this.statusError = msg;
         this.applyError = msg || this.t('peerMcp_applyFailed');
+        // 文案保持与原行内渲染一致(前缀键 + 冒号 + 具体原因)
+        showErrorDialog(`${this.t('peerMcp_applyFailed')}:${this.applyError}`);
       }
     }
   }

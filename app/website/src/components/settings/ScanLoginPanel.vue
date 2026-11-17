@@ -41,14 +41,6 @@
       </p>
     </div>
 
-    <div
-      v-if="errorMessage"
-      class="flex items-center gap-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:border-rose-900 dark:bg-rose-950/30 dark:text-rose-300"
-    >
-      <span class="material-symbols-outlined text-sm">error</span>
-      {{ errorMessage }}
-    </div>
-
     <button
       type="button"
       class="inline-flex h-10 w-full items-center justify-center gap-2 rounded-lg border border-slate-200 px-4 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:text-slate-100 dark:hover:bg-slate-800"
@@ -69,6 +61,7 @@ import QRCode from 'qrcode';
 import { scanInit, scanStatus } from '../../services/authApi';
 import { useAuthStore } from '../../stores/auth';
 import { useI18n } from '../../i18n';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 
 const emit = defineEmits(['success', 'error']);
 
@@ -185,6 +178,7 @@ async function pollOnce() {
     } else {
       phase.value = 'error';
       errorMessage.value = loginError.value || t('scan_failed');
+      showErrorDialog(errorMessage.value);
       emit('error');
     }
     return;

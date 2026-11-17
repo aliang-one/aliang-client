@@ -394,6 +394,8 @@ export default {
 
   // -- App --
   app_restoringSession: '正在恢复会话…',
+  error_dialog_title: '操作失败',
+  error_dialog_ok: '知道了',
 
   // -- Auth Store --
   auth_guest: '访客',

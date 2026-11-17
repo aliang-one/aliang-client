@@ -67,14 +67,7 @@
     </div>
 
     <div
-      v-if="error"
-      class="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-200"
-      role="alert"
-    >
-      {{ error }}
-    </div>
-    <div
-      v-else-if="successMessage"
+      v-if="successMessage"
       class="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-300"
       role="status"
     >
@@ -332,6 +325,7 @@
 <script>
 import { getAgentStatus, getMeshStatus } from '../../services/agentApi';
 import { useI18n } from '../../i18n';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 import {
   listMeshDeviceIdMismatches,
   listMeshRulesByPeer,
@@ -586,6 +580,15 @@ export default {
     }
   },
   watch: {
+    // 保存失败等动作结果类报错走全局弹窗(2026-11-17 定案);行内红条删除
+    error: {
+      immediate: true,
+      handler(next) {
+        if (next) {
+          showErrorDialog(next);
+        }
+      }
+    },
     config: {
       deep: true,
       handler(nextConfig) {

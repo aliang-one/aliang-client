@@ -472,10 +472,7 @@
                 <span class="material-symbols-outlined">more_horiz</span>
               </button>
             </div>
-            <div v-if="dashboardError" class="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300">
-              {{ dashboardError }}
-            </div>
-            <div v-else-if="dashboardLoading" class="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-10 text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-900/40 dark:text-slate-400">
+            <div v-if="dashboardLoading" class="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-10 text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-900/40 dark:text-slate-400">
               {{ t('dash_loadingModelUsage') }}
             </div>
             <div v-else-if="!modelDistribution.length" class="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-10 text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-900/40 dark:text-slate-400">
@@ -817,8 +814,6 @@
               />
             </div>
 
-            <p v-if="loginError" class="text-xs text-rose-500">{{ loginError }}</p>
-
             <div class="flex gap-3 pt-1">
               <button
                 type="button"
@@ -1012,6 +1007,7 @@ import ScanLoginPanel from './settings/ScanLoginPanel.vue';
 import { isOnboardingCompleted, openOnboardingGuide } from '../composables/useOnboardingGuide';
 import { openTutorialDocs } from '../composables/useTutorialDocs';
 import { useI18n } from '../i18n';
+import { showErrorDialog } from '../composables/useErrorDialog';
 import { useCertStatus } from '../composables/useCertStatus';
 import { useNavigation } from '../composables/useNavigation';
 import { useAgentStatus } from '../composables/useAgentStatus';
@@ -1080,6 +1076,14 @@ watch(runIsRunning, () => {
     runActionMessage.value = '';
   }
 });
+
+// 登录失败是动作结果类报错反馈(2026-11-17 定案):统一走全局报错弹窗,
+// 行内 rose 红字已删除;loginError 由 auth store 写入,这里只做读取侧弹窗。
+watch(loginError, (message) => {
+  if (message) {
+    showErrorDialog(message);
+  }
+}, { immediate: true });
 const accountBalance = ref(null);
 const tunStartModal = ref(createTunStartModalState());
 const dashboardLoading = ref(false);
@@ -1579,6 +1583,7 @@ async function loadDashboardUsageData() {
     usageTotalPages.value = Math.min(Math.max(pagination.totalPages, 1), usageMaxPages);
   } catch (error) {
     dashboardError.value = error instanceof Error ? error.message : 'Failed to load dashboard usage data.';
+    showErrorDialog(dashboardError.value);
     dashboardStats.value = {};
     dashboardModels.value = [];
     dashboardTrend.value = [];
@@ -2133,7 +2138,12 @@ async function toggleProxyPower() {
     const message = error instanceof Error ? error.message : 'Proxy action failed';
     runSyncError.value = message;
     if (tunStartModal.value.visible) {
+      // TUN 启动弹窗本身就是带步骤/捕获错误的整体失败状态面板,失败细节留弹窗内展示
       markTunStartModalError(message);
+    } else {
+      // 其余代理动作失败(动作结果类报错反馈,2026-11-17 定案)走全局报错弹窗;
+      // 状态条(proxyStatusTitle/Subtitle)为成功失败共用面板,保留不动
+      showErrorDialog(message);
     }
   } finally {
     runActionLoading.value = false;

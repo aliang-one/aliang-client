@@ -97,11 +97,6 @@
           </div>
         </div>
 
-        <div v-if="loginError" class="flex items-center gap-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:border-rose-900 dark:bg-rose-950/30 dark:text-rose-300">
-          <span class="material-symbols-outlined text-sm">error</span>
-          {{ loginError }}
-        </div>
-
         <button
           type="submit"
           class="inline-flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-primary px-4 text-sm font-semibold text-white shadow-sm transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
@@ -120,10 +115,6 @@
       </div>
 
       <template v-else>
-        <div v-if="loadError" class="mb-4 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:border-rose-900 dark:bg-rose-950/30 dark:text-rose-300">
-          {{ loadError }}
-        </div>
-
         <div class="grid gap-2.5 sm:grid-cols-2">
           <article class="rounded-xl border border-slate-200 bg-slate-50/80 p-3 dark:border-slate-800 dark:bg-slate-900/50">
             <div class="flex items-start justify-between gap-3">
@@ -198,7 +189,7 @@
                   :disabled="profileSaving"
                 />
               </div>
-              <p v-if="profileFeedback.text" :class="feedbackClass(profileFeedback.kind)">{{ profileFeedback.text }}</p>
+              <p v-if="profileFeedback.text && profileFeedback.kind !== 'error'" :class="feedbackClass(profileFeedback.kind)">{{ profileFeedback.text }}</p>
               <button
                 type="submit"
                 class="inline-flex min-h-10 w-full items-center justify-center rounded bg-primary px-4 py-2 text-sm font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
@@ -227,10 +218,7 @@
               </button>
             </div>
 
-            <div v-if="apiKeysLoadError && !apiKeys.length" class="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:border-rose-900 dark:bg-rose-950/30 dark:text-rose-300">
-              {{ apiKeysLoadError }}
-            </div>
-            <div v-else-if="!selectedApiKey" class="mt-3 rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-6 text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-900/40 dark:text-slate-400">
+            <div v-if="!selectedApiKey" class="mt-3 rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-6 text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-900/40 dark:text-slate-400">
               {{ t('user_noApiKeys') }}
             </div>
             <div v-else class="mt-3 space-y-3">
@@ -291,7 +279,7 @@
                 </div>
               </div>
 
-              <p v-if="apiKeyCopyFeedback.text" :class="feedbackClass(apiKeyCopyFeedback.kind)">{{ apiKeyCopyFeedback.text }}</p>
+              <p v-if="apiKeyCopyFeedback.text && apiKeyCopyFeedback.kind !== 'error'" :class="feedbackClass(apiKeyCopyFeedback.kind)">{{ apiKeyCopyFeedback.text }}</p>
 
               <div v-if="selectedApiKey.group?.description" class="rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-xs leading-6 text-slate-600 dark:border-slate-800 dark:bg-slate-900/30 dark:text-slate-300">
                 <p class="font-semibold uppercase tracking-wide text-slate-500">{{ t('user_apiKeyDescription') }}</p>
@@ -308,9 +296,6 @@
 
             <div v-if="isRefreshing && !hasLoaded" class="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-5 text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-900/40 dark:text-slate-400">
               {{ t('user_loadingData') }}
-            </div>
-            <div v-else-if="apiKeysLoadError && !apiKeys.length" class="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:border-rose-900 dark:bg-rose-950/30 dark:text-rose-300">
-              {{ apiKeysLoadError }}
             </div>
             <div v-else-if="!apiKeys.length" class="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-5 text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-900/40 dark:text-slate-400">
               {{ t('user_noApiKeys') }}
@@ -439,7 +424,7 @@
                   :disabled="redeemPending"
                 />
               </div>
-              <p v-if="redeemFeedback.text" :class="feedbackClass(redeemFeedback.kind)">{{ redeemFeedback.text }}</p>
+              <p v-if="redeemFeedback.text && redeemFeedback.kind !== 'error'" :class="feedbackClass(redeemFeedback.kind)">{{ redeemFeedback.text }}</p>
               <button
                 type="submit"
                 class="inline-flex min-h-10 w-full items-center justify-center rounded border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:text-slate-100 dark:hover:bg-slate-800"
@@ -498,10 +483,7 @@
               <div v-if="apiKeyDocsLoading" class="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-6 text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-900/40 dark:text-slate-400">
                 {{ t('user_apiKeyDocsLoading') }}
               </div>
-              <div v-else-if="apiKeyDocsError" class="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-900 dark:bg-rose-950/30 dark:text-rose-300">
-                {{ apiKeyDocsError }}
-              </div>
-              <pre v-else class="whitespace-pre-wrap break-words rounded-xl bg-slate-950 px-4 py-4 text-xs leading-6 text-slate-100">{{ apiKeyDocsContent }}</pre>
+              <pre v-else-if="apiKeyDocsContent" class="whitespace-pre-wrap break-words rounded-xl bg-slate-950 px-4 py-4 text-xs leading-6 text-slate-100">{{ apiKeyDocsContent }}</pre>
             </div>
           </div>
         </div>
@@ -536,6 +518,7 @@ import {
 } from '../../services/userCenterApi';
 import ScanLoginPanel from './ScanLoginPanel.vue';
 import { copyText } from '../../utils/clipboard';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 
 const { t } = useI18n();
 const API_KEY_DOCS_PATH = '/docs/sub2api-apikey-api-reference.md';
@@ -589,7 +572,7 @@ const {
   isAuthenticated,
   loginPending,
   logoutPending,
-  loginError,
+  loginError, // 报错展示统一走全局弹窗(DashboardPage watch),行内不再渲染
   authNotice,
   loginWithPassword,
   logoutUser,
@@ -672,6 +655,7 @@ async function refreshAll() {
       apiKeysEnvelope = await getUserCenterAPIKeys();
     } catch (error) {
       apiKeysLoadError.value = error instanceof Error ? error.message : t('user_loadApiKeysFailed');
+      showErrorDialog(apiKeysLoadError.value);
     }
 
     const unauthenticatedMessage = findUnauthenticatedMessage([
@@ -684,6 +668,7 @@ async function refreshAll() {
     if (unauthenticatedMessage) {
       resetUserCenterState();
       loadError.value = unauthenticatedMessage;
+      showErrorDialog(loadError.value);
       await restoreAuthSession();
       return;
     }
@@ -704,6 +689,7 @@ async function refreshAll() {
     if (apiKeysEnvelope) {
       if (apiKeysEnvelope.status !== 'success') {
         apiKeysLoadError.value = apiKeysEnvelope.message || t('user_loadApiKeysFailed');
+        showErrorDialog(apiKeysLoadError.value);
         applyAPIKeys([]);
       } else {
         applyAPIKeys(apiKeysEnvelope.data?.items);
@@ -715,6 +701,7 @@ async function refreshAll() {
     hasLoaded.value = true;
   } catch (error) {
     loadError.value = error instanceof Error ? error.message : t('user_loadFailed');
+    showErrorDialog(loadError.value);
   }
   finally {
     isRefreshing.value = false;
@@ -727,6 +714,7 @@ async function submitProfileUpdate() {
   if (!usernameDraft.value.trim()) {
     profileFeedback.kind = 'error';
     profileFeedback.text = t('user_usernameEmpty');
+    showErrorDialog(profileFeedback.text);
     return;
   }
 
@@ -737,6 +725,7 @@ async function submitProfileUpdate() {
     if (envelope.status === 'unauthenticated') {
       profileFeedback.kind = 'error';
       profileFeedback.text = envelope.message || t('user_sessionExpired');
+      showErrorDialog(profileFeedback.text);
       await restoreAuthSession();
       return;
     }
@@ -752,6 +741,7 @@ async function submitProfileUpdate() {
   } catch (error) {
     profileFeedback.kind = 'error';
     profileFeedback.text = error instanceof Error ? error.message : t('user_profileUpdateFailed');
+    showErrorDialog(profileFeedback.text);
   } finally {
     profileSaving.value = false;
   }
@@ -763,6 +753,7 @@ async function submitRedeemCode() {
   if (!redeemCode.value.trim()) {
     redeemFeedback.kind = 'error';
     redeemFeedback.text = t('user_redeemCodeEmpty');
+    showErrorDialog(redeemFeedback.text);
     return;
   }
 
@@ -773,6 +764,7 @@ async function submitRedeemCode() {
     if (envelope.status === 'unauthenticated') {
       redeemFeedback.kind = 'error';
       redeemFeedback.text = envelope.message || t('user_sessionExpired');
+      showErrorDialog(redeemFeedback.text);
       await restoreAuthSession();
       return;
     }
@@ -787,6 +779,7 @@ async function submitRedeemCode() {
   } catch (error) {
     redeemFeedback.kind = 'error';
     redeemFeedback.text = error instanceof Error ? error.message : t('user_redeemFailed');
+    showErrorDialog(redeemFeedback.text);
   } finally {
     redeemPending.value = false;
   }
@@ -846,6 +839,7 @@ async function openAPIKeyDocs() {
     apiKeyDocsContent.value = await response.text();
   } catch (error) {
     apiKeyDocsError.value = error instanceof Error ? error.message : t('user_apiKeyDocsLoadFailed');
+    showErrorDialog(apiKeyDocsError.value);
   } finally {
     apiKeyDocsLoading.value = false;
   }
@@ -862,6 +856,7 @@ async function copyApiKey(item) {
   if (!value) {
     apiKeyCopyFeedback.kind = 'error';
     apiKeyCopyFeedback.text = t('user_apiKeyCopyFailed');
+    showErrorDialog(apiKeyCopyFeedback.text);
     return;
   }
 
@@ -871,6 +866,7 @@ async function copyApiKey(item) {
   if (!ok) {
     apiKeyCopyFeedback.kind = 'error';
     apiKeyCopyFeedback.text = t('user_apiKeyCopyFailed');
+    showErrorDialog(apiKeyCopyFeedback.text);
     return;
   }
   apiKeyCopyFeedback.kind = 'success';

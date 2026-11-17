@@ -27,6 +27,7 @@
       @close="closeTutorialDocs"
     />
     <ChatPage v-if="currentPage === 'chat'" />
+    <ErrorDialog />
     </template>
   </div>
 </template>
@@ -41,6 +42,7 @@ import CertManagementModal from './components/CertManagementModal.vue';
 import QuickSetupModal from './components/QuickSetupModal.vue';
 import SoftwareUpdateNotice from './components/SoftwareUpdateNotice.vue';
 import TutorialDocsModal from './components/TutorialDocsModal.vue';
+import ErrorDialog from './components/ErrorDialog.vue';
 import { useAuthStore } from './stores/auth';
 import { useNavigation } from './composables/useNavigation';
 import { closeTutorialDocs, isTutorialDocsOpen, tutorialDocId } from './composables/useTutorialDocs';

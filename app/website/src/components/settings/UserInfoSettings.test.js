@@ -45,8 +45,15 @@ vi.mock('./ScanLoginPanel.vue', () => ({
   default: { name: 'ScanLoginPanel', render: () => null }
 }));
 
+// 报错反馈统一走全局弹窗(2026-11-17 定案)——组件测试 mock 该模块,断言
+// showErrorDialog 收到对应文案;行内不再渲染 error 文本。
+vi.mock('../../composables/useErrorDialog', () => ({
+  showErrorDialog: vi.fn()
+}));
+
 import { createApp, h } from 'vue';
 import UserInfoSettings from './UserInfoSettings.vue';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 
 const flush = async (rounds = 10) => {
   for (let i = 0; i < rounds; i += 1) await Promise.resolve();
@@ -101,6 +108,7 @@ const copyFeedback = (el) => Array.from(el.querySelectorAll('p')).find((p) => p.
 describe('UserInfoSettings 复制链路(http 无 clipboard 回归)', () => {
   beforeEach(() => {
     stubBackend();
+    vi.mocked(showErrorDialog).mockClear();
     try { delete navigator.clipboard; } catch (_) { /* 已不存在 */ }
     try { delete document.execCommand; } catch (_) { /* 已不存在 */ }
   });
@@ -142,13 +150,14 @@ describe('UserInfoSettings 复制链路(http 无 clipboard 回归)', () => {
     expect(copyFeedback(el)?.textContent).toBe('user_apiKeyCopied');
   });
 
-  it('兜底也被拒(execCommand=false)时报复制失败文案,不抛原文', async () => {
+  it('兜底也被拒(execCommand=false)时走全局报错弹窗,行内不再渲染错误文本', async () => {
     stubClipboard(undefined);
     stubExecCommand(() => false);
     const el = mountPane();
     await flush();
     copyButtons(el)[0].click();
     await flush();
-    expect(copyFeedback(el)?.textContent).toBe('user_apiKeyCopyFailed');
+    expect(showErrorDialog).toHaveBeenCalledWith('user_apiKeyCopyFailed');
+    expect(copyFeedback(el)).toBeUndefined();
   });
 });

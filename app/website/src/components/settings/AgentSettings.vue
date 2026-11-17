@@ -275,7 +275,7 @@
       </div>
     </div>
 
-    <p v-if="feedback" class="mt-3 text-[11px]" :class="feedbackClass">{{ feedback }}</p>
+    <p v-if="feedback && feedbackType !== 'error'" class="mt-3 text-[11px]" :class="feedbackClass">{{ feedback }}</p>
   </div>
 </template>
 
@@ -287,6 +287,7 @@ import {
 } from '../../services/agentApi';
 import { useI18n } from '../../i18n';
 import { useAgentStatus } from '../../composables/useAgentStatus';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 
 export default {
   name: 'AgentSettings',
@@ -468,6 +469,11 @@ export default {
     setFeedback(message, type = 'info') {
       this.feedback = message;
       this.feedbackType = type;
+      // 报错反馈走全局弹窗(2026-11-17 定案);成功/进行中反馈仍行内展示。
+      // 健康度面板(注册/连接状态+重试按钮)属状态面板,不受此处影响。
+      if (type === 'error') {
+        showErrorDialog(message);
+      }
     },
     async refreshStatus() {
       const result = await this.refresh();

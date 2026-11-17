@@ -79,19 +79,10 @@
       >{{ t('agent_memory_clear') }}</button>
     </div>
 
-    <div
-      v-if="actionError"
-      class="mt-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-xs leading-5 text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300"
-    >{{ actionError }}</div>
-
     <div v-if="listLoading" class="mt-5 flex min-h-24 items-center justify-center text-xs text-slate-500 dark:text-slate-400">
       <span class="material-symbols-outlined mr-2 text-base motion-safe:animate-spin">progress_activity</span>
       {{ t('agent_integrations_loading') }}
     </div>
-    <div
-      v-else-if="loadError"
-      class="mt-5 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300"
-    >{{ loadError }}</div>
 
     <template v-else-if="selectedProject">
       <ul v-if="memories.length" class="mt-4 divide-y divide-slate-100 dark:divide-slate-800">
@@ -122,10 +113,6 @@
                 >{{ t('agent_memory_save') }}</button>
               </div>
             </div>
-            <div
-              v-if="editError"
-              class="mt-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300"
-            >{{ editError }}</div>
           </template>
           <template v-else>
             <p class="break-all text-xs leading-5 text-slate-800 dark:text-slate-100">{{ row.content }}</p>
@@ -159,8 +146,7 @@
     </template>
     <p v-else class="mt-4 text-xs text-slate-400">{{ t('agent_memory_projects_empty') }}</p>
 
-    <div v-if="error" class="mt-3 text-xs text-red-600 dark:text-red-400" role="status">{{ error }}</div>
-    <div v-else-if="successMessage" class="mt-3 text-xs text-emerald-600 dark:text-emerald-400" role="status">{{ successMessage }}</div>
+    <div v-if="successMessage" class="mt-3 text-xs text-emerald-600 dark:text-emerald-400" role="status">{{ successMessage }}</div>
 
     <!-- 新增弹窗（骨架沿 AgentMCPRegistrySettings 二级弹窗形态） -->
     <div
@@ -188,11 +174,6 @@
         </label>
         <p class="mt-1 text-right text-[10px] text-slate-400" data-testid="memory-content-counter">{{ form.content.length }} / {{ contentCap }}</p>
 
-        <div
-          v-if="formError"
-          class="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300"
-        >{{ formError }}</div>
-
         <div class="mt-5 flex justify-end gap-2">
           <button
             type="button"
@@ -214,6 +195,7 @@
 
 <script>
 import { useI18n } from '../../i18n';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 
 // 与后端 agentCoreMemoryContentCap（services/agent_ai_agentcore_memory.go）
 // 同源：500 字符（Go 按 rune 计，前端 String.length 按 UTF-16 码元计，CJK
@@ -315,6 +297,15 @@ export default {
     },
   },
   watch: {
+    // 加载/保存失败(error prop)走全局报错弹窗(2026-11-17 定案);成功反馈仍行内
+    error: {
+      immediate: true,
+      handler(next) {
+        if (next) {
+          showErrorDialog(next);
+        }
+      },
+    },
     config: {
       deep: true,
       handler(nextConfig) {
@@ -346,6 +337,7 @@ export default {
         }
       } catch (err) {
         this.loadError = this.t('agent_memory_load_failed', { error: err?.message || '' });
+        showErrorDialog(this.loadError);
       } finally {
         this.listLoading = false;
       }
@@ -365,6 +357,7 @@ export default {
         this.memories = Array.isArray(data?.memories) ? data.memories : [];
       } catch (err) {
         this.loadError = this.t('agent_memory_load_failed', { error: err?.message || '' });
+        showErrorDialog(this.loadError);
       } finally {
         this.listLoading = false;
       }
@@ -402,6 +395,7 @@ export default {
       const content = String(this.form.content || '').trim();
       if (!content) {
         this.formError = this.t('agent_memory_content_required');
+        showErrorDialog(this.formError);
         return;
       }
       this.working = true;
@@ -415,6 +409,7 @@ export default {
         await this.loadAll();
       } catch (err) {
         this.formError = this.t('agent_memory_save_failed', { error: err?.message || '' });
+        showErrorDialog(this.formError);
       } finally {
         this.working = false;
       }
@@ -433,6 +428,7 @@ export default {
       const content = String(this.editContent || '').trim();
       if (!content) {
         this.editError = this.t('agent_memory_content_required');
+        showErrorDialog(this.editError);
         return;
       }
       this.working = true;
@@ -446,6 +442,7 @@ export default {
         await this.loadAll();
       } catch (err) {
         this.editError = this.t('agent_memory_save_failed', { error: err?.message || '' });
+        showErrorDialog(this.editError);
       } finally {
         this.working = false;
       }
@@ -469,6 +466,7 @@ export default {
         if (!this.isMissingError(err)) {
           // 删除/清空走 action_failed：与保存通道文案可区分（评审 NIT③）。
           this.actionError = this.t('agent_memory_action_failed', { error: err?.message || '' });
+          showErrorDialog(this.actionError);
         }
       } finally {
         await this.loadAll();
@@ -489,6 +487,7 @@ export default {
         );
       } catch (err) {
         this.actionError = this.t('agent_memory_action_failed', { error: err?.message || '' });
+        showErrorDialog(this.actionError);
       } finally {
         await this.loadAll();
         this.working = false;

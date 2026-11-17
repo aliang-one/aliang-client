@@ -16,12 +16,14 @@
         </div>
       </div>
 
+      <!-- submitError 是实时表单门禁校验(每键触发、阻止提交),留行内;
+           error prop(加载失败)已改走全局报错弹窗,见 watch.error -->
       <div
-        v-if="error || submitError"
+        v-if="submitError"
         class="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-200"
         role="alert"
       >
-        {{ error || submitError }}
+        {{ submitError }}
       </div>
 
       <!-- 软警告（不阻断保存）：AI 规则与代理规则条件重叠，AI 恒优先（HIGH#3） -->
@@ -689,6 +691,7 @@
 <script>
 import { useI18n } from '../../i18n';
 import { openTutorialDocs } from '../../composables/useTutorialDocs';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 import { getStatusSummary, testSshConnection } from '../../services/statusApi';
 
 function defaultConfig() {
@@ -1564,6 +1567,15 @@ export default {
     }
   },
   watch: {
+    // 加载失败走全局报错弹窗(2026-11-17 定案);行内红条只留实时门禁校验
+    error: {
+      immediate: true,
+      handler(next) {
+        if (next) {
+          showErrorDialog(next);
+        }
+      }
+    },
     config: {
       deep: true,
       handler(nextConfig) {

@@ -153,7 +153,6 @@
               </div>
             </div>
 
-            <p v-if="systemServiceError" class="mt-3 text-[11px] text-red-500">{{ systemServiceError }}</p>
             <p v-if="systemServiceMessage" class="mt-3 text-[11px] text-emerald-600 dark:text-emerald-400">{{ systemServiceMessage }}</p>
 
             <div class="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
@@ -248,6 +247,7 @@
 // 卸载+确认弹窗)与证书 CA 两区块,逐方法照搬零行为改动。
 // 宿主:仪表盘侧栏「系统状态」紧凑卡的弹窗(spec §4.2A)。
 import { useI18n } from '../../i18n';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 import { useCertStatus } from '../../composables/useCertStatus';
 
 export default {
@@ -424,6 +424,7 @@ export default {
         URL.revokeObjectURL(url);
       } catch (err) {
         this.systemServiceError = err instanceof Error ? err.message : this.t('cert_downloadFailed');
+        showErrorDialog(this.systemServiceError);
       }
     },
     async requestJSON(url, options = {}) {
@@ -474,6 +475,7 @@ export default {
         this.systemServiceConfirmAction = '';
       } catch (err) {
         this.systemServiceError = err instanceof Error ? err.message : this.t('sys_svcRegisterFailed');
+        showErrorDialog(this.systemServiceError);
       } finally {
         this.serviceActionLoading = false;
         this.serviceAction = '';
@@ -493,6 +495,7 @@ export default {
         this.systemServiceConfirmAction = '';
       } catch (err) {
         this.systemServiceError = err instanceof Error ? err.message : this.t('sys_svcUninstallFailed');
+        showErrorDialog(this.systemServiceError);
       } finally {
         this.serviceActionLoading = false;
         this.serviceAction = '';
@@ -506,6 +509,7 @@ export default {
         this.systemServiceInfo = result && typeof result === 'object' ? result : this.systemServiceInfo;
       } catch (err) {
         this.systemServiceError = err instanceof Error ? err.message : this.t('sys_svcStatusFailed');
+        showErrorDialog(this.systemServiceError);
       }
     }
   }

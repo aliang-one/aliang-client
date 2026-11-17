@@ -73,8 +73,6 @@
       </ul>
     </article>
 
-    <p v-if="error" class="mt-2 text-[11px] text-rose-600 dark:text-rose-300" role="status">{{ error }}</p>
-
     <div
       v-if="scrollbackOpen"
       class="fixed inset-0 z-[1090] flex items-end justify-center bg-slate-950/65 backdrop-blur-sm sm:items-center sm:p-4"
@@ -133,6 +131,7 @@
 <script>
 import { getAgentRuntimeSessions, getAgentTerminalScrollback } from '../../services/agentApi';
 import { useI18n } from '../../i18n';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 
 export default {
   name: 'AgentRuntimeSessions',
@@ -182,6 +181,7 @@ export default {
         this.collectedAt = data?.collected_at || new Date().toISOString();
       } catch (_) {
         this.error = this.t('agent_live_loadFailed');
+        showErrorDialog(this.error);
       } finally {
         this.hasLoaded = true;
         this.loading = false;

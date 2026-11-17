@@ -43,14 +43,6 @@
       <p class="mt-3 text-[10px] leading-4 text-slate-500 dark:text-slate-400">
         {{ t('peerGates_rebindHint') }}
       </p>
-      <div
-        v-if="gatesError"
-        role="status"
-        data-testid="peer-gates-error"
-        class="mt-2 break-words text-xs text-red-600 dark:text-red-400"
-      >
-        {{ gatesError }}
-      </div>
     </div>
   </div>
 </template>
@@ -59,6 +51,7 @@
 // 注意路径：本组件在 settings/agent/ 下，PeerMCPSettings 在 settings/ 上一级。
 import PeerMCPSettings from '../PeerMCPSettings.vue';
 import { useI18n } from '../../../i18n';
+import { showErrorDialog } from '../../../composables/useErrorDialog';
 import { getPeerDeviceGates, setPeerDeviceGates } from '../../../services/agentApi';
 
 // 两枚门禁行的静态形状（i18n 键 + testid），键名与服务端契约一致。
@@ -115,6 +108,7 @@ export default {
         this.gatesLoaded = true;
       } catch (e) {
         this.gatesError = `${this.t('peerGates_loadFailed')}:${this.errorMessage(e)}`;
+        showErrorDialog(this.gatesError);
       } finally {
         this.gatesLoading = false;
       }
@@ -137,6 +131,7 @@ export default {
       } catch (e) {
         this.gates = { ...this.gates, [key]: prev };
         this.gatesError = `${this.t('peerGates_saveFailed')}:${this.errorMessage(e)}`;
+        showErrorDialog(this.gatesError);
       } finally {
         this.gatesSaving = false;
       }

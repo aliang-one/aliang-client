@@ -44,11 +44,8 @@
           <div v-if="loading" class="rounded-lg border border-dashed border-slate-300 px-4 py-10 text-center text-sm text-slate-500 dark:border-slate-700 dark:text-slate-400">
             {{ t('tutorialDocs_loading') }}
           </div>
-          <div v-else-if="error" class="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300">
-            {{ error }}
-          </div>
           <article
-            v-else
+            v-else-if="renderedContent"
             class="tutorial-markdown max-w-none text-sm leading-7 text-slate-700 dark:text-slate-200"
             v-html="renderedContent"
           ></article>
@@ -61,6 +58,7 @@
 <script setup>
 import { computed, ref, watch } from 'vue';
 import { useI18n } from '../i18n';
+import { showErrorDialog } from '../composables/useErrorDialog';
 
 const props = defineProps({
   open: {
@@ -128,6 +126,7 @@ async function loadDoc(docId) {
     markdown.value = await response.text();
   } catch (err) {
     error.value = err instanceof Error ? err.message : t('tutorialDocs_loadFailed');
+    showErrorDialog(error.value);
   } finally {
     loading.value = false;
   }

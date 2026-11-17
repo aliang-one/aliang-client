@@ -398,6 +398,8 @@ export default {
 
   // -- App --
   app_restoringSession: 'Restoring saved session...',
+  error_dialog_title: 'Operation failed',
+  error_dialog_ok: 'Got it',
 
   // -- Auth Store --
   auth_guest: 'Guest',

@@ -109,7 +109,7 @@
     <p class="mt-3 text-[11px] leading-5 text-slate-400 dark:text-slate-500">
       {{ t('agent_fileAccess_footnote') }}
     </p>
-    <p v-if="feedback" class="mt-2 text-[11px]" :class="feedbackType === 'error' ? 'text-rose-600 dark:text-rose-300' : 'text-emerald-600 dark:text-emerald-300'">
+    <p v-if="feedback && feedbackType !== 'error'" class="mt-2 text-[11px]" :class="feedbackType === 'error' ? 'text-rose-600 dark:text-rose-300' : 'text-emerald-600 dark:text-emerald-300'">
       {{ feedback }}
     </p>
   </div>
@@ -122,6 +122,7 @@ import {
   openAgentFileAccessSettings,
 } from '../../services/agentApi';
 import { useI18n } from '../../i18n';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 
 // 轮询节奏：探测是「用户在 Mac 上一个个点允许」，1.5s 足够及时又不吵。
 const POLL_INTERVAL_MS = 1500;
@@ -222,6 +223,7 @@ export default {
       } catch (_) {
         this.feedback = this.t('agent_fileAccess_requestFailed');
         this.feedbackType = 'error';
+        showErrorDialog(this.feedback);
         this.busy = false;
       }
     },
@@ -261,6 +263,7 @@ export default {
       } catch (_) {
         this.feedback = this.t('agent_fileAccess_settingsFailed');
         this.feedbackType = 'error';
+        showErrorDialog(this.feedback);
       }
     },
     categoryLabelKey(key) {

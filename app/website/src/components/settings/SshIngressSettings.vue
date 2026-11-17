@@ -45,14 +45,7 @@
     </div>
 
     <div
-      v-if="error || localError"
-      class="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-200"
-      role="alert"
-    >
-      {{ error || localError }}
-    </div>
-    <div
-      v-else-if="successMessage"
+      v-if="successMessage"
       class="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-300"
       role="status"
     >
@@ -283,6 +276,7 @@
 
 <script>
 import { useI18n } from '../../i18n';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 
 function normalizeStringList(items) {
   return Array.isArray(items)
@@ -360,7 +354,7 @@ export default {
       privKeyModal: false,
       privKeyCopied: false,
       privKeyCopyTimer: null,
-      localError: ''         // keygen 请求自身失败的红框（与父层 error prop 并列）
+      localError: ''         // keygen 请求自身失败的报错（与父层 error prop 并列,走全局弹窗）
     };
   },
   computed: {
@@ -402,10 +396,10 @@ export default {
       }
     },
     // 一键流回流（spec §2.2 v3）：父层每次保存开头清空 error/success、结尾
-    // 再置值——跃迁必触发。successMessage 只认「变为非空」；error 一概不挂
-    // watch,pending 跨保存失败保留——否则一键保存失败后（表单已带钥匙、
-    // 一键按钮已隐藏）用户手工再存成功时,丢 pending 会永久吞掉私钥且无报错
-    // （恢复链单测钉死此语义）。
+    // 再置值——跃迁必触发。successMessage 只认「变为非空」；error watch(见
+    // 下)只弹报错弹窗、不触碰 pending——pending 跨保存失败保留——否则一键
+    // 保存失败后（表单已带钥匙、一键按钮已隐藏）用户手工再存成功时,丢
+    // pending 会永久吞掉私钥且无报错（恢复链单测钉死此语义）。
     successMessage(message) {
       if (message) {
         this.loadHostkey();
@@ -417,6 +411,15 @@ export default {
             this.privKeyModal = true;
           }
           this.keygenPending = null;
+        }
+      }
+    },
+    // 保存失败回流走全局报错弹窗(2026-11-17 定案)；行内红框已撤,只弹窗
+    error: {
+      immediate: true,
+      handler(next) {
+        if (next) {
+          showErrorDialog(next);
         }
       }
     },
@@ -533,8 +536,8 @@ export default {
     },
     // 一键生成并启用（spec §2.2）：keygen → 公钥插队头 → enable=true →
     // 复用现款 save() 契约（整配置透传+ssh_ingress 覆盖）。keygen 自身失败
-    // 走 localError 红框；保存结果由父层 error/successMessage props 回流,
-    // watch 方向语义见 watch 注释。
+    // 走 localError + 全局报错弹窗（行内红框已撤）；保存结果由父层
+    // error/successMessage props 回流,watch 方向语义见 watch 注释。
     async oneClickSetup() {
       // 双击防重：keygenInFlight 在途旗标封死整个 fetch 窗口;loading/saving
       // 是父层保存态。keygenPending 刻意不进守卫——它是 v3 恢复链的载体
@@ -559,6 +562,7 @@ export default {
         this.save();
       } catch (_) {
         this.localError = this.t('sshIngress_keygenFailed');
+        showErrorDialog(this.localError);
       } finally {
         this.keygenInFlight = false;
       }

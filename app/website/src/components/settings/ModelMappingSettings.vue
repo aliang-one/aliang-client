@@ -69,8 +69,7 @@
       + {{ t('modelMapping_addRule') }}
     </button>
 
-    <div v-if="error" class="text-xs text-red-600 dark:text-red-400">{{ error }}</div>
-    <div v-else-if="successMessage" class="text-xs text-emerald-600 dark:text-emerald-400">{{ successMessage }}</div>
+    <div v-if="successMessage" class="text-xs text-emerald-600 dark:text-emerald-400">{{ successMessage }}</div>
 
     <button
       type="button"
@@ -85,6 +84,7 @@
 
 <script>
 import { useI18n } from '../../i18n';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 
 function defaultModelMapping() {
   return { enable: false, rules: {} };
@@ -140,6 +140,15 @@ export default {
     };
   },
   watch: {
+    // 报错反馈走全局弹窗(2026-11-17 定案);成功反馈仍行内展示
+    error: {
+      immediate: true,
+      handler(next) {
+        if (next) {
+          showErrorDialog(next);
+        }
+      }
+    },
     config: {
       deep: true,
       handler(nextConfig) {

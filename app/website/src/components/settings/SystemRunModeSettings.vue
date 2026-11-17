@@ -63,7 +63,8 @@
           >
             {{ wintunDependency.message || t('sys_wintunInstalling') }}
           </div>
-          <p v-if="modeError" class="text-[11px] text-red-500">{{ modeError }}</p>
+          <!-- modeError 已改走全局报错弹窗(2026-11-17 定案);琥珀横幅/冲突面板/
+               modeStatus 共享状态条属状态展示留行内;成功反馈照旧行内 -->
           <p v-if="modeSuccess" class="text-[11px] text-emerald-600 dark:text-emerald-400">{{ modeSuccess }}</p>
 
           <div class="grid grid-cols-1 gap-2">
@@ -206,6 +207,7 @@
 import { nextTick } from 'vue';
 import { useNavigation } from '../../composables/useNavigation';
 import { useRunStatus } from '../../composables/useRunStatus';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 import { useI18n } from '../../i18n';
 
 export default {
@@ -480,6 +482,7 @@ export default {
           }
         } catch {
           this.modeError = this.t('sys_tunConflictScanFailed');
+          showErrorDialog(this.modeError);
           this.selectedMode = normalizedMode;
           this.tunConflictScan = {
             should_prompt: true,
@@ -547,6 +550,7 @@ export default {
         this.selectedMode = this.pendingTunSwitchAfterInstall ? 'tun' : this.backendMode;
       } catch (err) {
         this.modeError = err instanceof Error ? err.message : this.t('sys_refreshModeFailed');
+        showErrorDialog(this.modeError);
       } finally {
         this.loadingMode = false;
       }
@@ -602,6 +606,7 @@ export default {
           this.wintunDependency,
           this.wintunDependency.error || this.wintunDependency.message || this.t('sys_wintunDependencyFailed')
         );
+        showErrorDialog(this.modeError);
         await this.dispatchTunProgressEvent('aliang:tun-progress-error', {
           title: this.t('sys_wintunInstallFailed'),
           detail: this.t('sys_wintunInstallFailedDetail'),
@@ -614,6 +619,7 @@ export default {
           null,
           err instanceof Error ? err.message : this.t('sys_refreshWintunFailed')
         );
+        showErrorDialog(this.modeError);
         await this.dispatchTunProgressEvent('aliang:tun-progress-error', {
           title: this.t('sys_wintunInstallFailed'),
           detail: this.t('sys_wintunInstallFailedDetail'),
@@ -664,6 +670,7 @@ export default {
           null,
           err instanceof Error ? err.message : this.t('sys_wintunStartFailed')
         );
+        showErrorDialog(this.modeError);
         await this.dispatchTunProgressEvent('aliang:tun-progress-error', {
           title: this.t('sys_wintunInstallFailed'),
           detail: this.t('sys_wintunInstallFailedDetail'),
@@ -690,6 +697,7 @@ export default {
         await this.refreshModeState({ preserveMessages: true });
       } catch (err) {
         this.modeError = err instanceof Error ? err.message : this.t('sys_modeSwitchFailed');
+        showErrorDialog(this.modeError);
       } finally {
         this.switchingMode = false;
       }

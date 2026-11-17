@@ -132,6 +132,9 @@ import { json } from '@codemirror/lang-json';
 import { yaml } from '@codemirror/lang-yaml';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { useI18n } from '../../i18n';
+// 动作失败反馈走全局报错弹窗(2026-11-17 定案);status 是成功/失败共用的
+// 单一渲染节点,行内渲染按改动最小方案保留(报错弹窗+行内短暂并存,可接受)
+import { showErrorDialog } from '../../composables/useErrorDialog';
 import { copyText } from '../../utils/clipboard';
 
 const { t } = useI18n();
@@ -283,6 +286,7 @@ async function saveConfig() {
     status.value = t('sync_saved');
   } catch (error) {
     status.value = t('sync_saveFailed', { msg: error.message });
+    showErrorDialog(status.value);
   } finally {
     saving.value = false;
   }
@@ -307,6 +311,7 @@ async function toggleSelect(item, selected) {
     });
   } catch (error) {
     status.value = t('sync_selectFailed', { msg: error.message });
+    showErrorDialog(status.value);
   }
 }
 
@@ -316,6 +321,7 @@ async function copyContent(item) {
   const copied = await copyText(item.content || '');
   if (!copied) {
     status.value = t('sync_copyUnavailable');
+    showErrorDialog(status.value);
     return;
   }
   try {
@@ -333,6 +339,7 @@ async function copyContent(item) {
     status.value = t('sync_copied', { name: item.name });
   } catch (error) {
     status.value = t('sync_copyFailed', { msg: error.message });
+    showErrorDialog(status.value);
   }
 }
 
@@ -364,6 +371,7 @@ async function applyItem(item) {
     await loadConfigs();
   } catch (error) {
     status.value = t('sync_applyFailed', { msg: error.message });
+    showErrorDialog(status.value);
   }
 }
 
@@ -377,6 +385,7 @@ async function removeConfig(item) {
     status.value = t('sync_deleted', { name: item.name });
   } catch (error) {
     status.value = t('sync_deleteFailed', { msg: error.message });
+    showErrorDialog(status.value);
   }
 }
 
@@ -405,6 +414,7 @@ async function compareWithCloud() {
     status.value = t('sync_compareComplete', { count: data.items?.length || 0 });
   } catch (error) {
     status.value = t('sync_compareFailed', { msg: error.message });
+    showErrorDialog(status.value);
   } finally {
     comparing.value = false;
   }
@@ -427,6 +437,7 @@ async function pushSelectedToCloud() {
     status.value = t('sync_pushedCount', { count: data.synced_count || 0, time: data.last_synced_at || '' });
   } catch (error) {
     status.value = t('sync_pushFailed', { msg: error.message });
+    showErrorDialog(status.value);
   } finally {
     pushing.value = false;
   }
@@ -434,5 +445,6 @@ async function pushSelectedToCloud() {
 
 loadConfigs().catch((error) => {
   status.value = t('sync_initFailed', { msg: error.message });
+  showErrorDialog(status.value);
 });
 </script>

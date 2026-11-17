@@ -27,10 +27,6 @@
       <span class="material-symbols-outlined mr-2 text-base motion-safe:animate-spin">progress_activity</span>
       {{ t('agent_integrations_loading') }}
     </div>
-    <div
-      v-else-if="error"
-      class="mt-5 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300"
-    >{{ error }}</div>
 
     <template v-else>
       <!-- MCP 服务 -->
@@ -165,6 +161,7 @@
 
 <script>
 import { useI18n } from '../../i18n';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 import { getAgentIntegrations } from '../../services/agentApi';
 import { kernelStateBadge, mcpEndpointLabel, sourceLabels } from '../../utils/integrations';
 
@@ -227,8 +224,9 @@ export default {
         this.serverPage = 1;
         this.skillPage = 1;
       } catch (_) {
-        // 代理失败/离线：给可读错误，不留白屏
+        // 代理失败/离线：报错走全局弹窗；主模板保持空数据区块渲染(不白屏)
         this.error = this.t('agent_integrations_loadFailed');
+        showErrorDialog(this.error);
       } finally {
         this.loading = false;
       }

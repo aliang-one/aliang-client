@@ -74,7 +74,6 @@
     <p class="mt-3 text-[11px] leading-4 text-slate-500 dark:text-slate-400">{{ t('agentCore_hint') }}</p>
 
     <div v-if="localError" class="mt-3 text-xs text-red-600 dark:text-red-400" role="status">{{ localError }}</div>
-    <div v-else-if="error" class="mt-3 text-xs text-red-600 dark:text-red-400" role="status">{{ error }}</div>
     <div v-else-if="successMessage" class="mt-3 text-xs text-emerald-600 dark:text-emerald-400" role="status">{{ successMessage }}</div>
 
     <button
@@ -91,6 +90,7 @@
 
 <script>
 import { useI18n } from '../../i18n';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 import {
   agentCoreTuningToLineFormat,
   normalizeAgentCoreLLMConfig,
@@ -131,6 +131,16 @@ export default {
     }
   },
   watch: {
+    // 加载/保存失败(error prop)走全局报错弹窗(2026-11-17 定案);
+    // localError 是实时门禁校验 computed,仍行内展示并阻止提交。
+    error: {
+      immediate: true,
+      handler(next) {
+        if (next) {
+          showErrorDialog(next);
+        }
+      }
+    },
     config: {
       deep: true,
       handler(nextConfig) {

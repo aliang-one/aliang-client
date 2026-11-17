@@ -506,8 +506,6 @@
           </select>
         </label>
 
-        <p v-if="createError" class="mt-2 text-[11px] leading-5 text-rose-600 dark:text-rose-400">{{ createError }}</p>
-
         <div class="mt-5 flex items-center justify-end gap-2">
           <button
             type="button"
@@ -542,7 +540,6 @@
         <p class="mt-2 text-[12px] leading-5 text-slate-500 dark:text-slate-400">
           {{ t('qs_combo_delete_confirm', { name: activeCombo.name }) }}
         </p>
-        <p v-if="deleteError" class="mt-2 text-[11px] leading-5 text-rose-600 dark:text-rose-400">{{ deleteError }}</p>
         <div class="mt-5 flex items-center justify-end gap-2">
           <button
             type="button"
@@ -629,6 +626,7 @@ import {
   updateCombo,
 } from '../services/quickSetupApi';
 import { useI18n } from '../i18n';
+import { showErrorDialog } from '../composables/useErrorDialog';
 import ConfigDiffEditors from './ConfigDiffEditors.vue';
 import QuickSetupConfigurePanel from './QuickSetupConfigurePanel.vue';
 import QuickSetupResultPanel from './QuickSetupResultPanel.vue';
@@ -1212,6 +1210,7 @@ async function confirmDeleteCombo() {
     }
   } catch (error) {
     deleteError.value = errorText(error);
+    showErrorDialog(deleteError.value);
   } finally {
     comboSaving.value = false;
   }
@@ -1262,6 +1261,7 @@ async function confirmCreateCombo() {
     comboCreating.value = false;
   } catch (error) {
     createError.value = errorText(error);
+    showErrorDialog(createError.value);
   } finally {
     comboSaving.value = false;
   }

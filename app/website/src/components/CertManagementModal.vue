@@ -38,8 +38,7 @@
         <div
           class="p-4 rounded-lg bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-700"
         >
-          <div v-if="statusError" class="text-sm text-red-500">{{ statusError }}</div>
-          <div v-else-if="certStatus" class="space-y-2">
+          <div v-if="certStatus" class="space-y-2">
             <div class="flex flex-wrap gap-2">
               <span
                 class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium"
@@ -289,7 +288,7 @@
 
         <!-- Feedback Message -->
         <div
-          v-if="feedback"
+          v-if="feedback && feedback.type !== 'error'"
           class="p-3 rounded border text-xs"
           :class="feedback.type === 'error'
             ? 'border-red-200 dark:border-red-700/40 bg-red-50/60 dark:bg-red-900/10 text-red-600 dark:text-red-300'
@@ -342,6 +341,7 @@
 <script setup>
 import { computed, reactive, ref, onMounted, onUnmounted, watch } from 'vue';
 import { useCertStatus } from '../composables/useCertStatus';
+import { showErrorDialog } from '../composables/useErrorDialog';
 import { useI18n } from '../i18n';
 
 const API_BASE = '/api';
@@ -404,6 +404,10 @@ function saveAudit(operation, ok, message) {
 function showFeedback(message, type = 'success') {
   if (feedbackTimer) clearTimeout(feedbackTimer);
   feedback.value = { message, type };
+  // 操作失败类反馈统一走全局报错弹窗(2026-11-17 定案);行内条只留成功类
+  if (type === 'error') {
+    showErrorDialog(message);
+  }
   feedbackTimer = setTimeout(() => { feedback.value = null; }, 6000);
 }
 
@@ -800,6 +804,14 @@ watch(() => props.modelValue, (val) => {
     if (!operationBusy.value) stopPolling();
   }
 });
+
+// 证书状态加载失败走全局报错弹窗(2026-11-17 定案);statusError 由
+// useCertStatus 组合式内部赋值,行内红字节点已移除,这里订阅弹出
+watch(statusError, (next) => {
+  if (next) {
+    showErrorDialog(next);
+  }
+}, { immediate: true });
 
 onMounted(() => {
   document.addEventListener('keydown', onKeydown);

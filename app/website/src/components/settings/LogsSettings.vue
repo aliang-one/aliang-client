@@ -388,10 +388,6 @@
         </div>
       </section>
 
-      <div v-if="statusError" class="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-900 dark:bg-rose-950/30 dark:text-rose-300">
-        {{ statusError }}
-      </div>
-
       <section class="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-background-dark">
         <button
           type="button"
@@ -467,9 +463,6 @@
             class="mt-4 overflow-y-auto rounded-xl border border-slate-200 bg-slate-950 p-4 font-mono text-xs text-slate-300 dark:border-slate-800"
             style="height: 460px;"
           >
-            <div v-if="logsError" class="mb-3 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-200">
-              {{ logsError }}
-            </div>
             <div v-if="!filteredEntries.length" class="rounded-lg border border-dashed border-slate-700 bg-slate-900/60 px-4 py-6 text-sm text-slate-500">
               {{ t('logs_noData') }}
             </div>
@@ -505,6 +498,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useI18n } from '../../i18n';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 import { blockIngressSession, getIngressSessions, getStatusConnections, getStatusSummary, kickIngressSession as kickSessionApi, unblockIngressSession } from '../../services/statusApi';
 
 const { t } = useI18n();
@@ -937,6 +931,7 @@ async function loadStatus() {
     lastUpdatedAt.value = Date.now();
   } catch (error) {
     statusError.value = error instanceof Error ? error.message : t('status_summaryLoadFailed');
+    showErrorDialog(statusError.value);
   } finally {
     isStatusLoading.value = false;
   }
@@ -1026,6 +1021,7 @@ async function loadLogs() {
     await scrollToBottomIfNeeded();
   } catch (error) {
     logsError.value = error instanceof Error ? error.message : t('logs_loadFailed');
+    showErrorDialog(logsError.value);
   } finally {
     isLogsLoading.value = false;
   }
@@ -1042,6 +1038,7 @@ async function clearLogs() {
     entries.value = [];
   } catch (error) {
     logsError.value = error instanceof Error ? error.message : t('logs_clearFailed');
+    showErrorDialog(logsError.value);
   }
 }
 

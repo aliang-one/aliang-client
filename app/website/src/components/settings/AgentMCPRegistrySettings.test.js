@@ -15,12 +15,18 @@ vi.mock('../../services/agentApi', () => ({
   deleteAliangMCPServer: vi.fn(),
   getAgentIntegrations: vi.fn(),
 }));
+// 报错反馈统一走全局弹窗(2026-11-17 定案)——组件测试 mock 该模块,断言
+// showErrorDialog 收到对应 i18n 键;行内不再渲染错误文本。
+vi.mock('../../composables/useErrorDialog', () => ({
+  showErrorDialog: vi.fn()
+}));
 
 import { createApp, h } from 'vue';
 import AgentMCPRegistrySettings, {
   formatKeyValueLines,
   parseKeyValueLines,
 } from './AgentMCPRegistrySettings.vue';
+import { showErrorDialog } from '../../composables/useErrorDialog';
 import {
   deleteAliangMCPServer,
   getAgentIntegrations,
@@ -63,6 +69,7 @@ function setInput(el, field, value) {
 describe('AgentMCPRegistrySettings MCP 注册表管理卡', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(showErrorDialog).mockClear();
     getAliangMCPRegistry.mockResolvedValue(registryData());
     getAgentIntegrations.mockResolvedValue({ mcp_servers: [] });
     putAliangMCPServer.mockResolvedValue({ codex_sync: { ok: true } });
@@ -100,7 +107,7 @@ describe('AgentMCPRegistrySettings MCP 注册表管理卡', () => {
     expect(el.querySelector('[data-field="command"]')).toBeFalsy();
   });
 
-  it('客户端校验：非法名提交不发 PUT 且显示 name_invalid', async () => {
+  it('客户端校验：非法名提交不发 PUT 且报错走全局弹窗(name_invalid)', async () => {
     const el = mountComp();
     await flush();
     buttonByText(el, 'agent_mcp_registry_add').click();
@@ -109,8 +116,8 @@ describe('AgentMCPRegistrySettings MCP 注册表管理卡', () => {
     buttonByText(el, 'agent_mcp_registry_save').click();
     await flush();
     expect(putAliangMCPServer).not.toHaveBeenCalled();
-    expect(el.textContent).toContain('agent_mcp_registry_name_invalid');
-    // 弹窗保持打开，等用户修正
+    expect(showErrorDialog).toHaveBeenCalledWith('agent_mcp_registry_name_invalid');
+    // 表单弹窗保持打开，等用户修正
     expect(el.querySelector('[data-field="name"]')).toBeTruthy();
   });
 
