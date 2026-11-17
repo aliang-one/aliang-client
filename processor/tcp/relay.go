@@ -170,8 +170,25 @@ func (r *DefaultRelayManager) Relay(ctx context.Context, originConn, remoteConn 
 	go r.relayStream(remoteConn, originConn, "client->server", &wg, requestCapture, nil, &clientToServerBytes, ctx, metadata, completionTracker)
 	go r.relayStream(originConn, remoteConn, "server->client", &wg, responseCapture, markFirstResponse, &serverToClientBytes, ctx, metadata, completionTracker)
 
-	// Wait for both directions to complete
-	wg.Wait()
+	// 等双向排空,但尊重拆除信号:ctx 取消(engine.stop 的拆除代次/调用方
+	// 主动取消)时主动断开两端让阻塞读立即退出,再给短窗口收尾统计——
+	// 退出优先,统计尽力保全。ctx 为 Background 时与旧版行为等价(永不触发)。
+	relayDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(relayDone)
+	}()
+	select {
+	case <-relayDone:
+	case <-ctx.Done():
+		_ = originConn.Close()
+		_ = remoteConn.Close()
+		select {
+		case <-relayDone:
+		case <-time.After(relayTeardownWait):
+			logger.Warn(fmt.Sprintf("[RELAY] conn_id=%s teardown wait timed out after cancel; abandoning stats wait (leaked streams tolerated on shutdown)", connID))
+		}
+	}
 
 	stats.CompletedAt = time.Now()
 	if firstNs := atomic.LoadInt64(&firstResponseNano); firstNs > 0 {
@@ -476,6 +493,10 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 	}
 	return n, err
 }
+
+// relayTeardownWait 是 ctx 取消后等待两个方向的 stream 退场收尾统计的
+// 兜底上界。
+const relayTeardownWait = 2 * time.Second
 
 // SimpleRelayFunc provides a simple pipe function compatible with existing code.
 // It creates a default relay manager and uses it to relay data.

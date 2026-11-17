@@ -241,3 +241,31 @@ func TestWrapCloseWithPeer_ForwardsHalfCloseWithoutClosingPeer(t *testing.T) {
 		t.Fatalf("peer close count = %d, want 0", peer.closeCount)
 	}
 }
+
+// TestRelayReturnsOnContextCancel 钉拆除语义(2026-11-16 停止链挂死修复的
+// 回归护栏):ctx 取消时 Relay 必须主动断开两端并快速返回,而不是无界
+// wg.Wait 等对端/半关闭 deadline。pipe 两端互不发数据,旧实现会永久挂死。
+func TestRelayReturnsOnContextCancel(t *testing.T) {
+	manager := NewDefaultRelayManager()
+	originConn, originPeer := net.Pipe()
+	remoteConn, remotePeer := net.Pipe()
+	defer func() { _ = originPeer.Close(); _ = remotePeer.Close() }()
+	metadata := &M.Metadata{Network: M.TCP, ConnID: "tun-ctx-cancel"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := manager.Relay(ctx, originConn, remoteConn, metadata)
+		done <- err
+	}()
+
+	// 让两条 stream 先进入阻塞读,再触发拆除信号。
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Relay did not return after context cancel — teardown regression")
+	}
+}

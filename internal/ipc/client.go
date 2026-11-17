@@ -43,6 +43,15 @@ func NewClientWithHTTP(httpURL string) *Client {
 	}
 }
 
+// NewClientWithTransport creates an IPC client over the given transport
+// (测试注入用)。
+func NewClientWithTransport(transport Transport, httpURL string) *Client {
+	return &Client{
+		transport: transport,
+		httpURL:   httpURL,
+	}
+}
+
 // Connect establishes connection to the Core daemon via IPC.
 func (c *Client) Connect() error {
 	c.mu.Lock()
@@ -83,13 +92,17 @@ func (c *Client) Close() error {
 // Send sends an IPC request and returns the response.
 // If IPC fails, it falls back to HTTP for development mode.
 func (c *Client) Send(action string, args interface{}) (*Response, error) {
-	// Try IPC first
-	if c.IsConnected() {
-		return c.sendIPC(action, args)
+	// Try IPC first. 断线状态先拨一次:core 换代(服务重启/崩溃恢复)后旧
+	// 管道已死,不重拨则 start_http/sync_agent_auth/stop_http 这些
+	// IPC-only 动作在 HTTP 回退里硬报错、永远失效(companion 的
+	// syncStateLoop 每 2s 一发,恰好提供自然重试节拍)。单次快速拨号、
+	// 绝不循环重拨,防 core 长期不可用时的拨号风暴。
+	if !c.IsConnected() {
+		if err := c.Connect(); err != nil {
+			return c.sendHTTP(action, args)
+		}
 	}
-
-	// Fallback to HTTP for development mode
-	return c.sendHTTP(action, args)
+	return c.sendIPC(action, args)
 }
 
 func (c *Client) sendIPC(action string, args interface{}) (*Response, error) {

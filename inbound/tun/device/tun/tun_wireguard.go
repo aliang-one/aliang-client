@@ -5,6 +5,7 @@ package tun
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/inbound/tun/device"
@@ -12,6 +13,9 @@ import (
 
 	"golang.zx2c4.com/wireguard/tun"
 )
+
+// endpointWaitTimeout 是 Close 后等待 Endpoint 读写协程退场的兜底上界。
+const endpointWaitTimeout = 3 * time.Second
 
 type TUN struct {
 	*iobased.Endpoint
@@ -98,6 +102,19 @@ func (t *TUN) Close() {
 		_ = t.nt.Close()
 	}
 	if t.Endpoint != nil {
-		t.Endpoint.Wait()
+		// Endpoint.Wait 等读写协程退场;device 已关,正常毫秒级返回。给
+		// 3s 上界:异常挂死时放弃等待优于让整个停止链挂死(2026-11-16
+		// Windows 停止链 StopPending 挂死实锤)。退出场景下泄漏安全;
+		// 单例已置 nil,复用取新设备,不会与被放弃的 device 重组。
+		done := make(chan struct{})
+		go func() {
+			t.Endpoint.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(endpointWaitTimeout):
+			logger.Warn("TUN endpoint wait timed out after close (goroutines leaked; safe on shutdown)")
+		}
 	}
 }

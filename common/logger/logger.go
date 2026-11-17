@@ -67,12 +67,15 @@ func (ml *mainLogger) newFileWriter() io.Writer {
 	}
 
 	if ml.config.EnableFileRotation {
-		return &lumberjack.Logger{
+		// 轮转写器包弹性兜底:Windows 下双进程共享日志文件时 lumberjack
+		// 的 rename 轮转会因对方句柄永久失败并静默丢弃全部日志(0.196
+		// 2026-11-16 实锤),详见 rotate_resilient.go。
+		return newRotateResilientWriter(&lumberjack.Logger{
 			Filename:   ml.config.FileLogPath,
 			MaxSize:    int(ml.config.MaxLogSize / 1024 / 1024),
 			MaxBackups: ml.config.MaxLogBackups,
 			Compress:   true,
-		}
+		}, ml.config.FileLogPath)
 	}
 
 	file, err := os.OpenFile(ml.config.FileLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)

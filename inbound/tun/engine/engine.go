@@ -57,6 +57,9 @@ func Stop() {
 	}
 }
 
+// stackWaitTimeout 是 stack.Close 后等待 gvisor stack 排空的兜底上界。
+const stackWaitTimeout = 5 * time.Second
+
 // IsRunning reports the actual engine resource state rather than a UI/service
 // bookkeeping flag. It is used by auth demotion to tear down a desynchronized
 // TUN runtime safely.
@@ -98,6 +101,11 @@ func stop() (err error) {
 	_defaultStack = nil
 	_defaultProxy = nil
 
+	// 先发拆除信号再关设备:在途 Relay 的等待经 ctx.Done 立即有界退出,
+	// 而不是等对端关闭或半关闭 deadline(最长 5 分钟)——那是停止链挂死
+	// (2026-11-16 StopPending)的帮凶之一。
+	tunnel.T().CancelTeardown()
+
 	if device != nil {
 		device.Close()
 	}
@@ -107,7 +115,19 @@ func stop() (err error) {
 	}
 	if stack != nil {
 		stack.Close()
-		stack.Wait()
+		// stack.Wait 加界:关闭后正常立即返回,异常挂死时放弃等待优于
+		// 让整个停止链(持 _engineMu)挂死并传染 IPC/SCM(2026-11-16
+		// 实锤)。退出场景泄漏安全;单例已置 nil,复用取新 stack。
+		done := make(chan struct{})
+		go func() {
+			stack.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(stackWaitTimeout):
+			logger.Warn("[ENGINE] stack wait timed out after close; continuing teardown")
+		}
 	}
 	return nil
 }

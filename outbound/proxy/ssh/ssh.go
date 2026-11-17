@@ -46,8 +46,11 @@ type SSH struct {
 // New 组装 SSH 出口;不连网(首次拨号懒建)。fail-fast:终点与全部跳板的
 // 私钥在此解析,坏 PEM 即报错;hostsDir 为空或不可创建同样报错——否则
 // 这些问题会推迟到首条连接的握手/落盘阶段才暴露。
-// poolSize 语义(registry 契约):0 → 默认 3;负数钳到 1;>16 钳到 16;
-// 显式 1..16 原样。
+// poolSize 语义(registry 契约):0 → 默认 1;负数钳到 1;>16 钳到 16;
+// 显式 1..16 原样。默认 1(2026-11-17):SSH 通道本就在单连接内多路复用,
+// 一条配置默认即一条 SSH 连接——旧默认 3 会在同一路径并行建 3 条链,由此
+// 派生「1 条配置显 3 链路」的困惑与死链观感;需要并行度的部署显式配
+// pool_size(1..16 仍支持)。
 func New(final NodeConfig, poolSize int, jumps []NodeConfig, hostsDir string) (*SSH, error) {
 	if hostsDir == "" {
 		return nil, errors.New("ssh: hostsDir 不能为空(known_hosts 需要落盘目录)")
@@ -67,7 +70,7 @@ func New(final NodeConfig, poolSize int, jumps []NodeConfig, hostsDir string) (*
 		}
 	}
 	if poolSize == 0 {
-		poolSize = 3
+		poolSize = 1
 	}
 	if poolSize < 1 {
 		poolSize = 1

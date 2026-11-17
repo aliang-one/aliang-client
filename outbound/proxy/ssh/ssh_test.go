@@ -165,13 +165,13 @@ func TestSSHBadPrivateKeyFailFast(t *testing.T) {
 }
 
 // TestSSHPoolSizeClamp 钉 poolSize 语义(registry 契约):
-// 0 → 默认 3;负数钳 1;>16 钳 16;显式 1..16 原样。
+// 0 → 默认 1;负数钳 1;>16 钳 16;显式 1..16 原样。
 func TestSSHPoolSizeClamp(t *testing.T) {
 	for _, tc := range []struct {
 		in   int
 		want int
 	}{
-		{0, 3},
+		{0, 1},
 		{-5, 1},
 		{1, 1},
 		{3, 3},
