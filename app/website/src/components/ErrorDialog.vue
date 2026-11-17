@@ -36,9 +36,10 @@
 </template>
 
 <script setup>
-import { onMounted, onUnmounted } from 'vue';
+import { computed } from 'vue';
 import { useI18n } from '../i18n';
 import { closeErrorDialog, errorDialogState } from '../composables/useErrorDialog';
+import { useEscLayer } from '../composables/useEscStack';
 
 const { t } = useI18n();
 const state = errorDialogState();
@@ -47,12 +48,6 @@ function close() {
   closeErrorDialog();
 }
 
-// Esc 关闭与仓库其他模态(CertManagementModal/滚回面板)同约定
-function onKeydown(e) {
-  if (e.key === 'Escape' && state.open) {
-    close();
-  }
-}
-onMounted(() => window.addEventListener('keydown', onKeydown));
-onUnmounted(() => window.removeEventListener('keydown', onKeydown));
+// Esc 关闭走全局层级栈:打开即压层,关闭即移除(栈顶独占,与其他模态统一调度)
+useEscLayer('error-dialog', close, computed(() => state.open));
 </script>

@@ -1003,6 +1003,7 @@
 <script setup>
 import { computed, ref, onMounted, onUnmounted, watch, nextTick } from 'vue';
 import OnboardingGuide from './OnboardingGuide.vue';
+import { useEscLayer } from '../composables/useEscStack';
 import ScanLoginPanel from './settings/ScanLoginPanel.vue';
 import { isOnboardingCompleted, openOnboardingGuide } from '../composables/useOnboardingGuide';
 import { openTutorialDocs } from '../composables/useTutorialDocs';
@@ -1759,20 +1760,12 @@ function onScanLoginSuccess() {
   loginPassword.value = '';
 }
 
-function handleDashboardKeydown(event) {
-  if (!(event instanceof KeyboardEvent) || event.key !== 'Escape') {
-    return;
-  }
-
-  if (isLoginModalOpen.value && !loginPending.value) {
-    closeLoginModal();
-    return;
-  }
-
-  if (tunStartModal.value.visible) {
-    closeTunStartModal();
-  }
-}
+// Esc 关闭走全局层级栈(替换原 handleDashboardKeydown 逐个 if 判断)。
+// 登录弹窗的 loginPending 守卫留在 handler 内:登录进行中 Esc 被吞不透传。
+useEscLayer('login-modal', () => {
+  if (!loginPending.value) closeLoginModal();
+}, () => isLoginModalOpen.value);
+useEscLayer('tun-start-modal', closeTunStartModal, () => tunStartModal.value.visible);
 
 function openCertModal() {
   emit('openCertModal');
@@ -2224,7 +2217,6 @@ onMounted(() => {
   serverLinkTimer = window.setInterval(sampleServerLink, 15000);
   syncAccountBalance();
   loadDashboardUsageData();
-  window.addEventListener('keydown', handleDashboardKeydown);
   window.addEventListener('aliang:tun-progress-open', handleExternalTunProgressOpen);
   window.addEventListener('aliang:tun-progress-update', handleExternalTunProgressUpdate);
   window.addEventListener('aliang:tun-progress-success', handleExternalTunProgressSuccess);
@@ -2245,7 +2237,6 @@ onUnmounted(() => {
     window.clearInterval(serverLinkTimer);
     serverLinkTimer = null;
   }
-  window.removeEventListener('keydown', handleDashboardKeydown);
   window.removeEventListener('aliang:tun-progress-open', handleExternalTunProgressOpen);
   window.removeEventListener('aliang:tun-progress-update', handleExternalTunProgressUpdate);
   window.removeEventListener('aliang:tun-progress-success', handleExternalTunProgressSuccess);

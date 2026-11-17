@@ -143,8 +143,10 @@
 // 聊天页编排壳：状态与全部业务逻辑收在 useAliangChat（WS 生命周期/看门狗/
 // 帧路由/审批/steer/三源清单/持久化），渲染拆在 chat/ 组件树（侧栏、顶栏、
 // 设置条、消息列表、气泡、审批卡、输入区）。本文件只做组件接线。
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
-import { isComposingEvent, useAliangChat } from '../composables/useAliangChat';
+import { computed, ref, watch } from 'vue';
+import { useAliangChat } from '../composables/useAliangChat';
+import { useNavigation } from '../composables/useNavigation';
+import { useEscLayer } from '../composables/useEscStack';
 import { normalizeDeviceProvider } from '../utils/chatSettings';
 import ChatSidebar from './chat/ChatSidebar.vue';
 import ChatHeader from './chat/ChatHeader.vue';
@@ -232,6 +234,9 @@ const {
   toggleSkill,
 } = useAliangChat();
 
+// ESC 页面返回层的闸门来源(组件本身由 App.vue v-if 控制,这里是双保险条件)
+const { currentPage } = useNavigation();
+
 // 子agent入口条挂载门（Task 7, spec 2026-11-07-subagent-panel §三）：仅
 // AliangCode（agentcore 归一）会话且有子agent条目时挂载；条目数据经
 // useAliangChat.activeSubagents（会话归属守卫在 getter 内）下传。
@@ -299,27 +304,13 @@ function onRecallConfirm() {
   sendRecall(activeConversation.value);
 }
 
-// 文档级 Esc 分流：撤回编辑态（chat-recall-banner 在场）优先消费——取消编辑
-// 态并恢复进入前草稿（spec §A「退出：banner 取消按钮或 Esc」），不关页。分层
-// 消费：Esc 先过 Composer textarea 的 keydown 再冒泡到这里——组合期被
-// isComposingEvent 守卫放行（归属输入法，这里同口径不消费）；slash 弹层分支
-// 在编辑态被禁用（onSlashInput 守卫）不会并发；非编辑态仍走 close() 关页。
-function handleKeydown(e) {
-  if (e.key === 'Escape') {
-    if (recallActive.value) {
-      if (isComposingEvent(e)) return;
-      cancelRecall();
-      return;
-    }
-    close();
-  }
-}
-
-onMounted(() => {
-  document.addEventListener('keydown', handleKeydown);
-});
-
-onUnmounted(() => {
-  document.removeEventListener('keydown', handleKeydown);
-});
+// ── ESC 层级栈接入(替换文档级 handleKeydown 分流)──
+// 页面返回层:当前页是 chat 时压层,handler 走 close()(在途重命名先落地再回
+// dashboard,见 useAliangChat.close;组件由 v-if 挂载,computed 条件为双保险)。
+// 撤回编辑态层后注册、后激活者压在页面层之上:banner 在场 Esc 只取消编辑态,
+// 不关页(spec §A「退出:banner 取消按钮或 Esc」)。IME 组合期透传由 dispatcher
+// 统一守(isComposing||keyCode===229),原 handleKeydown 内的 isComposingEvent
+// 分支随之退役。
+useEscLayer('page-return', close, () => currentPage.value === 'chat');
+useEscLayer('chat-recall-edit', cancelRecall, () => recallActive.value);
 </script>

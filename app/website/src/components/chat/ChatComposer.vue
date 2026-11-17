@@ -333,6 +333,10 @@ function onInputKeydown(e) {
     if (e.key === 'Escape') {
       emit('slash-close');
       e.preventDefault();
+      // 弹层在本输入框内消化,不冒泡:否则事件继续上行使全局 Esc 层(页面
+      // 返回层)二次响应,关弹层的同时把聊天页也关掉(旧链的预存双关,
+      // ChatPage 兜底 handler 收编进层级栈后由此处 stopPropagation 封口)
+      e.stopPropagation();
       return;
     }
   }

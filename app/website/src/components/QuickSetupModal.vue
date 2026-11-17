@@ -614,7 +614,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
+import { computed, nextTick, ref, watch } from 'vue';
 import {
   applyQuickSetup,
   createCombo,
@@ -627,6 +627,7 @@ import {
 } from '../services/quickSetupApi';
 import { useI18n } from '../i18n';
 import { showErrorDialog } from '../composables/useErrorDialog';
+import { useEscLayer } from '../composables/useEscStack';
 import ConfigDiffEditors from './ConfigDiffEditors.vue';
 import QuickSetupConfigurePanel from './QuickSetupConfigurePanel.vue';
 import QuickSetupResultPanel from './QuickSetupResultPanel.vue';
@@ -885,14 +886,9 @@ const createReady = computed(() => {
   }
   return true;
 });
-// 模态内嵌套弹窗（新建/删除确认、恢复原始配置确认）或恢复进行中的占用期：
-// 任一占用都屏蔽外层 Esc 关闭，避免绕过确认守卫
-const comboOverlayOpen = computed(() => (
-  comboCreating.value
-  || deleteConfirmOpen.value
-  || restoreConfirmOpen.value
-  || restoring.value
-));
+// 嵌套弹窗/恢复流程的 Esc 守卫不再手写(comboOverlayOpen 已删):各占用态
+// 经 useEscLayer 各自压层,栈顶独占天然保证「先关内层、占用期吞 Esc」,
+// 不可能绕过确认守卫直接关主弹窗。层注册见下方 Esc 层级栈区块。
 
 function selectSoftware(code) {
   if (selectedSoftware.value === code) {
@@ -1350,16 +1346,19 @@ function errorText(error) {
   return error instanceof Error ? error.message : String(error ?? '');
 }
 
-function onModalKeydown(event) {
-  // 嵌套确认弹窗占用期（恢复守卫 / 组合新建与删除确认）不响应外层 Esc
-  if (comboOverlayOpen.value) {
-    return;
-  }
-  if (event.key === 'Escape' && props.open) {
-    event.stopImmediatePropagation();
-    emit('close');
-  }
-}
+// ── ESC 层级栈接入(替换 onModalKeydown + window 监听)──
+// 栈序即优先序:主弹窗先注册(底),嵌套弹窗/占用态后激活者在顶。
+// Esc 永远只作用栈顶:内层开着关内层,恢复进行中吞 Esc,都不可能绕守卫关主弹窗。
+useEscLayer('quick-setup', () => emit('close'), () => props.open);
+useEscLayer('quick-setup-create', closeCreateDialog, () => comboCreating.value);
+useEscLayer('quick-setup-delete-confirm', () => {
+  deleteConfirmOpen.value = false;
+}, () => deleteConfirmOpen.value);
+useEscLayer('quick-setup-restore-confirm', () => {
+  if (!restoring.value) restoreConfirmOpen.value = false;
+}, () => restoreConfirmOpen.value);
+useEscLayer('quick-setup-restoring', () => {}, () => restoring.value);
+
 async function loadCatalog() {
   loadingCatalog.value = true;
   statusMessage.value = '';
@@ -1410,11 +1409,5 @@ watch(
 watch(selectedSoftware, () => {
   pickDefaultCombo();
   refreshLiveFiles();
-});
-onMounted(() => {
-  window.addEventListener('keydown', onModalKeydown, true);
-});
-onUnmounted(() => {
-  window.removeEventListener('keydown', onModalKeydown, true);
 });
 </script>
