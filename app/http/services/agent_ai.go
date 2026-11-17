@@ -51,6 +51,10 @@ type agentAIManager struct {
 	// 纯内存（进程崩溃场景=registry 同亡，靠服务端详情合成兜底），封顶丢弃最旧。
 	pendingSubagentTerminals map[string]map[string]interface{}
 	pendingSubagentOrder     []string
+	// pendingSubagentStamp 是同键写入序号（2026-11-17 审计 P2）：重放清账按
+	// 「快照时的戳 == 现在的戳」判定，窗口内被新终态覆盖的键不被旧帧清账连带
+	// 删除（map 值不可比，戳是身份判定的最小实现）。
+	pendingSubagentStamp map[string]uint64
 	// pendingApprovalRequests 是审批请求投递 journal(L1 可靠投递,2026-11-01,
 	// 见 agent_ai_approval_journal.go):approval_id → 原始 request payload。
 	// 发送前 remember,服务端 ai.approval.request.ack / waiter 终结时清除,
@@ -1347,6 +1351,7 @@ func newAgentAIManager() *agentAIManager {
 		codexInputs:              make(map[string]*agentAICodexInputWaiter),
 		pendingTerminals:         make(map[string]map[string]interface{}),
 		pendingSubagentTerminals: make(map[string]map[string]interface{}),
+		pendingSubagentStamp:     make(map[string]uint64),
 		pendingApprovalRequests:  make(map[string]map[string]interface{}),
 		bindings:                 make(map[string]agentAIBindingRecord),
 		processedRuns:            make(map[string]agentAIProcessedRun),
@@ -1373,7 +1378,11 @@ func (m *agentAIManager) runEmitter(run agentAIRun, write agentTerminalWriter) *
 			logger.Info(fmt.Sprintf("[ai.run.terminal] status=%s type=%s session=%s run=%s seq=%v",
 				remoteString(payload, "status"), remoteString(payload, "type"), run.sessionID, run.runID, payload["event_seq"]))
 			if err := m.rememberPendingTerminal(payload); err != nil {
-				return err
+				// 持久化失败不能拦下帧本身：这里早退会让 emit 连写线都不做——
+				// 终态帧对全端静默丢失，健康连接数天不重连=云端永卡 running
+				// （审计 2026-11-17 P1）。内存账在 remember 里已落（重连即重放），
+				// 这里只降级成响亮日志继续走。
+				logger.Error(fmt.Sprintf("[ai.run.terminal] 持久化失败 run=%s session=%s err=%v——终态帧照常上行,重连由内存账重放", run.runID, run.sessionID, err))
 			}
 			return m.completeProcessedRun(run.runID, payload)
 		}
@@ -5838,7 +5847,14 @@ func truncateForCloud(value string) string {
 	if len(value) <= agentAICloudFieldCap {
 		return value
 	}
-	return value[:agentAICloudFieldCap] + "…<truncated>"
+	// rune 安全截断（2026-11-17 审计 P2）：字节下标裸切会把多字节 rune 劈成
+	// 非法 UTF-8 尾巴。json.Marshal 会把非法字节消毒成 U+FFFD——线协议不破，
+	// 但截点处字符花屏；按 rune 边界回退至多 3 字节，截点干净。
+	cut := value[:agentAICloudFieldCap]
+	for len(cut) > 0 && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut + "…<truncated>"
 }
 
 // emitCodexFileChangeEvents fans a codex fileChange item's changes out as one

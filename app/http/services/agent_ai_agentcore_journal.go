@@ -342,8 +342,18 @@ func (j *agentCoreJournal) healMergeJournal(sourceSessionID, targetSessionID str
 		body.WriteString("\n")
 		moved++
 	}
-	file, err := os.OpenFile(targetPath, os.O_APPEND|os.O_WRONLY, 0o600)
+	// O_RDWR 而非 O_WRONLY：封口探测要 ReadAt 尾字节，写只读描述符直接 EBADF
+	// （同 appendLineLocked 的取舍，见其注释）。
+	file, err := os.OpenFile(targetPath, os.O_APPEND|os.O_RDWR, 0o600)
 	if err != nil {
+		return 0, false
+	}
+	// 残行封口（2026-11-17 审计 P2）：appendLineLocked 对同类的 O_APPEND 追加
+	// 有显式防御，这里此前没有——目标文件若带崩溃/ENOSPC 残尾，第一条并回行
+	// 会粘在残尾上、两条一起坏掉，且源文件随即被删，损坏固化。封口失败放弃
+	// 合流（源文件保留，下次 heal 重试）。
+	if !sealTornTail(file, fmt.Sprintf("heal target=%s", targetID)) {
+		file.Close()
 		return 0, false
 	}
 	if _, err := file.WriteString(body.String()); err != nil {
@@ -1110,22 +1120,33 @@ func (j *agentCoreJournal) appendLineLocked(sessionID string, row map[string]int
 		return false
 	}
 	defer f.Close()
-	// 残行容忍（写侧）：上一进程可能死在写一半，文件尾没有换行。O_APPEND
-	// 直接追加会让新行粘在残行尾巴上、两条一起坏掉（reader 侧双双跳过）。
-	// 读尾字节探测，残行先补一个换行封口；残行本身不可修复，交给 reader
-	// 按「解析失败跳过」降级。
-	if fi, statErr := f.Stat(); statErr == nil && fi.Size() > 0 {
-		var tail [1]byte
-		if _, rdErr := f.ReadAt(tail[:], fi.Size()-1); rdErr == nil && tail[0] != '\n' {
-			if _, wErr := f.Write([]byte{'\n'}); wErr != nil {
-				logger.Warn(fmt.Sprintf("agentcore-journal: repair torn tail failed session=%s err=%v", sessionID, wErr))
-				return false
-			}
-		}
+	// 残行容忍（写侧）：残尾封口抽公共 helper（healMergeJournal 同款防御）。
+	if !sealTornTail(f, fmt.Sprintf("session=%s", sessionID)) {
+		return false
 	}
 	if _, err := f.Write(line); err != nil {
 		logger.Warn(fmt.Sprintf("agentcore-journal: append failed session=%s err=%v", sessionID, err))
 		return false
+	}
+	return true
+}
+
+// sealTornTail 对可能带残尾（无换行结尾）的文件封口：上一进程可能死在写一半
+// （kill -9/掉电/ENOSPC），文件尾没有换行。O_APPEND 直接追加会让新行粘在残行
+// 尾巴上、两条一起坏掉（reader 侧双双跳过）。读尾字节探测，残行先补一个换行；
+// 残行本身不可修复，交给 reader 按「解析失败跳过」降级。file 必须可写。
+// 封口失败返回 false（调用方放弃本次追加，保全文件待重试）。
+func sealTornTail(file *os.File, what string) bool {
+	fi, statErr := file.Stat()
+	if statErr != nil || fi.Size() == 0 {
+		return true
+	}
+	var tail [1]byte
+	if _, rdErr := file.ReadAt(tail[:], fi.Size()-1); rdErr == nil && tail[0] != '\n' {
+		if _, wErr := file.Write([]byte{'\n'}); wErr != nil {
+			logger.Warn(fmt.Sprintf("agentcore-journal: repair torn tail failed %s err=%v", what, wErr))
+			return false
+		}
 	}
 	return true
 }

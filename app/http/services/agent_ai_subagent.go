@@ -281,6 +281,27 @@ func (r *agentAISubagentRegistry) progress(id string, now time.Time, patch agent
 	return record, true
 }
 
+// enrichUsage 把 usage 富化写回注册表（2026-11-17 审计 P2：旧实现只改 finish
+// 返回的值拷贝——Go map 取值即拷贝，注册表那份恒为 0，drainUnsentTerminals
+// 补发的终态帧里 total_tokens/duration_ms 键恒缺）。在 finish 之前调用：返回
+// 拷贝随之带上，注册表同步有值。0 值不覆盖（无用量信息时保持 builder 省键）。
+func (r *agentAISubagentRegistry) enrichUsage(toolUseID string, totalTokens, durationMs int64) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if record, ok := r.byToolUseID[toolUseID]; ok {
+		if totalTokens > 0 {
+			record.TotalTokens = totalTokens
+		}
+		if durationMs > 0 {
+			record.DurationMs = durationMs
+		}
+		r.byToolUseID[toolUseID] = record
+	}
+}
+
 func (r *agentAISubagentRegistry) finish(id, phase, summary string, now time.Time) (agentAISubagent, bool) {
 	if r == nil || (phase != "completed" && phase != "failed" && phase != "interrupted") {
 		return agentAISubagent{}, false

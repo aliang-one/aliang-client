@@ -265,6 +265,13 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAIUsage, Required: []string{"type", "session_id", "run_id", "event_seq"}, Optional: []string{"message_id", "input_tokens", "output_tokens", "cache_read_tokens", "model"}},
 				{Type: AgentEventUsageReport, Required: []string{"type", "records"}},
 				{Type: AgentEventAITask, Required: []string{"type", "session_id", "message_id", "tasks", "run_id", "event_seq"}},
+				// 子 agent 生命周期 + 控制回执（2026-11-17 审计补登：整族此前漏登，
+				// 自述契约无任何出口）。task_id 为事件键，服务端按 (session,msg,task)
+				// 幂等 upsert + 终态防回退；phase 全集
+				// queued|started|progress|completed|failed|interrupted（queued=并发
+				// 闸排队态，仅 agentcore 桥产出）。
+				{Type: AgentEventAISubagent, Required: []string{"type", "session_id", "message_id", "task_id", "phase"}, Optional: []string{"tool_use_id", "description", "subagent_type", "spawn_depth", "task_type", "is_backgrounded", "current_step", "status_detail", "last_tool", "tool_uses", "total_tokens", "duration_ms", "summary", "output_file", "started_at", "ended_at", "run_id", "event_seq"}},
+				{Type: AgentEventAISubagentControlAck, Required: []string{"type", "session_id", "task_id", "result"}, Optional: []string{"action", "error", "code", "detail", "run_id", "event_seq", "acked_at"}},
 				{Type: AgentEventAIStatus, Required: []string{"type", "session_id", "status", "run_id", "event_seq"}},
 				{Type: AgentEventAIError, Required: []string{"type", "session_id", "error", "run_id", "event_seq"}, Optional: []string{"message_id", "error_status", "error_type", "error_code", "retry_attempt", "retry_max", "detail", "status"}},
 				{Type: AgentEventChannelAlert, Required: []string{"type", "code", "message", "since"}, Optional: []string{"consecutive_401"}},
@@ -329,7 +336,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				// 行之前，宿主从截断后 journal 全文重建 history（帧不携带
 				// transcript）；仅 agentcore 生效。
 				{Type: AgentEventAISessionCreate, Required: []string{"type", "session_id"}, Optional: []string{"project_path", "mode", "provider", "tool", "model", "effort", "approval_mode", "source_session_id", "resume_session_id", "initial_context", "transcript", "truncate_before_message_id", "claude_remote_policy"}, Emits: []string{AgentEventAISessionCreated, AgentEventAIError}},
-				{Type: AgentEventAIMessage, Required: []string{"type", "session_id", "message_id", "content"}, Optional: []string{"attachments", "provider", "tool", "model", "project_path", "approval_mode", "source_session_id", "resume_session_id", "claude_remote_policy", "surface"}, Emits: []string{AgentEventAIMessageReceived, AgentEventAIRunStarted, AgentEventAIDelta, AgentEventAIThinking, AgentEventAICommand, AgentEventAIFileChange, AgentEventAIUsage, AgentEventAITask, AgentEventAIApprovalRequest, AgentEventAIRunProgress, AgentEventAIDone, AgentEventAIError}},
+				{Type: AgentEventAIMessage, Required: []string{"type", "session_id", "message_id", "content"}, Optional: []string{"attachments", "provider", "tool", "model", "project_path", "approval_mode", "source_session_id", "resume_session_id", "claude_remote_policy", "surface"}, Emits: []string{AgentEventAIMessageReceived, AgentEventAIRunStarted, AgentEventAIDelta, AgentEventAIThinking, AgentEventAICommand, AgentEventAIFileChange, AgentEventAIUsage, AgentEventAITask, AgentEventAIApprovalRequest, AgentEventAISubagent, AgentEventAIRunProgress, AgentEventAIDone, AgentEventAIError}},
 				{Type: AgentEventAISteer, Required: []string{"type", "session_id", "message_id", "content"}, Optional: []string{"mode", "surface"}, Emits: []string{AgentEventAISteerAck}},
 				{Type: AgentEventAIApprovalResponse, Required: []string{"type", "session_id", "approval_id", "decision"}, Optional: []string{"message_id", "scope", "raw", "delivery_id", "attempt"}, Emits: []string{AgentEventAIApprovalAck, AgentEventAIStatus, AgentEventAIError}},
 				{Type: AgentEventAIApprovalState, Required: []string{"type", "approval_id", "status"}, Optional: []string{"session_id"}},
@@ -337,6 +344,9 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAISessionSubscribe, Required: []string{"type", "session_id"}},
 				{Type: AgentEventAISessionUnsubscribe, Required: []string{"type", "session_id"}},
 				{Type: AgentEventAIStop, Required: []string{"type", "session_id"}, Optional: []string{"run_id", "source_session_id"}, Emits: []string{AgentEventAIStatus}},
+				// 子 agent 控制面（2026-11-17 审计补登）：cloud→agent 定向控制。
+				// result 全集见 AgentEventAISubagentControlAck 常量注释。
+				{Type: AgentEventAISubagentControl, Required: []string{"type", "session_id", "task_id", "action"}, Optional: []string{"content", "message_id"}, Emits: []string{AgentEventAISubagentControlAck}},
 				{Type: AgentEventAITuiSync, Required: []string{"type", "session_id", "source_session_id", "digest"}, Optional: []string{"project_path"}, Emits: nil},
 				{Type: AgentEventAIRename, Required: []string{"type", "session_id", "title"}, Optional: []string{"project_path", "provider", "tool", "source_session_id", "resume_session_id"}, Emits: []string{AgentEventAIRenameAck}},
 				{Type: AgentEventAISessionClose, Required: []string{"type", "session_id"}, Emits: []string{AgentEventAISessionClosed}},

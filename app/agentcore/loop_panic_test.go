@@ -104,6 +104,41 @@ func TestExecuteOneRecoversPanickingApprover(t *testing.T) {
 	}
 }
 
+// TestExecuteOneRecoversPanicWithNilLogf：cfg.Logf 是文档明许的可选出口（nil=不打日志）。
+// 兜底若裸调 nil Logf，defer 里已 recover 的原 panic 会被新 panic 替换继续外逃——
+// 安全网反转成进程杀手（审计 2026-11-17 P1）。锁死：nil Logf 下兜底仍然产出失败
+// tool_result，进程不死。
+func TestExecuteOneRecoversPanicWithNilLogf(t *testing.T) {
+	rec := &requestRecorder{}
+	srv := sseServer(t, rec.handler(t, []string{panickingTurn1(), panickingTurn2()}))
+
+	registry := NewRegistry()
+	registry.Register(&panicTool{stubTool{name: "Boom"}})
+
+	cfg := &Config{
+		Client:    NewClient(srv.URL),
+		Model:     "claude-x",
+		SessionID: "sess-panic-nil-logf",
+		Tools:     registry,
+		// Logf 故意不配——这是 Config 文档明许的合法形态。
+	}
+	res, err := Run(context.Background(), cfg, []Message{TextMessage("user", "调一次工具")})
+	if err != nil {
+		t.Fatalf("nil Logf 下工具 panic 不应带崩 Run: %v", err)
+	}
+	if res.Turns != 2 {
+		t.Fatalf("Turns = %d, want 2", res.Turns)
+	}
+	reqs := rec.snapshot()
+	if len(reqs) != 2 {
+		t.Fatalf("请求次数 = %d, want 2", len(reqs))
+	}
+	text := allToolResultText(t, reqs[1].Messages)
+	if !strings.Contains(text, "boom") {
+		t.Errorf("第二轮请求应包含带 panic 摘要的 tool_result，实际 %q", text)
+	}
+}
+
 // allToolResultText 拼接整份消息列表里所有 tool_result 的文本，不假设位置。
 func allToolResultText(t *testing.T, msgs []Message) string {
 	t.Helper()

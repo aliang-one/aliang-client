@@ -27,11 +27,12 @@ import (
 // agentAISocketQueueCap 单 socket 事件队列深度。溢出=消费者死了/卡了，断开。
 const agentAISocketQueueCap = 64
 
-// agentAISocketSubCap 单 socket 订阅数上限；超限全清再加（与 completedApprovals
-// 的 map 封顶同风格——防常驻 remote socket 的订阅集随会话结束无限累积）。
-// 全清而非逐出最旧的取舍：订阅集没有时间戳，逐出策略需要额外记账；且订阅方
-// （重连后的对端）拿快照后会重新订阅当前关注的会话，旧订阅本就是失联残留，
-// 清掉不构成正确性问题。
+// agentAISocketSubCap 单 socket 订阅数上限；超限按最旧优先逐出，且**跳过活跃
+// run 的会话**。2026-11-17 审计推翻了旧「全清」策略：远端常驻 socket 的订阅集
+// 只增不减（run 结束不退订），全清会连坐清掉在飞 run 与打开详情页的订阅——
+// 在飞 run 的 started/delta 没有任何重放通道，丢流最长要到下一个周期 hello 才
+// 由 resubscribeRemoteAISessionsForActiveRuns 补回，详情页则永不自动恢复。
+// 逐出需要顺序，故 socket 记 subOrder（subscribe 时追加、unsubscribe 时摘除）。
 const agentAISocketSubCap = 64
 
 // agentAISnapshotTranscriptCap 订阅快照的转录条数上限：只保最近 N 条（journal
@@ -61,9 +62,17 @@ type agentAISocket struct {
 	closeOnce sync.Once
 	mu        sync.Mutex
 	subs      map[string]struct{}
+	// subOrder 是 subs 的插入序（最旧在前）：cap 逐出按它取最旧。
+	// 只在 s.mu 内读写；不含已删键（subscribe/unsubscribe 同步维护）。
+	subOrder []string
 	// onDead 由 registerAISocket 注入：溢出/写失败断开时把自身从注册表摘除。
 	// 经 closeOnce 保证只触发一次。
 	onDead func(id string)
+	// onUnsent 由 registerAISocket 注入（审计 2026-11-17）：pump 死亡（写失败/
+	// 摘除后退出/活检不过）时，队列里没写出去的帧连同正在手上的那帧一起交回
+	// manager——子 agent 终态帧进断线暂存，其余丢弃。触发前提 closed 已置位
+	// （enqueue 快路径生效），清点不会漏后到的帧。
+	onUnsent func(payloads []map[string]interface{})
 }
 
 // alive 报告 socket 是否仍活跃（closed 未触发）。唯一的关闭极性 helper：
@@ -114,9 +123,11 @@ func (s *agentAISocket) pump() {
 	for {
 		select {
 		case <-s.closed:
+			s.deliverUnsent(nil)
 			return
 		case payload := <-s.out:
 			if !s.alive() {
+				s.deliverUnsent([]map[string]interface{}{payload})
 				return
 			}
 			if err := s.write(payload); err != nil {
@@ -127,8 +138,29 @@ func (s *agentAISocket) pump() {
 					}
 				})
 				logger.Warn(fmt.Sprintf("[AI-SOCKET] write failed, socket detached id=%s role=%s err=%v", s.id, s.role, err))
+				s.deliverUnsent([]map[string]interface{}{payload})
 				return
 			}
+		}
+	}
+}
+
+// deliverUnsent 清点 pump 死亡时队列里没写出去的帧，连同 head（正在手上的那帧，
+// 已从队列弹出但从未送达）一起交给 onUnsent。必须在 closed 置位之后调用：
+// enqueue 的快路径保证清点期间与之后都不会有新帧入队。onUnsent 为 nil 时纯丢弃
+// （与旧行为等价）。
+func (s *agentAISocket) deliverUnsent(head []map[string]interface{}) {
+	if s.onUnsent == nil {
+		return
+	}
+	unsent := head
+	for {
+		select {
+		case p := <-s.out:
+			unsent = append(unsent, p)
+		default:
+			s.onUnsent(unsent)
+			return
 		}
 	}
 }
@@ -154,6 +186,17 @@ func (m *agentAIManager) registerAISocket(role string, write agentTerminalWriter
 		out:    make(chan map[string]interface{}, agentAISocketQueueCap),
 		closed: make(chan struct{}),
 		subs:   make(map[string]struct{}),
+	}
+	// onUnsent：pump 临终清点（审计 2026-11-17）。socket 已死、closed 已置位，
+	// 这里取 m.mu 与 onDead 的 Once 闭包无嵌套（deliverUnsent 在 Do 之外调）。
+	// 只捞子 agent 终态帧进断线暂存（幂等 upsert，重放无副作用）；其余帧与旧行
+	// 为一致丢弃。
+	sock.onUnsent = func(payloads []map[string]interface{}) {
+		for _, p := range payloads {
+			if agentAISubagentFrameTerminal(p) {
+				m.rememberPendingSubagentTerminal(p)
+			}
+		}
 	}
 	// onDead 只做「从注册表摘除」，且只摘「仍是自己」的条目——旧远端被驱逐
 	// 后若残留一次迟到的溢出 onDead，不得误删同键的新 socket。**绝不**再走
@@ -272,18 +315,89 @@ func (m *agentAIManager) subscribeAISocket(socketID, sessionID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s := m.aiSockets[socketID]; s != nil {
-		s.mu.Lock()
-		if len(s.subs) >= agentAISocketSubCap {
-			cleared := len(s.subs)
-			s.subs = make(map[string]struct{})
-			// 观测点（评审 M5）：超限全清必须留痕——否则「我的 socket 突然
-			// 收不到事件了」没有任何排查入口。Warn 在 m.mu+s.mu 内同步打，
-			// logger 自持锁、与注册表锁无交集，无死锁环。
-			logger.Warn(fmt.Sprintf("[AI-SOCKET] subscribe cap reached, socket=%s cleared=%d", socketID, cleared))
-		}
-		s.subs[sessionID] = struct{}{}
-		s.mu.Unlock()
+		m.subscribeAISocketLocked(s, sessionID)
 	}
+}
+
+// subscribeAISocketLocked 订阅内核（逐出+去重+插入序维护）。要求持有 m.mu
+// （逐出时查活跃 run）；内部自取 s.mu。
+func (m *agentAIManager) subscribeAISocketLocked(s *agentAISocket, sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.subs[sessionID]; !exists && len(s.subs) >= agentAISocketSubCap {
+		// 逐出最旧且非活跃 run 的订阅；活跃 run 的订阅绝不全清连坐
+		// （审计 2026-11-17：started/delta 无重放通道）。活跃项轮转保到队尾，
+		// 最多转一圈（rotateLimit）；极端场景（满表全是活跃 run，cap=64 不
+		// 现实）转完一圈仍超限则退回逐最旧，保证循环可终止。
+		evicted := 0
+		rotateLimit := len(s.subOrder)
+		for len(s.subs) >= agentAISocketSubCap && len(s.subOrder) > 0 && rotateLimit > 0 {
+			rotateLimit--
+			oldest := s.subOrder[0]
+			s.subOrder = s.subOrder[1:]
+			if _, ok := s.subs[oldest]; ok {
+				if m.sessionHasActiveRunLocked(oldest) {
+					// 活跃 run 的订阅排到队尾保全，继续看下一个最旧。
+					s.subOrder = append(s.subOrder, oldest)
+					continue
+				}
+				delete(s.subs, oldest)
+				evicted++
+			}
+		}
+		// 兜底：上面因「全是活跃 run」跳出时仍超限——逐最旧不管活跃。
+		for len(s.subs) >= agentAISocketSubCap && len(s.subOrder) > 0 {
+			oldest := s.subOrder[0]
+			s.subOrder = s.subOrder[1:]
+			if _, ok := s.subs[oldest]; ok {
+				delete(s.subs, oldest)
+				evicted++
+			}
+		}
+		// 观测点（评审 M5）：逐出必须留痕——否则「我的 socket 突然
+		// 收不到事件了」没有任何排查入口。Warn 在 m.mu+s.mu 内同步打，
+		// logger 自持锁、与注册表锁无交集，无死锁环。
+		if evicted > 0 {
+			logger.Warn(fmt.Sprintf("[AI-SOCKET] subscribe cap reached, socket=%s evicted=%d kept_active_runs=true", s.id, evicted))
+		}
+	}
+	if _, exists := s.subs[sessionID]; !exists {
+		s.subs[sessionID] = struct{}{}
+		s.subOrder = append(s.subOrder, sessionID)
+	}
+}
+
+// subscribeAndEnqueueSnapshot 把「订阅 + 快照入队」放进同一个 m.mu 临界区——
+// 消灭订阅快照的 FIFO 保序微窗口（审计 2026-11-17 P2）：旧序 subscribe 返回到
+// enqueue 之间是两次独立锁交接，fanOutFrom 恰在此间隙扇出的 delta 会先于快照
+// 入队，FIFO 反而保证 delta 先出队、随后被快照整体替换吞掉。现在 fanOut 在
+// m.mu 内收集订阅目标，持锁跨 subscribe+enqueue 后，任何 delta 要么在本订阅前
+// （快照内容与它无关）要么在本方法返回后（队列序恒在快照之后）。快照构建
+// （journal 读）仍由调用方在本方法之前完成（先读后订的 2026-11-09 序仲裁不变）。
+// enqueue 非阻塞（有界队列，溢出走断开），m.mu 下发送安全。socket 缺席/已死
+// （半订阅极端场景，评审 M4）回落直写，只读握手语义不变。
+func (m *agentAIManager) subscribeAndEnqueueSnapshot(socketID, sessionID string, payload map[string]interface{}, writeJSON agentTerminalWriter) {
+	if payload == nil {
+		return
+	}
+	m.mu.Lock()
+	s := m.aiSockets[socketID]
+	if s == nil || !s.alive() {
+		m.mu.Unlock()
+		if writeJSON != nil {
+			_ = writeJSON(payload)
+		}
+		return
+	}
+	m.subscribeAISocketLocked(s, sessionID)
+	s.enqueue(payload)
+	m.mu.Unlock()
+}
+
+// sessionHasActiveRunLocked 报告会话是否挂着活跃 run。要求持有 m.mu。
+func (m *agentAIManager) sessionHasActiveRunLocked(sessionID string) bool {
+	s := m.sessions[sessionID]
+	return s != nil && s.activeRunID != ""
 }
 
 func (m *agentAIManager) unsubscribeAISocket(socketID, sessionID string) {
@@ -291,7 +405,15 @@ func (m *agentAIManager) unsubscribeAISocket(socketID, sessionID string) {
 	defer m.mu.Unlock()
 	if s := m.aiSockets[socketID]; s != nil {
 		s.mu.Lock()
-		delete(s.subs, sessionID)
+		if _, ok := s.subs[sessionID]; ok {
+			delete(s.subs, sessionID)
+			for i, k := range s.subOrder {
+				if k == sessionID {
+					s.subOrder = append(s.subOrder[:i], s.subOrder[i+1:]...)
+					break
+				}
+			}
+		}
 		s.mu.Unlock()
 	}
 }
