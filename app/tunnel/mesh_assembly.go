@@ -121,12 +121,8 @@ func (m *Manager) egressPeer() meshproxy.Dialer {
 // 激活后让查询 SERVFAIL 风暴。ssh 关闭时规则本就不编译(design 降级链),
 // 私钥/钉扎缺失由编译期能力闸(meshForwardAvailable)与构造失败双层兜底。
 func (m *Manager) meshDNSForwardPeer() meshproxy.Dialer {
-	deviceID, lanAddrs, ok := routing.MeshDNSForwardTarget()
+	deviceID, _, ok := routing.MeshDNSForwardTarget()
 	if !ok {
-		return nil
-	}
-	// 载体可用性过滤:lanAddrs 空 = relay-only = custom 不可达,fail-open。
-	if len(lanAddrs) == 0 {
 		return nil
 	}
 	cfg := config.GetGlobalConfig()
@@ -156,6 +152,12 @@ func (m *Manager) meshDNSForwardPeer() meshproxy.Dialer {
 	// 任务 10b 打通半(与 egressPeer 同闸):手填为空时 beacon 增补。
 	if len(addrs) == 0 {
 		addrs = augmentLANAddrsFromBeacon(deviceID, strings.TrimSpace(entry.HostKey))
+	}
+	// 载体可用性过滤(P2 评审修:先增补后判空——原闸在增补之前,relay-only
+	// peer(空 LANAddrs)在快照处就早退,beacon 增补在此路径是死代码):
+	// 增补后仍空 = relay-only = custom 不可达,fail-open。
+	if len(addrs) == 0 {
+		return nil
 	}
 	spec := meshproxy.PeerSpec{
 		DeviceID: deviceID,

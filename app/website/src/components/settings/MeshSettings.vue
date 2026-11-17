@@ -446,17 +446,21 @@ export default {
       return normalizeMeshConfig(this.config?.mesh);
     },
     // LAN 发现候选富化(任务 10b 打通):device_id 命中已配置 peers=已配置;
-    // pinnable=指纹在场(对端 ssh_ingress 已配),不可钉扎候选只展示不供添加。
+    // pinnable=指纹在场且形态为 SHA256:…(P3 评审修:零格式闸会把 beacon 上
+    // 任意非空串——含攻击者公钥行——钉为 host_key;一键入表只认指纹形态)。
     lanPeerRows() {
       const configured = new Set(this.configMesh.peers.map((peer) => peer.device_id));
-      return this.lanPeers.map((peer) => ({
-        device_id: peer?.device_id || '',
-        addr: peer?.addr || '',
-        cert_fingerprint: peer?.cert_fingerprint || '',
-        last_seen_unix: peer?.last_seen_unix || 0,
-        configured: configured.has(peer?.device_id),
-        pinnable: Boolean(peer?.cert_fingerprint)
-      }));
+      return this.lanPeers.map((peer) => {
+        const fingerprint = typeof peer?.cert_fingerprint === 'string' ? peer.cert_fingerprint : '';
+        return {
+          device_id: peer?.device_id || '',
+          addr: peer?.addr || '',
+          cert_fingerprint: fingerprint,
+          last_seen_unix: peer?.last_seen_unix || 0,
+          configured: configured.has(peer?.device_id),
+          pinnable: fingerprint.startsWith('SHA256:')
+        };
+      });
     },
     // 状态条状态机:降级 > 加载 > 未配置 > 离线(兜底/无兜底) > 在线。
     // 「未装配」优先于离线——peers 空+不转发+无兜底时没有 mesh 可言,
@@ -871,6 +875,9 @@ export default {
     addLanPeer(row) {
       if (!row || row.configured || !row.pinnable || !row.addr) {
         return;
+      }
+      if (typeof row.cert_fingerprint !== 'string' || !row.cert_fingerprint.startsWith('SHA256:')) {
+        return; // 双保险:非指纹形态(如攻击者公钥行)不得入表钉扎
       }
       if (this.form.peerRows.some((peer) => peer.device_id === row.device_id)) {
         return;

@@ -1272,13 +1272,19 @@ describe('MeshSettings LAN 发现一键入表', () => {
     }
   });
 
-  it('候选渲染:addr/钉扎状态/已配置态;指纹空按钮禁用', async () => {
-    stubApi({ lanPeers: lanCandidates() });
+  it('候选渲染:addr/钉扎状态/已配置态;指纹空或非指纹形态按钮禁用', async () => {
+    stubApi({
+      lanPeers: [
+        ...lanCandidates(),
+        // P3 评审修:非 SHA256: 形态(攻击者公钥行)不得钉扎——按钮禁用
+        { device_id: 'dev-lan-z', mesh_port: 56432, addr: '192.168.1.52:56432', cert_fingerprint: 'ssh-ed25519 AAAAC3NzaC1lZDI1', last_seen_unix: 70 }
+      ]
+    });
     const { el } = mountCard(baseConfig());
     await flush();
 
-    // 三行都渲染
-    expect(el.querySelectorAll('[data-mesh-lan-discovery] [data-mesh-lan-row]')).toHaveLength(3);
+    // 四行都渲染
+    expect(el.querySelectorAll('[data-mesh-lan-discovery] [data-mesh-lan-row]')).toHaveLength(4);
     // 可钉扎候选:添加按钮可用
     const addX = el.querySelector('[data-mesh-lan-add="dev-lan-x"]');
     expect(addX).not.toBeNull();
@@ -1287,6 +1293,10 @@ describe('MeshSettings LAN 发现一键入表', () => {
     const addY = el.querySelector('[data-mesh-lan-add="dev-lan-y"]');
     expect(addY).not.toBeNull();
     expect(addY.disabled).toBe(true);
+    // 非 SHA256: 形态:同样禁用(零格式闸的 UI 侧)
+    const addZ = el.querySelector('[data-mesh-lan-add="dev-lan-z"]');
+    expect(addZ).not.toBeNull();
+    expect(addZ.disabled).toBe(true);
     // 已配置 device_id(dev-b 在 base peers):只读标签,无添加按钮
     expect(el.querySelector('[data-mesh-lan-configured]')).not.toBeNull();
     expect(el.querySelector('[data-mesh-lan-add="dev-b"]')).toBeNull();
