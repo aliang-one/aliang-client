@@ -91,3 +91,48 @@ func TestValidateMeshDependencyPunchRequiresMesh(t *testing.T) {
 		t.Fatalf("Config.Validate must not reject punch dependency (save-only gate), got %v", err)
 	}
 }
+
+// —— stun_servers(transfer-punch-stun 批次)——
+
+func TestMeshStunServersEffective(t *testing.T) {
+	// (a) 空/nil 回落默认档(拷贝,调用方改切片不污染常量)。
+	var nilMesh *MeshConfig
+	got := nilMesh.EffectiveStunServers()
+	if len(got) != len(MeshDefaultStunServers) {
+		t.Fatalf("nil mesh EffectiveStunServers 应回落默认档, got %v", got)
+	}
+	got[0] = "mutated"
+	if MeshDefaultStunServers[0] == "mutated" {
+		t.Fatal("EffectiveStunServers 必须返回拷贝,不得暴露底层常量")
+	}
+	empty := &MeshConfig{}
+	if len(empty.EffectiveStunServers()) != len(MeshDefaultStunServers) {
+		t.Fatal("空配置 EffectiveStunServers 应回落默认档")
+	}
+	// (b) 配置非空原样返回(TrimSpace 在 Validate 就地做过)。
+	cfg := &MeshConfig{StunServers: []string{"stun.example.com:3478"}}
+	if got := cfg.EffectiveStunServers(); len(got) != 1 || got[0] != "stun.example.com:3478" {
+		t.Fatalf("配置非空应原样返回, got %v", got)
+	}
+}
+
+func TestMeshStunServersValidate(t *testing.T) {
+	// (a) 合法:TrimSpace 就地规整后通过。
+	ok := &MeshConfig{StunServers: []string{"  stun.example.com:3478  ", "stun2.example.com:3478"}}
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("合法 stun_servers 不应报错: %v", err)
+	}
+	if ok.StunServers[0] != "stun.example.com:3478" {
+		t.Fatalf("Validate 应就地 TrimSpace, got %q", ok.StunServers[0])
+	}
+	// (b) 非 host:port 拒。
+	bad := &MeshConfig{StunServers: []string{"stun.example.com"}}
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "stun_servers[0]") {
+		t.Fatalf("非 host:port 应报错含 stun_servers[0], got %v", err)
+	}
+	// (c) 超 4 条拒。
+	over := &MeshConfig{StunServers: []string{"a:1", "b:2", "c:3", "d:4", "e:5"}}
+	if err := over.Validate(); err == nil || !strings.Contains(err.Error(), "上限 4") {
+		t.Fatalf("超 4 条应报错含上限, got %v", err)
+	}
+}
