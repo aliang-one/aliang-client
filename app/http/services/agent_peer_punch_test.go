@@ -912,3 +912,105 @@ func TestAgentPunchConfiguredServers(t *testing.T) {
 		t.Fatalf("配置了应原样返回, got %v", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 传输腿复合键(transfer-punch-stun Task 5):同 peer 的 mesh 会话与传输
+// 会话在缓存/sock 表互不可见——mesh 会话喂传输流=喂错 handler,反之亦然
+// (计划期裁决 4)。
+// ---------------------------------------------------------------------------
+
+// TestAgentPunchTransferCacheKeyIsolation 锁键形态契约:mesh 键=裸 peerID
+// (存量形态不变),transfer 键带前缀;purpose 缺省显式化为 mesh(帧面语义:
+// 老版本 A 侧发的无 purpose 帧 = mesh)。
+func TestAgentPunchTransferCacheKeyIsolation(t *testing.T) {
+	a := newAgentPeerPunchA()
+	key := punchCacheKey("dev-1", "transfer")
+	if key == "dev-1" {
+		t.Fatal("transfer 键必须带前缀,不得与 mesh 键同形")
+	}
+	if punchCacheKey("dev-1", "") != "dev-1" {
+		t.Fatal("mesh 键形态不变(裸 peerID)")
+	}
+	if purposeOrMesh("") != "mesh" || purposeOrMesh("transfer") != "transfer" {
+		t.Fatal("purposeOrMesh 缺省须显式化为 mesh")
+	}
+	_ = a // 结构体级断言在集成测试覆盖;此处锁键形态契约
+}
+
+// TestAgentPunchTransferDialFullChainAndIsolation 全链锁复合键的真实隔离
+// 行为(键形态之外的机械面):同 peer 先 mesh 拨通,再 transfer 拨——缓存
+// 不得命中 mesh 会话(session 帧再起一帧),session 帧须捎带 purpose=
+// transfer 与 transfer_id;transfer 二拨走 transfer 键缓存;mesh 会话不被
+// transfer 拨顶替(缓存/顶替类用例零回归的传输侧对偶)。
+func TestAgentPunchTransferDialFullChainAndIsolation(t *testing.T) {
+	a, fake := newPunchAForTest(t)
+	orig := a.send
+	var transferFrame map[string]interface{}
+	a.send = func(payload map[string]interface{}) error {
+		if payload["type"] == models.AgentEventPeerPunchSession && payload["purpose"] == "transfer" {
+			transferFrame = payload
+		}
+		return orig(payload)
+	}
+
+	// mesh 首拨(裸 peerID 键)。
+	connMesh, err := a.dialSource(context.Background(), "dev-b")
+	if err != nil {
+		t.Fatalf("mesh 首拨失败: %v", err)
+	}
+	_ = connMesh.Close()
+	if n := fake.countSessionFrames(); n != 1 {
+		t.Fatalf("mesh 首拨应恰发一帧 session,实发 %d", n)
+	}
+
+	// transfer 拨:同 peer 不同用途——缓存/sock 表互不可见,必须重开打洞。
+	connTr, err := a.dialSourceOpts(context.Background(), "dev-b", punchDialOpts{
+		budget:     agentTransferPunchBudget,
+		purpose:    "transfer",
+		transferID: "tr-1",
+	})
+	if err != nil {
+		t.Fatalf("transfer 拨失败: %v", err)
+	}
+	_ = connTr.Close()
+	if n := fake.countSessionFrames(); n != 2 {
+		t.Fatalf("transfer 拨不得复用 mesh 会话(session 帧应为 2),实发 %d", n)
+	}
+	if transferFrame == nil {
+		t.Fatal("transfer 拨的 session 帧未捕获")
+	}
+	if transferFrame["purpose"] != "transfer" || transferFrame["transfer_id"] != "tr-1" {
+		t.Fatalf("transfer session 帧缺 purpose/transfer_id: %v", transferFrame)
+	}
+
+	// transfer 二拨:走 transfer 键缓存(session 帧不增),数据面照通
+	//(缓存命中不再发帧,transferID 不参与寻址)。
+	connTr2, err := a.dialSourceOpts(context.Background(), "dev-b", punchDialOpts{
+		purpose:    "transfer",
+		transferID: "tr-2",
+	})
+	if err != nil {
+		t.Fatalf("transfer 二拨(缓存)失败: %v", err)
+	}
+	if _, err := connTr2.Write([]byte("tr")); err != nil {
+		t.Fatalf("transfer 二拨写失败: %v", err)
+	}
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(connTr2, buf); err != nil || string(buf) != "tr" {
+		t.Fatalf("transfer 二拨回显错: %q %v", buf, err)
+	}
+	_ = connTr2.Close()
+	if n := fake.countSessionFrames(); n != 2 {
+		t.Fatalf("transfer 二拨应走缓存(session 帧仍为 2),实发 %d", n)
+	}
+
+	// mesh 二拨:mesh 键缓存未被 transfer 拨顶替(session 帧仍为 2)。
+	connMesh2, err := a.dialSource(context.Background(), "dev-b")
+	if err != nil {
+		t.Fatalf("mesh 二拨(缓存)失败: %v", err)
+	}
+	_ = connMesh2.Close()
+	if n := fake.countSessionFrames(); n != 2 {
+		t.Fatalf("transfer 拨不得顶替 mesh 会话(session 帧应仍为 2),实发 %d", n)
+	}
+}

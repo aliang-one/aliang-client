@@ -557,8 +557,10 @@ var (
 // (Task 8 情报:同 UDP conn 的多个 Transport 互为读循环对家);快路径
 // (Acquire 命中)不持 dialMu,缓存自带的表级并发安全足够。sockets 表存
 // 每 peer 活会话的打洞 socket:SessionCache 只关 Transport 不关底层 conn
-// (Task 8 契约),socket 的回收=下次同 peer 重拨时驱逐旧件(僵尸窗口内
-// 至多滞留一张/peer,进程级封顶 peer 数),注释见 dialMiss。
+// (Task 8 契约),socket 的回收=下次同键重拨时驱逐旧件(僵尸窗口内至多
+// 滞留一张/键,进程级封顶)。键=punchCacheKey(peerID, purpose)——mesh
+// 裸 peerID,传输腿带前缀,与 cache 同键分层(transfer-punch-stun Task 5
+// 计划期裁决 4),注释见 dialMiss。
 type agentPeerPunchA struct {
 	mu                sync.Mutex
 	pendingResult     map[string]chan map[string]interface{}
@@ -637,24 +639,66 @@ func init() {
 	})
 }
 
+// punchDialOpts 是拨号链的变体输入(transfer-punch-stun Task 5):mesh
+// 语义全零值;传输腿带加长预算与 purpose/transferID(会话帧捎带,B 侧按
+// purpose 路由过门流)。
+type punchDialOpts struct {
+	budget     time.Duration // DialPeer 预算;0=punch.DialBudget
+	purpose    string        // ""=mesh;"transfer"=文件传输腿
+	transferID string        // purpose=transfer 时必填(信令寻址+接收侧查表)
+}
+
+// punchCacheKey 会话缓存/sock 表键(计划期裁决 4):mesh 沿用裸 peerID
+//(存量键形态不变);transfer 加前缀——同 peer 两用途的会话绝不交叉复用,
+// 否则缓存命中会把数据流喂给对端的错误 handler。skipMemo 保持裸 peerID
+//(NAT 属性按对端,与用途无关)。
+func punchCacheKey(peerID, purpose string) string {
+	if purpose == "" {
+		return peerID
+	}
+	return purpose + ":" + peerID
+}
+
+// purposeOrMesh 缺省 purpose 显式化为 "mesh"(B 侧单分支判读;帧面语义:
+// 老版本 A 侧发的无 purpose 帧 = mesh)。
+func purposeOrMesh(purpose string) string {
+	if purpose == "" {
+		return "mesh"
+	}
+	return purpose
+}
+
+// agentTransferPunchBudget 传输腿拨号预算:覆盖 B 侧 bind+双 STUN 判型最坏
+// ~6s + 正常拨号,替代预热(spec 计划期裁决 1);耗尽落 COS 由上传链兜底。
+const agentTransferPunchBudget = 12 * time.Second
+
 // dialSource 是 PunchDialFunc 的 A 侧本体(cache-first):快路径缓存开流,
 // miss 同步完整打洞链——首拨付信令成本,后续走缓存;一切失败恒错误,
-// 由 ExitClient 装配序(LAN→udp→piko)落 piko 中继。
+// 由 ExitClient 装配序(LAN→udp→piko)落 piko 中继。mesh 语义零值变体
+//(签名是注册缝,不可改)。
 func (a *agentPeerPunchA) dialSource(ctx context.Context, peerID string) (net.Conn, error) {
+	return a.dialSourceOpts(ctx, peerID, punchDialOpts{})
+}
+
+// dialSourceOpts 变体拨号入口:门禁/快路径/miss 链对 mesh 与传输腿同源,
+// 仅键(punchCacheKey)与预算/帧面(punchDialOpts)不同。
+func (a *agentPeerPunchA) dialSourceOpts(ctx context.Context, peerID string, opts punchDialOpts) (net.Conn, error) {
 	if !a.gate() {
 		return nil, errors.New("agent punch: disabled by config")
 	}
-	if conn, ok := a.tryCached(ctx, peerID); ok {
+	key := punchCacheKey(peerID, opts.purpose)
+	if conn, ok := a.tryCached(ctx, key); ok {
 		return conn, nil
 	}
-	return a.dialMiss(ctx, peerID)
+	return a.dialMiss(ctx, peerID, opts)
 }
 
 // tryCached 快路径:Acquire 命中→开流;开流失败=会话已死(含僵尸窗口),
 // 返回未命中交 miss 路径驱逐重拨。lease 即取即释——流的生命周期独立于
-// lease,Release 只减引用计数(Task 8 契约)。
-func (a *agentPeerPunchA) tryCached(ctx context.Context, peerID string) (net.Conn, bool) {
-	lease := a.cache.Acquire(peerID)
+// lease,Release 只减引用计数(Task 8 契约)。key=punchCacheKey 产物
+//(用途隔离在调用侧落键,本函数只管开流)。
+func (a *agentPeerPunchA) tryCached(ctx context.Context, key string) (net.Conn, bool) {
+	lease := a.cache.Acquire(key)
 	if lease == nil {
 		return nil, false
 	}
@@ -668,21 +712,26 @@ func (a *agentPeerPunchA) tryCached(ctx context.Context, peerID string) (net.Con
 
 // dialMiss miss 路径(dialMu 串行):重拨检查 → 驱逐旧 socket → memo 预检
 // → 信令链(session→result→Classify→candidates)→ DialAndPut → 开流。
-func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string) (net.Conn, error) {
+func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string, opts punchDialOpts) (net.Conn, error) {
 	a.dialMu.Lock()
 	defer a.dialMu.Unlock()
 
+	// 键分层(计划期裁决 4):cache 与 sockets 表按用途隔离,同 peer 的
+	// mesh 会话与传输会话互不可见;skipMemo/日志/SkipMemo 记账保持裸
+	// peerID(NAT 属性按对端,与用途无关)。
+	key := punchCacheKey(peerID, opts.purpose)
+
 	// 双重检查:等锁期间别的 goroutine 已建会话→直接快路径。
-	if conn, ok := a.tryCached(ctx, peerID); ok {
+	if conn, ok := a.tryCached(ctx, key); ok {
 		return conn, nil
 	}
 
-	// 驱逐旧 socket:该 peer 上一个会话已死(否则快路径就命中了),其
+	// 驱逐旧 socket:该键上一个会话已死(否则快路径就命中了),其
 	// 打洞 socket 由本表持有(SessionCache 只关 Transport);僵尸窗口内
-	// 的滞留件在下次重拨时此刻回收——每 peer 至多一张,进程级封顶。
+	// 的滞留件在下次重拨时此刻回收——每键至多一张,进程级封顶。
 	a.mu.Lock()
-	oldSock := a.sockets[peerID]
-	delete(a.sockets, peerID)
+	oldSock := a.sockets[key]
+	delete(a.sockets, key)
 	a.mu.Unlock()
 	if oldSock != nil {
 		_ = oldSock.Close()
@@ -719,6 +768,11 @@ func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string) (net.Conn
 		// 路由信封(Task 13 契约):server 靠它寻址 B,转发前剥除——B 收到
 		// 的帧与 Task 1 锁定契约逐字一致。B 侧忽略未知字段,向后兼容。
 		"target_device_id": peerID,
+		// 会话目的(transfer-punch-stun Task 5):缺省=mesh 语义向后兼容
+		//(老 B 侧忽略未知字段);transfer 带 transfer_id 供 B 侧查接收
+		// 上下文。target_device_id 路由信封不变。
+		"purpose":     purposeOrMesh(opts.purpose),
+		"transfer_id": opts.transferID,
 	}); err != nil {
 		return nil, fmt.Errorf("agent punch: send session: %w", err)
 	}
@@ -816,7 +870,11 @@ func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string) (net.Conn
 		Token:      token,
 		TLS:        punch.PunchTLSConfig{ClientCert: cert, ServerFingerprint: fingerprint},
 		Candidates: func() []string { return peerCandidates },
-		KeepAlive:  true,
+		// 预算接线(计划期裁决 1):mesh 零值走 punch.DialBudget 默认;
+		// 传输腿带 agentTransferPunchBudget 加长预算——漏接=传输腿静默
+		// 退回默认预算,整个「预算吸收 B 侧判型时延」设计失效。
+		Budget:    opts.budget,
+		KeepAlive: true,
 	})
 	if err != nil {
 		_ = socket.Close()
@@ -828,7 +886,7 @@ func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string) (net.Conn
 		logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH-A] punch failed peer=%s err=%v(落 piko)", peerID, err))
 		return nil, fmt.Errorf("agent punch: dial peer: %w", err)
 	}
-	lease := a.cache.Put(peerID, session)
+	lease := a.cache.Put(key, session)
 	if lease == nil {
 		// 拨号成功却入表被拒=会话残缺(理论不可达):别泄漏,当场收摊。
 		_ = session.Transport.Close()
@@ -839,16 +897,17 @@ func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string) (net.Conn
 		_ = session.Stream.Close() // 首流收口(见 ④ 注)
 	}
 
-	// ⑤ 成功:socket 入表(会话物理底层),开流交付,lease 即取即释。
+	// ⑤ 成功:socket 入表(会话物理底层,键=用途复合键),开流交付,
+	// lease 即取即释。
 	a.mu.Lock()
-	a.sockets[peerID] = socket
+	a.sockets[key] = socket
 	a.mu.Unlock()
 	conn, err := lease.OpenStream(ctx)
 	lease.Release()
 	if err != nil {
 		return nil, fmt.Errorf("agent punch: open stream: %w", err)
 	}
-	logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH-A] punched peer=%s session=%s", peerID, sessionID))
+	logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH-A] punched peer=%s key=%s session=%s", peerID, key, sessionID))
 	return conn, nil
 }
 
@@ -953,6 +1012,18 @@ func AgentPeerPunchSetFrameSink(sink func(map[string]interface{}) error) {
 // 单例的 cache-first 拨号源——快路径缓存开流,miss 同步完整打洞链。
 func AgentPeerPunchDial(ctx context.Context, peerID string) (net.Conn, error) {
 	return sharedAgentPeerPunchA().dialSource(ctx, peerID)
+}
+
+// AgentPeerPunchTransferDial 文件传输打洞拨号入口(上传腿 punch 载体,
+// transfer-punch-stun Task 5):transfer purpose 会话+加长预算;门禁/信令/
+// 缓存链与 mesh 同源,仅缓存键(punchCacheKey 复合键)与预算/帧面不同。
+// 失败恒错误,由上传链落 COS。
+func AgentPeerPunchTransferDial(ctx context.Context, peerID, transferID string) (net.Conn, error) {
+	return sharedAgentPeerPunchA().dialSourceOpts(ctx, peerID, punchDialOpts{
+		budget:     agentTransferPunchBudget,
+		purpose:    "transfer",
+		transferID: transferID,
+	})
 }
 
 // AgentPeerPunchHandleFrame 供集成测试与诊断面投递 punch 帧(生产路径走
