@@ -304,6 +304,7 @@ export default {
   chat_steerQueued: 'Queued — takes effect next turn',
   chat_steerApplied: 'Delivered',
   chat_steerNotRunning: 'Turn ended — steer not applied',
+  chat_steerDowngraded: 'Turn ended — resent as a regular message',
   chat_steerUnknown: 'Steer status: {result}',
   chat_steerUnknownResult: 'unknown',
   chat_steerFailed: 'Steer failed',

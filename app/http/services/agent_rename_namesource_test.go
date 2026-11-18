@@ -249,7 +249,7 @@ func TestApplyClaudeRenameNamesDerivedIsFallbackWithoutStamp(t *testing.T) {
 
 	applyClaudeRenameNames(sessions, map[string]agentRenamePidRecord{
 		sid: liveRecord(sid, "vibe-on-phone-a8", "derived", now.Add(-time.Hour), now),
-	}, nil)
+	}, nil, "")
 
 	assert.Equal(t, "vibe-on-phone-a8", sessions[0].Title, "derived name may fill an empty display title")
 	assert.Empty(t, sessions[0].TitleUpdatedAt, "derived names must never stamp title_updated_at")
@@ -273,7 +273,7 @@ func TestApplyClaudeRenameNamesDerivedDoesNotClobberIndexedTitle(t *testing.T) {
 
 	applyClaudeRenameNames(sessions, map[string]agentRenamePidRecord{
 		sid: liveRecord(sid, "vibe-on-phone-a8", "derived", now.Add(-time.Hour), now),
-	}, nil)
+	}, nil, "")
 
 	assert.Equal(t, "index 摘要", sessions[0].Title, "a slug must not replace a better indexed title")
 	assert.Empty(t, sessions[0].TitleUpdatedAt)
@@ -288,7 +288,7 @@ func TestApplyClaudeRenameNamesUserUsesNameSinceNotChurningUpdatedAt(t *testing.
 
 	applyClaudeRenameNames(sessions, map[string]agentRenamePidRecord{
 		sid: liveRecord(sid, "用户改名", "user", renameAt, churnAt),
-	}, nil)
+	}, nil, "")
 
 	assert.Equal(t, "用户改名", sessions[0].Title)
 	assert.Equal(t, renameAt.Format(time.RFC3339Nano), sessions[0].TitleUpdatedAt,
@@ -313,7 +313,7 @@ func TestApplyClaudeRenameNamesPeerAndHookAreUserIntent(t *testing.T) {
 			sessions := []models.AgentVibeSession{{ID: "claude_" + sid, Status: "idle"}}
 			applyClaudeRenameNames(sessions, map[string]agentRenamePidRecord{
 				sid: liveRecord(sid, "跨会话改名", source, now, now),
-			}, nil)
+			}, nil, "")
 			assert.Equal(t, "跨会话改名", sessions[0].Title)
 			assert.NotEmpty(t, sessions[0].TitleUpdatedAt)
 			assert.Equal(t, source, sessions[0].TitleSource)
@@ -329,7 +329,7 @@ func TestApplyClaudeRenameNamesLegacyMissingSourceStaysUser(t *testing.T) {
 
 	applyClaudeRenameNames(sessions, map[string]agentRenamePidRecord{
 		sid: liveRecord(sid, "老版本改名", "", time.Time{}, updatedAt),
-	}, nil)
+	}, nil, "")
 
 	assert.Equal(t, "老版本改名", sessions[0].Title)
 	assert.Equal(t, updatedAt.Format(time.RFC3339Nano), sessions[0].TitleUpdatedAt,
@@ -350,7 +350,7 @@ func TestApplyClaudeRenameNamesDerivedDoesNotOverrideCachedPhoneRename(t *testin
 	sessions := []models.AgentVibeSession{{ID: "claude_" + sid, Status: "idle"}}
 	applyClaudeRenameNames(sessions, map[string]agentRenamePidRecord{
 		sid: liveRecord(sid, "vibe-on-phone-a8", "derived", time.Now().Add(-time.Hour), time.Now().UTC()),
-	}, nil)
+	}, nil, "")
 
 	assert.Equal(t, "手机改名", sessions[0].Title, "a newer derived record must not retake a phone rename")
 	assert.Equal(t, phoneTS, sessions[0].TitleUpdatedAt)
@@ -379,7 +379,7 @@ func TestApplyClaudeRenameNamesReconcilesLegacyDerivedCacheEntry(t *testing.T) {
 	sessions := []models.AgentVibeSession{{ID: "claude_" + sid, Status: "idle"}}
 	applyClaudeRenameNames(sessions, map[string]agentRenamePidRecord{
 		sid: liveRecord(sid, "vibe-on-phone-a8", "derived", recordTS, time.Now().UTC()),
-	}, nil)
+	}, nil, "")
 
 	assert.Empty(t, sessions[0].TitleUpdatedAt, "the reconciled legacy entry must stop stamping")
 	cached, err := loadAgentRenameCacheFile(path)
@@ -416,7 +416,7 @@ func TestApplyClaudeRenameNamesPurgeDoesNotClobberObservedRename(t *testing.T) {
 	applyClaudeRenameNames(sessions, map[string]agentRenamePidRecord{
 		observedSID: liveRecord(observedSID, "用户新名", "user", now, now),
 		purgedSID:   liveRecord(purgedSID, "vibe-on-phone-a8", "derived", now.Add(-3*time.Hour), now),
-	}, nil)
+	}, nil, "")
 
 	cached, err := loadAgentRenameCacheFile(path)
 	require.NoError(t, err)

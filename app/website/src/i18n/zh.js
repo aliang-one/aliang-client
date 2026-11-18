@@ -303,6 +303,7 @@ export default {
   chat_steerQueued: '已受理，将在下一轮生效',
   chat_steerApplied: '已送达',
   chat_steerNotRunning: '回合已结束，插话未生效',
+  chat_steerDowngraded: '回合已结束，已转为普通消息发送',
   chat_steerUnknown: '插话状态：{result}',
   chat_steerUnknownResult: '未知',
   chat_steerFailed: '插话失败',

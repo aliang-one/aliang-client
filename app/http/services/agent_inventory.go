@@ -1252,7 +1252,7 @@ func collectClaudeVibeSessionsWithStats(scanDirs []string) ([]models.AgentVibeSe
 	// a rename, once observed, never reverts — even after Claude Code prunes
 	// the pid file.
 	renameRecords := loadClaudeRenameRecords(home)
-	applyClaudeRenameNames(sessions, renameRecords, transcriptFreshness)
+	applyClaudeRenameNames(sessions, renameRecords, transcriptFreshness, home)
 	// After the overlay has settled the cache, repair the desktop-side mirror
 	// (transcript custom-title line + sidecar) for phone renames that a live
 	// Claude Code process has since buried under newer writes.
@@ -1305,6 +1305,13 @@ type agentRenamePidRecord struct {
 	PID       int
 	Status    string
 	UpdatedAt time.Time
+	// StatusUpdatedAt is when the current Status was written (UNIX ms in real
+	// 2.1.x records; falls back to UpdatedAt, then to the file mtime). It is
+	// the lower bound of "this busy state began" and anchors the
+	// transcript-turn-end reconcile for stale busy records: a CC-written
+	// turn_end marker timestamped AFTER StatusUpdatedAt proves the turn the
+	// busy state belonged to has since finished.
+	StatusUpdatedAt time.Time
 	// MessagingSocketPath is the cross-session messaging UDS socket written by
 	// CC >= 2.1.224 (~/.claude/sessions/<pid>.json). Empty on older versions,
 	// which is exactly the capability gate for the TUI sync injector.
@@ -1345,6 +1352,7 @@ func loadClaudeRenameRecords(home string) map[string]agentRenamePidRecord {
 			PID                 int         `json:"pid"`
 			Status              string      `json:"status"`
 			UpdatedAt           interface{} `json:"updatedAt"`
+			StatusUpdatedAt     interface{} `json:"statusUpdatedAt"`
 			MessagingSocketPath string      `json:"messagingSocketPath"`
 		}
 		if err := json.Unmarshal(raw, &row); err != nil {
@@ -1353,6 +1361,14 @@ func loadClaudeRenameRecords(home string) map[string]agentRenamePidRecord {
 		if row.SessionID == "" {
 			continue
 		}
+		// statusUpdatedAt is the field CC stamps on every status write
+		// (verified in real 2.1.286 records, alongside updatedAt); older
+		// builds omit it — fall back to updatedAt, then to the file mtime
+		// (pidRecordTimestamp's own chain).
+		statusAt := pidRecordTimeValue(row.StatusUpdatedAt)
+		if statusAt.IsZero() {
+			statusAt = pidRecordTimestamp(row.UpdatedAt, file)
+		}
 		out[row.SessionID] = agentRenamePidRecord{
 			Name:                strings.TrimSpace(row.Name),
 			NameSource:          strings.TrimSpace(row.NameSource),
@@ -1360,6 +1376,7 @@ func loadClaudeRenameRecords(home string) map[string]agentRenamePidRecord {
 			PID:                 row.PID,
 			Status:              strings.TrimSpace(row.Status),
 			UpdatedAt:           pidRecordTimestamp(row.UpdatedAt, file),
+			StatusUpdatedAt:     statusAt,
 			MessagingSocketPath: strings.TrimSpace(row.MessagingSocketPath),
 		}
 	}
@@ -1435,6 +1452,98 @@ func wireAgentRenameSource(entry agentRenameCacheEntry) string {
 // pre-437bc99 "live process == forever running" bug.
 const claudeStatusFreshnessWindow = 3 * time.Minute
 
+// claudeBusyReconcileTailBytes bounds the transcript tail read for the stale
+// busy reconcile: turn-end markers (system/turn_duration, written at turn end)
+// live at the file tail, so the last 64KB is always enough — never read whole
+// transcripts (they grow to tens of MB).
+const claudeBusyReconcileTailBytes = 64 * 1024
+
+// claudeBusyTurnEndedAfterRecord reports whether the session transcript's tail
+// carries a CC-written turn-end marker whose timestamp is NEWER than the pid
+// record's busy write time. That is content proof the turn the busy state
+// belonged to has since finished — i.e. CC missed the busy→idle rewrite
+// (verified against CC CLI 2.1.286: the turn_duration line lands in the
+// transcript while the pid record stays busy), and the inventory must show
+// idle instead of a zombie "running".
+//
+// Evidence rules (2026-11-18 定案铁律):
+//   - NEVER judge by file mtime staleness — a legitimately running turn can
+//     legally go quiet for over an hour. Only the turn-end marker's own
+//     timestamp counts.
+//   - The LAST tail marker decides: a marker at/earlier than the busy write
+//     means a newer turn has since started on this same file → still busy.
+//     (Finding an older marker first and stopping would flip a live turn.)
+//   - No marker / no transcript / no busy time / unparsable evidence → false:
+//     keep today's semantics (display busy; records without a usable status
+//     fall back to the freshness window as before).
+//
+// turn_duration and stop_hook_summary are CC's per-turn-end marker pair
+// (1:1 with real turns, <5ms apart — verified on real 2.1.286 transcripts),
+// so both count as the same turn-end evidence. Sidechain rows are skipped.
+func claudeBusyTurnEndedAfterRecord(home, nativeSessionID string, busyAt time.Time) bool {
+	if busyAt.IsZero() {
+		return false
+	}
+	path := ccPeerSessionJSONL(home, nativeSessionID)
+	if path == "" {
+		return false
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	offset := info.Size() - claudeBusyReconcileTailBytes
+	if offset < 0 {
+		offset = 0
+	}
+	buf := make([]byte, info.Size()-offset)
+	if _, err := file.ReadAt(buf, offset); err != nil && err != io.EOF {
+		return false
+	}
+	ended := false
+	for _, line := range bytes.Split(buf, []byte("\n")) {
+		ts := claudeTurnEndTimestamp(line)
+		if ts.IsZero() {
+			continue
+		}
+		// Keep scanning: the LAST marker wins. A marker after the busy write
+		// proves the frozen turn ended; a later marker at/before it proves a
+		// newer turn started (record refreshed after its turn_end) — back to
+		// busy.
+		ended = ts.After(busyAt)
+	}
+	return ended
+}
+
+// claudeTurnEndTimestamp parses one transcript line's turn-end marker
+// timestamp (RFC3339). Returns the zero time for anything that is not a
+// CC-written system/turn_duration or system/stop_hook_summary row (including
+// a tail-boundary partial line — truncated JSON cannot unmarshal).
+func claudeTurnEndTimestamp(line []byte) time.Time {
+	var row struct {
+		Type        string `json:"type"`
+		Subtype     string `json:"subtype"`
+		IsSidechain bool   `json:"isSidechain"`
+		Timestamp   string `json:"timestamp"`
+	}
+	if json.Unmarshal(line, &row) != nil {
+		return time.Time{}
+	}
+	if row.Type != "system" || row.IsSidechain {
+		return time.Time{}
+	}
+	switch strings.TrimSpace(row.Subtype) {
+	case "turn_duration", "stop_hook_summary":
+		return renameTimestamp(row.Timestamp)
+	}
+	return time.Time{}
+}
+
 // applyClaudeRenameNames overlays user-set /rename titles and the live-status
 // signal onto the collected Claude sessions, keyed by native sessionId (the
 // "claude_"-stripped session ID). A live pid record competes with the durable
@@ -1443,8 +1552,10 @@ const claudeStatusFreshnessWindow = 3 * time.Minute
 // (previously every pid file overwrote unconditionally in glob order). Newly
 // observed pid names are merged into the cache so titles survive Claude Code's
 // pid-file pruning. transcriptFreshness (native sessionId → jsonl mtime)
-// backs the status branch for records without a busy/idle status.
-func applyClaudeRenameNames(sessions []models.AgentVibeSession, records map[string]agentRenamePidRecord, transcriptFreshness map[string]time.Time) {
+// backs the status branch for records without a busy/idle status. home is the
+// scanned agent home, used to resolve the native transcript for the stale-busy
+// content reconcile.
+func applyClaudeRenameNames(sessions []models.AgentVibeSession, records map[string]agentRenamePidRecord, transcriptFreshness map[string]time.Time, home string) {
 	renameCache := loadAgentRenameCache()
 	observed := map[string]agentRenameCacheEntry{}
 	purged := map[string]bool{}
@@ -1476,7 +1587,19 @@ func applyClaudeRenameNames(sessions []models.AgentVibeSession, records map[stri
 			// permanent "running" on an idle session.
 			switch {
 			case record.Status == "busy":
-				sessions[index].Status = "running"
+				// Content reconcile for stale busy records (2026-11-18 定案):
+				// CC 2.1.286 misses the busy→idle rewrite when a turn ends
+				// (only the transcript turn_duration line lands), so the pid
+				// record freezes on busy and the list mirrors a zombie
+				// "running" forever. A CC-written turn-end marker timestamped
+				// AFTER the busy write is content proof the turn finished —
+				// display idle. Display-only: CC's files are never rewritten
+				// and no synthetic frames are emitted.
+				if claudeBusyTurnEndedAfterRecord(home, nativeID, record.StatusUpdatedAt) {
+					sessions[index].Status = "idle"
+				} else {
+					sessions[index].Status = "running"
+				}
 			case record.Status == "idle":
 				sessions[index].Status = "idle"
 			case time.Since(transcriptFreshness[nativeID]) < claudeStatusFreshnessWindow:
