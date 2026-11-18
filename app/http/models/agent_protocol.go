@@ -141,7 +141,7 @@ const (
 	// 上传腿 LAN 直连(角色互换):A(目标设备)拉起一次性收件 listener,B(源设备)
 	// 直推文件——省掉 B→COS 的全量上行广域网段。凭据模型与 peer.lan.listen
 	// 完全同构(token 单用途短时 + 现签证书指纹钉扎)。
-	AgentEventPeerLanPushListen       = "peer.lan.push.listen"       // server→A(目标设备): 拉起一次性收件 listener
+	AgentEventPeerLanPushListen       = "peer.lan.push.listen"        // server→A(目标设备): 拉起一次性收件 listener
 	AgentEventPeerLanPushListenResult = "peer.lan.push.listen.result" // A→server: 绑定结果(addr+fingerprint)或失败原因
 )
 
@@ -404,6 +404,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				// 发起（ttl_seconds 必填——一次性 listener 的存活上限）；result 回
 				// port+fingerprint；candidates 双向经 server 按 session_id 转发
 				// 对端——STUN 公网候选交换，数组字段表内照惯例用裸名。
+				// purpose 缺省=mesh（老版本帧兼容）；transfer 腿显式捎带 transfer_id。
 				{Type: AgentEventPeerPunchSession, Required: []string{"type", "request_id", "session_id", "token", "ttl_seconds"}, Optional: []string{"advertise_ip", "purpose", "transfer_id"}, Emits: []string{AgentEventPeerPunchSessionResult}},
 				{Type: AgentEventPeerPunchSessionResult, Required: []string{"type", "request_id", "ok"}, Optional: []string{"port", "fingerprint", "fail_reason"}},
 				{Type: AgentEventPeerPunchCandidates, Required: []string{"type", "session_id", "candidates"}},

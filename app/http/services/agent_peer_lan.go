@@ -846,6 +846,8 @@ func registerAgentPunchTransferContext(transferID string, tctx agentPunchTransfe
 }
 
 // takeAgentPunchTransferContext 单次消费取表(无/已摘 → nil)。
+// 消费只摘 ctx 不停定时器——孤儿定时器到点经身份检查自清双表(≤TTL 界内)，
+// 故意设计勿「补对称」。
 func takeAgentPunchTransferContext(transferID string) (agentPunchTransferContext, bool) {
 	agentPunchTransferCtxMu.Lock()
 	defer agentPunchTransferCtxMu.Unlock()
