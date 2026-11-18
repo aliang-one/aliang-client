@@ -109,7 +109,7 @@
 
 ### 传输腿 punch 直连+STUN 可配置化遗留账(批次 2026-11-18,feat/transfer-punch-stun)
 
-**What:** 六条非阻塞遗留:①传输腿预热(接收方并行 punch 会话)——被预算吸收(agentTransferPunchBudget=12s)替代,二期看真机数据;②诊断面板传输腿 carrier 分桶统计(lan/punch/cos);③coturn 自托管部署手册(集群 UDP 端口暴露面);④STUN 健康探测/多档 fallback(列表内逐台择优,现固定首台可达即用语义);⑤punch 失败阶段审计细分(dial-error 现记 probe,流中断 mid_transfer,LanPushFailStage 字段名两腿共用有轻度名实漂移);⑥cert_generate_failed 臂 consume-not-putback 口径与 listen_failed 不一致(极罕见路径,重试撞 transfer_context_missing 落 COS=设计退化方向)。
+**What:** 八条非阻塞遗留:①传输腿预热(接收方并行 punch 会话)——被预算吸收(agentTransferPunchBudget=12s)替代,二期看真机数据;②诊断面板传输腿 carrier 分桶统计(lan/punch/cos);③coturn 自托管部署手册(集群 UDP 端口暴露面);④STUN 健康探测/多档 fallback(列表内逐台择优,现固定首台可达即用语义);⑤punch 失败阶段审计细分(dial-error 现记 probe,流中断 mid_transfer,LanPushFailStage 字段名两腿共用有轻度名实漂移);⑥cert_generate_failed 臂 consume-not-putback 口径与 listen_failed 不一致(极罕见路径,重试撞 transfer_context_missing 落 COS=设计退化方向);⑦A 侧 fail-closed 守卫未随计划落地(purpose=transfer 且 transferID 空串的三行守卫,dialSourceOpts/dialMiss 未实现——下游双闸兜住:编排入口拒空+B 侧 bad_transfer_id 拒单,防御纵深补 3 行即收);⑧punch 传输腿 90s TTL 体积悬崖(B 侧 punchAcceptLoop 定时器到点无条件收摊,A 侧 session 帧恒发 ttl_seconds=90——传输 >~85s 未完 transport 中途死→mid_transfer→COS 全量重传(punch 字节白付),与 lan_push 协议 15min serve grace 不对称;按 size 跳过 punch 或传输腿加长 ttl,真机数据定)。
 
 **Why:** 均不影响正确性/安全红线/主流程;验收口径=vm220↔liang-dev 真机打洞实测(部署后),真机数据决定二期投入(端口预测/IPv6 等原有二期项)。
 
