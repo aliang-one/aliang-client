@@ -49,6 +49,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -570,6 +571,17 @@ func (s *AgentService) handleAgentPeerLanPushListen(msg map[string]interface{}, 
 		ttlSeconds = 30
 	}
 
+	// 传输腿 punch 接收上下文(transfer-punch-stun):传输参数此刻齐备,
+	// 打洞会话(purpose=transfer)按 transfer_id 查用。TCP listener 与 punch
+	// 会话并行不悖——同网段走 TCP 腿,跨网段走 punch 腿,先到先得。
+	registerAgentPunchTransferContext(transferID, agentPunchTransferContext{
+		token:     token,
+		filename:  filename,
+		targetDir: targetDir,
+		maxBytes:  maxBytes,
+		writeJSON: writeJSON,
+	}, time.Duration(ttlSeconds)*time.Second)
+
 	tlsCert, fingerprint, err := generateAgentLanCertificate()
 	if err != nil {
 		fail("cert_generate_failed")
@@ -734,6 +746,53 @@ func pushAgentLanStream(ctx context.Context, secConn net.Conn, ident agentTransf
 	}
 	_ = writeJSON(agentTransferProgressPayload(ident.RequestID, ident.TransferID, agentTransferDirectionUpload, totalSize, totalSize, 0))
 	return totalSize, sum, ack.Path, nil
+}
+
+// ---------------------------------------------------------------------------
+// 传输腿 punch 接收上下文注册表(transfer-punch-stun)
+// ---------------------------------------------------------------------------
+
+// agentPunchTransferContext 是一个传输腿打洞会话的 B 侧接收上下文:由
+// handleAgentPeerLanPushListen 注册(传输参数在 listen 帧里齐备),B 侧
+// purpose=transfer 会话按 transfer_id 查表。单次消费:第一个打洞会话取走
+// 即删——重拨=新会话查空回 transfer_context_missing,上传链落 COS(v1
+// 不做会话间续借;close 帧系 TODOS ⑦)。
+type agentPunchTransferContext struct {
+	token     string
+	filename  string
+	targetDir string
+	maxBytes  int64
+	writeJSON func(interface{}) error // listen 帧时刻的 WS writer;断连后进度帧静默丢,非致命
+}
+
+var (
+	agentPunchTransferCtxMu sync.Mutex
+	agentPunchTransferCtx   = map[string]agentPunchTransferContext{}
+)
+
+// registerAgentPunchTransferContext 入表+TTL 摘除(listen TTL + 30s 余量,
+// 覆盖 punch 会话 90s 寿命口径不对齐的窗口——宁可表多活一会,查空由单次
+// 消费语义兜住)。
+func registerAgentPunchTransferContext(transferID string, tctx agentPunchTransferContext, ttl time.Duration) {
+	agentPunchTransferCtxMu.Lock()
+	agentPunchTransferCtx[transferID] = tctx
+	agentPunchTransferCtxMu.Unlock()
+	time.AfterFunc(ttl+30*time.Second, func() {
+		agentPunchTransferCtxMu.Lock()
+		delete(agentPunchTransferCtx, transferID)
+		agentPunchTransferCtxMu.Unlock()
+	})
+}
+
+// takeAgentPunchTransferContext 单次消费取表(无/已摘 → nil)。
+func takeAgentPunchTransferContext(transferID string) (agentPunchTransferContext, bool) {
+	agentPunchTransferCtxMu.Lock()
+	defer agentPunchTransferCtxMu.Unlock()
+	tctx, ok := agentPunchTransferCtx[transferID]
+	if ok {
+		delete(agentPunchTransferCtx, transferID)
+	}
+	return tctx, ok
 }
 
 // ---------------------------------------------------------------------------

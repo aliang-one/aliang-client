@@ -13,6 +13,13 @@ package services
 // 活会话经 SessionCache 复用(免逐拨重打洞,仅 mesh;传输腿一次性拨号,
 // transfer-punch-stun 质量评审裁决 5)。
 //
+// B 端流程含 purpose 路由(transfer-punch-stun Task 7):session 帧的
+// purpose 缺省/mesh → 过门流喂 ssh 入口(既有语义零变化);transfer → 按
+// transfer_id 单次消费接收上下文注册表(handleAgentPeerLanPushListen 注册,
+// agent_peer_lan.go)换 transferServe 缝喂 lan_push 协议体;缺上下文
+// fail-loud 回 transfer_context_missing,绝不静默喂 ssh 入口(用途错配=
+// 数据喂错 handler)。
+//
 // B 端流程的顺序硬约束(Task 4 规格审查锁定):
 //  1. 先绑 socket + Classify,后 QUIC listen——STUN 探测(Discover 的
 //     ReadFromUDP)与 quic.Transport 读循环同 conn 抢包,listen 先起会把
@@ -139,6 +146,10 @@ type agentPeerPunchB struct {
 	serve    func(*net.UDPConn, punch.ListenerOpts) (int, <-chan struct{}, error)
 	gate     func() bool
 	handler  func(sessionID string) func(net.Conn)
+	// transferServe 是 purpose=transfer 会话的过门流去向(transfer-punch-stun
+	// Task 7 注入缝):生产默认 agentPunchTransferServe——先设握手窗再喂
+	// lan_push 接收协议体(punch 流自带 TLS,禁再包 tls.Server)。
+	transferServe func(transferID string, tctx agentPunchTransferContext) func(net.Conn)
 }
 
 // agentPunchConfigEnabled punch 载体配置门:customer.mesh.punch_enable
@@ -178,18 +189,33 @@ func agentPeerPunchIngressHandler(sessionID string) func(net.Conn) {
 	}
 }
 
+// agentPunchTransferServe 生产传输服务体:过门流直接进 lan_push 协议体
+// (punch 流自带 TLS,禁再包 tls.Server——协议体拆层契约)。⚠️ 评审强制
+// 接线(T6 质量评审 Important-1):协议体首行读无自带 deadline,依赖调用方
+// 预设握手窗——TCP 薄壳设了(agentLanPushServeOnce),punch 路径必须在此
+// 设,否则已连通但静默的对端会让 hello 读无限悬挂(TCP 路径 5s 失败落
+// COS,punch 路径却挂在 QUIC 空闲超时)。wrapper 交付 conn 前先
+// SetDeadline(握手窗)。
+func agentPunchTransferServe(transferID string, tctx agentPunchTransferContext) func(net.Conn) {
+	return func(conn net.Conn) {
+		_ = conn.SetDeadline(time.Now().Add(agentLanHandshakeTimeout)) // 握手窗(评审强制)
+		serveAgentLanPushConn(conn, tctx.token, transferID, tctx.filename, tctx.targetDir, tctx.maxBytes, tctx.writeJSON)
+	}
+}
+
 // newAgentPeerPunchB 生产默认:物理口绑定+默认 STUN 对+punch.ServeListener
 // +配置门+ssh 入口注入。
 func newAgentPeerPunchB() *agentPeerPunchB {
 	return &agentPeerPunchB{
-		sessions: map[string]*agentPeerPunchSession{},
-		skipMemo: &punch.SkipMemo{},
-		bind:     func() (*net.UDPConn, string, error) { return punch.NewBoundUDPConn(punch.DefaultResolver) },
-		servers:  agentPunchConfiguredServers,
-		classify: punch.Classify,
-		serve:    punch.ServeListener,
-		gate:     agentPunchConfigEnabled,
-		handler:  agentPeerPunchIngressHandler,
+		sessions:      map[string]*agentPeerPunchSession{},
+		skipMemo:      &punch.SkipMemo{},
+		bind:          func() (*net.UDPConn, string, error) { return punch.NewBoundUDPConn(punch.DefaultResolver) },
+		servers:       agentPunchConfiguredServers,
+		classify:      punch.Classify,
+		serve:         punch.ServeListener,
+		gate:          agentPunchConfigEnabled,
+		handler:       agentPeerPunchIngressHandler,
+		transferServe: agentPunchTransferServe,
 	}
 }
 
@@ -233,9 +259,10 @@ func (s *AgentService) handleAgentPeerPunchCandidates(msg map[string]interface{}
 	sharedAgentPeerPunchA().handleCandidatesFrame(msg)
 }
 
-// handleSession B 端主流程(顺序硬约束见文件头):门禁 → 帧校验 → 绑
-// socket → STUN 判型(记账)→ 现签证书 → 单 transport 起听 → 注册+收摊
-// reaper → 回 result → 回自身候选(判型有映射时)。
+// handleSession B 端主流程(顺序硬约束见文件头):门禁 → 帧校验(含
+// purpose 路由/传输上下文单次消费)→ 绑 socket → STUN 判型(记账)→
+// 现签证书 → 单 transport 起听 → 注册+收摊 reaper → 回 result → 回自身
+// 候选(判型有映射时)。
 func (b *agentPeerPunchB) handleSession(msg map[string]interface{}, writeJSON func(interface{}) error, selfPeerID string) {
 	requestID := remoteString(msg, "request_id")
 	if requestID == "" {
@@ -269,6 +296,17 @@ func (b *agentPeerPunchB) handleSession(msg map[string]interface{}, writeJSON fu
 	// advertise_ip 可选字段 v1 收下不消费:B 的候选来自 STUN 映射;LAN 提示
 	// 作候选源是二期看数据再定的事(计划 Task 15 遗留账)。
 
+	// 会话目的(transfer-punch-stun Task 7):缺省显式化为 mesh(老 A 侧
+	// 无 purpose 帧=mesh,purposeOrMesh 同款归一——路由缺省→b.handler 缝,
+	// 既有语义零变化);未知 purpose 拒帧——用途错配即数据喂错 handler,
+	// fail-loud。
+	purpose := purposeOrMesh(remoteString(msg, "purpose"))
+	if purpose != "mesh" && purpose != "transfer" {
+		fail("bad_purpose")
+		return
+	}
+	transferID := remoteString(msg, "transfer_id")
+
 	// 顺序硬约束①②:先绑 socket,STUN 判型也必须先于 QUIC listen——探测
 	// 窗口(Discover 的 ReadFromUDP)与 Transport 读循环同 conn 抢包。
 	socket, iface, err := b.bind()
@@ -297,6 +335,29 @@ func (b *agentPeerPunchB) handleSession(msg map[string]interface{}, writeJSON fu
 		}
 	}
 
+	// 传输上下文 serve 前取出(Handler 是 serve 的入参,先于 serve 求值);
+	// serve 失败在下方 listen_failed 分支放回表项,消费语义归成功路径独占。
+	// purpose 校验先行(bad_purpose 在帧校验段,缺上下文在此),失败早退
+	// 不白签证书。
+	tctx, haveTctx := agentPunchTransferContext{}, false
+	if purpose == "transfer" {
+		if !validAgentTransferID(transferID) {
+			fail("bad_transfer_id")
+			return
+		}
+		tctx, haveTctx = takeAgentPunchTransferContext(transferID)
+		if !haveTctx {
+			// 声明了传输用途却无接收上下文(listen 未发生/已被消费/TTL 摘除):
+			// fail-loud 回 A,绝不静默喂 ssh 入口(用途错配=数据喂错 handler)。
+			fail("transfer_context_missing")
+			return
+		}
+	}
+	handlerFn := b.handler(sessionID)
+	if haveTctx {
+		handlerFn = b.transferServe(transferID, tctx)
+	}
+
 	// 证书机器复用 peer.lan 的现签件(ECDSA P-256 自签 1h,指纹=叶子 DER
 	// 的 sha256 hex),语义同构不重写(agent_peer_lan.go:130)。
 	cert, fingerprint, err := generateAgentLanCertificate()
@@ -314,12 +375,16 @@ func (b *agentPeerPunchB) handleSession(msg map[string]interface{}, writeJSON fu
 		TTL:       time.Duration(ttlSeconds) * time.Second,
 		Token:     token,
 		TLS:       punch.PunchTLSConfig{ServerCert: cert, ExpectedToken: token},
-		Handler:   b.handler(sessionID),
+		Handler:   handlerFn,
 		Transport: transport,
 	})
 	if err != nil {
 		_ = transport.Close()
 		_ = socket.Close()
+		if haveTctx {
+			// 放回表项:serve 失败不消费(单次消费语义由成功路径独占)。
+			registerAgentPunchTransferContext(transferID, tctx, time.Duration(ttlSeconds)*time.Second)
+		}
 		logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH] listener failed session=%s err=%v", sessionID, err))
 		fail("listen_failed")
 		return

@@ -591,3 +591,72 @@ func dialPushTestConn(t *testing.T, addr, fingerprint, token, transferID string,
 	}
 	return tlsConn
 }
+
+// ---------------------------------------------------------------------------
+// 传输腿 punch 接收上下文注册表(transfer-punch-stun Task 7):listen 帧时刻
+// 注册(handleAgentPeerLanPushListen),B 侧 purpose=transfer 打洞会话按
+// transfer_id 单次消费。
+// ---------------------------------------------------------------------------
+
+// TestAgentPunchTransferContextRegistry 注册表三契约:register→take 拿到
+// 完整上下文、再 take 空(单次消费)、TTL 到点摘除后 take 空。
+func TestAgentPunchTransferContextRegistry(t *testing.T) {
+	// 单次消费:register → take 拿到带全字段 → 再 take 空。
+	registerAgentPunchTransferContext("tr_regtest001", agentPunchTransferContext{
+		token:     "tok-reg",
+		filename:  "f.bin",
+		targetDir: "sub",
+		maxBytes:  123,
+		writeJSON: func(interface{}) error { return nil },
+	}, 30*time.Second)
+	got, ok := takeAgentPunchTransferContext("tr_regtest001")
+	if !ok || got.token != "tok-reg" || got.filename != "f.bin" || got.targetDir != "sub" || got.maxBytes != 123 || got.writeJSON == nil {
+		t.Fatalf("take 应拿到注册时的完整上下文: ok=%t got=%+v", ok, got)
+	}
+	if _, ok := takeAgentPunchTransferContext("tr_regtest001"); ok {
+		t.Fatal("第二次 take 必须为空(单次消费:重拨=新会话查空回 transfer_context_missing)")
+	}
+
+	// TTL 摘除:负 TTL 让 AfterFunc(ttl+30s) 即刻到点。摘除是异步 timer,
+	// 轮询内部表见证(take 是单次消费,用它轮询会首轮消费让断言假绿)。
+	registerAgentPunchTransferContext("tr_regtest002", agentPunchTransferContext{token: "tok"}, -40*time.Second)
+	deadline := time.After(3 * time.Second)
+	for {
+		agentPunchTransferCtxMu.Lock()
+		_, still := agentPunchTransferCtx["tr_regtest002"]
+		agentPunchTransferCtxMu.Unlock()
+		if !still {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("TTL 到点后注册表未摘除表项")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if _, ok := takeAgentPunchTransferContext("tr_regtest002"); ok {
+		t.Fatal("TTL 摘除后 take 必须为空")
+	}
+}
+
+// TestAgentPeerLanPushListen_RegistersPunchTransferContext listen 帧注册接线:
+// handleAgentPeerLanPushListen 成功路径必须把传输参数写入注册表(打洞会话按
+// transfer_id 查用),字段与 listen 帧逐项一致。
+func TestAgentPeerLanPushListen_RegistersPunchTransferContext(t *testing.T) {
+	newAgentTransferEnv(t)
+	svc := peerToolsTestEnv(t, nil)
+	result, token := lanPushServeTestServer(t, svc, "reg.bin", map[string]interface{}{
+		"target_dir": "docs",
+		"max_bytes":  float64(4096),
+	})
+	if result["ok"] != true {
+		t.Fatalf("push listen failed: %+v", result)
+	}
+	tctx, ok := takeAgentPunchTransferContext("tr_lanpusht001")
+	if !ok {
+		t.Fatal("listen 成功后注册表应有该 transfer_id 的接收上下文")
+	}
+	if tctx.token != token || tctx.filename != "reg.bin" || tctx.targetDir != "docs" || tctx.maxBytes != 4096 || tctx.writeJSON == nil {
+		t.Fatalf("注册的上下文字段与 listen 帧不符: %+v", tctx)
+	}
+}
