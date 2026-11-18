@@ -203,6 +203,10 @@ function steerStatusLabel(item) {
       return t('chat_steerApplied');
     case 'not_running':
       return t('chat_steerNotRunning');
+    case 'downgraded':
+      // not_running 降级改发成功后的中性终态（内容已转普通消息，不再渲染
+      // 「未生效」的误导性失败语气）。
+      return t('chat_steerDowngraded');
     case 'unknown':
       // 未知 result（含未来新增值如 held）：中性渲染，不误标失败（评审折叠项）
       return t('chat_steerUnknown', { result: item?.result || t('chat_steerUnknownResult') });

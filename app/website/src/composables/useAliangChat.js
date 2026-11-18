@@ -380,6 +380,61 @@ export function endRunWindow(conv) {
   return had;
 }
 
+// 会话持久化前清洗（原 composable 内联实现上提：纯函数，saveToStorage/测试
+// 共用）。瞬态对象逐一剥离的纪律与本函数同文件注释一致。
+export function conversationForStorage(conv) {
+  const copy = { ...conv };
+  copy.approvals = [];
+  // 方案交互卡同为瞬态（Task 14）：后端 run 结束才重发请求，跨页保留的
+  // 「已选择」终态/待答卡只会误导（作答通道已随页面关闭而失联）。
+  copy.optionCards = [];
+  // tool_ask 提问卡同为瞬态（2026-11-08）：SLA 25min 内后端重发请求帧，
+  // 跨页保留的待答卡只会误导（作答通道已随页面关闭而失联）。
+  copy.toolAsks = [];
+  // steer 轻量条是瞬态 UI：ack 状态不跨页持久（陈旧的「已受理」比没有更糟）
+  copy.steerItems = [];
+  // pendingConfig（「下轮生效」角标）同为瞬态：重载后「是否已开新回合」
+  // 无从判定，跨页保留只会展示陈旧角标——与 approvals/steerItems 同剥。
+  delete copy.pendingConfig;
+  // snapshotCatchupAt（快照对账去重窗口起点）与 recoveredRun（恢复会话
+  // 待终态回取快照标记）同为瞬态：跨页无意义，重进页 resubscribe 重建。
+  delete copy.snapshotCatchupAt;
+  delete copy.recoveredRun;
+  // deviceLoadedAt（journal 详情装载时刻）：瞬态——跨页重开必须重新对账
+  // （草稿↔journal reconcile 与设备壳装载共用此 TTL 键），持久化它会让
+  // 重进页 5 分钟内跳过重建、继续展示过时的本地拼接稿。
+  delete copy.deviceLoadedAt;
+  // deviceTranscript 不落盘（评审折叠项）：重开设备会话有 5 分钟 TTL+详情
+  // 分页重拉兜底，防大转录长期占 localStorage。
+  delete copy.deviceTranscript;
+  // running/runActive 是「进行中」僵尸的著名持有者（2026-11-18 定案）：两
+  // flag 的唯一复位点是 endRunWindow（仅 ai.done/ai.error 调用），关窗/断线
+  // 期间持久化的会话重进页会恢复出永动的「进行中」且无任何自愈通道。权威
+  // 在 agent（journal/快照），localStorage 只是视图缓存——落盘前剥掉。
+  delete copy.running;
+  delete copy.runActive;
+  return copy;
+}
+
+// 会话恢复清洗（原 composable 内联实现上提：纯函数，恢复链/测试共用）。
+// running/runActive 强制复位，与 conversationForStorage 的落盘剥除同一律：
+// 权威在 agent，localStorage 里残留的进行中态是僵尸 flag（唯一复位点
+// endRunWindow 只由 ai.done/ai.error 触发，跨页恢复路径永远等不到）。running
+// 气泡不动——交由快照对账按权威收账，避免丢用户已见的流式内容。
+export function normalizeConversation(conv) {
+  if (!conv || typeof conv !== 'object') return null;
+  if (!Array.isArray(conv.messages)) conv.messages = [];
+  conv.approvals = [];
+  // optionCards/toolAsks 从不落盘（storage 侧已剥离），此处兜底旧数据/异常形态。
+  conv.optionCards = [];
+  conv.toolAsks = [];
+  // 僵尸 flag 恢复清洗（同上）：旧版本落盘（或异常写入）留下的 running 态
+  // 在恢复时一律压平，输入框解锁交给真实的 run 生命周期帧/快照重建。
+  conv.running = false;
+  conv.runActive = false;
+  return conv;
+}
+
 // 会话 running 判定（原内联实现上提 + run 窗口并入）：快照态 OR run 窗口
 // OR 本地气泡推断，三源并集。另一端跑着的会话（壳 running/快照 running）
 // 与本端正在流的会话都算 running——running 期间本端新消息走 steer 分流
@@ -1613,33 +1668,8 @@ export function useAliangChat() {
     }
   }
 
-  function conversationForStorage(conv) {
-    const copy = { ...conv };
-    copy.approvals = [];
-    // 方案交互卡同为瞬态（Task 14）：后端 run 结束才重发请求，跨页保留的
-    // 「已选择」终态/待答卡只会误导（作答通道已随页面关闭而失联）。
-    copy.optionCards = [];
-    // tool_ask 提问卡同为瞬态（2026-11-08）：SLA 25min 内后端重发请求帧，
-    // 跨页保留的待答卡只会误导（作答通道已随页面关闭而失联）。
-    copy.toolAsks = [];
-    // steer 轻量条是瞬态 UI：ack 状态不跨页持久（陈旧的「已受理」比没有更糟）
-    copy.steerItems = [];
-    // pendingConfig（「下轮生效」角标）同为瞬态：重载后「是否已开新回合」
-    // 无从判定，跨页保留只会展示陈旧角标——与 approvals/steerItems 同剥。
-    delete copy.pendingConfig;
-    // snapshotCatchupAt（快照对账去重窗口起点）与 recoveredRun（恢复会话
-    // 待终态回取快照标记）同为瞬态：跨页无意义，重进页 resubscribe 重建。
-    delete copy.snapshotCatchupAt;
-    delete copy.recoveredRun;
-    // deviceLoadedAt（journal 详情装载时刻）：瞬态——跨页重开必须重新对账
-    // （草稿↔journal reconcile 与设备壳装载共用此 TTL 键），持久化它会让
-    // 重进页 5 分钟内跳过重建、继续展示过时的本地拼接稿。
-    delete copy.deviceLoadedAt;
-    // deviceTranscript 不落盘（评审折叠项）：重开设备会话有 5 分钟 TTL+详情
-    // 分页重拉兜底，防大转录长期占 localStorage。
-    delete copy.deviceTranscript;
-    return copy;
-  }
+  // conversationForStorage 已上提为模块级纯函数（running/runActive 僵尸 flag
+  // 剥除批）：此处不再有闭包版，引用解析到模块作用域。
 
   function createConversation() {
     const conv = {
@@ -1947,6 +1977,13 @@ export function useAliangChat() {
         // 定谳收敛：journal turn 行终态才齐，权威 idle 快照应用后恢复旗使命
         // 已尽（终态帧丢失的滞留 running 泡也已由纯内核关账）。
         local.recoveredRun = false;
+        // 收窗（endRunWindow）对齐 ai.done 分支：runActive/running 复位 +
+        // 残留 running 泡关账。此前两 flag 无此处复位点——关窗期间快照对账
+        // 只清气泡不清 flag，「进行中」僵尸经重进页恢复永动（2026-11-18 定案
+        // 家族②）。已知窄窗口竞态：快照取数与处理之间落进外来 ai.run.started
+        // 会把刚起跑的活窗误关（快照 status 是取数时刻的旧值）——既有同类
+        // 风险（recoveredRun/气泡收敛同窗），可接受；下一枚 run 帧会重建窗口。
+        endRunWindow(local);
         // 收敛结算镜像旧 done 分支：审批清卡（快照 pending_approvals 为空即
         // 权威「无在挂」）+ 看门狗解除 + finishRun——不落 finishRun 会把输入
         // 框永久锁死在 sendDisabled。
@@ -2204,19 +2241,9 @@ export function useAliangChat() {
     nextTick(() => inputRef.value?.focus());
   }
 
-  // findRunningAssistant/ensureAssistantBubble 上提为模块级纯函数（2026-11-09
-  // vm22 事故族：run 窗口感知/串行回合收敛需要独立单测）——此处不再有闭包版，
-  // 引用解析到模块作用域。
-
-  function normalizeConversation(conv) {
-    if (!conv || typeof conv !== 'object') return null;
-    if (!Array.isArray(conv.messages)) conv.messages = [];
-    conv.approvals = [];
-    // optionCards/toolAsks 从不落盘（storage 侧已剥离），此处兜底旧数据/异常形态。
-    conv.optionCards = [];
-    conv.toolAsks = [];
-    return conv;
-  }
+  // findRunningAssistant/ensureAssistantBubble/conversationForStorage/
+  // normalizeConversation 均已上提为模块级纯函数（run 窗口感知/串行回合收敛/
+  // 僵尸 flag 清洗都需要独立单测）——此处不再有闭包版，引用解析到模块作用域。
 
   function approvalKeyFromValues(sessionId, approvalId) {
     return `${sessionId || ''}:${approvalId || ''}`;
@@ -2659,7 +2686,7 @@ export function useAliangChat() {
       const items = Array.isArray(c.steerItems) ? c.steerItems : [];
       const item = items.find(it => it.messageId === mid);
       if (!item) continue;
-      applySteerAck(item, e);
+      applySteerAck(item, e, c);
       refreshOnEvent(); // 插话落定（not_running 等）可能伴随清单 running 态翻转，节流刷新侧栏
       return;
     }
@@ -2668,13 +2695,23 @@ export function useAliangChat() {
 
   // queued/applied/not_running 落各自状态；error/unsupported 是契约内失败值
   // （失败渲染 + detail）；其余未知 result（含未来新增值）中性渲染 `插话状态：x`，
-  // 不误标失败（评审折叠项）。
-  function applySteerAck(item, e) {
+  // 不误标失败（评审折叠项）。not_running 额外触发降级改发（见
+  // downgradeSteerAfterAck）——需要提交方会话对象，handleSteerAck 反查时透传。
+  function applySteerAck(item, e, conv = null) {
     const result = String(e.result || '');
     item.result = result;
-    if (result === 'queued' || result === 'applied' || result === 'not_running') {
+    if (result === 'queued' || result === 'applied') {
       item.status = result;
       item.detail = '';
+      return;
+    }
+    if (result === 'not_running') {
+      // 会话真实已 idle 的权威证据。已降级过的条目不回写 not_running（迟到
+      // 重投 ack 不得把「已转普通消息」的状态打回「未生效」），也不再进降级。
+      if (item.downgraded) return;
+      item.status = result;
+      item.detail = '';
+      downgradeSteerAfterAck(conv, item);
       return;
     }
     if (result === 'error' || result === 'unsupported') {
@@ -2684,6 +2721,91 @@ export function useAliangChat() {
     }
     item.status = 'unknown';
     item.detail = '';
+  }
+
+  // 插话降级改发（2026-11-18 手机 parity）：steer ack 回 not_running 表示
+  // agent 侧会话真实已 idle——本端 running 窗口是僵尸态。先 endRunWindow
+  // 翻窗，再把原插话内容自动改发为普通消息（ai.message 正常路径；agent 对
+  // 休眠会话按 ai.message 懒建恢复转正为新回合，语义与手机端
+  // classifySessionBusyError==='session_not_running' → sendAiMessage 对齐）。
+  //
+  // 防环/只发一次的三道闸：
+  //   ① item.downgraded 单向锁——先置位再发送，迟到重投 ack / 并发回包绝不
+  //      二次改发；改发尝试过的条目永不再进本函数。
+  //   ② 翻窗先于改发——endRunWindow 后 isConversationRunning=false，用户手动
+  //      重发自然走普通发送（sendMessage 正常链），不会再分流进 submitSteer。
+  //   ③ 同会话 create 门在途守卫——pendingCreates 按 session_id 单槽，二次
+  //      set 会顶掉首等待方使其空等死钟；active 会话 sending 在途时放弃自动
+  //      改发（保持 not_running 展示，用户下次发送自然带上语境）。
+  //
+  // 范围与附件取舍：仅本地会话降级。设备壳不降级——壳可能缺 model（内核必
+  // 拒跑「未指定模型」），且壳的权威态由设备清单/快照通道收账，自动改发会
+  // 与该通道抢写。web 端 steer 从不携带附件（sendMessage 对 running 会话的
+  // 附件上游即拦，chat_attachSteerBlocked），降级只承载文本，无附件取舍问题。
+  // 失败兜底：create 被拒/socket 断开时占位气泡已按 sendMessage 同款画错误，
+  // 轻量条保持 not_running（插话确实未生效，事实陈述不因改发失败而失真）。
+  async function downgradeSteerAfterAck(conv, item) {
+    if (!conv || conv.deviceSession || item.downgraded) return;
+    item.downgraded = true; // 单向锁：此后任何路径都只尝试这一次
+    if (conv.id === activeId.value && sending.value) return;
+    const text = String(item.content || '').trim();
+    if (!text) return;
+    endRunWindow(conv);
+    // 空模型：内核必拒跑。保持 not_running 展示，让用户补模型后手动重发。
+    if (!String(conv.model || '').trim()) return;
+    const messageId = generateId();
+    conv.messages.push({ role: 'user', content: text, messageId, provider: conv.provider, ts: now() });
+    if (!conv.title) conv.title = text.slice(0, 20);
+    conv.updatedAt = now();
+    const assistantMsg = { role: 'assistant', content: '', status: 'running', ts: now() };
+    conv.messages.push(assistantMsg);
+    // 占位气泡即时落盘（同 sendMessage）：delta 只进内存，占位不落盘则刷新
+    // 后恢复不出运行态、resubscribe 通道哑火。
+    saveToStorage();
+    if (conv.id === activeId.value) {
+      sending.value = true;
+      scrollToBottom(true);
+    }
+    if (!conv.aiSessionId) conv.aiSessionId = 'local-' + conv.id;
+    try {
+      await ensureAISocket();
+      const ack = await waitForCreateAck(conv);
+      if (ack.status !== 'created') {
+        // create 被拒/超时：撤掉空占位（同 sendMessage 早退分支），错误已由
+        // ai.error 分支/兜底渲染；轻量条保持 not_running。
+        const asst = findRunningAssistant(conv);
+        if (asst && !asst.content) conv.messages = conv.messages.filter(m => m !== asst);
+        if (conv.id === activeId.value && !createError.value) createError.value = t('chat_serviceUnavailable');
+        sending.value = false;
+        disarmIdleWatchdog();
+        saveToStorage();
+        return;
+      }
+      conv.recoveredRun = false; // 新回合自本端发起:delta 全量可达,无需终态回取
+      if (conv.id === activeId.value) armIdleWatchdog(conv);
+      const ok = sendAI({
+        type: 'ai.message',
+        session_id: conv.aiSessionId,
+        message_id: messageId,
+        content: text,
+      });
+      if (!ok) throw new Error('socket-closed');
+      // 改发已被通道接收：轻量条翻降级态（中性文案，见 chat_steerDowngraded）。
+      item.status = 'downgraded';
+      item.detail = '';
+      saveToStorage();
+    } catch (_) {
+      disarmIdleWatchdog();
+      const asst = findRunningAssistant(conv);
+      if (asst) {
+        asst.status = 'error';
+        asst.content = t('chat_serviceUnavailable');
+      }
+      if (conv.id === activeId.value) sending.value = false;
+      // user/占位双泡保留（内容没丢，占位上的错误可见可重发）；轻量条保持
+      // not_running。
+      saveToStorage();
+    }
   }
 
   // --- 撤回重发：编辑态进出与发送链（Task 13） ---
