@@ -1531,6 +1531,18 @@ func (c *Config) GetAgentDeviceSyncURL(deviceID string) string {
 	return fmt.Sprintf("%s/api/v1/agent/devices/%s/sync", c.AgentBaseURL(), url.PathEscape(strings.TrimSpace(deviceID)))
 }
 
+// GetAgentMeshIdentityURL mesh 身份上送(自动组网批次):agent POST 公钥行
+// + host key 指纹,服务端按账号落 roster 目录。
+func (c *Config) GetAgentMeshIdentityURL() string {
+	return fmt.Sprintf("%s/api/agent/mesh-identity", c.AgentBaseURL())
+}
+
+// GetAgentMeshRosterURL 同账号 roster 拉取(自动组网批次):自动 peer 的
+// 带外信任锚(beacon 明文自报的核验权威)。
+func (c *Config) GetAgentMeshRosterURL() string {
+	return fmt.Sprintf("%s/api/agent/mesh-roster", c.AgentBaseURL())
+}
+
 func (c *Config) GetAgentDevicesURL() string {
 	return fmt.Sprintf("%s/api/devices", c.AgentBaseURL())
 }

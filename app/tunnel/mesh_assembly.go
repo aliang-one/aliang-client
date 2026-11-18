@@ -32,6 +32,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"aliang.one/nursorgate/app/mesh/lanbeacon"
@@ -419,24 +420,55 @@ func augmentLANAddrsFromBeacon(deviceID, pinnedHostKey string) []string {
 	return addrs
 }
 
+// meshRosterLookup roster 回查缝(自动组网批次):app/tunnel 不能 import
+// app/http/services(反向成环,agent_service.go 先例),roster 缓存住在
+// services 层——boot 由 cmd 注入(services.MeshRosterEntryFor),atomic
+// 值存函数引用(meshSelfIDSource 同款先例)。nil=未接线=回查恒 false
+// (fail-closed,自动组网不生效)。
+var meshRosterLookup atomic.Value // func(deviceID string) (pubLine, fp string, ok bool)
+
+// SetMeshRosterLookup 注入 roster 回查缝(boot 接线;幂等覆盖)。
+func SetMeshRosterLookup(fn func(deviceID string) (pubLine, fp string, ok bool)) {
+	meshRosterLookup.Store(fn)
+}
+
+func meshRosterFor(deviceID string) (pubLine, fp string, ok bool) {
+	fn, _ := meshRosterLookup.Load().(func(string) (string, string, bool))
+	if fn == nil {
+		return "", "", false
+	}
+	return fn(deviceID)
+}
+
 // WireMeshAutoPeerProbe boot 接线(自动组网批次):config 探针 → beacon
 // 同账号自动表。幂等覆盖;两个 boot 形态(start/core)各调一次。
-// ⚠️ 信任闸:customer.mesh.auto_peers(让渡型默认关)在闭包内认证期活读
-// ——开关关=探针恒未命中(拨号/委托/编译三面回查全部 fail-closed 回旧
-// 语义),开=同账号自报对端自动可拨(可信局域网语义)。
-func WireMeshAutoPeerProbe() {
+// ⚠️ 信任闸(评审 major 收口):①customer.mesh.auto_peers 让渡开关默认
+// 关,闭包内认证期活读;②平台 roster 核验(带外权威,经 meshRosterLookup
+// 缝):beacon 自报的公钥行/指纹必须与 roster 绑定精确相等——自签顶替/
+// 伪造 beacon 因不在 roster 而全拒(HostKey 取 roster 权威值,不取 beacon
+// 自报)。
+func WireMeshAutoPeerProbe(rosterLookup func(deviceID string) (pubLine, fp string, ok bool)) {
+	SetMeshRosterLookup(rosterLookup)
 	config.SetMeshAutoPeerProbe(func(deviceID string) (config.MeshAutoPeerView, bool) {
 		if cfg := config.GetGlobalConfig(); cfg == nil || cfg.Customer == nil || !cfg.Customer.Mesh.EffectiveAutoPeers() {
 			return config.MeshAutoPeerView{}, false
 		}
+		pubLine, rosterFp, rok := meshRosterFor(deviceID)
+		if !rok {
+			return config.MeshAutoPeerView{}, false
+		}
 		for _, ap := range lanbeacon.AutoPeers() {
-			if ap.DeviceID == deviceID {
-				return config.MeshAutoPeerView{
-					DeviceID: ap.DeviceID,
-					LANAddrs: []string{ap.Addr},
-					HostKey:  ap.HostKey,
-				}, true
+			if ap.DeviceID != deviceID {
+				continue
 			}
+			if strings.TrimSpace(ap.MeshPubKey) != pubLine || ap.HostKey != rosterFp {
+				continue // beacon 自报与 roster 不一致:拒(fail-closed)
+			}
+			return config.MeshAutoPeerView{
+				DeviceID: ap.DeviceID,
+				LANAddrs: []string{ap.Addr},
+				HostKey:  rosterFp, // 权威值(roster),非 beacon 自报
+			}, true
 		}
 		return config.MeshAutoPeerView{}, false
 	})
