@@ -19,6 +19,10 @@ package services
 //   - 指纹:B 每次协商现签 ECDSA P-256 自签证书,fingerprint=sha256(DER);
 //     A 拿候选里的指纹钉扎(InsecureSkipVerify+手动比对),防 LAN 内嗅探/仿冒。
 //
+// 协议体拆层(收/发两腿同款):hello→ok→字节流→ACK 的协议体
+// (serveAgentLanPushConn / pushAgentLanStream)载体无关,TLS 只在 TCP 薄壳里
+// 包一次;punch 路径直接喂协议体(punch 流自带 TLS,禁再包一层)。
+//
 // 边界(v1 明确从简,spec §6.3):
 //   - 目录归档不走直连(zip 打包兜不住单用途短时语义,服务端也不会发候选)。
 //   - 不支持续传:partial 已有偏移时直接放弃 LAN 腿走 COS。
@@ -374,9 +378,7 @@ func parseAgentLanPushCandidates(msg map[string]interface{}) *agentLanDirectCand
 }
 
 // agentLanPushServeOnce 是 A 端收件 listener 的服务体:恰好处理一条连接。
-// 协议见本节头注释。收件围栏/落盘/marker 全部复用接收链的既有件(landing
-// fence / .partial 命名 / 重名不覆盖 / done marker);收满 size_bytes 才 ACK,
-// 任何失败:删 partial、回 ok:false、静默断开。
+// TCP+TLS 薄壳:TLS 在这里包一次,协议体交给载体无关的 serveAgentLanPushConn。
 func (s *AgentService) agentLanPushServeOnce(conn net.Conn, tlsCert tls.Certificate, expectedToken, expectedTransferID, filename, targetDir string, maxBytes int64, writeJSON func(interface{}) error) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(agentLanHandshakeTimeout))
@@ -385,7 +387,17 @@ func (s *AgentService) agentLanPushServeOnce(conn net.Conn, tlsCert tls.Certific
 		logger.Info(fmt.Sprintf("[AGENT-PEER-LAN-PUSH] handshake failed: %v", err))
 		return
 	}
-	reader := bufio.NewReader(io.LimitReader(tlsConn, agentLanHeadlineLimit))
+	serveAgentLanPushConn(tlsConn, expectedToken, expectedTransferID, filename, targetDir, maxBytes, writeJSON)
+}
+
+// serveAgentLanPushConn 是 lan_push 接收协议体(载体无关):secConn 已在外层
+// 完成 TLS,本函数只做 hello→ok→定长字节流→ACK。TCP 路径由薄壳喂 tls.Conn,
+// punch 路径直接喂协议体(punch 流自带 TLS,禁再包一层)。收件围栏/落盘/
+// marker 全部复用接收链的既有件(landing fence / .partial 命名 / 重名不覆盖 /
+// done marker);收满 size_bytes 才 ACK,任何失败:删 partial、回 ok:false、
+// 静默断开。
+func serveAgentLanPushConn(secConn net.Conn, expectedToken, expectedTransferID, filename, targetDir string, maxBytes int64, writeJSON func(interface{}) error) {
+	reader := bufio.NewReader(io.LimitReader(secConn, agentLanHeadlineLimit))
 	line, err := reader.ReadBytes('\n')
 	if err != nil || len(line) > agentLanHeadlineLimit {
 		logger.Info("[AGENT-PEER-LAN-PUSH] headline read failed or oversized")
@@ -406,7 +418,7 @@ func (s *AgentService) agentLanPushServeOnce(conn net.Conn, tlsCert tls.Certific
 	}
 	if hello.SizeBytes < 0 || (maxBytes > 0 && hello.SizeBytes > maxBytes) {
 		// 声明大小越限:拒绝收流(虚报 size 的对端兜底),回 ok:false。
-		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"too_large"}`), '\n'))
+		_, _ = secConn.Write(append([]byte(`{"ok":false,"reason":"too_large"}`), '\n'))
 		logger.Info(fmt.Sprintf("[AGENT-PEER-LAN-PUSH] declared size %d exceeds max_bytes %d", hello.SizeBytes, maxBytes))
 		return
 	}
@@ -416,11 +428,11 @@ func (s *AgentService) agentLanPushServeOnce(conn net.Conn, tlsCert tls.Certific
 	// deadline 掐到即刻——读流立即超时失败,走下方失败路径删 partial 不 ACK,
 	// 与接收腿「取消必须完全失效」契约对齐(旧空闸让取消后传输照常完成)。
 	slotCancel := func() {
-		_ = conn.SetDeadline(time.Now())
+		_ = secConn.SetDeadline(time.Now())
 	}
 	ok, duplicate := transferReceiveSlot().acquire(expectedTransferID, slotCancel)
 	if !ok {
-		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"receiver_busy"}`), '\n'))
+		_, _ = secConn.Write(append([]byte(`{"ok":false,"reason":"receiver_busy"}`), '\n'))
 		logger.Info(fmt.Sprintf("[AGENT-PEER-LAN-PUSH] receive slot busy transfer_id=%s duplicate=%t", expectedTransferID, duplicate))
 		return
 	}
@@ -429,39 +441,39 @@ func (s *AgentService) agentLanPushServeOnce(conn net.Conn, tlsCert tls.Certific
 	// 落盘三件套(接收链同款):inbox 收件根 + target_dir 围栏 + .partial 命名。
 	inbox, err := agentTransferInboxDir()
 	if err != nil {
-		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"internal"}`), '\n'))
+		_, _ = secConn.Write(append([]byte(`{"ok":false,"reason":"internal"}`), '\n'))
 		return
 	}
 	safeName, err := sanitizeTransferFileName(filename)
 	if err != nil {
-		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"bad_filename"}`), '\n'))
+		_, _ = secConn.Write(append([]byte(`{"ok":false,"reason":"bad_filename"}`), '\n'))
 		return
 	}
 	landDir, err := agentTransferLandingDir(inbox, targetDir)
 	if err != nil {
-		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"fence_escape"}`), '\n'))
+		_, _ = secConn.Write(append([]byte(`{"ok":false,"reason":"fence_escape"}`), '\n'))
 		return
 	}
 	if err := os.MkdirAll(landDir, 0o755); err != nil {
-		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"internal"}`), '\n'))
+		_, _ = secConn.Write(append([]byte(`{"ok":false,"reason":"internal"}`), '\n'))
 		return
 	}
 	partialPath := agentTransferPartialPath(inbox, expectedTransferID, safeName)
 	partial, err := os.OpenFile(partialPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
-		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"internal"}`), '\n'))
+		_, _ = secConn.Write(append([]byte(`{"ok":false,"reason":"internal"}`), '\n'))
 		return
 	}
 
 	// token 过、槽到手、落盘就位:回 ok 放 B 开流,传输宽限盖 conn deadline。
-	_, _ = tlsConn.Write(append([]byte(`{"ok":true}`), '\n'))
-	conn.SetDeadline(time.Now().Add(agentLanServeGrace))
+	_, _ = secConn.Write(append([]byte(`{"ok":true}`), '\n'))
+	secConn.SetDeadline(time.Now().Add(agentLanServeGrace))
 
 	hasher := sha256.New()
 	throttle := newAgentTransferThrottle(hello.SizeBytes)
 	var received int64
 	body := &progressReader{
-		r: tlsConn,
+		r: secConn,
 		n: &received,
 		onRead: func() {
 			if throttle.shouldEmit(atomic.LoadInt64(&received), time.Now()) {
@@ -512,7 +524,7 @@ func (s *AgentService) agentLanPushServeOnce(conn net.Conn, tlsCert tls.Certific
 		"size_bytes": written,
 		"path":       finalPath,
 	})
-	if _, err := tlsConn.Write(append(ack, '\n')); err != nil {
+	if _, err := secConn.Write(append(ack, '\n')); err != nil {
 		logger.Warn(fmt.Sprintf("[AGENT-PEER-LAN-PUSH] ack write failed transfer_id=%s err=%v", expectedTransferID, err))
 		return
 	}
@@ -597,6 +609,7 @@ func (s *AgentService) handleAgentPeerLanPushListen(msg map[string]interface{}, 
 // 钉扎指纹、声明大小、流文件、核 ACK。成功返回 (size, sha, path, nil)——
 // size/sha 与自算一致已由本函数核过,path 是 A 侧最终落盘路径。任何失败返回
 // 非 nil error,由调用方落回 COS 常规上传——本函数绝不部分成功。
+// TCP+TLS 薄壳:拨号+钉扎 TLS 在这里做,协议体交给载体无关的 pushAgentLanStream。
 func attemptAgentTransferLANPush(ctx context.Context, ident agentTransferIdentity, cand *agentLanDirectCandidate, sourcePath string, totalSize int64, writeJSON func(interface{}) error) (int64, string, string, error) {
 	if totalSize <= 0 {
 		// 归档(zip 流式打包总量未知)与 stat 不到的源:直推腿不参与。
@@ -618,15 +631,24 @@ func attemptAgentTransferLANPush(ctx context.Context, ident agentTransferIdentit
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		return 0, "", "", fmt.Errorf("lan tls handshake failed: %w", err)
 	}
+	return pushAgentLanStream(ctx, tlsConn, ident, cand.Token, sourcePath, totalSize, writeJSON)
+}
+
+// pushAgentLanStream 是 lan_push 发送协议体(载体无关):secConn 已完成 TLS
+// (含指纹钉扎),本函数只做 hello→ok→流文件→核 ACK,成功返回
+// (size, sha, path, nil)——size/sha 与自算一致已由本函数核过,path 是 A 侧
+// 最终落盘路径。TCP 路径由 attemptAgentTransferLANPush 薄壳喂 tls.Client 流;
+// punch 路径直接喂协议体(punch 流自带 TLS,禁再包一层)。
+func pushAgentLanStream(ctx context.Context, secConn net.Conn, ident agentTransferIdentity, token string, sourcePath string, totalSize int64, writeJSON func(interface{}) error) (int64, string, string, error) {
 	hello, _ := json.Marshal(map[string]interface{}{
-		"token":       cand.Token,
+		"token":       token,
 		"transfer_id": ident.TransferID,
 		"size_bytes":  totalSize,
 	})
-	if _, err := tlsConn.Write(append(hello, '\n')); err != nil {
+	if _, err := secConn.Write(append(hello, '\n')); err != nil {
 		return 0, "", "", fmt.Errorf("lan hello write failed: %w", err)
 	}
-	reader := bufio.NewReader(io.LimitReader(tlsConn, agentLanHeadlineLimit))
+	reader := bufio.NewReader(io.LimitReader(secConn, agentLanHeadlineLimit))
 	line, err := reader.ReadBytes('\n')
 	if err != nil {
 		return 0, "", "", fmt.Errorf("lan headline read failed: %w", err)
@@ -641,13 +663,13 @@ func attemptAgentTransferLANPush(ctx context.Context, ident agentTransferIdentit
 	// 开流:传输宽限。ctx 取消真闸(P1 评审修):tls 流式读写不感知 ctx,起
 	// watcher 在 ctx.Done 时把 conn deadline 掐到即刻——流/ACK 读立即超时
 	// 失败,取消语义与 COS 腿对齐(映射 cancelled,不静默完成)。
-	rawConn.SetDeadline(time.Now().Add(agentLanServeGrace))
+	secConn.SetDeadline(time.Now().Add(agentLanServeGrace))
 	stopWatcher := make(chan struct{})
 	defer close(stopWatcher)
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = rawConn.SetDeadline(time.Now())
+			_ = secConn.SetDeadline(time.Now())
 		case <-stopWatcher:
 		}
 	}()
@@ -669,7 +691,7 @@ func attemptAgentTransferLANPush(ctx context.Context, ident agentTransferIdentit
 			}
 		},
 	}
-	written, copyErr := io.Copy(io.MultiWriter(tlsConn, hasher), io.LimitReader(body, totalSize))
+	written, copyErr := io.Copy(io.MultiWriter(secConn, hasher), io.LimitReader(body, totalSize))
 	if copyErr != nil {
 		// ctx 取消(transfer.cancel)优先于包装错误:COS 腿同款语义,取消映射
 		// cancelled 终态而非「落 COS 重传」(取消必须完全失效)。
@@ -687,7 +709,7 @@ func attemptAgentTransferLANPush(ctx context.Context, ident agentTransferIdentit
 	sum := hex.EncodeToString(hasher.Sum(nil))
 
 	// ACK 围栏:A 收满核 sha 后回最终行;给足宽限(A 的 rename/marker 在 ACK 前)。
-	rawConn.SetDeadline(time.Now().Add(agentLanServeGrace))
+	secConn.SetDeadline(time.Now().Add(agentLanServeGrace))
 	ackLine, err := reader.ReadBytes('\n')
 	if err != nil || len(ackLine) > agentLanHeadlineLimit {
 		if ctxErr := ctx.Err(); ctxErr != nil {

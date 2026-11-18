@@ -511,6 +511,65 @@ func TestAgentPeerLanPushListen_SlotCancelKillsConn(t *testing.T) {
 	}
 }
 
+// 协议体拆层测试:net.Pipe 两端直接喂收/发两个协议体(无 TLS——TLS 已拆到
+// TCP 薄壳;punch 路径将来同款喂法)。hello→ok→字节流→ACK 全程走完,断言
+// B 侧返回值、A 侧落盘 sha/size 与 ACK 三方一致。
+func TestAgentLanPushProtocolBodies_NetPipeRoundTrip(t *testing.T) {
+	inbox := newAgentTransferEnv(t)
+	content := deterministicTransferBytes(64*1024 + 7) // 非整 KB,防对齐巧合
+	src := filepath.Join(t.TempDir(), "src.bin")
+	if err := os.WriteFile(src, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wantSHA := sha256HexOf(content)
+
+	bEnd, aEnd := net.Pipe()
+	defer bEnd.Close()
+	defer aEnd.Close()
+	const token = "pipe-token-1234567890"
+	const transferID = "tr_pipepush001"
+	writeProgress := func(interface{}) error { return nil }
+
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		serveAgentLanPushConn(aEnd, token, transferID, "pipe.bin", "", 4<<20, writeProgress)
+	}()
+
+	ident := agentTransferIdentity{RequestID: "req-pipe-1", TransferID: transferID, Filename: "pipe.bin"}
+	size, sha, ackPath, err := pushAgentLanStream(context.Background(), bEnd, ident, token, src, int64(len(content)), writeProgress)
+	if err != nil {
+		t.Fatalf("protocol push over pipe failed: %v", err)
+	}
+	// B 侧返回值:size/sha 已由 pushAgentLanStream 对 ACK 核过(err==nil 即一致)。
+	if size != int64(len(content)) || sha != wantSHA {
+		t.Fatalf("push return mismatch size=%d want=%d sha=%s want=%s", size, len(content), sha, wantSHA)
+	}
+	// ACK 带回的 path 必须落在替换后的 inbox 收件根内。
+	if !strings.HasPrefix(ackPath, inbox+string(os.PathSeparator)) {
+		t.Fatalf("ack path %q must land under inbox %q", ackPath, inbox)
+	}
+	// 落盘 sha/size 与 ACK 一致。
+	landed, err := os.ReadFile(ackPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(landed) != len(content) || sha256HexOf(landed) != wantSHA {
+		t.Fatalf("landed content mismatch len=%d want=%d sha=%s want=%s", len(landed), len(content), sha256HexOf(landed), wantSHA)
+	}
+	marker, err := readAgentTransferMarker(transferID)
+	if err != nil || marker == nil || marker.State != transferMarkerStateDone || marker.Path != ackPath ||
+		marker.SizeBytes != int64(len(content)) || marker.SHA256 != wantSHA {
+		t.Fatalf("done marker mismatch: %+v err=%v", marker, err)
+	}
+	// 收侧协议体必须已返回(不悬在 deadline 等待上)。
+	select {
+	case <-serveDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve protocol body did not return after ack")
+	}
+}
+
 // dialPushTestConn 模拟 B 端真 TLS 拨号(钉扎+hello),供 A 侧取消测试。
 func dialPushTestConn(t *testing.T, addr, fingerprint, token, transferID string, size int64) *tls.Conn {
 	t.Helper()
