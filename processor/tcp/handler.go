@@ -1573,6 +1573,48 @@ func (h *TCPConnectionHandler) getMeshExitForExecution(deviceID string) (*meshpr
 		h.meshExitsMu.Unlock()
 		return client, nil
 	}
+	// 自动组网对端回查(自动组网批次):手填 peers 查无此人时探 beacon
+	// 同账号自动表(config.MeshAutoPeerFor 探针,装配层接线)。指纹/地址/
+	// 公钥由 beacon 供给;身份钥仍取 customer.mesh.private_key(v1 不做缓
+	// 存钥自动生成)。Relay 恒开(manager 恒接线 serve 对端端点),Punch
+	// 闸与手填同款。CacheKey 含 LANAddrs/HostKey——对端地址漂移即翻键
+	// 重建 ExitClient(预期行为,SPEC §10.4)。
+	if v, ok := config.MeshAutoPeerFor(deviceID); ok && len(v.LANAddrs) > 0 && strings.TrimSpace(v.HostKey) != "" {
+		spec := meshproxy.PeerSpec{
+			DeviceID: v.DeviceID,
+			LANAddrs: v.LANAddrs,
+			HostKey:  strings.TrimSpace(v.HostKey),
+			SSHUser:  "mesh",
+			Relay:    true,
+		}
+		var pikoDial meshproxy.PikoDialFunc
+		if dial := meshTransportDialFromSource(); dial != nil {
+			pikoDial = dial
+		}
+		punchDial := meshPunchDialFromSource()
+		if !meshCfg.EffectivePunchEnabled() {
+			punchDial = nil
+		}
+		spec.Punch = punchDial != nil
+		autoKey := spec.CacheKey(meshCfg.PrivateKey, meshCfg.KeyPassphrase)
+		h.meshExitsMu.RLock()
+		client, cached := h.meshExits[autoKey]
+		h.meshExitsMu.RUnlock()
+		if cached {
+			return client, nil
+		}
+		client, err := meshproxy.NewExitClient(spec, meshCfg.PrivateKey, meshCfg.KeyPassphrase, pikoDial, punchDial)
+		if err != nil {
+			return nil, err
+		}
+		h.meshExitsMu.Lock()
+		if h.meshExits == nil {
+			h.meshExits = make(map[string]*meshproxy.ExitClient)
+		}
+		h.meshExits[autoKey] = client
+		h.meshExitsMu.Unlock()
+		return client, nil
+	}
 	return nil, fmt.Errorf("mesh: peer %q not found in customer.mesh.peers", deviceID)
 }
 

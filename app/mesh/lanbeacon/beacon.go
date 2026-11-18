@@ -18,14 +18,22 @@ package lanbeacon
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	gossh "golang.org/x/crypto/ssh"
 )
 
 const (
@@ -49,22 +57,102 @@ const (
 // beaconPayload 广播报文。CertFingerprint=本机 ssh_ingress host key 指纹
 // (SHA256:…,装配层注入读取函数;ssh_ingress 未配置=空串,候选诚实降级
 // 为「仅展示不可钉扎」),字段名保留历史形状避免新旧舰队互不识别。
+// AccountHash=本机登录账号 ID 的 sha256 截断(AccountHashFromID;未登录/
+// 旧版=空串——空串按旧版兼容收,非空且与己不等=跨账号丢弃,同账号自动
+// 组网批次引入)。MeshPubKey=本机 mesh 身份公钥的 authorized_keys 行
+// (type+b64,公钥本公开无泄密;空=未配置 mesh 身份/旧版)。Sig=MeshPubKey
+// 对签名域(canonicalSignBytes)的 Ed25519 签名 b64——⚠️ 保证边界(评审
+// major 诚实化):签名只防「无签名伪造降级/顶替」,不防「自签新钥顶替」
+// (攻击者自有钥+嗅探账号哈希可签出合法 Sig)——信任锚缺带外权威,故自动
+// 组网消费面被 mesh.auto_peers 显式开关关住(默认关),跨信任域绑定须平台
+// roster(台账遗留);无 Sig=旧版兼容收(仅展示,不入自动组网)。
 type beaconPayload struct {
 	DeviceID        string `json:"device_id"`
 	MeshPort        int    `json:"mesh_port"`
 	CertFingerprint string `json:"cert_fingerprint"`
+	AccountHash     string `json:"account_hash,omitempty"`
+	MeshPubKey      string `json:"mesh_pub_key,omitempty"`
+	Sig             string `json:"sig,omitempty"`
 	TS              int64  `json:"ts"`
+}
+
+// BeaconSignFields 参与签名的载荷字段(canonicalSignBytes 同序;TS 进域防
+// 重播:同公钥+同 ts 的报文签名相同属正常重播容忍,超龄闸另行兜底)。
+type BeaconSignFields struct {
+	DeviceID        string
+	MeshPort        int
+	CertFingerprint string
+	AccountHash     string
+	MeshPubKey      string
+	TS              int64
+}
+
+func (p beaconPayload) signFields() BeaconSignFields {
+	return BeaconSignFields{
+		DeviceID:        p.DeviceID,
+		MeshPort:        p.MeshPort,
+		CertFingerprint: p.CertFingerprint,
+		AccountHash:     p.AccountHash,
+		MeshPubKey:      p.MeshPubKey,
+		TS:              p.TS,
+	}
+}
+
+// canonicalSignBytes 定长序拼接(NUL 分隔;int 用十进制)。签名域扩展须
+// 同步 signFields 与此处——序列化形状即协议。
+func canonicalSignBytes(f BeaconSignFields) []byte {
+	return []byte(strings.Join([]string{
+		"mesh-beacon-v1",
+		f.DeviceID,
+		strconv.Itoa(f.MeshPort),
+		f.CertFingerprint,
+		f.AccountHash,
+		f.MeshPubKey,
+		strconv.FormatInt(f.TS, 10),
+	}, "\x00"))
+}
+
+// SignBeaconFields 以 mesh 身份私钥(PEM,Ed25519 锚定——512B 读限预算
+// 内放得下签名)对广播域签名,返回签名 b64。
+func SignBeaconFields(privateKeyPEM string, f BeaconSignFields) (string, error) {
+	signer, err := gossh.ParsePrivateKey([]byte(privateKeyPEM))
+	if err != nil {
+		return "", fmt.Errorf("parse mesh identity key: %w", err)
+	}
+	sig, err := signer.Sign(rand.Reader, canonicalSignBytes(f))
+	if err != nil {
+		return "", fmt.Errorf("sign beacon: %w", err)
+	}
+	if sig.Format != gossh.KeyAlgoED25519 {
+		return "", fmt.Errorf("mesh identity key must be Ed25519, got %q", sig.Format)
+	}
+	return base64.StdEncoding.EncodeToString(sig.Blob), nil
+}
+
+// verifyBeaconSignature 用广播内携带的公钥验签(公告完整性:绑定
+// device_id+公钥,防真实身份被第三方伪造广播顶替;首触信任仍以握手
+// fail-closed 兜底)。
+func verifyBeaconSignature(pub gossh.PublicKey, f BeaconSignFields, sigB64 string) bool {
+	blob, err := base64.StdEncoding.DecodeString(sigB64)
+	if err != nil {
+		return false
+	}
+	return pub.Verify(canonicalSignBytes(f), &gossh.Signature{Format: gossh.KeyAlgoED25519, Blob: blob}) == nil
 }
 
 // LanPeerCandidate 一条 LAN 候选;GET /api/mesh/lan_peers 的 data.peers[]
 // 与此同形(snake_case)。Addr=UDP 来源 IP + 报文 mesh_port 组成的可拨地址
 // (广播源端口是临时口,拨号端口恒取报文内 mesh_port);空=来源地址缺失
-// (理论上仅测试直调 ingest 才会发生)。
+// (理论上仅测试直调 ingest 才会发生)。AccountHash=对端账号哈希(空=旧版
+// 广播,未验证同账号;同账号判定见 ingest)。MeshPubKey=对端 mesh 公钥行
+// (坏行仍收候选展示,但不算自动 peer 要素)。
 type LanPeerCandidate struct {
 	DeviceID        string `json:"device_id"`
 	MeshPort        int    `json:"mesh_port"`
 	Addr            string `json:"addr"`
 	CertFingerprint string `json:"cert_fingerprint"`
+	AccountHash     string `json:"account_hash,omitempty"`
+	MeshPubKey      string `json:"mesh_pub_key,omitempty"`
 	LastSeenUnix    int64  `json:"last_seen_unix"`
 }
 
@@ -74,6 +162,12 @@ type LanPeerCandidate struct {
 // 超龄判定与对外展示(last_seen_unix)。
 type lanCandidate struct {
 	LanPeerCandidate
+	// pubKey 是 MeshPubKey 行的预解析公钥(插入时一次;nil=坏行/缺行,
+	// 不算自动 peer 要素)。与 LanPeerCandidate 同生命周期,随 TTL 剪枝。
+	pubKey gossh.PublicKey
+	// sigVerified=广播携带 Sig 且以公告内公钥验签通过(明文 UDP 上的身份
+	// 绑定:防真实 peer 条目被无签名伪造广播顶替)。自动组网晋升硬要素。
+	sigVerified bool
 	lastArrival time.Time
 }
 
@@ -105,6 +199,19 @@ type Beacon struct {
 	// 3s 调用一次;nil = 恒空(诚实降级)。SetFingerprintProvider 须在 Start
 	// 前(Set 后字段写入与 broadcastLoop 读并发,由 b.mu 保护读取侧)。
 	fingerprintFn func() string
+	// accountHashFn 同账号判定源(装配层注入):返回本机登录账号 ID 哈希
+	// (AccountHashFromID 形态)或空串(未登录)。内存级读取,广播/ingest 各
+	// 调用一次;nil = 恒空(未登录态,发现面维持旧版全收兼容)。Set 后字段
+	// 写入与广播/ingest 读并发,由 b.mu 保护读取侧(同 fingerprintFn 纪律)。
+	accountHashFn func() string
+	// meshPubKeyFn 本机 mesh 身份公钥行源(装配层注入):返回 authorized_keys
+	// 行(type+b64)或空串(未配置 mesh 身份)。读盘级成本同指纹,广播周期
+	// 调用一次;nil = 恒空。
+	meshPubKeyFn func() string
+	// payloadSignerFn 广播签名源(装配层注入):以本机 mesh 身份私钥对签名域
+	// 签名,返回 b64;空串/nil = 广播不带 Sig(旧版形状,自动组网不晋升)。
+	// 签名在 assemblePayload 锁外计算(私钥解析+签名,读盘级成本)。
+	payloadSignerFn func(BeaconSignFields) string
 }
 
 // SetFingerprintProvider 注入广播指纹源(任务 10b)。nil=清除(恒空)。
@@ -112,6 +219,49 @@ func (b *Beacon) SetFingerprintProvider(fn func() string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.fingerprintFn = fn
+}
+
+// SetAccountHashProvider 注入同账号判定源。nil=清除(恒空,全收兼容)。
+func (b *Beacon) SetAccountHashProvider(fn func() string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.accountHashFn = fn
+}
+
+// SetMeshPubKeyProvider 注入本机 mesh 公钥行源。nil=清除(恒空)。
+func (b *Beacon) SetMeshPubKeyProvider(fn func() string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.meshPubKeyFn = fn
+}
+
+// SetPayloadSigner 注入广播签名源。nil=清除(广播不带 Sig,旧版形状)。
+func (b *Beacon) SetPayloadSigner(fn func(BeaconSignFields) string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.payloadSignerFn = fn
+}
+
+// AccountHashFromID 账号 ID → 候选同账号判定哈希(sha256 截断 16 hex)。
+// 截断防明文账号经广播泄漏;16 hex=64bit,误撞概率在同子网设备量级下可忽。
+func AccountHashFromID(id int64) string {
+	if id == 0 {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(strconv.FormatInt(id, 10)))
+	return hex.EncodeToString(sum[:8])
+}
+
+// ownAccountHash 取本机账号哈希(短临界区,provider 在锁外调用——provider
+// 读 auth 内存态,但锁外调用与 fingerprint 同纪律,防未来变慢读拖住 ingest)。
+func (b *Beacon) ownAccountHash() string {
+	b.mu.Lock()
+	fn := b.accountHashFn
+	b.mu.Unlock()
+	if fn == nil {
+		return ""
+	}
+	return strings.TrimSpace(fn())
 }
 
 // InjectCandidateForTests 测试缝:绕过 UDP 时序直插候选(跨包测试用,
@@ -255,18 +405,38 @@ func (b *Beacon) broadcastLoop(ctx context.Context) {
 func (b *Beacon) assemblePayload() beaconPayload {
 	b.mu.Lock()
 	selfID, meshPort, fingerprintFn := b.selfID, b.meshPort, b.fingerprintFn
+	accountHashFn := b.accountHashFn
+	meshPubKeyFn := b.meshPubKeyFn
+	payloadSignerFn := b.payloadSignerFn
 	b.mu.Unlock()
 	// 指纹读取(读盘)在锁外:3s 周期一次,失败/慢读不得拖住 Candidates 读侧。
 	fingerprint := ""
 	if fingerprintFn != nil {
 		fingerprint = fingerprintFn()
 	}
-	return beaconPayload{
+	// 账号哈希(内存读)与公钥行(读盘)同在锁外;TrimSpace 收 provider 输出。
+	accountHash := ""
+	if accountHashFn != nil {
+		accountHash = strings.TrimSpace(accountHashFn())
+	}
+	meshPubKey := ""
+	if meshPubKeyFn != nil {
+		meshPubKey = strings.TrimSpace(meshPubKeyFn())
+	}
+	p := beaconPayload{
 		DeviceID:        selfID,
 		MeshPort:        meshPort,
 		CertFingerprint: fingerprint,
+		AccountHash:     accountHash,
+		MeshPubKey:      meshPubKey,
 		TS:              time.Now().Unix(),
 	}
+	// 广播签名(私钥解析+签名,读盘级)在锁外;公钥缺席/签名失败=不带 Sig
+	// (旧版形状——诚实降级:自动组网三要素缺一即不晋升,见自动 peer 闸)。
+	if payloadSignerFn != nil && meshPubKey != "" {
+		p.Sig = payloadSignerFn(p.signFields())
+	}
+	return p
 }
 
 func (b *Beacon) broadcastOnce() {
@@ -325,6 +495,12 @@ func (b *Beacon) ingest(data []byte, now time.Time, senderIP string) {
 	if p.DeviceID == "" || p.MeshPort <= 0 || p.MeshPort > 65535 {
 		return // 缺字段/畸形端口:候选要供点选拨号,死端口无价值
 	}
+	// 同账号闸:双方哈希非空且不等=跨账号广播,丢弃(自动组网批次)。
+	// 发送方无哈希(旧版/未登录)=旧版兼容收;本方无哈希(未登录)=全收兼容
+	// ——两个兼容态只影响候选展示,连接面仍被钉扎+握手 fail-closed 挡住。
+	if own := b.ownAccountHash(); own != "" && p.AccountHash != "" && p.AccountHash != own {
+		return
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if p.DeviceID == b.selfID {
@@ -348,12 +524,37 @@ func (b *Beacon) ingest(data []byte, now time.Time, senderIP string) {
 			MeshPort:        p.MeshPort,
 			Addr:            addr,
 			CertFingerprint: p.CertFingerprint,
+			AccountHash:     p.AccountHash,
+			MeshPubKey:      p.MeshPubKey,
 			LastSeenUnix:    p.TS,
 		},
 		lastArrival: now,
 	}
+	// mesh 公钥行预解析(自动 peer 双要素之二):坏行候选仍收录(展示面),
+	// 但 parsedKey 为 nil 即不算自动 peer 要素。
+	if line := strings.TrimSpace(p.MeshPubKey); line != "" {
+		if k, _, _, _, err := gossh.ParseAuthorizedKey([]byte(line)); err == nil {
+			entry.pubKey = k
+		}
+	}
+	// 广播签名验签(自动组网批次):带 Sig 而验签失败=整包丢弃;无 Sig=
+	// 旧版兼容收,但 sigVerified=false 永不晋升自动 peer。⚠️ Sig 通过只证
+	// 明「公告自洽」(绑定 device_id+公钥),不证明账号成员——同 id 自签
+	// 新钥可顶替条目,信任锚在 mesh.auto_peers 开关+握手(见类型注释)。
+	if p.Sig != "" {
+		if entry.pubKey == nil || !verifyBeaconSignature(entry.pubKey, p.signFields(), p.Sig) {
+			return
+		}
+		entry.sigVerified = true
+	}
 	if cur, ok := b.candidates[p.DeviceID]; ok {
+		// 已验签条目不被无签名报文降级(防降级攻击的**半个补丁**:只挡无
+		// 签名方向;自签新钥的带签名广播仍可顶替——残余风险由 auto_peers
+		// 显式开关+可信 LAN 语义+握手收口,见 beaconPayload 信任边界注释)。
 		// 乱序到达的旧报文不回退 last_seen(展示值跟随对端 ts)。
+		if cur.sigVerified && !entry.sigVerified {
+			return
+		}
 		if cur.LastSeenUnix > entry.LastSeenUnix {
 			entry.LastSeenUnix = cur.LastSeenUnix
 		}

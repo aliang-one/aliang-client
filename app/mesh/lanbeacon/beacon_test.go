@@ -7,6 +7,9 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	sshin "aliang.one/nursorgate/inbound/ssh"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 // 测试基建约定(2026-11-08 macOS 实测定案):UDP 全局广播 255.255.255.255
@@ -310,5 +313,241 @@ func TestDefaultSwapAndClear(t *testing.T) {
 	SetDefault(nil)
 	if d := Default(); d != nil {
 		t.Fatalf("清空后 Default() = %v, want nil", d)
+	}
+}
+
+// —— 同账号闸(自动组网批次)——
+
+// TestIngestAccountGate 同账号判定四象限:双方有值不等=丢;相等=收;
+// 发送方无值(旧版/未登录)=兼容收;本方无值(未登录)=全收兼容。
+// 直调 ingest,确定性无 UDP 时序。
+func TestIngestAccountGate(t *testing.T) {
+	newBeacon := func(own string) *Beacon {
+		b := NewBeacon("dev-self", 56441, DefaultBeaconPort)
+		if own != "" {
+			b.SetAccountHashProvider(func() string { return own })
+		}
+		return b
+	}
+	payload := func(id, hash string, ts time.Time) []byte {
+		data, err := json.Marshal(beaconPayload{
+			DeviceID:    id,
+			MeshPort:    41000,
+			AccountHash: hash,
+			TS:          ts.Unix(),
+		})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return data
+	}
+	base := time.Now()
+
+	t.Run("跨账号丢弃", func(t *testing.T) {
+		b := newBeacon("own-hash")
+		b.ingest(payload("dev-x", "other-hash", base), base, "192.0.2.10")
+		if hasCandidate(b, "dev-x", 41000) {
+			t.Fatal("跨账号广播应被丢弃")
+		}
+	})
+	t.Run("同账号收录且哈希透传", func(t *testing.T) {
+		b := newBeacon("own-hash")
+		b.ingest(payload("dev-y", "own-hash", base), base, "192.0.2.11")
+		cands := b.Candidates()
+		if !hasCandidate(b, "dev-y", 41000) {
+			t.Fatal("同账号广播应收录")
+		}
+		for _, c := range cands {
+			if c.DeviceID == "dev-y" && c.AccountHash != "own-hash" {
+				t.Fatalf("候选 AccountHash = %q, want own-hash", c.AccountHash)
+			}
+		}
+	})
+	t.Run("发送方无哈希旧版兼容收", func(t *testing.T) {
+		b := newBeacon("own-hash")
+		b.ingest(payload("dev-legacy", "", base), base, "192.0.2.12")
+		if !hasCandidate(b, "dev-legacy", 41000) {
+			t.Fatal("无哈希(旧版)广播应兼容收录")
+		}
+	})
+	t.Run("本方无哈希全收兼容", func(t *testing.T) {
+		b := newBeacon("") // provider 不注入=未登录态
+		b.ingest(payload("dev-any", "other-hash", base), base, "192.0.2.13")
+		if !hasCandidate(b, "dev-any", 41000) {
+			t.Fatal("本方未登录时应全收兼容")
+		}
+	})
+}
+
+// TestAssemblePayloadCarriesAccountHash 广播载荷携带账号哈希:provider 注入
+// 即透传,未注入恒空(空串字段 omitempty 不上线,旧接收方零感知)。
+func TestAssemblePayloadCarriesAccountHash(t *testing.T) {
+	b := NewBeacon("dev-self", 56441, DefaultBeaconPort)
+	if got := b.assemblePayload().AccountHash; got != "" {
+		t.Fatalf("未注入 provider 时 AccountHash = %q, want 空", got)
+	}
+	b.SetAccountHashProvider(func() string { return "own-hash" })
+	if got := b.assemblePayload().AccountHash; got != "own-hash" {
+		t.Fatalf("AccountHash = %q, want own-hash", got)
+	}
+}
+
+// TestAccountHashFromID 哈希形态契约:0=空串;非 0=16 hex 小写、稳定、
+// 不同 ID 不同哈希。
+func TestAccountHashFromID(t *testing.T) {
+	if got := AccountHashFromID(0); got != "" {
+		t.Fatalf("ID=0 → %q, want 空串(未登录哨兵)", got)
+	}
+	a := AccountHashFromID(42)
+	b := AccountHashFromID(42)
+	if a != b {
+		t.Fatalf("同 ID 哈希不稳定: %q vs %q", a, b)
+	}
+	if len(a) != 16 {
+		t.Fatalf("哈希长度 = %d, want 16 hex 截断", len(a))
+	}
+	for _, c := range a {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			t.Fatalf("哈希含非小写 hex 字符: %q", a)
+		}
+	}
+	if AccountHashFromID(43) == a {
+		t.Fatal("不同 ID 哈希不应相同")
+	}
+}
+
+// —— 广播签名(自动组网批次)——
+
+// TestSignedBeaconAutoPromotion 签名广播全链:合法自签名广播进候选且
+// 晋升 AutoPeers;同 device_id 无签名伪造不得降级已验签条目;坏签名整包丢弃。
+func TestSignedBeaconAutoPromotion(t *testing.T) {
+	key, err := sshin.GenerateIngressKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	const (
+		selfID  = "dev-self"
+		peerID  = "dev-signed"
+		ownHash = "own-hash"
+		fp      = "SHA256:TestFingerprint"
+	)
+	signer := func(f BeaconSignFields) string {
+		sig, err := SignBeaconFields(key.PrivateKey, f)
+		if err != nil {
+			t.Fatalf("sign: %v", err)
+		}
+		return sig
+	}
+	b := NewBeacon(selfID, 56441, DefaultBeaconPort)
+	b.SetAccountHashProvider(func() string { return ownHash })
+
+	// 对端实例自签自的广播(真实形态:对端以自己的 mesh 身份钥签自己的
+	// 载荷——本端只换验签视角)。对端改任一签名域都会验签失败,正是
+	// 防劫持性质本身。
+	peer := NewBeacon(peerID, 56441, DefaultBeaconPort)
+	peer.SetAccountHashProvider(func() string { return ownHash })
+	peer.SetFingerprintProvider(func() string { return fp })
+	peer.SetMeshPubKeyProvider(func() string { return key.PublicKey })
+	peer.SetPayloadSigner(signer)
+	p := peer.assemblePayload()
+	if p.Sig == "" {
+		t.Fatal("签名链路应产出 Sig")
+	}
+	data, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	now := time.Now()
+	b.ingest(data, now, "192.0.2.20")
+	if !hasCandidate(b, peerID, p.MeshPort) {
+		t.Fatal("合法签名广播应收录")
+	}
+	peers := b.autoPeers()
+	if len(peers) != 1 || peers[0].DeviceID != peerID {
+		t.Fatalf("AutoPeers 应含签名同账号 peer, got %+v", peers)
+	}
+	if peers[0].HostKey != fp || peers[0].Addr == "" {
+		t.Fatalf("AutoPeer 字段不全: %+v", peers[0])
+	}
+
+	// 无签名伪造(同 device_id):不得降级已验签条目。
+	forged := p
+	forged.Sig = ""
+	forged.MeshPubKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIForgedPayload attacker"
+	forgedData, _ := json.Marshal(forged)
+	b.ingest(forgedData, now.Add(time.Second), "192.0.2.99")
+	peers = b.autoPeers()
+	if len(peers) != 1 || peers[0].MeshPubKey != key.PublicKey {
+		t.Fatalf("无签名伪造不得降级已验签条目, got %+v", peers)
+	}
+
+	// 坏签名(伪 Sig):整包丢弃。
+	bad := p
+	bad.Sig = "AAAAinvalid"
+	badData, _ := json.Marshal(bad)
+	b.ingest(badData, now.Add(2*time.Second), "192.0.2.98")
+	if !hasCandidate(b, peerID, p.MeshPort) {
+		t.Fatal("坏签名应整包丢弃,合法条目应保留")
+	}
+}
+
+// TestMeshAdmissionForPoisoningResilience 准入查表直测(评审 major#1/#5):
+// 真实对端公钥行被复制成「异 device_id+无签名」毒化候选并存时,MeshAdmissionFor
+// 必须继续扫描命中合格条目(提前 return 会让准入抛硬币);跨账号候选同公钥
+// 在场 → 拒绝。SetDefault 挂本例 beacon,Cleanup 还原。
+func TestMeshAdmissionForPoisoningResilience(t *testing.T) {
+	key, err := sshin.GenerateIngressKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	const ownHash = "own-hash"
+	const fp = "SHA256:TestFP"
+
+	self := NewBeacon("dev-self", 56441, DefaultBeaconPort)
+	self.SetAccountHashProvider(func() string { return ownHash })
+	SetDefault(self)
+	t.Cleanup(func() { SetDefault(nil) })
+
+	// 合格对端:自签自的广播(同账号+指纹+公钥+签名四要素齐)。
+	peer := NewBeacon("dev-real", 56441, DefaultBeaconPort)
+	peer.SetAccountHashProvider(func() string { return ownHash })
+	peer.SetFingerprintProvider(func() string { return fp })
+	peer.SetMeshPubKeyProvider(func() string { return key.PublicKey })
+	peer.SetPayloadSigner(func(f BeaconSignFields) string {
+		sig, err := SignBeaconFields(key.PrivateKey, f)
+		if err != nil {
+			t.Fatalf("sign: %v", err)
+		}
+		return sig
+	})
+	now := time.Now()
+	p := peer.assemblePayload()
+	pData, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	self.ingest(pData, now, "10.0.0.2")
+
+	// 毒化候选:同公钥行,异 device_id,无签名(评审 major#1 场景)。
+	poison := p
+	poison.DeviceID = "dev-poison"
+	poison.Sig = ""
+	poisonData, _ := json.Marshal(poison)
+	self.ingest(poisonData, now.Add(time.Second), "10.0.0.66")
+
+	pub, _, _, _, err := gossh.ParseAuthorizedKey([]byte(key.PublicKey))
+	if err != nil {
+		t.Fatalf("parse pub: %v", err)
+	}
+	dev, ok := MeshAdmissionFor(pub)
+	if !ok || dev != "dev-real" {
+		t.Fatalf("毒化候选并存应继续扫描命中合格条目: dev=%q ok=%v", dev, ok)
+	}
+
+	// 跨账号变体:本方账号切换(hash 变)后,原同公钥候选(旧账号哈希)
+	// 全体不合格 → 拒绝(账号闸在准入层二次判定)。
+	self.SetAccountHashProvider(func() string { return "switched-hash" })
+	if _, ok := MeshAdmissionFor(pub); ok {
+		t.Fatal("账号切换后旧候选应全体不合格")
 	}
 }

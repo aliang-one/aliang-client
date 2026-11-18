@@ -165,3 +165,72 @@ func TestValidateMeshNextHopSelfRejected(t *testing.T) {
 		t.Fatalf("next_hop 非自指应通过: %v", err)
 	}
 }
+
+// —— 自动组网对端回查(自动组网批次)——
+
+// TestMeshDelegateNextHopAutoPeer 手填 peers 未命中时回查自动表:探针命中
+// → 返回自动 peer(HostKey 恒非空);探针未命中/已清场 → 沿旧语义 fail-closed。
+func TestMeshDelegateNextHopAutoPeer(t *testing.T) {
+	cfg := meshGateConfig(nil, delegateEnabled("dev-auto"), nil)
+	SetMeshAutoPeerProbe(func(deviceID string) (MeshAutoPeerView, bool) {
+		if deviceID == "dev-auto" {
+			return MeshAutoPeerView{
+				DeviceID: "dev-auto",
+				LANAddrs: []string{"172.16.0.196:56432"},
+				HostKey:  "SHA256:auto-probe",
+			}, true
+		}
+		return MeshAutoPeerView{}, false
+	})
+	t.Cleanup(func() { SetMeshAutoPeerProbe(nil) })
+
+	peer, ok := cfg.MeshDelegateNextHop()
+	if !ok {
+		t.Fatal("自动表命中应返回下一跳")
+	}
+	if peer.DeviceID != "dev-auto" || peer.HostKey != "SHA256:auto-probe" {
+		t.Fatalf("自动 peer 字段不符: %+v", peer)
+	}
+	if len(peer.LANAddrs) != 1 || peer.LANAddrs[0] != "172.16.0.196:56432" {
+		t.Fatalf("自动 peer LANAddrs 不符: %+v", peer.LANAddrs)
+	}
+
+	// Negative(评审 minor#4):next_hop 指向探针未注册设备 → 旧语义
+	// fail-closed(自动表不扩权给未点名设备)。
+	other := meshGateConfig(nil, delegateEnabled("dev-other"), nil)
+	if _, ok := other.MeshDelegateNextHop(); ok {
+		t.Fatal("探针未命中(next_hop=dev-other)应 fail-closed")
+	}
+	SetMeshAutoPeerProbe(nil)
+	if _, ok := cfg.MeshDelegateNextHop(); ok {
+		t.Fatal("探针清场后应回旧语义 fail-closed")
+	}
+}
+
+// TestMeshAutoPeerForNoProbe 探针未注入 = 恒未命中(旧设备/未接线形态)。
+func TestMeshAutoPeerForNoProbe(t *testing.T) {
+	SetMeshAutoPeerProbe(nil)
+	t.Cleanup(func() { SetMeshAutoPeerProbe(nil) })
+	if _, ok := MeshAutoPeerFor("dev-any"); ok {
+		t.Fatal("探针未注入应恒未命中")
+	}
+}
+
+// TestEffectiveAutoPeersDefaultOff 自动组网准入开关默认关语义(评审 major
+// 诚实化):nil/显式 false=关(让渡型三态),显式 true=开;零值 MeshConfig
+// 恒关(防误把总开关默认开语义传染到让渡面)。
+func TestEffectiveAutoPeersDefaultOff(t *testing.T) {
+	var nilMesh *MeshConfig
+	if nilMesh.EffectiveAutoPeers() {
+		t.Fatal("nil mesh 应恒关")
+	}
+	if (&MeshConfig{}).EffectiveAutoPeers() {
+		t.Fatal("零值 mesh(nil 指针)应默认关")
+	}
+	if !(&MeshConfig{AutoPeers: boolPtrForMeshGate(true)}).EffectiveAutoPeers() {
+		t.Fatal("显式 true 应开启")
+	}
+	if (&MeshConfig{AutoPeers: boolPtrForMeshGate(false)}).EffectiveAutoPeers() {
+		t.Fatal("显式 false 应关")
+	}
+}

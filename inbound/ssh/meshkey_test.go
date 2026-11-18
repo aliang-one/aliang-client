@@ -150,3 +150,49 @@ func TestMeshKeyForDuplicateKeepsFirstEntry(t *testing.T) {
 		t.Fatalf("first-listed entry must win the label: got %q, want dev-first", mk.DeviceID)
 	}
 }
+
+// TestPublicKeyCallbackMeshAdmission 自动组网活准入(RunConfig.MeshAdmission):
+// MeshKeys 未命中的公钥经准入闭包命中 → FormMesh + 对端 deviceID 标签;
+// 准入闭包拒/未注入 → 沿 unknown-key 拒;黑名单优先于自动准入。
+func TestPublicKeyCallbackMeshAdmission(t *testing.T) {
+	pub, _ := newTestKey(t)
+	fp := gossh.FingerprintSHA256(pub)
+	s := NewServer(RunConfig{
+		ForwardGate: func() bool { return true },
+		MeshAdmission: func(key gossh.PublicKey) (string, bool) {
+			if gossh.FingerprintSHA256(key) == fp {
+				return "dev-auto", true
+			}
+			return "", false
+		},
+	}, "")
+
+	perms, err := s.publicKeyCallback(stubConnMeta{}, pub)
+	if err != nil {
+		t.Fatalf("准入闭包命中应放行: %v", err)
+	}
+	if perms.Extensions[extIngressForm] != FormMesh {
+		t.Fatalf("form = %q, want mesh", perms.Extensions[extIngressForm])
+	}
+	if perms.Extensions[extMeshDeviceID] != "dev-auto" {
+		t.Fatalf("device id ext = %q, want dev-auto", perms.Extensions[extMeshDeviceID])
+	}
+
+	// 黑名单优先:同钥被拉黑(device 标签)即拒。
+	s2 := NewServer(RunConfig{
+		ForwardGate: func() bool { return true },
+		MeshAdmission: func(key gossh.PublicKey) (string, bool) {
+			return "dev-auto", true
+		},
+		Blocked: func(q BlockQuery) bool { return q.DeviceID == "dev-auto" },
+	}, "")
+	if _, err := s2.publicKeyCallback(stubConnMeta{}, pub); err == nil {
+		t.Fatal("黑名单命中(自动准入)应拒绝")
+	}
+
+	// 未注入 MeshAdmission → unknown-key 拒(旧语义)。
+	s3 := NewServer(RunConfig{ForwardGate: func() bool { return true }}, "")
+	if _, err := s3.publicKeyCallback(stubConnMeta{}, pub); err == nil {
+		t.Fatal("无准入闭包(手填列表未命中)应拒绝")
+	}
+}

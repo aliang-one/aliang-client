@@ -63,6 +63,14 @@ type RunConfig struct {
 	// 「凭证未变」短路冻结在旧实例里)。nil = 无黑名单,全放行(不比对)。
 	Blocked func(BlockQuery) bool
 
+	// MeshAdmission 是 mesh 形态的运行期活准入(自动组网批次):MeshKeys
+	// 未命中的公钥查 beacon 自动 peer 活表(同账号+指纹+公钥+签名四要素,
+	// lanbeacon.MeshAdmissionFor 同源),命中返回对端 device_id 即按 mesh
+	// 形态准入。认证期读时求值、不参与 runIdentity 比对(发现新对端零重
+	// 启,Blocked 同款闭包纪律)。nil = 关闭(仅手填 mesh_authorized_keys)。
+	// 注意:MeshKeys 是手填权威,自动准入恒为其补集,两者不合并落盘。
+	MeshAdmission func(key gossh.PublicKey) (deviceID string, ok bool)
+
 	// LocalNodeID 返回本机节点标识。装配层仍注入(AgentService.currentDeviceID);
 	// mesh-exit 形态自 D2 起不再消费(旧帧协议的 AppendHop 防环随帧协议删除,
 	// 防环改由注入 Metadata 的 MeshInjected 标记承担,SPEC §6.2)。F1 已核:
