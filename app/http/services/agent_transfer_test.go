@@ -1087,8 +1087,8 @@ func TestAttemptAgentTransferPunchPushDialErrorClassified(t *testing.T) {
 	if err == nil {
 		t.Fatal("缝返回错误必须恒错误(调用方落 COS)")
 	}
-	if stage := classifyAgentLanFailStage(err); stage == "" {
-		t.Fatalf("classify 阶段映射必须非空: %v", err)
+	if stage := classifyAgentLanFailStage(err); stage != "probe" {
+		t.Fatalf("拨号失败=零字节在流,必须归类 probe(与 lan dial 同款),得到 %q(%v)", stage, err)
 	}
 }
 
@@ -1218,8 +1218,22 @@ func TestAgentTransferUploadPunchOrchestration(t *testing.T) {
 		src := writeTempFile(t, t.TempDir(), "payload.bin", data)
 		cos := newFakeTransferCOS(t, 0)
 
+		// 流中断失败注入(非拨号失败):对端读完 hello 回 ok 后立即断流——
+		// B 端 io.Copy 落 io.ErrClosedPipe,失败发生在传输中段(classify
+		// default 臂=mid_transfer),终态回带=落 COS 近因。
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			reader := bufio.NewReader(server)
+			if _, err := reader.ReadBytes('\n'); err != nil { // hello
+				return
+			}
+			_, _ = server.Write([]byte("{\"ok\":true}\n"))
+			// 不收流,直接关:net.Pipe 无缓冲,ok 写透即被 B 读走,断流后
+			// B 的首个 body 写必失败。
+		}()
 		calls := withPunchDialSeam(t, func(ctx context.Context, peerID, transferID string) (net.Conn, error) {
-			return nil, errors.New("punch dial budget exhausted")
+			return client, nil
 		})
 
 		msg := punchUploadMsg(t, "tr_punchfb01", src, int64(len(data)), false, cos.url(), "dev-b")
@@ -1233,11 +1247,69 @@ func TestAgentTransferUploadPunchOrchestration(t *testing.T) {
 		if via := remoteString(terminal, "via"); via != "cos" {
 			t.Fatalf("兜底终态 via 必须是 cos,得到 %q", via)
 		}
-		if stage := remoteString(terminal, "lan_fail_stage"); stage == "" {
-			t.Fatalf("punch 失败阶段必须非空回带: %v", terminal)
+		if stage := remoteString(terminal, "lan_fail_stage"); stage != "mid_transfer" {
+			t.Fatalf("punch 流中断失败阶段必须钉死 mid_transfer(LAN probe 被 punch 近因覆盖),得到 %q: %v", stage, terminal)
 		}
 		if n := len(cos.snapshot()); n != 1 {
 			t.Fatalf("COS 兜底应收 1 次 PUT,实收 %d", n)
+		}
+		if atomic.LoadInt32(calls) != 1 {
+			t.Fatalf("punch 拨号缝应被调恰一次,实调 %d", *calls)
+		}
+	})
+
+	// 取消臂编排级锁(Task 8 评审 Important):取消落在 punch 腿必须 cancelled
+	// 终态+绝不落 COS 重传。选型=实现最短的拨号阶段取消——缝内阻塞到
+	// ctx.Done 再回 ctx.Err(),与流中取消走的是编排层同一个 ctx.Err() 判定
+	// (agent_transfer_upload.go 取消臂),断言形态对齐 LAN 腿同款用例
+	// TestAttemptAgentTransferLanPush_CtxCancelMidStream。
+	t.Run("punch_cancel_emits_cancelled_never_cos", func(t *testing.T) {
+		_ = newAgentTransferEnv(t)
+		capture, write := newTransferCapture()
+		data := deterministicTransferBytes(2048)
+		src := writeTempFile(t, t.TempDir(), "payload.bin", data)
+		cos := newFakeTransferCOS(t, 0)
+
+		dialed := make(chan struct{})
+		calls := withPunchDialSeam(t, func(ctx context.Context, peerID, transferID string) (net.Conn, error) {
+			close(dialed)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+
+		msg := punchUploadMsg(t, "tr_punchcx01", src, int64(len(data)), false, cos.url(), "dev-b")
+		svc := &AgentService{}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			svc.handleAgentTransferUpload(msg, write)
+		}()
+		select {
+		case <-dialed:
+		case <-time.After(10 * time.Second):
+			t.Fatal("punch 拨号缝未被进入,取消无从谈起")
+		}
+		svc.handleAgentTransferCancel(map[string]interface{}{
+			"type": models.AgentEventTransferCancel, "transfer_id": "tr_punchcx01",
+		}, write)
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Fatal("取消后上传链未收口")
+		}
+
+		terminal := waitForTransferTerminal(t, capture)
+		if terminal["ok"] != false || remoteString(terminal, "error_code") != transferErrCancelled {
+			t.Fatalf("取消落在 punch 腿必须 cancelled 终态,不得静默完成: %v", terminal)
+		}
+		// 帧源判别:COS 腿循环顶的 ctx 兜底回带裸 context canceled,只有
+		// punch 取消臂回带「punch dial …: context canceled」——锁死这帧
+		// 确由编排层取消臂发出(删臂即红)。
+		if errText := remoteString(terminal, "error"); !strings.Contains(errText, "punch dial") {
+			t.Fatalf("cancelled 帧必须源自 punch 取消臂(error 含 punch dial 近因),得到 %q: %v", errText, terminal)
+		}
+		if n := len(cos.snapshot()); n != 0 {
+			t.Fatalf("取消必须绝不落 COS 重传,实收 %d 次 PUT", n)
 		}
 		if atomic.LoadInt32(calls) != 1 {
 			t.Fatalf("punch 拨号缝应被调恰一次,实调 %d", *calls)

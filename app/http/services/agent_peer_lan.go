@@ -854,6 +854,9 @@ func classifyAgentLanFailStage(err error) string {
 	switch {
 	case strings.Contains(msg, "lan dial"):
 		return "probe"
+	// punch 拨号失败与 lan dial 同理:零字节在流,记 probe 不记 mid_transfer。
+	case strings.Contains(msg, "punch dial"):
+		return "probe"
 	case strings.Contains(msg, "handshake"), strings.Contains(msg, "headline"), strings.Contains(msg, "refused"):
 		return "connect"
 	case errors.Is(err, errAgentTransferShaMismatch), errors.Is(err, errAgentTransferSizeMismatch):
