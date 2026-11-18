@@ -107,4 +107,16 @@
 **Priority:** P3
 **Depends on:** 真机两类网络实测数据(①②);其余无
 
+### 传输腿 punch 直连+STUN 可配置化遗留账(批次 2026-11-18,feat/transfer-punch-stun)
+
+**What:** 六条非阻塞遗留:①传输腿预热(接收方并行 punch 会话)——被预算吸收(agentTransferPunchBudget=12s)替代,二期看真机数据;②诊断面板传输腿 carrier 分桶统计(lan/punch/cos);③coturn 自托管部署手册(集群 UDP 端口暴露面);④STUN 健康探测/多档 fallback(列表内逐台择优,现固定首台可达即用语义);⑤punch 失败阶段审计细分(dial-error 现记 probe,流中断 mid_transfer,LanPushFailStage 字段名两腿共用有轻度名实漂移);⑥cert_generate_failed 臂 consume-not-putback 口径与 listen_failed 不一致(极罕见路径,重试撞 transfer_context_missing 落 COS=设计退化方向)。
+
+**Why:** 均不影响正确性/安全红线/主流程;验收口径=vm220↔liang-dev 真机打洞实测(部署后),真机数据决定二期投入(端口预测/IPv6 等原有二期项)。
+
+**Context:** spec=`docs/superpowers/specs/2026-11-18-transfer-punch-stun-design.md`;计划=`docs/superpowers/plans/2026-11-18-transfer-punch-stun.md`;PhoneServer 侧 punch_peer_id 下发为独立仓提交(AliangPhoneServer feat/transfer-punch-peer-id)。
+
+**Effort:** S(逐条)
+**Priority:** P3
+**Depends on:** 真机实测数据(部署后)
+
 ## Completed
