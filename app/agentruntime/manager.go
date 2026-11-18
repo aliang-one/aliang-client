@@ -362,14 +362,46 @@ func newAgentProcessCommand() (*exec.Cmd, error) {
 	cmd := newBackgroundCommand(executable, "agent")
 	cmd.Env = userAgentEnv(os.Environ())
 
+	// Pointing stdout and stderr at the same io.Writer makes os/exec merge
+	// both streams onto one pipe that it copies into our rotating writer,
+	// which bounds the captured agent.log (see rotatingLogWriter).
+	// 2026-11-18 vm459 事故加固:writer 为 nil 时此前什么都不设,os/exec 默认把
+	// 子进程 stdout/stderr 接到 devNull——agent.log 恒 0 字节,Windows 现场
+	// 排障等于瞎的。退化为同目录 agent-fallback.log 直写,启动即落一行标记。
+	var logSink io.Writer
 	if writer := openAgentLogWriter(); writer != nil {
-		// Pointing stdout and stderr at the same io.Writer makes os/exec merge
-		// both streams onto one pipe that it copies into our rotating writer,
-		// which bounds the captured agent.log (see rotatingLogWriter).
-		cmd.Stdout = writer
-		cmd.Stderr = writer
+		logSink = writer
+	} else if fallback := openAgentFallbackLogFile(); fallback != nil {
+		fmt.Fprintf(fallback, "=== agent log fallback opened (rotating writer unavailable) %s ===\n",
+			time.Now().UTC().Format(time.RFC3339))
+		logSink = fallback
+	} else {
+		logger.Warn(fmt.Sprintf("agent stdout/stderr discarded: no log sink available"))
+	}
+	if logSink != nil {
+		cmd.Stdout = logSink
+		cmd.Stderr = logSink
 	}
 	return cmd, nil
+}
+
+// openAgentFallbackLogFile 轮转 writer 不可用时的兜底直写句柄
+// (<stateDir>/agent/agent-fallback.log,追加模式)。句柄随进程生命周期
+// 存活,不主动关闭(每次重开进程只追加一个句柄,可接受)。失败返回 nil,
+// 失败原因已经过 logger.Warn 记录。
+func openAgentFallbackLogFile() *os.File {
+	stateDir, err := runtimepath.UserStateDir()
+	if err != nil {
+		logger.Warn(fmt.Sprintf("agent log fallback unavailable: resolve state dir: %v", err))
+		return nil
+	}
+	path := filepath.Join(stateDir, "agent", "agent-fallback.log")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		logger.Warn(fmt.Sprintf("agent log fallback unavailable: open %s: %v", path, err))
+		return nil
+	}
+	return f
 }
 
 func userAgentEnv(env []string) []string {
@@ -428,14 +460,20 @@ func ownerBaseURL() string {
 func openAgentLogWriter() *rotatingLogWriter {
 	stateDir, err := runtimepath.UserStateDir()
 	if err != nil {
+		// 2026-11-18 vm459 事故:三个 return nil 此前全部静默,writer 为 nil
+		// 时子进程日志直落 devNull。失败原因必须进 owner 日志,否则现场
+		// 「为什么没有日志」无从查起。
+		logger.Warn(fmt.Sprintf("agent log writer unavailable: resolve state dir: %v", err))
 		return nil
 	}
 	dir := filepath.Join(stateDir, "agent")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
+		logger.Warn(fmt.Sprintf("agent log writer unavailable: mkdir %s: %v", dir, err))
 		return nil
 	}
 	writer, err := newRotatingLogWriter(dir, "agent.log", agentLogMaxSize, agentLogMaxBackups)
 	if err != nil {
+		logger.Warn(fmt.Sprintf("agent log writer unavailable: rotate writer under %s: %v", dir, err))
 		return nil
 	}
 	return writer
