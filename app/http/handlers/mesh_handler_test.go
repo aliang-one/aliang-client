@@ -234,6 +234,66 @@ func TestMeshStatusHandlerUnconfiguredDefaults(t *testing.T) {
 	}
 }
 
+// meshStatusStunProbe 是 stun_servers 字段测试的响应解码面(transfer-punch-stun
+// Task 3:前端 MeshSettings 卡渲染现值的数据源)。
+type meshStatusStunProbe struct {
+	Code int `json:"code"`
+	Data struct {
+		StunServers []string `json:"stun_servers"`
+	} `json:"data"`
+}
+
+func meshStatusStunServers(t *testing.T, cfg *config.Config) []string {
+	t.Helper()
+	h := &MeshHandler{
+		beacon:   func() *lanbeacon.Beacon { return nil },
+		config:   func() *config.Config { return cfg },
+		deviceID: func() string { return "" },
+		lanPort:  func() int { return 0 },
+	}
+	rec := httptest.NewRecorder()
+	h.HandleStatus(rec, httptest.NewRequest(http.MethodGet, "/api/mesh/status", nil))
+	if rec.Code != 200 {
+		t.Fatalf("GET code = %d, want 200", rec.Code)
+	}
+	var resp meshStatusStunProbe
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, rec.Body.String())
+	}
+	return resp.Data.StunServers
+}
+
+// TestMeshStatusHandlerStunServers stun_servers 回读三形态:
+//   - 配置非空:原样回读配置值;
+//   - mesh 块在但列表空:回落默认档字面量(EffectiveStunServers 同语义,
+//     与打洞运行时读同一生效值);
+//   - mesh 块缺失/整份配置缺失:恒 [] 非 null(未配置不冒充默认,与 peers/
+//     开关同款 Mesh!=nil 守卫出位;null 会逼前端判空)。
+func TestMeshStatusHandlerStunServers(t *testing.T) {
+	custom := &config.Config{Customer: &config.CustomerConfig{
+		Mesh: &config.MeshConfig{StunServers: []string{"stun.x:1"}},
+	}}
+	if got := meshStatusStunServers(t, custom); len(got) != 1 || got[0] != "stun.x:1" {
+		t.Fatalf("配置非空 stun_servers = %v, want [stun.x:1]", got)
+	}
+
+	emptyList := &config.Config{Customer: &config.CustomerConfig{
+		Mesh: &config.MeshConfig{},
+	}}
+	want := []string{"stun.miwifi.com:3478", "stun.l.google.com:19302"}
+	if got := meshStatusStunServers(t, emptyList); len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("空列表 stun_servers = %v, want %v(默认档)", got, want)
+	}
+
+	meshNil := &config.Config{Customer: &config.CustomerConfig{}}
+	if got := meshStatusStunServers(t, meshNil); got == nil || len(got) != 0 {
+		t.Fatalf("mesh 块缺失 stun_servers = %#v, want 空数组", got)
+	}
+	if got := meshStatusStunServers(t, nil); got == nil || len(got) != 0 {
+		t.Fatalf("整份配置缺失 stun_servers = %#v, want 空数组", got)
+	}
+}
+
 // meshStatusEffectiveProbe 是 effective 字段测试的响应解码面(只取两个开关
 // 字段;其余标量由 Aggregate/Unconfigured 用例钉)。
 type meshStatusEffectiveProbe struct {
