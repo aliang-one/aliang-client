@@ -29,8 +29,8 @@
 - **会话目的路由**:`peer.punch.session` 帧加可选 `purpose` 字段(缺省/`"mesh"` = 现语义,向后兼容;`"transfer"` 带 `transfer_id`)。B 侧按 purpose 把过门流路由到对应 handler:`agentPeerPunchB.handler` 已是按会话注入缝(`agent_peer_punch.go:140`),扩展为按会话注册的路由表(mesh 会话→sshin 现路径;transfer 会话→lan_push 协议体)。传输路由的 WS writeJSON 取 **listen 帧时刻的 writer 捕获**(断连后进度帧静默丢,非致命;result 真值走流内 ACK 与上传链 HTTP 双通道)。
 - **凭据**:token 复用 lan_push 单次传输 token(单次有效,空 token 门禁/拒因三分 punchGateErrorCode 全照旧);TLS 用 punch 现签证书 + A钉B 指纹钉扎 fail-closed(mTLS v1 降级模型,B 侧只要求证书+token 门禁)。
 - **协议层零新设计**:打通的 punch 流(`punchStreamConn`)就是干净 net.Conn,lan_push 协议(hello/token/size_bytes/ACK 行)原样跑。实施形:把 `agentLanPushServeOnce` 的 TLS 包装拆成内外两层——TCP 路径包 tls.Server 后进协议体;punch 路径(punch 流已自带 TLS)直接进协议体,协议体函数共享。
-- **拨号预算吸收**(计划期修订,原「预热」条):传输腿拨号预算 `agentTransferPunchBudget=12s`,覆盖 B 侧 bind+双 STUN 判型最坏 ~6s + 正常拨号;预热(接收方并行 punch 会话)移入遗留账——收益仅同对端冷缓存首传,SessionCache 复用吸收后续。诚实代价:STUN 全死最坏路径落 COS 前多等 ≤17.5s(信令围栏 10s+5s+拨号 2.5s,均既有常量)。
-- **A 侧拨号**:按目标 device_id 直拨(传输腿不依赖 `mesh.peers` 条目;信令走 PhoneServer `target_device_id` 信封,中继已部署);**目标 device_id 由 PhoneServer upload 帧顶层可选键 `punch_peer_id` 下发**(计划期实锤:upload 帧原不带目标身份;PhoneServer 侧一并改,老 agent 零感知);cache-first 通道与 `AgentPeerPunchDial` 同源,**会话缓存/sock 表键带用途前缀(`transfer:<peerID>`)**——mesh 与传输会话互不交叉(计划期实锤:同 peer 混缓存会喂错 handler)。
+- **拨号预算吸收**(计划期修订,原「预热」条):传输腿拨号预算 `agentTransferPunchBudget=12s`,覆盖 B 侧 bind+双 STUN 判型最坏 ~6s + 正常拨号;预热(接收方并行 punch 会话)移入遗留账——收益仅同对端冷缓存首传,每传输独立信令,预算吸收仍成立(单次预算覆盖信令最坏时延)。诚实代价:STUN 全死最坏路径落 COS 前多等 ≤17.5s(信令围栏 10s+5s+拨号 2.5s,均既有常量)。
+- **A 侧拨号**:按目标 device_id 直拨(传输腿不依赖 `mesh.peers` 条目;信令走 PhoneServer `target_device_id` 信封,中继已部署);**目标 device_id 由 PhoneServer upload 帧顶层可选键 `punch_peer_id` 下发**(计划期实锤:upload 帧原不带目标身份;PhoneServer 侧一并改,老 agent 零感知);cache-first 通道与 `AgentPeerPunchDial` 同源**仅 mesh**;**传输腿一次性拨号**(质量评审裁决 5:不进缓存/sock 表,KeepAlive=false,推完即收)——B 侧接收上下文单次消费,二次传输若复用一次会话必 hello 失配;每传输独立信令。
 - **预算/兜底**:`DialBudget` 2.5s 照旧;预算耗尽/门禁拒单落 COS。日志 `[AGENT-TRANSFER-PUNCH] via carrier=lan|punch|cos` 标记每条传输的最终载体。
 - **收摊**:传输会话沿 listener TTL 收摊现例;同 transfer_id 重发=**新 punch session_id**(旧会话靠 TTL 自然过期,文件被服务两次无害;close 帧系 TODOS ⑦,不在本批——实施计划须显式确认该语义)。
 
