@@ -109,10 +109,16 @@ func TestMeshStunServersEffective(t *testing.T) {
 	if len(empty.EffectiveStunServers()) != len(MeshDefaultStunServers) {
 		t.Fatal("空配置 EffectiveStunServers 应回落默认档")
 	}
-	// (b) 配置非空原样返回(TrimSpace 在 Validate 就地做过)。
+	// (b) 配置非空原样返回(TrimSpace 在 Validate 就地做过),且是拷贝——
+	// 与默认档分支的防污染断言对称(评审 P4):改返回切片不得回写配置。
 	cfg := &MeshConfig{StunServers: []string{"stun.example.com:3478"}}
-	if got := cfg.EffectiveStunServers(); len(got) != 1 || got[0] != "stun.example.com:3478" {
-		t.Fatalf("配置非空应原样返回, got %v", got)
+	gotCfg := cfg.EffectiveStunServers()
+	if len(gotCfg) != 1 || gotCfg[0] != "stun.example.com:3478" {
+		t.Fatalf("配置非空应原样返回, got %v", gotCfg)
+	}
+	gotCfg[0] = "mutated"
+	if cfg.StunServers[0] != "stun.example.com:3478" {
+		t.Fatal("配置分支同样必须返回拷贝,调用方改切片不得污染配置")
 	}
 }
 

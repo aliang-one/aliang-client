@@ -639,6 +639,23 @@ func TestAgentPunchTransferContextRegistry(t *testing.T) {
 	}
 }
 
+// TestAgentPunchTransferContextRegistryReRegisterStopsOldTimer 重注册不堆叠
+// 定时器(评审 P11):服务器重发 listen 帧会让同 transferID 二次注册——旧
+// 实现的旧 AfterFunc 先到会删掉新条目。语义:注册→再注册→旧 TTL 到点→
+// 新条目仍在(由新定时器持有),take 仍能消费到新上下文。
+func TestAgentPunchTransferContextRegistryReRegisterStopsOldTimer(t *testing.T) {
+	// 首注册的定时器定在 ~500ms 后到(ttl+30s 余量=-29.5s+30s);随即以长
+	// TTL 重注册。旧实现不收回旧定时器:500ms 处旧回调把新条目摘走。
+	registerAgentPunchTransferContext("tr_regstack001", agentPunchTransferContext{token: "tok-old"}, -29500*time.Millisecond)
+	registerAgentPunchTransferContext("tr_regstack001", agentPunchTransferContext{token: "tok-new"}, 30*time.Second)
+	// 睡过旧定时器的到点窗口(500ms 到点,1200ms 含调度抖动余量)。
+	time.Sleep(1200 * time.Millisecond)
+	got, ok := takeAgentPunchTransferContext("tr_regstack001")
+	if !ok || got.token != "tok-new" {
+		t.Fatalf("再注册后旧 TTL 到点,新条目必须存活且可消费(定时器堆叠缺陷 P11): ok=%t token=%q", ok, got.token)
+	}
+}
+
 // TestAgentPeerLanPushListen_RegistersPunchTransferContext listen 帧注册接线:
 // handleAgentPeerLanPushListen 成功路径必须把传输参数写入注册表(打洞会话按
 // transfer_id 查用),字段与 listen 帧逐项一致。

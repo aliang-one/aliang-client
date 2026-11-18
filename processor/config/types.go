@@ -914,6 +914,7 @@ func (c *MeshConfig) EffectivePunchEnabled() bool {
 // 部署后应配置进 customer.mesh.stun_servers 首位(部署手册见 spec §2.3)。
 // 默认档住 config 层而非 punch 包:processor 不得反向依赖 app(punch.Default
 // STUNServers 已删,消费面见 services agentPunchConfiguredServers)。
+// 勿直接改写本切片,读取一律走 EffectiveStunServers(拷贝纪律由其独占)。
 var MeshDefaultStunServers = []string{"stun.miwifi.com:3478", "stun.l.google.com:19302"}
 
 const meshStunServersMax = 4

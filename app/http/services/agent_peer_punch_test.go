@@ -908,9 +908,23 @@ func TestAgentPunchConfiguredServers(t *testing.T) {
 	if len(got) != 2 || got[0] != "stun.miwifi.com:3478" {
 		t.Fatalf("空配置应回落默认档, got %v", got)
 	}
+	// 副档字面锁(评审 P1):Google 副档拍板为主域 stun.l.google.com,勿手滑
+	// 改回 stun1 次域——默认档形态是实测定稿,测试钉死。
+	if got[1] != "stun.l.google.com:19302" {
+		t.Fatalf("默认档副档必须为 stun.l.google.com:19302(勿改回 stun1 次域), got %v", got)
+	}
 	withCfg(t, &config.MeshConfig{StunServers: []string{"stun.custom:3478"}})
 	if got := agentPunchConfiguredServers(); len(got) != 1 || got[0] != "stun.custom:3478" {
 		t.Fatalf("配置了应原样返回, got %v", got)
+	}
+	// nil 全局配置(评审 P2):启动早期/配置未装配时不 panic,回落默认档。
+	// SetGlobalConfig(nil) 先例见 processor/tcp/route_override_test.go。
+	oldNil := config.GetGlobalConfig()
+	config.SetGlobalConfig(nil)
+	t.Cleanup(func() { config.SetGlobalConfig(oldNil) })
+	got = agentPunchConfiguredServers()
+	if len(got) != 2 || got[0] != "stun.miwifi.com:3478" {
+		t.Fatalf("nil 全局配置应回落默认档, got %v", got)
 	}
 }
 

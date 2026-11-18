@@ -814,20 +814,35 @@ type agentPunchTransferContext struct {
 var (
 	agentPunchTransferCtxMu sync.Mutex
 	agentPunchTransferCtx   = map[string]agentPunchTransferContext{}
+	// 每条目一个 TTL 定时器(评审 P11):重注册(服务器重发 listen 帧/
+	// listen_failed 放回)必须 Stop 旧定时器——旧 AfterFunc 先到会把
+	// 新条目摘走(堆叠缺陷)。
+	agentPunchTransferTimers = map[string]*time.Timer{}
 )
 
 // registerAgentPunchTransferContext 入表+TTL 摘除(listen TTL + 30s 余量,
 // 覆盖 punch 会话 90s 寿命口径不对齐的窗口——宁可表多活一会,查空由单次
-// 消费语义兜住)。
+// 消费语义兜住)。同 transferID 重注册=顶替:旧定时器收回,摘除归新定时器。
 func registerAgentPunchTransferContext(transferID string, tctx agentPunchTransferContext, ttl time.Duration) {
 	agentPunchTransferCtxMu.Lock()
+	defer agentPunchTransferCtxMu.Unlock()
 	agentPunchTransferCtx[transferID] = tctx
-	agentPunchTransferCtxMu.Unlock()
-	time.AfterFunc(ttl+30*time.Second, func() {
+	if old, ok := agentPunchTransferTimers[transferID]; ok {
+		old.Stop() // Stop 只拦未触发的;已触发在途的由回调身份检查兜住
+	}
+	var timer *time.Timer
+	timer = time.AfterFunc(ttl+30*time.Second, func() {
 		agentPunchTransferCtxMu.Lock()
+		defer agentPunchTransferCtxMu.Unlock()
+		// 身份检查:Stop 与回调在途的竞态窗口里,被顶替的旧回调不得摘
+		// 走新条目——只有「仍是当前定时器」才允许摘除。
+		if agentPunchTransferTimers[transferID] != timer {
+			return
+		}
 		delete(agentPunchTransferCtx, transferID)
-		agentPunchTransferCtxMu.Unlock()
+		delete(agentPunchTransferTimers, transferID)
 	})
+	agentPunchTransferTimers[transferID] = timer
 }
 
 // takeAgentPunchTransferContext 单次消费取表(无/已摘 → nil)。

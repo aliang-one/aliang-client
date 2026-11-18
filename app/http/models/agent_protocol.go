@@ -404,7 +404,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				// 发起（ttl_seconds 必填——一次性 listener 的存活上限）；result 回
 				// port+fingerprint；candidates 双向经 server 按 session_id 转发
 				// 对端——STUN 公网候选交换，数组字段表内照惯例用裸名。
-				{Type: AgentEventPeerPunchSession, Required: []string{"type", "request_id", "session_id", "token", "ttl_seconds"}, Optional: []string{"advertise_ip"}, Emits: []string{AgentEventPeerPunchSessionResult}},
+				{Type: AgentEventPeerPunchSession, Required: []string{"type", "request_id", "session_id", "token", "ttl_seconds"}, Optional: []string{"advertise_ip", "purpose", "transfer_id"}, Emits: []string{AgentEventPeerPunchSessionResult}},
 				{Type: AgentEventPeerPunchSessionResult, Required: []string{"type", "request_id", "ok"}, Optional: []string{"port", "fingerprint", "fail_reason"}},
 				{Type: AgentEventPeerPunchCandidates, Required: []string{"type", "session_id", "candidates"}},
 			},
