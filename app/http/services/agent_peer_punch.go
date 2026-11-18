@@ -342,6 +342,8 @@ func (b *agentPeerPunchB) handleSession(msg map[string]interface{}, writeJSON fu
 	tctx, haveTctx := agentPunchTransferContext{}, false
 	if purpose == "transfer" {
 		if !validAgentTransferID(transferID) {
+			// socket 已绑,拒单须自收(与 cert_generate_failed 臂同款纪律)。
+			_ = socket.Close()
 			fail("bad_transfer_id")
 			return
 		}
@@ -349,6 +351,8 @@ func (b *agentPeerPunchB) handleSession(msg map[string]interface{}, writeJSON fu
 		if !haveTctx {
 			// 声明了传输用途却无接收上下文(listen 未发生/已被消费/TTL 摘除):
 			// fail-loud 回 A,绝不静默喂 ssh 入口(用途错配=数据喂错 handler)。
+			// socket 已绑,拒单须自收(与 cert_generate_failed 臂同款纪律)。
+			_ = socket.Close()
 			fail("transfer_context_missing")
 			return
 		}
