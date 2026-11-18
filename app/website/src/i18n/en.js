@@ -1067,6 +1067,11 @@ export default {
   mesh_privateKeyPlaceholder: 'PEM private key (OpenSSH/PKCS#8)',
   mesh_privateKeyHint: 'The private key never leaves this device. Send each peer the matching public key and paste it into their SSH-ingress mesh allow-list (mesh_authorized_keys), with your device name as a trailing note.',
   mesh_keyPassphrase: 'Key passphrase',
+  // UDP hole punching (transfer-punch-stun): punch toggle + STUN list; pair with zh.js
+  mesh_punchEnable: 'UDP hole punching',
+  mesh_punchEnableHint: 'Try direct UDP hole-punched links with peers (opens a public UDP port on this device; off by default).',
+  mesh_stunServers: 'STUN servers',
+  mesh_stunServersHint: 'Leave empty to use the defaults (stun.miwifi.com / Google); for a self-hosted coturn enter host:port, one per line',
   // -- Dependency & identity hints (G4/SPEC §10.3): warning bar for mesh depending
   //    on SSH ingress + warning-level hint when peers[].device_id mismatches the
   //    admission-table trailing comment; must pair with zh.js --

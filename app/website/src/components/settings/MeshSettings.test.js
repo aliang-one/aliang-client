@@ -33,7 +33,8 @@ describe('MeshSettings normalizeMeshConfig', () => {
       punch_enable: false,
       max_hops: 0,
       peers: [],
-      fallback: { enable: false, next_hop: '' }
+      fallback: { enable: false, next_hop: '' },
+      stun_servers: []
     });
     // 显式布尔断言：nil → 显式 true/false，而非 undefined（镜像 ssh_ingress 先例）
     const defaults = normalizeMeshConfig(undefined);
@@ -115,6 +116,12 @@ describe('MeshSettings normalizeMeshConfig', () => {
     expect(normalizeMeshConfig({ fallback: 'x' }).fallback).toEqual({ enable: false, next_hop: '' });
     expect(normalizeMeshConfig({ fallback: { enable: 'yes' } }).fallback.enable).toBe(false);
     expect(normalizeMeshConfig({ fallback: { next_hop: 42 } }).fallback.next_hop).toBe('');
+  });
+
+  it('normalizeMeshConfig 归一 stun_servers(TrimSpace/剔空/非数组归空)', () => {
+    expect(normalizeMeshConfig({ stun_servers: ['  a:1 ', '', 'b:2'] }).stun_servers).toEqual(['a:1', 'b:2']);
+    expect(normalizeMeshConfig({}).stun_servers).toEqual([]);
+    expect(normalizeMeshConfig({ stun_servers: 'x' }).stun_servers).toEqual([]);
   });
 });
 
@@ -592,6 +599,9 @@ describe('MeshSettings 卡片', () => {
     expect(el.querySelector('[data-field="meshPrivateKey"]').disabled).toBe(true);
     expect(el.querySelector('[data-field="meshKeyPassphrase"]').disabled).toBe(true);
     expect(peerKeyInput(el, 'dev-b').disabled).toBe(true);
+    // 打洞直连(transfer-punch-stun):punch 开关与 STUN textarea 同口径禁用
+    expect(el.querySelector('[data-field="meshPunchEnable"]').disabled).toBe(true);
+    expect(el.querySelector('[data-field="meshStunServers"]').disabled).toBe(true);
     expect(saveButton(el).disabled).toBe(true);
   });
 
@@ -640,7 +650,8 @@ describe('MeshSettings 卡片', () => {
       punch_enable: false,
       max_hops: 0,
       peers: [],
-      fallback: { enable: false, next_hop: '' }
+      fallback: { enable: false, next_hop: '' },
+      stun_servers: []
     });
   });
 
@@ -678,6 +689,11 @@ describe('MeshSettings 卡片', () => {
       'mesh_sshDependencyWarning',
       'mesh_sshEnableTogether',
       'mesh_deviceIdMismatchHint',
+      // 打洞直连(transfer-punch-stun):punch 开关 + STUN 列表
+      'mesh_punchEnable',
+      'mesh_punchEnableHint',
+      'mesh_stunServers',
+      'mesh_stunServersHint',
       'mesh_save',
       'mesh_saving'
     ];
@@ -1336,5 +1352,133 @@ describe('MeshSettings LAN 发现一键入表', () => {
     const saveBtn = saveButton(el);
     expect(saveBtn).not.toBeNull();
     expect(saved).toHaveLength(0);
+  });
+});
+
+// —— 打洞直连(transfer-punch-stun):punch 开关 + STUN 列表 textarea ——
+// 契约:编辑源=configMesh(normalizeMeshConfig 出口),/api/mesh/status 回读的
+// stun_servers(Task 3)只是显示参考——绝不把 status 预填的默认档写回表单/
+// 保存载荷(一开卡片就固化显式列表=失去跟随默认档演进能力);空列表经数组
+// 整体替换分支显式落盘 [](=回默认档)。
+describe('MeshSettings 打洞直连与 STUN 列表', () => {
+  const punchInput = (el) => el.querySelector('[data-field="meshPunchEnable"]');
+  const stunInput = (el) => el.querySelector('[data-field="meshStunServers"]');
+
+  function setStun(el, text) {
+    const node = stunInput(el);
+    node.value = text;
+    node.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
+  function togglePunch(el, checked) {
+    const node = punchInput(el);
+    node.checked = checked;
+    node.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  beforeEach(() => {
+    stubApi();
+  });
+
+  afterEach(() => {
+    while (mountedApps.length) {
+      const { app, el } = mountedApps.pop();
+      app.unmount();
+      el.remove();
+    }
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('punch 开关回显保存态现值;开启 → save 载荷 punch_enable=true 且随 patch 带出', async () => {
+    const { el, saved } = mountCard(baseConfig()); // punch_enable: false(默认关)
+    await flush();
+    expect(punchInput(el).checked).toBe(false);
+    togglePunch(el, true);
+    await flush();
+    clickSave(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    expect(saved[0].mesh.punch_enable).toBe(true);
+    const patch = buildCustomerSavePatch(saved[0], baseConfig());
+    expect(patch.mesh.punch_enable).toBe(true);
+  });
+
+  it('配置 punch_enable=true → 开关勾选回显;不动它保存不产伪 diff', async () => {
+    const current = baseConfig({ punch_enable: true });
+    const { el, saved } = mountCard(current);
+    await flush();
+    expect(punchInput(el).checked).toBe(true);
+    clickSave(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    expect(saved[0].mesh.punch_enable).toBe(true);
+    expect(buildCustomerSavePatch(saved[0], current)?.mesh).toBeUndefined();
+  });
+
+  it('STUN textarea 编辑源=configMesh:配置值逐行回显;status 默认档绝不预填(配置缺键 value 恒空)', async () => {
+    // status 回读 stun_servers(默认档可见)只是显示参考:配置缺键时留空,
+    // 占位符(hint)说明默认档——表单值恒来自 configMesh.stun_servers
+    stubApi({
+      meshStatus: { ...defaultMeshStatus(), stun_servers: ['stun.miwifi.com:3478', 'stun.l.google.com:19302'] }
+    });
+    const bare = mountCard(baseConfig());
+    await flush();
+    expect(stunInput(bare.el).value).toBe('');
+
+    const configured = mountCard(baseConfig({ stun_servers: ['a.example.com:3478', 'b.example.com:3479'] }));
+    await flush();
+    expect(stunInput(configured.el).value).toBe('a.example.com:3478\nb.example.com:3479');
+  });
+
+  it('编辑 STUN 列表 → save:split 归一(TrimSpace/剔空行)进载荷与 patch', async () => {
+    const { el, saved } = mountCard(baseConfig());
+    await flush();
+    setStun(el, '  stun.example.com:3478  \n\nstun2.example.com:3478\n');
+    await flush();
+    clickSave(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    expect(saved[0].mesh.stun_servers).toEqual(['stun.example.com:3478', 'stun2.example.com:3478']);
+    const patch = buildCustomerSavePatch(saved[0], baseConfig());
+    expect(patch.mesh.stun_servers).toEqual(['stun.example.com:3478', 'stun2.example.com:3478']);
+  });
+
+  it('未编辑(配置缺键)→ save:stun_servers=[] 与归一化现值等价,不产伪 diff', async () => {
+    const { el, saved } = mountCard(baseConfig());
+    await flush();
+    clickSave(el);
+    await flush();
+    expect(saved[0].mesh.stun_servers).toEqual([]);
+    expect(buildCustomerSavePatch(saved[0], baseConfig())?.mesh).toBeUndefined();
+  });
+
+  it('清空已有列表 → save:patch.mesh.stun_servers=[](数组整体替换,回默认档)', async () => {
+    const current = baseConfig({ stun_servers: ['a.example.com:3478'] });
+    const { el, saved } = mountCard(current);
+    await flush();
+    setStun(el, '');
+    await flush();
+    clickSave(el);
+    await flush();
+    const patch = buildCustomerSavePatch(saved[0], current);
+    expect(patch.mesh.stun_servers).toEqual([]);
+  });
+
+  it('unconfigured 启发式收口(TODOS ⑤):peers 空+不转发+无兜底但 punch 已开 → 非未配置', async () => {
+    stubApi({
+      meshStatus: { ...defaultMeshStatus(), peers: [], forward_enable: false, punch_enable: true }
+    });
+    const { el } = mountCard({ ...baseConfig(), mesh: undefined });
+    await flush();
+    expect(statusPill(el).textContent).toContain('mesh_statusOnline');
+
+    // 反例:punch 也关 → 未配置灰态(既有行为不回归)
+    stubApi({
+      meshStatus: { ...defaultMeshStatus(), peers: [], forward_enable: false, punch_enable: false }
+    });
+    const idle = mountCard({ ...baseConfig(), mesh: undefined });
+    await flush();
+    expect(statusPill(idle.el).textContent).toContain('mesh_statusIdle');
   });
 });

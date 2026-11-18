@@ -171,7 +171,10 @@ describe('PlatformProxySettings 卡片（平台流量代理）', () => {
       punch_enable: false,
       max_hops: 5,
       peers: [{ device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: false }],
-      fallback: { enable: true, next_hop: 'dev-b' }
+      fallback: { enable: true, next_hop: 'dev-b' },
+      // stun_servers(transfer-punch-stun):本卡 mesh 快照走同一
+      // normalizeMeshConfig,读侧恒产出数组(缺键=[]=后端默认档)
+      stun_servers: []
     });
     // 恒产出显式布尔（ssh_ingress 先例）：nil 不透传成 undefined
     expect(typeof saved[0].mesh.enable).toBe('boolean');

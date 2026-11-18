@@ -1,7 +1,7 @@
 // mesh 组网卡片纯逻辑模块（与 MeshSettings.vue 同名分层：.js=可纯测的归一化/
 // 解析逻辑，.vue=卡片骨架；import 一律带显式扩展名避免同名解析歧义）。
 // 线格式 customer.mesh 与后端 processor/config types.go MeshConfig 对齐：
-// {enable, forward_enable, punch_enable, max_hops,
+// {enable, forward_enable, punch_enable, max_hops, stun_servers,
 //  peers:[{device_id,lan_addrs,relay,host_key?}],
 //  fallback:{enable,next_hop}, private_key?, key_passphrase?}
 // ——带 ? 的密钥字段只透传不默认（空串/缺键不落键,见各函数内注释）。
@@ -85,6 +85,11 @@ export function normalizeMeshConfig(payload) {
     max_hops: normalizeMaxHops(source.max_hops),
     peers: normalizeMeshPeers(source.peers),
     fallback: normalizeMeshFallback(source.fallback),
+    // stun_servers(transfer-punch-stun)：TrimSpace/剔空；非数组（老配置/脏
+    // 数据）归空数组=回落后端默认档。读侧恒产出数组，保存 patch 不缺键。
+    stun_servers: Array.isArray(source.stun_servers)
+      ? source.stun_servers.map((v) => String(v ?? '').trim()).filter(Boolean)
+      : [],
     // 密钥透传（SPEC §13.3.1）：private_key/key_passphrase 空串不落键
     // （省缺 = 「未配置密钥」,后端 deep-merge 语义一致）
     ...(source.private_key ? { private_key: String(source.private_key) } : {}),
