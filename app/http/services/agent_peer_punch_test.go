@@ -19,6 +19,7 @@ import (
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/mesh/punch"
+	"aliang.one/nursorgate/processor/config"
 	"github.com/quic-go/quic-go"
 )
 
@@ -888,5 +889,26 @@ func TestAgentPeerPunchAGateOff(t *testing.T) {
 	}
 	if n := fake.countSessionFrames(); n != 0 {
 		t.Fatalf("门关不应发任何帧,实发 %d", n)
+	}
+}
+
+// agentPunchConfiguredServers 读配置取 STUN 列表:配置空回落默认档,配置了
+// 原样返回(transfer-punch-stun 批次)。全局配置摆置沿
+// agent_ai_agentcore_skills_test.go 同款:SetGlobalConfig + t.Cleanup 回滚
+// (仓内无 swapGlobalMeshConfig 这类现成缝)。
+func TestAgentPunchConfiguredServers(t *testing.T) {
+	withCfg := func(t *testing.T, mesh *config.MeshConfig) {
+		old := config.GetGlobalConfig()
+		config.SetGlobalConfig(&config.Config{Customer: &config.CustomerConfig{Mesh: mesh}})
+		t.Cleanup(func() { config.SetGlobalConfig(old) })
+	}
+	withCfg(t, &config.MeshConfig{}) // 空 mesh → 回落默认档
+	got := agentPunchConfiguredServers()
+	if len(got) != 2 || got[0] != "stun.miwifi.com:3478" {
+		t.Fatalf("空配置应回落默认档, got %v", got)
+	}
+	withCfg(t, &config.MeshConfig{StunServers: []string{"stun.custom:3478"}})
+	if got := agentPunchConfiguredServers(); len(got) != 1 || got[0] != "stun.custom:3478" {
+		t.Fatalf("配置了应原样返回, got %v", got)
 	}
 }

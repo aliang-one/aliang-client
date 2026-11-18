@@ -4,6 +4,9 @@
 // 绑物理接口的 socket,学到的公网映射必须属于这张卡;若在函数内部另建
 // socket,TUN-on 下学到的是引擎换发 socket 的映射,洞会打错 5-tuple
 // (与 socket.go:26 的绑定铁律同源,这是 conn 作参数的原因)。
+// 默认服务器档已迁 processor/config.MeshDefaultStunServers(分层:processor
+// 不得反向依赖 app);本包只做 Discover/Classify 原语,服务器列表由编排层
+// 经参数传入。
 
 package punch
 
@@ -16,24 +19,6 @@ import (
 
 	"github.com/pion/stun"
 )
-
-// 默认双服务器档:Google 公益 STUN 两台。v1 包内常量、无配置覆盖项
-// (YAGNI;coturn 自托管是二期看数据再定的事,届时一并加配置)。
-const (
-	stunServerPrimary   = "stun.l.google.com:19302"
-	stunServerSecondary = "stun1.l.google.com:19302"
-)
-
-// defaultSTUNServers 默认判型服务器对,编排层(services,Task 10)经
-// DefaultSTUNServers 取这对调 Classify——常量不导出(服务器档是包内事实),
-// 导出取数函数并回防御性拷贝,编排层不抄写服务器串。
-var defaultSTUNServers = []string{stunServerPrimary, stunServerSecondary}
-
-// DefaultSTUNServers 返回默认判型服务器对的拷贝(供 services 层 B/A 两侧
-// 编排调 Classify 用):改返回切片不污染包内默认档。
-func DefaultSTUNServers() []string {
-	return append([]string(nil), defaultSTUNServers...)
-}
 
 // discoverAttempts 单次 Discover 在总预算内的发包次数(首发+2 次重传)。
 // UDP 会丢包,单发太脆;次数写死小常数,预算仍由 timeout 参数封顶。

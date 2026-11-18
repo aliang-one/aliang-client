@@ -153,6 +153,18 @@ func agentPunchConfigEnabled() bool {
 	return cfg.Customer.Mesh.EffectivePunchEnabled()
 }
 
+// agentPunchConfiguredServers 生产 STUN 服务器取值:customer.mesh.stun_servers
+// 读侧(空回落 MeshDefaultStunServers,EffectiveStunServers 语义)。闭包逐调用
+// 回读全局配置——保存即生效,不缓存(工厂 CacheKey 派生式置位同款哲学)。
+func agentPunchConfiguredServers() []string {
+	cfg := config.GetGlobalConfig()
+	if cfg == nil || cfg.Customer == nil {
+		// 与 EffectiveStunServers 同款拷贝纪律:不外泄共享常量切片。
+		return append([]string(nil), config.MeshDefaultStunServers...)
+	}
+	return cfg.Customer.Mesh.EffectiveStunServers()
+}
+
 // agentPeerPunchIngressHandler 生产 Handler:每条过门流=一条「到 ssh 入口」
 // 的连接,喂 sshin.HandleIngressConn(app/tunnel/manager.go mesh relay 的
 // 同款喂法);remote label 带 punch- 前缀+session 供入口审计区分载体来源。
@@ -172,7 +184,7 @@ func newAgentPeerPunchB() *agentPeerPunchB {
 		sessions: map[string]*agentPeerPunchSession{},
 		skipMemo: &punch.SkipMemo{},
 		bind:     func() (*net.UDPConn, string, error) { return punch.NewBoundUDPConn(punch.DefaultResolver) },
-		servers:  punch.DefaultSTUNServers,
+		servers:  agentPunchConfiguredServers,
 		classify: punch.Classify,
 		serve:    punch.ServeListener,
 		gate:     agentPunchConfigEnabled,
@@ -580,7 +592,7 @@ func newAgentPeerPunchA() *agentPeerPunchA {
 		cache:             punch.NewSessionCache(),
 		gate:              agentPunchConfigEnabled,
 		bind:              func() (*net.UDPConn, string, error) { return punch.NewBoundUDPConn(punch.DefaultResolver) },
-		servers:           punch.DefaultSTUNServers,
+		servers:           agentPunchConfiguredServers,
 		classify:          punch.Classify,
 		cert:              generateAgentLanCertificate,
 		send: func(payload map[string]interface{}) error {
