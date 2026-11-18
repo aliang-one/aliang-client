@@ -133,7 +133,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	tunnel.StartMeshLANAssembly(services.GetSharedAgentService().CurrentDeviceID)
 	// 自动组网探针接线(自动组网批次):config.MeshAutoPeerFor 回查 beacon
 	// 同账号自动表。
-	tunnel.WireMeshAutoPeerProbe()
+	tunnel.WireMeshAutoPeerProbe(services.MeshRosterEntryFor)
 
 	// 启动服务器
 	logger.Info("Starting aliang server...")

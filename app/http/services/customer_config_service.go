@@ -415,16 +415,29 @@ func buildSSHIngressRunConfig(effective *config.SSHIngressConfig) *sshin.RunConf
 		// 生效不重启——闭包纪律同 ForwardGate。
 		Blocked: blocked,
 		// MeshAdmission 自动组网活准入(自动组网批次):MeshKeys 未命中的
-		// mesh 公钥先查 auto_peers 开关(让渡型默认关 fail-closed——beacon
-		// 明文自报信任锚无带外权威),开才查 beacon 自动 peer 活表(同账号
-		// +指纹+签名验签四要素,lanbeacon.MeshAdmissionFor)。不参与
-		// runIdentity 比对——发现新对端零重启(Blocked 同款闭包纪律)。
-		// 开关关=恒拒(仅手填 mesh_authorized_keys)。
+		// mesh 公钥,依次过 ①auto_peers 开关(让渡型默认关 fail-closed)
+		// ②beacon 自动表四要素(lanbeacon.MeshAdmissionFor)③平台 roster
+		// 核验(带外权威:device_id↔公钥↔host key 指纹绑定,评审 major 的
+		// 「自签顶替」洞由此收口)。三者全过才按 mesh 形态准入;roster 未
+		// 拉取/条目缺失=拒绝(fail-closed)。不参与 runIdentity 比对——
+		// 零重启(Blocked 同款闭包纪律)。
 		MeshAdmission: func(key gossh.PublicKey) (string, bool) {
 			if cfg := config.GetGlobalConfig(); cfg == nil || cfg.Customer == nil || !cfg.Customer.Mesh.EffectiveAutoPeers() {
 				return "", false
 			}
-			return lanbeacon.MeshAdmissionFor(key)
+			deviceID, ok := lanbeacon.MeshAdmissionFor(key)
+			if !ok {
+				return "", false
+			}
+			pubLine, _, rok := MeshRosterEntryFor(deviceID)
+			if !rok {
+				return "", false
+			}
+			rosterPub, _, _, _, perr := gossh.ParseAuthorizedKey([]byte(pubLine))
+			if perr != nil || string(rosterPub.Marshal()) != string(key.Marshal()) {
+				return "", false // roster 公钥与认证钥不一致:拒绝(防自签顶替)
+			}
+			return deviceID, true
 		},
 	}
 }
