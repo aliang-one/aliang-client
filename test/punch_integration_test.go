@@ -45,13 +45,18 @@ package test
 // 未导出不可覆写),bound 20s。全套实测 ~17s。
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -797,4 +802,244 @@ func TestPunchIntegrationBridgeContract(t *testing.T) {
 	if sid, _ := aToB[0]["session_id"].(string); sid == "" {
 		t.Fatal("投给 B 的 candidates 帧缺 session_id")
 	}
+}
+
+// ===== (f) 传输腿:生产编排体端到端 =====
+
+// punchLanPushAck lan_push 终态 ACK 行的契约形态(services 包 sender 协议体
+// 已锁定的四字段;本文件手写发送侧只消费这些)。
+type punchLanPushAck struct {
+	OK        bool   `json:"ok"`
+	SHA256    string `json:"sha256"`
+	SizeBytes int64  `json:"size_bytes"`
+	Path      string `json:"path"`
+	Reason    string `json:"reason"`
+}
+
+// punchDeterministicBytes 生成确定性载荷(固定图案循环,跨平台逐字节可比)。
+func punchDeterministicBytes(n int) []byte {
+	pattern := []byte("punch-integration-transfer-leg-0123456789")
+	buf := make([]byte, n)
+	for i := range buf {
+		buf[i] = pattern[i%len(pattern)]
+	}
+	return buf
+}
+
+// punchTransferDialBounded 有界传输腿拨号(挂死保护):ctx 预算=bound,外层
+// 再加 5s 围栏兜底——到点 Fatal,不挂死测试进程。
+func punchTransferDialBounded(t *testing.T, peerID, transferID string, bound time.Duration) (net.Conn, error) {
+	t.Helper()
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	ch := make(chan dialResult, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), bound)
+		defer cancel()
+		c, e := services.AgentPeerPunchTransferDial(ctx, peerID, transferID)
+		ch <- dialResult{c, e}
+	}()
+	select {
+	case r := <-ch:
+		return r.conn, r.err
+	case <-time.After(bound + 5*time.Second):
+		t.Fatalf("AgentPeerPunchTransferDial 在 %v 内未返回(挂死?)", bound)
+		return nil, errors.New("unreachable")
+	}
+}
+
+// punchPushLanStreamHandwritten 手写 lan_push 发送协议体(hello→等 ok→定长
+// 字节流→等 ACK)。pushAgentLanStream 未导出且其协议行语义已被 services
+// 包内测试逐行锁定,本文件经生产拨号 conn 复刻发送侧行为,集成面只锁
+// 「信令+路由+消费」语义。goroutine 安全(不触 t.Fatal,错误返给调用方);
+// 单一 bufio.Reader 贯穿两条回行,防缓冲区跨界丢字节;deadline 分段对齐
+// 生产 sender(握手窗 5s,流+ACK 给足宽限)。
+func punchPushLanStreamHandwritten(conn net.Conn, token, transferID, sourcePath string, totalSize int64) (punchLanPushAck, error) {
+	var zero punchLanPushAck
+	hello, err := json.Marshal(map[string]interface{}{
+		"token":       token,
+		"transfer_id": transferID,
+		"size_bytes":  totalSize,
+	})
+	if err != nil {
+		return zero, err
+	}
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return zero, fmt.Errorf("lan hello deadline: %w", err)
+	}
+	if _, err := conn.Write(append(hello, '\n')); err != nil {
+		return zero, fmt.Errorf("lan hello write failed: %w", err)
+	}
+	reader := bufio.NewReader(io.LimitReader(conn, 4096)) // agentLanHeadlineLimit 同值
+	readyLine, err := reader.ReadBytes('\n')
+	if err != nil {
+		return zero, fmt.Errorf("lan headline read failed: %w", err)
+	}
+	var ready struct {
+		OK     bool   `json:"ok"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(readyLine, &ready); err != nil || !ready.OK {
+		return zero, fmt.Errorf("lan peer refused handshake (reason=%s)", ready.Reason)
+	}
+	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		return zero, fmt.Errorf("lan stream deadline: %w", err)
+	}
+	src, err := os.Open(sourcePath)
+	if err != nil {
+		return zero, err
+	}
+	defer src.Close()
+	written, err := io.Copy(conn, io.LimitReader(src, totalSize))
+	if err != nil {
+		return zero, fmt.Errorf("lan stream failed after %d bytes: %w", written, err)
+	}
+	if written != totalSize {
+		return zero, fmt.Errorf("lan push truncated: sent %d, declared %d", written, totalSize)
+	}
+	ackLine, err := reader.ReadBytes('\n')
+	if err != nil {
+		return zero, fmt.Errorf("lan ack read failed: %w", err)
+	}
+	var ack punchLanPushAck
+	if err := json.Unmarshal(ackLine, &ack); err != nil || !ack.OK {
+		return zero, fmt.Errorf("lan peer refused ack (reason=%s)", ack.Reason)
+	}
+	return ack, nil
+}
+
+// TestPunchIntegrationTransferLeg 传输腿(purpose=transfer)沿 FullChain
+// 拓扑的端到端契约(与 services 包 e2e 用例分工:那边自持注入实例锁「生产
+// serve 体+真拨号链」回环,这边走生产单例+mock 信令桥锁「信令线上形态+
+// 双端生产编排体+单次消费语义」):
+//
+//  1. 接收侧经生产 listen 帧入口(handleAgentPeerLanPushListen,经
+//     AgentPeerPunchHandleFrame 的路由等价臂投递)注册 punch 接收上下文
+//     ——帧校验/token/filename 齐备性/注册表入表全走生产路径;并行 TCP
+//     收件腿照生产起(无人拨,TTL 到点自然收摊,不扰本断言)。
+//  2. 拨号侧 AgentPeerPunchTransferDial(purpose=transfer 一次性会话,
+//     session 帧捎带 transfer_id)真打洞拿 conn。
+//  3. 独立 goroutine 手写 lan_push 协议推临时文件(发送协议体已被 services
+//     包内测试锁定,此处复刻发送侧行为)。
+//  4. 断言接收侧 inbox 落盘 sha/size 逐字一致 + done marker 收满收尾。
+//  5. 反向臂:上下文被首会话单次消费后,同 transfer_id 重拨与从未注册的
+//     新 transfer_id 同链路回 transfer_context_missing(session.result
+//     ok=false + fail_reason),绝不静默喂 ssh 入口。
+func TestPunchIntegrationTransferLeg(t *testing.T) {
+	env := newPunchEnv(t)
+	const peer = "dev-pi-b-xfer"
+	const transferID = "tr_punchleg01"
+	const token = "tok-x"
+	const filename = "f.bin"
+
+	inbox := t.TempDir()
+	t.Setenv("ALIANG_TRANSFER_INBOX_DIR", inbox) // 接收侧收件根(services 包夹具同款机制)
+
+	// ① 接收侧注册:listen 帧走生产 dispatch(校验+入表;listen 时刻的
+	// writeJSON 经共用 writer 接桥,桥按帧型忽略非 punch 帧=吞帧)。
+	services.AgentPeerPunchHandleFrame(punchNormalizeFrame(map[string]interface{}{
+		"type":        models.AgentEventPeerLanPushListen,
+		"request_id":  "pi-xfer-listen-1",
+		"transfer_id": transferID,
+		"token":       token,
+		"filename":    filename,
+		"target_dir":  "",
+		"max_bytes":   0,
+		"ttl_seconds": 10,
+	}))
+
+	// ② 拨号侧:传输腿真拨号(一次性,不进缓存)。
+	conn, err := punchTransferDialBounded(t, peer, transferID, 15*time.Second)
+	if err != nil {
+		t.Fatalf("AgentPeerPunchTransferDial: %v", err)
+	}
+
+	// 信令线上形态:session 帧捎带 purpose/transfer_id(Task 5 契约),路由
+	// 信封寻址接收侧设备。
+	out := env.bridge.aSessionFrameAt(0)
+	if out["purpose"] != "transfer" || out["transfer_id"] != transferID {
+		t.Fatalf("传输腿 session 帧应捎带 purpose=transfer/transfer_id=%s: %v", transferID, out)
+	}
+	if out["target_device_id"] != peer {
+		t.Fatalf("传输腿 session 帧 target_device_id=%v, 期望 %q", out["target_device_id"], peer)
+	}
+
+	// ③ 独立 goroutine 推临时文件,主测有界等结果。
+	data := punchDeterministicBytes(128 * 1024)
+	src := filepath.Join(t.TempDir(), filename)
+	if err := os.WriteFile(src, data, 0o644); err != nil {
+		t.Fatalf("写源文件失败: %v", err)
+	}
+	type pushResult struct {
+		ack punchLanPushAck
+		err error
+	}
+	pushCh := make(chan pushResult, 1)
+	go func() {
+		defer conn.Close() // 推完即收(one-shot:Close 连动收摊 transport+socket)
+		ack, perr := punchPushLanStreamHandwritten(conn, token, transferID, src, int64(len(data)))
+		pushCh <- pushResult{ack, perr}
+	}()
+	var pushed pushResult
+	select {
+	case pushed = <-pushCh:
+	case <-time.After(30 * time.Second):
+		t.Fatal("lan_push 推流在 30s 内未完成(挂死?)")
+	}
+	if pushed.err != nil {
+		t.Fatalf("lan_push 推流失败: %v", pushed.err)
+	}
+	ack := pushed.ack
+
+	// ④ ACK 双端核对 + 接收侧 inbox 落盘逐字一致 + done marker。
+	sum := sha256.Sum256(data)
+	wantSHA := hex.EncodeToString(sum[:])
+	if ack.SizeBytes != int64(len(data)) || !strings.EqualFold(ack.SHA256, wantSHA) {
+		t.Fatalf("ACK 双端核对失配: size=%d want=%d sha=%s want=%s", ack.SizeBytes, len(data), ack.SHA256, wantSHA)
+	}
+	if rel, relErr := filepath.Rel(inbox, ack.Path); relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		t.Fatalf("ACK path 应落在 inbox 根: %s(inbox=%s)", ack.Path, inbox)
+	}
+	got, readErr := os.ReadFile(ack.Path)
+	if readErr != nil || !bytes.Equal(got, data) {
+		t.Fatalf("接收侧 inbox 落盘内容失配: err=%v len=%d want=%d", readErr, len(got), len(data))
+	}
+	markerRaw, mErr := os.ReadFile(filepath.Join(inbox, ".aliang-transfer", transferID+".json"))
+	if mErr != nil {
+		t.Fatalf("done marker 读取失败: %v", mErr)
+	}
+	var marker struct {
+		TransferID string `json:"transfer_id"`
+		State      string `json:"state"`
+		SHA256     string `json:"sha256"`
+		SizeBytes  int64  `json:"size_bytes"`
+	}
+	if err := json.Unmarshal(markerRaw, &marker); err != nil {
+		t.Fatalf("done marker 解析失败: %v", err)
+	}
+	if marker.TransferID != transferID || marker.State != "done" ||
+		marker.SizeBytes != int64(len(data)) || !strings.EqualFold(marker.SHA256, wantSHA) {
+		t.Fatalf("done marker 不符(state 应 done,sha/size 应与源一致): %+v", marker)
+	}
+
+	// ⑤ 反向臂:transfer_context_missing 拒单(单次消费后的重拨 + 从未
+	// 注册的新 transfer_id)——session.result ok=false 回 A,拨号错误透传
+	// fail_reason,桥上可对账。
+	refused := func(label, tid string) {
+		_, derr := punchTransferDialBounded(t, peer, tid, 15*time.Second)
+		if derr == nil || !strings.Contains(derr.Error(), "transfer_context_missing") {
+			t.Fatalf("%s: 期望 transfer_context_missing 拒单, 得到 %v", label, derr)
+		}
+		res := env.bridge.resultAt(env.bridge.resultCount() - 1)
+		if ok, _ := res["ok"].(bool); ok {
+			t.Fatalf("%s: 桥上最后 result ok=%v, 期望 false: %v", label, res["ok"], res)
+		}
+		if fr, _ := res["fail_reason"].(string); fr != "transfer_context_missing" {
+			t.Fatalf("%s: 桥上最后 result fail_reason=%q, 期望 transfer_context_missing", label, fr)
+		}
+	}
+	refused("单次消费后同 transfer_id 重拨", transferID)
+	refused("未注册的 transfer_id", "tr_punchleg02")
 }

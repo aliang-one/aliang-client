@@ -1182,7 +1182,10 @@ func AgentPeerPunchTransferDial(ctx context.Context, peerID, transferID string) 
 // result/candidates 进 A 侧 pending,candidates 亦进 B 侧注册表——与分派
 // 臂逐臂同源,仅少了 setRemoteConnectionState 的 WS 状态副作用与 safeGo
 // 异步化:时序差由两侧既有的 pending 注册先行/candidates 暂存机制吸收,
-// 那两件本来就在为信令异步兜底)。未知帧型静默忽略。
+// 那两件本来就在为信令异步兜底)。另收传输腿的前置帧 peer.lan.push.listen
+// (transfer-punch-stun Task 9:生产=server 下发 listen 帧给目标设备注册
+// punch 接收上下文,同款路由等价直调;listen_result 经共用 writer 回帧,
+// 接桥时桥按帧型静默忽略非 punch 帧)。未知帧型静默忽略。
 func AgentPeerPunchHandleFrame(msg map[string]interface{}) {
 	switch remoteString(msg, "type") {
 	case models.AgentEventPeerPunchSession:
@@ -1191,6 +1194,8 @@ func AgentPeerPunchHandleFrame(msg map[string]interface{}) {
 		sharedAgentPeerPunchA().handleResultFrame(msg)
 	case models.AgentEventPeerPunchCandidates:
 		GetSharedAgentService().handleAgentPeerPunchCandidates(msg)
+	case models.AgentEventPeerLanPushListen:
+		GetSharedAgentService().handleAgentPeerLanPushListen(msg, agentPunchFrameWriter())
 	}
 }
 
