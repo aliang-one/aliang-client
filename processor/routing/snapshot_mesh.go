@@ -164,6 +164,12 @@ func meshForwardAvailable(cfg *config.Config, deviceID string) bool {
 			return true
 		}
 	}
+	// 自动组网对端回查（自动组网批次）：手填 peers 未命中时探 beacon 自动
+	// 表——同账号+指纹+公钥+签名四要素的派生视图，HostKey 恒非空。用户
+	// 写出 mesh:<deviceID> 规则即显式点名该对端，钉扎/地址由自动组网供给。
+	if _, ok := config.MeshAutoPeerFor(deviceID); ok {
+		return true
+	}
 	return false
 }
 

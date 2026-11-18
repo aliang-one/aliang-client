@@ -14,6 +14,7 @@ import (
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/http/storage"
+	"aliang.one/nursorgate/app/mesh/lanbeacon"
 	"aliang.one/nursorgate/common/cache"
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/common/model"
@@ -413,6 +414,18 @@ func buildSSHIngressRunConfig(effective *config.SSHIngressConfig) *sshin.RunConf
 		// Blocked 黑名单活视图(构造见上):认证期读全局配置,拉黑/解封即时
 		// 生效不重启——闭包纪律同 ForwardGate。
 		Blocked: blocked,
+		// MeshAdmission 自动组网活准入(自动组网批次):MeshKeys 未命中的
+		// mesh 公钥先查 auto_peers 开关(让渡型默认关 fail-closed——beacon
+		// 明文自报信任锚无带外权威),开才查 beacon 自动 peer 活表(同账号
+		// +指纹+签名验签四要素,lanbeacon.MeshAdmissionFor)。不参与
+		// runIdentity 比对——发现新对端零重启(Blocked 同款闭包纪律)。
+		// 开关关=恒拒(仅手填 mesh_authorized_keys)。
+		MeshAdmission: func(key gossh.PublicKey) (string, bool) {
+			if cfg := config.GetGlobalConfig(); cfg == nil || cfg.Customer == nil || !cfg.Customer.Mesh.EffectiveAutoPeers() {
+				return "", false
+			}
+			return lanbeacon.MeshAdmissionFor(key)
+		},
 	}
 }
 

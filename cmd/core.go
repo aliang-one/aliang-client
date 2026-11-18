@@ -194,6 +194,9 @@ func initializeCoreSubsystems() error {
 	// NewAgentService——后者在 user agent runtime 也会构造,双装会抢
 	// 56440/56441 并广播双 beacon。device_id 解析常驻身份文件,幂等。
 	tunnel.StartMeshLANAssembly(services.GetSharedAgentService().CurrentDeviceID)
+	// 自动组网探针接线(自动组网批次):config.MeshAutoPeerFor → beacon
+	// 同账号自动表。
+	tunnel.WireMeshAutoPeerProbe()
 	// SSH 入口启动恢复:customer 配置已在上方加载完成,按其期望态 reconcile
 	// ——重启后自动恢复已启用入口(平台代理自愈的同款纪律:失败仅日志不
 	// 阻断 boot)。与配置提交协调路径共用 services.ReconcileSSHIngressFromConfig

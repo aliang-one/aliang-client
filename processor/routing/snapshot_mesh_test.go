@@ -582,3 +582,39 @@ func TestMeshDNSForwardTargetRelayOnlyPeer(t *testing.T) {
 		t.Fatalf("relay-only peer 无 LAN 载体, lanAddrs = %v, want 空", addrs)
 	}
 }
+
+// TestMeshForwardAvailableAutoPeer 自动组网批次:手填 peers 未命中时,
+// config.MeshAutoPeerFor 探针命中即视为能力成立(HostKey 由表侧四要素闸
+// 收口,此处只验 union 通与不通两个方向);探针清场即回旧语义。
+func TestMeshForwardAvailableAutoPeer(t *testing.T) {
+	mk := func() *config.Config {
+		return &config.Config{
+			Customer: &config.CustomerConfig{
+				Mesh: &config.MeshConfig{
+					Enable:     boolPtr(true),
+					PrivateKey: "k",
+					Peers:      nil,
+				},
+				SSHIngress: &config.SSHIngressConfig{Enable: boolPtr(true)},
+			},
+		}
+	}
+	config.SetMeshAutoPeerProbe(func(deviceID string) (config.MeshAutoPeerView, bool) {
+		if deviceID == "dev-auto" {
+			return config.MeshAutoPeerView{DeviceID: deviceID, LANAddrs: []string{"10.0.0.9:56432"}, HostKey: "SHA256:auto"}, true
+		}
+		return config.MeshAutoPeerView{}, false
+	})
+	t.Cleanup(func() { config.SetMeshAutoPeerProbe(nil) })
+
+	if !meshForwardAvailable(mk(), "dev-auto") {
+		t.Fatal("探针命中(dev-auto)→ available")
+	}
+	if meshForwardAvailable(mk(), "dev-unknown") {
+		t.Fatal("探针未命中 → unavailable(旧语义)")
+	}
+	config.SetMeshAutoPeerProbe(nil)
+	if meshForwardAvailable(mk(), "dev-auto") {
+		t.Fatal("探针清场 → unavailable(旧语义)")
+	}
+}

@@ -131,6 +131,9 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// 而 /api/mesh/status 仍按配置报 enable=true(假绿)。device_id 解析常驻
 	// 身份文件,幂等;装配器自带对账周期,失败仅日志不阻断 boot。
 	tunnel.StartMeshLANAssembly(services.GetSharedAgentService().CurrentDeviceID)
+	// 自动组网探针接线(自动组网批次):config.MeshAutoPeerFor 回查 beacon
+	// 同账号自动表。
+	tunnel.WireMeshAutoPeerProbe()
 
 	// 启动服务器
 	logger.Info("Starting aliang server...")

@@ -39,10 +39,12 @@ import (
 	sshin "aliang.one/nursorgate/inbound/ssh"
 	tuntun "aliang.one/nursorgate/inbound/tun/tunnel"
 	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
+	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/egress"
 	"aliang.one/nursorgate/processor/routing"
 	"aliang.one/nursorgate/processor/tcp"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 // DefaultMeshLANPort 已退役:LAN 载体 TCP 监听收编进 56432 统一入口
@@ -282,6 +284,26 @@ func startMeshLANLocked(deviceID func() string) {
 	// 候选诚实降级为「仅展示不可钉扎」)。core 进程同体持有 beacon 与 SSH
 	// 入口,读盘路径双进程无歧义。
 	beacon.SetFingerprintProvider(ingressHostKeyFingerprint)
+	// 同账号判定源(自动组网批次):本机登录账号 ID 哈希。未登录/无 ID=空串
+	// →ingest 维持旧版全收兼容;登录态下跨账号广播在候选入口即丢弃。
+	beacon.SetAccountHashProvider(meshAccountHashProvider)
+	// mesh 公钥行 + 广播签名源(自动组网批次):以 config private_key 解析
+	// 出公钥行/签名(私钥缺席=恒空,广播退化为旧版形状——自动组网不晋升,
+	// 发现面照常)。读取/签名成本与指纹读盘同量级,锁外调用。
+	beacon.SetMeshPubKeyProvider(meshPubKeyLineProvider)
+	beacon.SetPayloadSigner(func(f lanbeacon.BeaconSignFields) string {
+		pem := meshIdentityPEM()
+		if pem == "" {
+			return ""
+		}
+		// 签名失败静默降级为不带 Sig(旧版形状,自动组网不晋升)——不做
+		// 失败日志(私钥持久性坏配会每 3s 刷屏);可观测面已有 lan_peers。
+		sig, err := lanbeacon.SignBeaconFields(pem, f)
+		if err != nil {
+			return ""
+		}
+		return sig
+	})
 	if berr := beacon.Start(context.Background()); berr != nil {
 		log.Printf("[MESH-LAN] assembly start failed (candidates unavailable, will retry): %v", berr)
 		return
@@ -308,6 +330,57 @@ func ingressHostKeyFingerprint() string {
 	return info.Fingerprint
 }
 
+// meshAccountHashProvider 同账号判定源:本机登录账号 ID 的 sha256 截断
+// (lanbeacon.AccountHashFromID 形态)。GetCurrentUserInfoOrLoad=内存优先
+// SQLite 兜底(离线重启后凭持久化账号仍可同账号判定);未登录/无 ID →
+// 空串,ingest 侧按「本方无哈希=全收兼容」处理,不引入登录前置到发现面。
+// ⚠️ 3s 负缓存:未登录态每次调用实查 SQLite(广播 3s+ingest 每包),busy
+// LAN 会打满 DB——登出/登录态切换的感知延迟 ≤3s 可接受。
+var (
+	meshAccountHashMu   sync.Mutex
+	meshAccountHashMemo string
+	meshAccountHashAt   time.Time
+)
+
+func meshAccountHashProvider() string {
+	meshAccountHashMu.Lock()
+	defer meshAccountHashMu.Unlock()
+	if !meshAccountHashAt.IsZero() && time.Since(meshAccountHashAt) < 3*time.Second {
+		return meshAccountHashMemo
+	}
+	h := ""
+	if u := auth.GetCurrentUserInfoOrLoad(); u != nil && u.ID != 0 {
+		h = lanbeacon.AccountHashFromID(u.ID)
+	}
+	meshAccountHashMemo = h
+	meshAccountHashAt = time.Now()
+	return h
+}
+
+// meshIdentityPEM 当前生效的 mesh 身份私钥 PEM(config 手填权威;空=未配
+// 置,自动组网相关 provider 诚实降级为恒空——v1 不做缓存钥自动生成)。
+func meshIdentityPEM() string {
+	cfg := config.GetGlobalConfig()
+	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.Customer.Mesh.PrivateKey)
+}
+
+// meshPubKeyLineProvider mesh 公钥行(authorized_keys 单行):由身份私钥
+// 解析派生(gossh.MarshalAuthorizedKey;ed25519 锚定在签名侧强制)。
+func meshPubKeyLineProvider() string {
+	pem := meshIdentityPEM()
+	if pem == "" {
+		return ""
+	}
+	signer, err := gossh.ParsePrivateKey([]byte(pem))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(gossh.MarshalAuthorizedKey(signer.PublicKey())))
+}
+
 // augmentLANAddrsFromBeacon 任务 10b 打通半:「beacon 候选→本地决策→直连」
 // 的 addr 增补。语义三闸:
 //  1. 用户手填恒权威:配置已有 LANAddrs → 原样返回(发现只补空白,不覆盖)。
@@ -318,6 +391,7 @@ func ingressHostKeyFingerprint() string {
 //  3. 真闸在握手:beacon 是明文 UDP,攻击者可重播伪造「device_id+addr+
 //     对端指纹」三元组——指纹匹配只是路由提示过滤,身份绑定由 SSH 握手的
 //     host key 核验兜底(持不了对端私钥即握手必败,fail-closed)。
+//
 // 回环地址剔除(候选来自同机回环时不可作 peer 拨号地址);返回 nil = 无增补。
 func augmentLANAddrsFromBeacon(deviceID, pinnedHostKey string) []string {
 	if strings.TrimSpace(pinnedHostKey) == "" || !strings.HasPrefix(pinnedHostKey, "SHA256:") {
@@ -343,6 +417,29 @@ func augmentLANAddrsFromBeacon(deviceID, pinnedHostKey string) []string {
 		return nil // 无增补(nil 语义,调用方保留原状)
 	}
 	return addrs
+}
+
+// WireMeshAutoPeerProbe boot 接线(自动组网批次):config 探针 → beacon
+// 同账号自动表。幂等覆盖;两个 boot 形态(start/core)各调一次。
+// ⚠️ 信任闸:customer.mesh.auto_peers(让渡型默认关)在闭包内认证期活读
+// ——开关关=探针恒未命中(拨号/委托/编译三面回查全部 fail-closed 回旧
+// 语义),开=同账号自报对端自动可拨(可信局域网语义)。
+func WireMeshAutoPeerProbe() {
+	config.SetMeshAutoPeerProbe(func(deviceID string) (config.MeshAutoPeerView, bool) {
+		if cfg := config.GetGlobalConfig(); cfg == nil || cfg.Customer == nil || !cfg.Customer.Mesh.EffectiveAutoPeers() {
+			return config.MeshAutoPeerView{}, false
+		}
+		for _, ap := range lanbeacon.AutoPeers() {
+			if ap.DeviceID == deviceID {
+				return config.MeshAutoPeerView{
+					DeviceID: ap.DeviceID,
+					LANAddrs: []string{ap.Addr},
+					HostKey:  ap.HostKey,
+				}, true
+			}
+		}
+		return config.MeshAutoPeerView{}, false
+	})
 }
 
 // teardownMeshLANLocked 收摊(meshLAN.mu 保护):beacon 先 Stop 再清 Default。

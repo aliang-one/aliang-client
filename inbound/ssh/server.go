@@ -308,6 +308,25 @@ func (s *Server) publicKeyCallback(meta gossh.ConnMetadata, key gossh.PublicKey)
 			extKeyFingerprint: fp,
 		}}, nil
 	}
+	// 自动组网活准入(RunConfig.MeshAdmission,自动组网批次):MeshKeys
+	// 未命中先查 beacon 自动 peer 活表(同账号+指纹+公钥+签名四要素),
+	// 命中按 mesh 形态准入且同样过黑名单闸;未命中再落 bare 形态。
+	if s.rc.MeshAdmission != nil {
+		if adDeviceID, ok := s.rc.MeshAdmission(key); ok {
+			if s.blockedNow(BlockQuery{Fingerprint: fp, DeviceID: adDeviceID}) {
+				s.limiter.Fail(ip)
+				logger.Debug(fmt.Sprintf("SSH ingress blocked auto-mesh key %s (device %q) for %q from %s",
+					fp, adDeviceID, meta.User(), ip))
+				return nil, fmt.Errorf("key blocked for %q", meta.User())
+			}
+			s.limiter.Reset(ip)
+			return &gossh.Permissions{Extensions: map[string]string{
+				extIngressForm:    FormMesh,
+				extMeshDeviceID:   adDeviceID,
+				extKeyFingerprint: fp,
+			}}, nil
+		}
+	}
 	if keyInList(key, s.rc.AuthorizedKeys) {
 		if s.blockedNow(BlockQuery{Fingerprint: fp}) {
 			s.limiter.Fail(ip)

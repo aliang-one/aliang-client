@@ -850,10 +850,19 @@ type MeshConfig struct {
 	// PunchEnable UDP 打洞直连(mesh-udp-punch plan Task 11)。默认关:打洞
 	// 要本机直接对公网暴露 UDP 口,是让渡型能力,必须显式开启(nil=false,
 	// 与 ForwardEnable 同族三态)。Task 12 起被工厂/装配门消费。
-	PunchEnable *bool               `json:"punch_enable,omitempty"`
-	MaxHops     int                 `json:"max_hops,omitempty"` // 链式转发经停上限(via 链长):0=默认,>8 收口;接收端拒绝过长经停链
-	Peers       []MeshPeer          `json:"peers,omitempty"`
-	Fallback    *MeshFallbackConfig `json:"fallback,omitempty"`
+	PunchEnable *bool `json:"punch_enable,omitempty"`
+	// AutoPeers 自动组网准入开关(customer.mesh.auto_peers,自动组网批次)。
+	// 默认关(nil=false):beacon 是明文 UDP,自动 peer 的信任锚=对端自报
+	// 自洽(账号哈希可嗅探/指纹公钥自报/自签),无带外权威——与
+	// ForwardEnable/PunchEnable 同族「让渡型默认关」,与总开关默认开刻意
+	// 相反。开启语义:同 LAN 且同账号(哈希相等)的自报对端自动获得 mesh
+	// 准入/拨号凭据(可信局域网场景);消费面=ingress MeshAdmission 闭包、
+	// MeshDelegateNextHop 回查、tcp 执行回查、规则编译回查。跨信任域硬绑
+	// 定须平台账号级 roster(台账遗留)。
+	AutoPeers *bool               `json:"auto_peers,omitempty"`
+	MaxHops   int                 `json:"max_hops,omitempty"` // 链式转发经停上限(via 链长):0=默认,>8 收口;接收端拒绝过长经停链
+	Peers     []MeshPeer          `json:"peers,omitempty"`
+	Fallback  *MeshFallbackConfig `json:"fallback,omitempty"`
 	// PrivateKey 本节点的 mesh 身份私钥(PEM,OpenSSH 或 PKCS#8)。
 	// 公钥分发到各对端的 ssh_ingress.mesh_authorized_keys(尾注释=本机 device_id)。
 	// 空 = 本节点不能作为转发发起方(仍可作为被转发方)。
@@ -904,6 +913,15 @@ func (c *MeshConfig) EffectivePunchEnabled() bool {
 	return c != nil && c.PunchEnable != nil && *c.PunchEnable // 默认关
 }
 
+// EffectiveAutoPeers 自动组网准入开关(自动组网批次)。默认关(nil=false):
+// 让渡型三态,与 EffectiveForwardEnabled/EffectivePunchEnabled 同族——
+// beacon 明文自报信任锚缺带外权威(评审 major),显式开启才接受同账号
+// 自报对端作为 mesh 准入/拨号凭据。依赖:生效前提是 mesh 总开关开着
+// (消费方各自与总开关合取,此处不重复判)。
+func (c *MeshConfig) EffectiveAutoPeers() bool {
+	return c != nil && c.AutoPeers != nil && *c.AutoPeers // 默认关
+}
+
 // EffectiveMaxHops 跳数上限:0/负数=默认 5,>8 收口到 8(读取端钳制防御,
 // 手改配置文件可绕过保存校验,越界只会被夹回合法域,不会 crash)。
 func (c *MeshConfig) EffectiveMaxHops() int {
@@ -944,6 +962,15 @@ func (c *Config) MeshDelegateNextHop() (*MeshPeer, bool) {
 			}
 			return p, true
 		}
+	}
+	// 自动组网对端回查(自动组网批次):手填 peers 查无此人时探自动表
+	// (beacon 同账号四要素派生,HostKey 恒非空——资格闸在表侧已收口)。
+	if v, ok := MeshAutoPeerFor(next); ok && strings.TrimSpace(v.HostKey) != "" {
+		return &MeshPeer{
+			DeviceID: v.DeviceID,
+			LANAddrs: v.LANAddrs,
+			HostKey:  strings.TrimSpace(v.HostKey),
+		}, true
 	}
 	return nil, false
 }
