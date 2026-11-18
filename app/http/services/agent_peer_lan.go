@@ -749,6 +749,52 @@ func pushAgentLanStream(ctx context.Context, secConn net.Conn, ident agentTransf
 }
 
 // ---------------------------------------------------------------------------
+// 上传腿 punch 载体(transfer-punch-stun §2.2):LAN 直推失败后、COS 兜底
+// 前,经打洞会话直连推流——同 LAN 无法直连(跨网段/NAT)但有 punch 通路
+// 的拓扑里省掉 B→COS 的全量上行广域网段。
+// ---------------------------------------------------------------------------
+
+// agentPunchTransferDialFn punch 拨号缝(测试替身替换;生产=导出入口)。
+// init 内接线而非初始化表达式:依赖分析穿透函数体,直接引用会与上传链
+// 构成初始化环(帧分派→handleAgentTransferUpload→attemptAgentTransferPunchPush→本缝)。
+var agentPunchTransferDialFn func(ctx context.Context, peerID, transferID string) (net.Conn, error)
+
+func init() {
+	agentPunchTransferDialFn = AgentPeerPunchTransferDial
+}
+
+// parseAgentPunchPeerID 提取 upload 帧顶层 punch_peer_id(PhoneServer 下发,
+// 老服务端缺字段=空串=不进 punch 腿,纯 COS 语义不变)。TrimSpace+长度闸。
+func parseAgentPunchPeerID(msg map[string]interface{}) string {
+	peer := strings.TrimSpace(remoteString(msg, "punch_peer_id"))
+	if peer == "" || len(peer) > 128 {
+		return ""
+	}
+	return peer
+}
+
+// attemptAgentTransferPunchPush 上传腿 punch 载体(transfer-punch-stun §2.2):
+// LAN 直推失败后、COS 兜底前,打洞直连推流。协议体与 LAN 腿逐字共用
+// (pushAgentLanStream,punch 流自带 TLS);token 用 lan_push 候选里的
+// 单次凭据(接收侧 listen 上下文同值核验)。任何失败恒错误,调用方落 COS。
+func attemptAgentTransferPunchPush(ctx context.Context, ident agentTransferIdentity, punchPeerID, lanToken, sourcePath string, totalSize int64, writeJSON func(interface{}) error) (int64, string, string, error) {
+	if totalSize <= 0 {
+		return 0, "", "", fmt.Errorf("%w: unknown source size", errAgentTransferLanSkip)
+	}
+	conn, err := agentPunchTransferDialFn(ctx, punchPeerID, ident.TransferID)
+	if err != nil {
+		return 0, "", "", fmt.Errorf("punch dial %s: %w", punchPeerID, err)
+	}
+	defer conn.Close()
+	// 握手窗(T6 质量评审 Important-1 强制):协议体首行读无自带 deadline,
+	// punch conn 未预设——已连通但静默的对端会无限悬挂(TCP 路径 5s 失败
+	// 落 COS,punch 路径必须同款围栏)。
+	_ = conn.SetDeadline(time.Now().Add(agentLanHandshakeTimeout))
+	logger.Info(fmt.Sprintf("[TRANSFER-PUNCH] punched peer=%s transfer_id=%s, streaming", punchPeerID, ident.TransferID))
+	return pushAgentLanStream(ctx, conn, ident, lanToken, sourcePath, totalSize, writeJSON)
+}
+
+// ---------------------------------------------------------------------------
 // 传输腿 punch 接收上下文注册表(transfer-punch-stun)
 // ---------------------------------------------------------------------------
 

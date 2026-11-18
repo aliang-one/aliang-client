@@ -8,24 +8,29 @@ package services
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
+	"aliang.one/nursorgate/app/mesh/punch"
 )
 
 // syscallENOSPCTest 供磁盘满判定测试取本平台的 ENOSPC。
@@ -906,5 +911,511 @@ func TestAgentTransferUploadResultDualChannel(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("HTTP receipt not posted")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 上传腿 punch 载体(transfer-punch-stun Task 8):拨号缝注入、punch_peer_id
+// 解析闸、attemptAgentTransferPunchPush 三臂、上传链分支编排(LAN 失败后/
+// COS 前)、静默对端握手窗、生产 serve 体端到端回环。
+// ---------------------------------------------------------------------------
+
+// withPunchDialSeam 替换 punch 拨号缝并计数调用(编排用例断言分支是否进入)。
+func withPunchDialSeam(t *testing.T, fn func(ctx context.Context, peerID, transferID string) (net.Conn, error)) *int32 {
+	t.Helper()
+	orig := agentPunchTransferDialFn
+	var calls int32
+	agentPunchTransferDialFn = func(ctx context.Context, peerID, transferID string) (net.Conn, error) {
+		atomic.AddInt32(&calls, 1)
+		return fn(ctx, peerID, transferID)
+	}
+	t.Cleanup(func() { agentPunchTransferDialFn = orig })
+	return &calls
+}
+
+// punchFakePeerResult 是 net.Pipe 假对端回传的断言面。
+type punchFakePeerResult struct {
+	helloToken      string
+	helloTransferID string
+	received        []byte
+}
+
+// punchProtocolPeer 在缝返回 conn 的对端扮演收件协议体:读 hello→回 ok→
+// 定长收流→回 ACK(实收 sha/size 与落盘路径回填)。hello 里的 token/
+// transfer_id/实收字节经 channel 回传供断言(token 必须是 lan_push 候选里
+// 的单次凭据)。
+func punchProtocolPeer(t *testing.T, peer net.Conn, ackPath string) <-chan punchFakePeerResult {
+	t.Helper()
+	out := make(chan punchFakePeerResult, 1)
+	go func() {
+		defer peer.Close()
+		reader := bufio.NewReader(peer)
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			t.Errorf("punch 假对端读 hello 失败: %v", err)
+			out <- punchFakePeerResult{}
+			return
+		}
+		var hello struct {
+			Token      string `json:"token"`
+			TransferID string `json:"transfer_id"`
+			SizeBytes  int64  `json:"size_bytes"`
+		}
+		if err := json.Unmarshal(line, &hello); err != nil {
+			t.Errorf("punch 假对端解 hello 失败: %v(%s)", err, line)
+			out <- punchFakePeerResult{}
+			return
+		}
+		if _, err := peer.Write([]byte("{\"ok\":true}\n")); err != nil {
+			t.Errorf("punch 假对端回 ok 失败: %v", err)
+			out <- punchFakePeerResult{}
+			return
+		}
+		hasher := sha256.New()
+		received, copyErr := io.CopyN(hasher, reader, hello.SizeBytes)
+		if copyErr != nil {
+			t.Errorf("punch 假对端收流失败: %v", copyErr)
+			out <- punchFakePeerResult{helloToken: hello.Token, helloTransferID: hello.TransferID}
+			return
+		}
+		ack, _ := json.Marshal(map[string]interface{}{
+			"ok": true, "sha256": hex.EncodeToString(hasher.Sum(nil)),
+			"size_bytes": received, "path": ackPath,
+		})
+		if _, err := peer.Write(append(ack, '\n')); err != nil {
+			t.Errorf("punch 假对端回 ACK 失败: %v", err)
+		}
+		out <- punchFakePeerResult{helloToken: hello.Token, helloTransferID: hello.TransferID}
+	}()
+	return out
+}
+
+// deadlineRecordingConn 记录每次 SetDeadline 的原值并把生效 deadline 钳到
+// clamp 以内——静默对端用例不真等 5s,但「deadline 已设+设的值就是握手窗
+// 量级」两件事都断言到(T7 评审义务的折通形态,报告注明)。
+type deadlineRecordingConn struct {
+	net.Conn
+	mu        sync.Mutex
+	requested []time.Time
+	clamp     time.Duration
+}
+
+func (c *deadlineRecordingConn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.requested = append(c.requested, t)
+	effective := t
+	if d := time.Until(t); d > c.clamp {
+		effective = time.Now().Add(c.clamp)
+	}
+	c.mu.Unlock()
+	return c.Conn.SetDeadline(effective)
+}
+
+func (c *deadlineRecordingConn) firstRequested() (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.requested) == 0 {
+		return time.Time{}, false
+	}
+	return c.requested[0], true
+}
+
+func TestParseAgentPunchPeerID(t *testing.T) {
+	frame := func(v interface{}) map[string]interface{} { return map[string]interface{}{"punch_peer_id": v} }
+	if got := parseAgentPunchPeerID(frame("dev-b")); got != "dev-b" {
+		t.Fatalf("普通设备 ID 应原样返回,得到 %q", got)
+	}
+	if got := parseAgentPunchPeerID(frame("  dev-b\n")); got != "dev-b" {
+		t.Fatalf("首尾空白应 TrimSpace,得到 %q", got)
+	}
+	for name, v := range map[string]interface{}{
+		"missing":  nil,
+		"empty":    "",
+		"blank":    "   ",
+		"too_long": strings.Repeat("x", 129),
+	} {
+		if got := parseAgentPunchPeerID(frame(v)); got != "" {
+			t.Fatalf("[%s] 应被长度闸拒为空串,得到 %q", name, got)
+		}
+	}
+	if got := parseAgentPunchPeerID(map[string]interface{}{}); got != "" {
+		t.Fatalf("老服务端缺字段必须不进 punch 腿,得到 %q", got)
+	}
+}
+
+func TestAttemptAgentTransferPunchPushViaSeam(t *testing.T) {
+	_ = newAgentTransferEnv(t)
+	data := deterministicTransferBytes(200 * 1024)
+	src := writeTempFile(t, t.TempDir(), "punch.bin", data)
+	ident := agentTransferIdentity{RequestID: "req-p1", TransferID: "tr_punchseam01", Filename: "punch.bin"}
+
+	const token = "tok-punch-1234567890"
+	var gotPeer, gotTransfer string
+	calls := withPunchDialSeam(t, func(ctx context.Context, peerID, transferID string) (net.Conn, error) {
+		gotPeer, gotTransfer = peerID, transferID
+		client, server := net.Pipe()
+		punchProtocolPeer(t, server, "/inbox/final/punch.bin")
+		return client, nil
+	})
+
+	size, sha, path, err := attemptAgentTransferPunchPush(context.Background(), ident, "dev-b", token, src, int64(len(data)), func(interface{}) error { return nil })
+	if err != nil {
+		t.Fatalf("缝成功路径应推完整个文件: %v", err)
+	}
+	if size != int64(len(data)) || sha != sha256HexOf(data) {
+		t.Fatalf("size/sha 应与源一致: size=%d want=%d sha=%s want=%s", size, len(data), sha, sha256HexOf(data))
+	}
+	if path != "/inbox/final/punch.bin" {
+		t.Fatalf("path 应回带 ACK 落盘路径,得到 %q", path)
+	}
+	if atomic.LoadInt32(calls) != 1 {
+		t.Fatalf("拨号缝应被调恰一次,实调 %d", *calls)
+	}
+	if gotPeer != "dev-b" || gotTransfer != "tr_punchseam01" {
+		t.Fatalf("缝参数应透传 peer/transfer_id: peer=%q transfer=%q", gotPeer, gotTransfer)
+	}
+}
+
+func TestAttemptAgentTransferPunchPushDialErrorClassified(t *testing.T) {
+	_ = newAgentTransferEnv(t)
+	src := writeTempFile(t, t.TempDir(), "punch.bin", []byte("payload"))
+	ident := agentTransferIdentity{RequestID: "r", TransferID: "tr_punchdial01"}
+	withPunchDialSeam(t, func(ctx context.Context, peerID, transferID string) (net.Conn, error) {
+		return nil, errors.New("symmetric nat suspect")
+	})
+	_, _, _, err := attemptAgentTransferPunchPush(context.Background(), ident, "dev-b", "tok", src, 7, func(interface{}) error { return nil })
+	if err == nil {
+		t.Fatal("缝返回错误必须恒错误(调用方落 COS)")
+	}
+	if stage := classifyAgentLanFailStage(err); stage == "" {
+		t.Fatalf("classify 阶段映射必须非空: %v", err)
+	}
+}
+
+func TestAttemptAgentTransferPunchPushSkipWhenSizeUnknown(t *testing.T) {
+	_ = newAgentTransferEnv(t)
+	src := writeTempFile(t, t.TempDir(), "punch.bin", []byte("x"))
+	ident := agentTransferIdentity{RequestID: "r", TransferID: "tr_punchskip01"}
+	calls := withPunchDialSeam(t, func(ctx context.Context, peerID, transferID string) (net.Conn, error) {
+		t.Error("总量未知必须 skip,不得拨号")
+		return nil, errors.New("unreachable")
+	})
+	_, _, _, err := attemptAgentTransferPunchPush(context.Background(), ident, "dev-b", "tok", src, 0, func(interface{}) error { return nil })
+	if !errors.Is(err, errAgentTransferLanSkip) {
+		t.Fatalf("总量未知应映射 errAgentTransferLanSkip,得到 %v", err)
+	}
+	if atomic.LoadInt32(calls) != 0 {
+		t.Fatal("skip 路径不得触拨号缝")
+	}
+}
+
+// TestAttemptAgentTransferPunchPushSilentPeerHandshakeWindow 静默对端围栏
+// (T6/T7 评审强制接线的义务用例):已连通但不说话的对端,协议体首行读
+// 必须被握手窗 deadline 拦下,不得无限悬挂。折通说明:不真等 5s——用
+// deadlineRecordingConn 钳短生效值,断言「首个 SetDeadline 请求值就是
+// 握手窗量级(now..now+agentLanHandshakeTimeout]」。
+func TestAttemptAgentTransferPunchPushSilentPeerHandshakeWindow(t *testing.T) {
+	_ = newAgentTransferEnv(t)
+	src := writeTempFile(t, t.TempDir(), "punch.bin", deterministicTransferBytes(4096))
+	ident := agentTransferIdentity{RequestID: "r", TransferID: "tr_punchsilent1"}
+
+	client, server := net.Pipe()
+	// 静默对端:只吞读不回话(hello 写得进去,ok 行永远不来)。
+	go func() {
+		_, _ = io.Copy(io.Discard, server)
+		_ = server.Close()
+	}()
+	rec := &deadlineRecordingConn{Conn: client, clamp: 400 * time.Millisecond}
+	withPunchDialSeam(t, func(ctx context.Context, peerID, transferID string) (net.Conn, error) {
+		return rec, nil
+	})
+
+	start := time.Now()
+	_, _, _, err := attemptAgentTransferPunchPush(context.Background(), ident, "dev-b", "tok", src, 4096, func(interface{}) error { return nil })
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("静默对端必须在握手窗内失败,不得悬挂")
+	}
+	if !strings.Contains(err.Error(), "headline") {
+		t.Fatalf("失败应发生在 ok 行读(headline),得到 %v", err)
+	}
+	if stage := classifyAgentLanFailStage(err); stage != "connect" {
+		t.Fatalf("静默对端应归类 connect 阶段,得到 %s(%v)", stage, err)
+	}
+	first, ok := rec.firstRequested()
+	if !ok {
+		t.Fatal("必须对 punch conn 设过 deadline(评审强制接线)")
+	}
+	if first.Before(start) || first.After(start.Add(agentLanHandshakeTimeout+50*time.Millisecond)) {
+		t.Fatalf("首个 deadline 必须是握手窗量级(≤%s): 请求=%v start=%v", agentLanHandshakeTimeout, first, start)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("钳短后的握手窗失败应远快于 5s: %v", elapsed)
+	}
+}
+
+// punchUploadMsg 组带 punch 触面(lan_push 候选+punch_peer_id)的上传帧;
+// 候选指向死端口,LAN 腿快速失败落 probe,编排随即进入 punch 分支。
+func punchUploadMsg(t *testing.T, transferID, sourcePath string, size int64, isDir bool, cosURL string, punchPeer string) map[string]interface{} {
+	t.Helper()
+	msg := transferUploadMsg(t, transferID, sourcePath, size, isDir, 1<<20, map[int]string{1: cosURL})
+	msg["direct_upload_candidates"] = []interface{}{map[string]interface{}{
+		"type": "lan_push", "addr": "127.0.0.1:1",
+		"token": "tok-punch-1234567890", "fingerprint": strings.Repeat("ab", 32),
+	}}
+	if punchPeer != "" {
+		msg["punch_peer_id"] = punchPeer
+	}
+	return msg
+}
+
+func TestAgentTransferUploadPunchOrchestration(t *testing.T) {
+	t.Run("punch_success_via_punch", func(t *testing.T) {
+		_ = newAgentTransferEnv(t)
+		capture, write := newTransferCapture()
+		data := deterministicTransferBytes(300 * 1024)
+		src := writeTempFile(t, t.TempDir(), "payload.bin", data)
+		cos := newFakeTransferCOS(t, 0)
+
+		calls := withPunchDialSeam(t, func(ctx context.Context, peerID, transferID string) (net.Conn, error) {
+			client, server := net.Pipe()
+			punchProtocolPeer(t, server, "/inbox/landed/payload.bin")
+			return client, nil
+		})
+
+		msg := punchUploadMsg(t, "tr_punchok01", src, int64(len(data)), false, cos.url(), "dev-b")
+		svc := &AgentService{}
+		svc.handleAgentTransferUpload(msg, write)
+
+		terminal := waitForTransferTerminal(t, capture)
+		if terminal["ok"] != true {
+			t.Fatalf("punch 成功路径必须终态成功: %v", terminal)
+		}
+		if via := remoteString(terminal, "via"); via != "punch" {
+			t.Fatalf("via 必须是 punch,得到 %q", via)
+		}
+		if got := agentTransferInt64(terminal, "size_bytes"); got != int64(len(data)) {
+			t.Fatalf("size_bytes = %d, want %d", got, len(data))
+		}
+		if got, want := remoteString(terminal, "sha256"), sha256HexOf(data); got != want {
+			t.Fatalf("sha256 = %s, want %s", got, want)
+		}
+		if got := remoteString(terminal, "path"); got != "/inbox/landed/payload.bin" {
+			t.Fatalf("path 应回带 ACK 落盘路径,得到 %q", got)
+		}
+		if n := len(cos.snapshot()); n != 0 {
+			t.Fatalf("punch 成功必须整段跳过 COS,实收 %d 次 PUT", n)
+		}
+		if atomic.LoadInt32(calls) != 1 {
+			t.Fatalf("punch 拨号缝应被调恰一次,实调 %d", *calls)
+		}
+	})
+
+	t.Run("punch_fail_falls_back_to_cos_with_stage", func(t *testing.T) {
+		_ = newAgentTransferEnv(t)
+		capture, write := newTransferCapture()
+		data := deterministicTransferBytes(2048)
+		src := writeTempFile(t, t.TempDir(), "payload.bin", data)
+		cos := newFakeTransferCOS(t, 0)
+
+		calls := withPunchDialSeam(t, func(ctx context.Context, peerID, transferID string) (net.Conn, error) {
+			return nil, errors.New("punch dial budget exhausted")
+		})
+
+		msg := punchUploadMsg(t, "tr_punchfb01", src, int64(len(data)), false, cos.url(), "dev-b")
+		svc := &AgentService{}
+		svc.handleAgentTransferUpload(msg, write)
+
+		terminal := waitForTransferTerminal(t, capture)
+		if terminal["ok"] != true {
+			t.Fatalf("punch 失败必须落 COS 兜底成功: %v", terminal)
+		}
+		if via := remoteString(terminal, "via"); via != "cos" {
+			t.Fatalf("兜底终态 via 必须是 cos,得到 %q", via)
+		}
+		if stage := remoteString(terminal, "lan_fail_stage"); stage == "" {
+			t.Fatalf("punch 失败阶段必须非空回带: %v", terminal)
+		}
+		if n := len(cos.snapshot()); n != 1 {
+			t.Fatalf("COS 兜底应收 1 次 PUT,实收 %d", n)
+		}
+		if atomic.LoadInt32(calls) != 1 {
+			t.Fatalf("punch 拨号缝应被调恰一次,实调 %d", *calls)
+		}
+	})
+
+	t.Run("no_punch_peer_id_keeps_cos_path", func(t *testing.T) {
+		_ = newAgentTransferEnv(t)
+		capture, write := newTransferCapture()
+		data := deterministicTransferBytes(2048)
+		src := writeTempFile(t, t.TempDir(), "payload.bin", data)
+		cos := newFakeTransferCOS(t, 0)
+
+		calls := withPunchDialSeam(t, func(ctx context.Context, peerID, transferID string) (net.Conn, error) {
+			t.Error("无 punch_peer_id 不得进 punch 分支")
+			return nil, errors.New("unreachable")
+		})
+
+		msg := punchUploadMsg(t, "tr_punchnoid1", src, int64(len(data)), false, cos.url(), "")
+		svc := &AgentService{}
+		svc.handleAgentTransferUpload(msg, write)
+
+		terminal := waitForTransferTerminal(t, capture)
+		if terminal["ok"] != true {
+			t.Fatalf("无 punch_peer_id 的 COS 兜底路径必须不变: %v", terminal)
+		}
+		if via := remoteString(terminal, "via"); via != "cos" {
+			t.Fatalf("LAN 失败后仍应 via=cos,得到 %q", via)
+		}
+		if stage := remoteString(terminal, "lan_fail_stage"); stage != "probe" {
+			t.Fatalf("LAN 死端口失败阶段应为 probe,得到 %q", stage)
+		}
+		if n := len(cos.snapshot()); n != 1 {
+			t.Fatalf("COS 应收 1 次 PUT,实收 %d", n)
+		}
+		if atomic.LoadInt32(calls) != 0 {
+			t.Fatal("不得触 punch 拨号缝")
+		}
+	})
+
+	t.Run("archive_never_enters_punch", func(t *testing.T) {
+		_ = newAgentTransferEnv(t)
+		capture, write := newTransferCapture()
+		dir := t.TempDir()
+		writeTempFile(t, dir, "note.txt", []byte("归档内容"))
+		cos := newFakeTransferCOS(t, 0)
+
+		calls := withPunchDialSeam(t, func(ctx context.Context, peerID, transferID string) (net.Conn, error) {
+			t.Error("归档传输不得进 punch 分支")
+			return nil, errors.New("unreachable")
+		})
+
+		msg := punchUploadMsg(t, "tr_puncharc01", dir, 0, true, cos.url(), "dev-b")
+		svc := &AgentService{}
+		svc.handleAgentTransferUpload(msg, write)
+
+		terminal := waitForTransferTerminal(t, capture)
+		if terminal["ok"] != true {
+			t.Fatalf("归档走 COS 常规上传必须成功: %v", terminal)
+		}
+		if _, hasVia := terminal["via"]; hasVia {
+			t.Fatalf("两腿都未失败,不得携带 via: %v", terminal)
+		}
+		if n := len(cos.snapshot()); n == 0 {
+			t.Fatal("归档 COS 上传必须发生")
+		}
+		if atomic.LoadInt32(calls) != 0 {
+			t.Fatal("归档不得触 punch 拨号缝")
+		}
+	})
+}
+
+// TestAgentPunchTransferServeEndToEndLoopback T7 评审转来的义务用例:经生产
+// agentPunchTransferServe 的端到端回环——注册接收上下文→真 punch 拨号(缝
+// 注入真实拨号链)→推文件→断言接收侧 inbox 落盘+ACK(sha/size 双端核对)
+// +done marker+单次消费。
+func TestAgentPunchTransferServeEndToEndLoopback(t *testing.T) {
+	inbox := newAgentTransferEnv(t)
+	const transferID = "tr_punche2e01"
+	const token = "punch-e2e-token-1"
+
+	// B 侧:真 ServeListener+生产 transferServe 默认;classify 桩宣告 loopback
+	// 映射(取 socket 本端口——A 侧 DialPeer 的候选可拨,不碰外网)。
+	b, _, _ := newPunchBForTest(t, func(bb *agentPeerPunchB) {
+		bb.classify = func(sock *net.UDPConn, _ []string) (punch.PublicMapping, bool, error) {
+			return punch.PublicMapping{IP: net.IPv4(127, 0, 0, 1), Port: sock.LocalAddr().(*net.UDPAddr).Port}, false, nil
+		}
+	})
+
+	// A 侧:真实拨号链;信令桥把 A 自发帧喂 B、B 回帧喂回 A(双角色同进程
+	// loopback,方向按帧出口区分——session=A 发,result/candidates=B 发)。
+	// 桥内先过 JSON round-trip 复刻线协议形态(数字转 float64、切片成
+	// []interface{}——remoteStringSlice 只认后者,进程内 []string 会被候选
+	// 过滤面误吞)。
+	wireClone := func(v interface{}) map[string]interface{} {
+		t.Helper()
+		raw, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("信令桥序列化失败: %v", err)
+		}
+		m := map[string]interface{}{}
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatalf("信令桥反序列化失败: %v", err)
+		}
+		return m
+	}
+	a, _ := newPunchAForTest(t)
+	write := func(v interface{}) error {
+		m := wireClone(v)
+		switch m["type"] {
+		case models.AgentEventPeerPunchSessionResult:
+			a.handleResultFrame(m)
+		case models.AgentEventPeerPunchCandidates:
+			a.handleCandidatesFrame(m)
+		}
+		return nil
+	}
+	a.send = func(payload map[string]interface{}) error {
+		m := wireClone(payload)
+		switch m["type"] {
+		case models.AgentEventPeerPunchSession:
+			b.handleSession(m, write, "device-b-self")
+		case models.AgentEventPeerPunchCandidates:
+			b.handleCandidates(m)
+		}
+		return nil
+	}
+
+	// 接收侧上下文经生产注册入口(listen 帧时刻的传输参数)。
+	registerAgentPunchTransferContext(transferID, agentPunchTransferContext{
+		token:     token,
+		filename:  "e2e-report.bin",
+		targetDir: "",
+		maxBytes:  int64(4 << 20),
+		writeJSON: func(interface{}) error { return nil },
+	}, 30*time.Second)
+
+	// 缝注入真实件:生产缝值是 AgentPeerPunchTransferDial(进程级单例),
+	// 测试内把同一真实链路接到本用例自持的 A 实例(参数逐字同款)。
+	calls := withPunchDialSeam(t, func(ctx context.Context, peerID, tid string) (net.Conn, error) {
+		if tid != transferID {
+			return nil, fmt.Errorf("transfer_id 透传失配: %q", tid)
+		}
+		return a.dialSourceOpts(ctx, peerID, punchDialOpts{
+			budget:     agentTransferPunchBudget,
+			purpose:    "transfer",
+			transferID: tid,
+		})
+	})
+
+	data := deterministicTransferBytes(256 * 1024)
+	src := writeTempFile(t, t.TempDir(), "e2e-report.bin", data)
+	ident := agentTransferIdentity{RequestID: "req-e2e", TransferID: transferID, Filename: "e2e-report.bin", SizeBytes: int64(len(data))}
+	size, sha, finalPath, err := attemptAgentTransferPunchPush(context.Background(), ident, "device-b", token, src, int64(len(data)), func(interface{}) error { return nil })
+	if err != nil {
+		t.Fatalf("端到端 punch 传输失败: %v", err)
+	}
+	if size != int64(len(data)) || sha != sha256HexOf(data) {
+		t.Fatalf("ACK 双端核对失配: size=%d want=%d sha=%s want=%s", size, len(data), sha, sha256HexOf(data))
+	}
+	if atomic.LoadInt32(calls) != 1 {
+		t.Fatalf("拨号缝应被调恰一次,实调 %d", *calls)
+	}
+	// 接收侧落盘:finalPath 在 inbox 根下且内容逐字一致。
+	if rel, relErr := filepath.Rel(inbox, finalPath); relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		t.Fatalf("finalPath 应落在 inbox 根: %s(inbox=%s)", finalPath, inbox)
+	}
+	got, readErr := os.ReadFile(finalPath)
+	if readErr != nil || !bytes.Equal(got, data) {
+		t.Fatalf("接收侧落盘内容失配: err=%v len=%d want=%d", readErr, len(got), len(data))
+	}
+	// done marker 佐证生产 serve 体完整走完(收满→rename→marker→ACK)。
+	marker, mErr := readAgentTransferMarker(transferID)
+	if mErr != nil || marker == nil || marker.State != transferMarkerStateDone || marker.SHA256 != sha256HexOf(data) {
+		t.Fatalf("done marker 缺失/不符: %+v err=%v", marker, mErr)
+	}
+	// 单次消费:上下文已被 session 帧取走,二次 take 必空。
+	if _, ok := takeAgentPunchTransferContext(transferID); ok {
+		t.Fatal("传输上下文应已被单次消费")
 	}
 }
