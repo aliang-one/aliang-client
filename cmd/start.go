@@ -11,6 +11,7 @@ import (
 	httpServer "aliang.one/nursorgate/app/http"
 	"aliang.one/nursorgate/app/http/services"
 	"aliang.one/nursorgate/app/http/storage"
+	"aliang.one/nursorgate/app/tunnel"
 	"aliang.one/nursorgate/common/logger"
 	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
@@ -124,6 +125,12 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// 统一入口绑定防漂移(同 core.go):56432 绑定面随 ssh_ingress 开关变化
 	// (SPEC §5.5),代理已在跑则按当前配置校正,未跑则空操作。
 	services.ReconcileUnifiedIngressBinding(config.GetGlobalConfig())
+	// mesh LAN 载体 + beacon 生产装配(与 daemon 侧 initializeCoreSubsystems
+	// 同款接线):start 命令形态(systemd ExecStart=aliang --host 0.0.0.0 等
+	// 网关直跑部署)此前漏接线,beacon 在该形态下永不装配——候选面静默缺失,
+	// 而 /api/mesh/status 仍按配置报 enable=true(假绿)。device_id 解析常驻
+	// 身份文件,幂等;装配器自带对账周期,失败仅日志不阻断 boot。
+	tunnel.StartMeshLANAssembly(services.GetSharedAgentService().CurrentDeviceID)
 
 	// 启动服务器
 	logger.Info("Starting aliang server...")
