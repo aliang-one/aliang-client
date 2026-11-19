@@ -341,7 +341,7 @@ func (h *TCPConnectionHandler) Handle(ctx context.Context, originConn net.Conn, 
 
 	if err != nil {
 		msg := fmt.Sprintf("[TCP HANDLER] conn_id=%s ❌ 处理失败 - 域名:%s, 端口:%d, 错误:%v", connID, metadata.HostName, metadata.DstPort, err)
-		if isExpectedClientDisconnect(err) {
+		if isExpectedClientDisconnect(err) || errors.Is(err, ErrDialNegCached) {
 			logger.Debug(msg)
 		} else {
 			logger.Error(msg)
@@ -737,9 +737,22 @@ func (h *TCPConnectionHandler) handleTLS(
 // CONNECT 同样留空;此前空 DstIP 经 String() 得到 "invalid IP" 直接
 // 秒败,SSH 隧道内全部直连流量失联。HostName 也为空则无从拨号,显式报错。
 func (h *TCPConnectionHandler) dialDirect(ctx context.Context, metadata *M.Metadata) (net.Conn, error) {
+	// 直连闸(single-flight + 负缓存,口径见 dial_negcache.go):同键真拨
+	// 在途或 TTL 内已失败的,秒拒不再真拨(被墙域重试风暴治理)。客户端
+	// 取消与本机出口不健康(DNS/网络不可达)不记死——那是调用方走了/
+	// 我方链路抖了,不是目的死了。
+	key := dialNegCacheKey(metadata)
+	if key != "" {
+		if d := dialNegCacheShared.begin(key); d != nil {
+			return nil, &DialNegCachedError{Remaining: d.remaining, InFlight: d.inFlight}
+		}
+	}
 	host := metadata.DstIP.String()
 	if !metadata.DstIP.IsValid() {
 		if metadata.HostName == "" {
+			if key != "" {
+				dialNegCacheShared.settle(key, false)
+			}
 			return nil, fmt.Errorf("dial direct: no destination (invalid IP and empty hostname)")
 		}
 		host = metadata.HostName
@@ -748,7 +761,14 @@ func (h *TCPConnectionHandler) dialDirect(ctx context.Context, metadata *M.Metad
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		logger.Debug(fmt.Sprintf("Dial failed: %v", err))
+		if key != "" {
+			failed := !errors.Is(err, context.Canceled) && !isLocalSideDialFailure(err)
+			dialNegCacheShared.settle(key, failed)
+		}
 		return nil, err
+	}
+	if key != "" {
+		dialNegCacheShared.settle(key, false)
 	}
 
 	return conn, nil

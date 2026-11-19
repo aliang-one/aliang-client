@@ -508,13 +508,16 @@ func MeshLANRunning() bool {
 	return meshLAN.running
 }
 
-// wireMeshAssemblySeams validateConfig 的装配接线点(与
-// SetMeshTransportDialSource 同位):egress 委托 peer 源 + tcp 本机节点
-// 标识缝 + TUN DNS 代转发对端。抽成单函数使接线顺序与注释同处一页;每次
-// Configure(含幂等续期)重跑,atomic Store 幂等。
-func (m *Manager) wireMeshAssemblySeams(deviceID string) {
-	selfID := strings.TrimSpace(deviceID)
-	tcp.SetMeshSelfIDSource(func() string { return selfID })
+// WireMeshAssemblySeams validateConfig 装配接线点的导出形态(2026-11-19
+// 0.196 登录死锁根治):委托门开时,平台自身流量(登录刷新/资料/更新)必须
+// 经链上下一跳,而本接线的原唯一触发点(validateConfig←Configure)由平台
+// 下发隧道配置驱动——凭据恢复要刷新,刷新要出口,出口要接线,接线要
+// Configure,Configure 要凭据:四环互扣。接线本身只是注册读实时配置的闭包
+// (注册≠拨号,幂等),core boot 提前接线零副作用;Configure 侧重接线保持
+// 原样(幂等,不漂移)。selfID 用提供器形态(boot 时身份可能未就绪,与
+// StartMeshLANAssembly 的懒解析同款纪律)。
+func (m *Manager) WireMeshAssemblySeams(selfID func() string) {
+	tcp.SetMeshSelfIDSource(selfID)
 	egress.SetPeerSource(m.egressPeer)
 	// TUN DNS 代转发(tunnel.T() 进程级单例,engine.go SetDialer 同款接法):
 	// 规则驱动,fn 内部每调用读 memo 化的门控结果,重复接线幂等。

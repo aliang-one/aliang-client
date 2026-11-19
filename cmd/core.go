@@ -200,6 +200,13 @@ func initializeCoreSubsystems() error {
 	// roster 同步循环接线(同 start.go:接线孤儿治理第三例)——漏接则
 	// auto_peers 信任锚永不填充,恒 fail-closed。幂等,失败仅日志不阻断。
 	services.StartMeshRosterSync()
+	// 出口委托 peer 源启动接线(2026-11-19 0.196 登录死锁根治,见
+	// WireMeshAssemblySeams 注):登录恢复要刷新→刷新要出口→出口要接线,
+	// 而接线的原唯一触发点(Configure)被平台下发隧道配置驱动,四环互扣。
+	// selfID 懒解析(身份常驻文件,与上方 StartMeshLANAssembly 同款纪律)。
+	if m := services.GetSharedAgentService().TunnelManager(); m != nil {
+		m.WireMeshAssemblySeams(services.GetSharedAgentService().CurrentDeviceID)
+	}
 	// SSH 入口启动恢复:customer 配置已在上方加载完成,按其期望态 reconcile
 	// ——重启后自动恢复已启用入口(平台代理自愈的同款纪律:失败仅日志不
 	// 阻断 boot)。与配置提交协调路径共用 services.ReconcileSSHIngressFromConfig

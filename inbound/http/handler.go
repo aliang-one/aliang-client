@@ -62,7 +62,13 @@ func HandleHttpConnection(conn net.Conn, reader *bufio.Reader, req *http.Request
 	// 3. Handle bidirectional relay with statistics
 	logger.Debug(fmt.Sprintf("Routing HTTP request through TCP handler for %s:%d", metadata.HostName, metadata.DstPort))
 	if err := tcpHandler.Handle(ctx, replayConn, metadata); err != nil {
-		logger.Error(fmt.Sprintf("TCP handler failed for %s: %v", metadata.HostName, err))
+		// 负缓存/在途秒拒是预期失败(直连闸治理,processor/tcp/dial_negcache.go),
+		// 同款降 Debug,与 Handle 层口径一致。
+		if errors.Is(err, tcp.ErrDialNegCached) {
+			logger.Debug(fmt.Sprintf("TCP handler fast-failed for %s: %v", metadata.HostName, err))
+		} else {
+			logger.Error(fmt.Sprintf("TCP handler failed for %s: %v", metadata.HostName, err))
+		}
 		return
 	}
 

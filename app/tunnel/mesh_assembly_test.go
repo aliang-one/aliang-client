@@ -96,6 +96,35 @@ func TestEgressPeerSourceAssemblesFirstPeer(t *testing.T) {
 	}
 }
 
+// TestWireMeshAssemblySeamsBootWiring 启动接线钉子(2026-11-19 0.196 登录
+// 死锁根治):不经 validateConfig/Configure 直接 boot 接线后,egress peer
+// 源与本机节点标识缝即必须可用——委托门开的机器在「隧道配置永不达」的
+// 登录死锁下也必须有出口,登录刷新才能走链完成恢复。
+func TestWireMeshAssemblySeamsBootWiring(t *testing.T) {
+	restoreMeshAssemblySeams(t)
+	manager := NewManager(nil)
+
+	restoreConfig := swapGlobalMeshConfig(t, &config.MeshConfig{
+		PrivateKey: meshAssemblyTestKeyPEM(t),
+		Peers:      []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:56432"}, HostKey: "SHA256:AAAA"}},
+		Fallback:   &config.MeshFallbackConfig{Enable: boolPtr(true), NextHop: "dev-b"},
+	})
+	defer restoreConfig()
+
+	manager.WireMeshAssemblySeams(func() string { return "dev-self" })
+
+	peer := egress.PeerSourceForTest()
+	if peer == nil {
+		t.Fatal("boot 接线后 peer 源必须可用(无需 validateConfig/Configure)")
+	}
+	if _, ok := peer.(*meshproxy.ExitClient); !ok {
+		t.Fatalf("peer 类型 = %T, want *meshproxy.ExitClient(决策 #4 承载形态)", peer)
+	}
+	if got := tcp.MeshSelfIDForTest(); got != "dev-self" {
+		t.Fatalf("tcp selfID = %q, want dev-self", got)
+	}
+}
+
 // TestManagerEgressPeerAssemblyNilCases egressPeer 装配的 nil 分支单元钉:
 // 未配置/开关关(无 Fallback)/next_hop 不指向 peer/peer 未钉扎/缺身份私钥
 // → nil(纯直连)。
@@ -380,12 +409,12 @@ func TestMeshDNSForwardPeer(t *testing.T) {
 		}
 	})
 
-	t.Run("接线冒烟:wireMeshAssemblySeams 后隧道缝走同一装配", func(t *testing.T) {
+	t.Run("接线冒烟:WireMeshAssemblySeams 后隧道缝走同一装配", func(t *testing.T) {
 		meshDNSForwardPeerForTest(t, []string{"dns,mesh:dev-b"},
 			meshAssemblyTestKeyPEM(t), dnsPeer(nil))
 		m := NewManager(nil)
 		restoreMeshAssemblySeams(t)
-		m.wireMeshAssemblySeams("dev_test")
+		m.WireMeshAssemblySeams(func() string { return "dev_test" })
 
 		// 读缝钉线(MeshDNSForwardPeerSourceForTest):断言接线真的把
 		// meshDNSForwardPeer 放进了隧道缝——删掉 wireMeshAssemblySeams 里的

@@ -15,6 +15,7 @@ import (
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/tools"
+	"aliang.one/nursorgate/app/tunnel"
 	"aliang.one/nursorgate/common/logger"
 	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
@@ -1367,6 +1368,12 @@ func (s *AgentService) currentDeviceID() string {
 // 消费方入口——mesh LAN 装配(cmd/core)与 /api/mesh/status
 // (handlers.MeshHandler,Task 14)。
 func (s *AgentService) CurrentDeviceID() string { return s.currentDeviceID() }
+
+// TunnelManager 暴露隧道 Manager 给 core boot 的 mesh 装配接线
+// (cmd/core → WireMeshAssemblySeams,2026-11-19 0.196 登录死锁根治)。
+// core 是 mesh 数据面唯一属主,user agent runtime 不得接线(见
+// mesh_assembly.go 进程归属注)。
+func (s *AgentService) TunnelManager() *tunnel.Manager { return s.tunnel }
 
 func currentAgentWebSocketURL() (string, error) {
 	cfg := config.GetGlobalConfig()
