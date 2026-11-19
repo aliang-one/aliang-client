@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 
@@ -40,8 +41,15 @@ func HandleRawConnect(clientConn net.Conn, metadata *M.Metadata) error {
 	// 4. Perform bidirectional relay with statistics
 	logger.Debug(fmt.Sprintf("[TUNNEL] 调用TCP Handler处理 %s:%d", metadata.HostName, metadata.DstPort))
 	if err := handler.Handle(ctx, clientConn, metadata); err != nil {
-		logger.Error(fmt.Sprintf("[TUNNEL] TCP Handler失败: 客户端:%s, 目标:%s, 错误:%v",
-			clientAddr, metadata.HostName, err))
+		// 负缓存/在途秒拒是预期失败(直连闸治理,processor/tcp/dial_negcache.go),
+		// 与 Handle 层同款降 Debug,不然重试风暴在统一入口照旧 ERROR 刷屏。
+		if errors.Is(err, tcp.ErrDialNegCached) {
+			logger.Debug(fmt.Sprintf("[TUNNEL] TCP Handler秒拒: 客户端:%s, 目标:%s, 错误:%v",
+				clientAddr, metadata.HostName, err))
+		} else {
+			logger.Error(fmt.Sprintf("[TUNNEL] TCP Handler失败: 客户端:%s, 目标:%s, 错误:%v",
+				clientAddr, metadata.HostName, err))
+		}
 		return err
 	}
 
