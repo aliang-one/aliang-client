@@ -61,6 +61,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -90,7 +91,7 @@ import (
 type punchSignalingBridge struct {
 	mu             sync.Mutex
 	aSessionFrames []map[string]interface{} // A→桥:session 帧(路由信封原样保留)
-	aCandidates    []map[string]interface{} // A→桥:candidates 帧(loopback 下常为空候选表)
+	aCandidates    []map[string]interface{} // A→桥:candidates 帧(loopback 下常为空候选表;public 用例族里 B 的真实兜底候选帧也经此口过账,见 realCandidatesFrames)
 	deliveredToB   []map[string]interface{} // 桥→B 已投递(session 帧已剥信封)
 	resultsToA     []map[string]interface{} // B→桥→A:result 帧
 	synthToA       [][]string               // 桥→A 合成候选(生产对应 B 的 STUN 公网映射)
@@ -99,6 +100,17 @@ type punchSignalingBridge struct {
 
 	dropSession    bool // 负路径 (d1):信令无响应(session 帧不投 B)
 	deadCandidates bool // 负路径 (d2):给 A 投死候选(不可达端口)
+
+	// public 用例族((g) TestPunchIntegrationPublicPeer)模式:
+	// noSynthCandidates 关掉桥在 result 后的 loopback 合成候选——那是对
+	// 「B 经 STUN 学到公网映射」的替身,public_listen 路径判型必败、B 发的
+	// 是接口快照兜底真实帧,合成候选在场会让对照/空候选两臂失真;候选回归
+	// B 侧真实帧(生产 server 按 session 转发的等价物)。
+	// dropPeerCandidates 丢弃非空候选帧(本族恒为 B 的真实兜底候选)构造
+	// 「B 判 public 而候选落空」;A 自身的空候选帧(空数组)照投——它经
+	// 投递面回投是本拓扑里空候选到达 A 的载体。
+	noSynthCandidates  bool
+	dropPeerCandidates bool
 }
 
 func newPunchSignalingBridge() *punchSignalingBridge {
@@ -175,9 +187,10 @@ func (br *punchSignalingBridge) sink(payload map[string]interface{}) error {
 		br.mu.Lock()
 		br.resultsToA = append(br.resultsToA, punchCopyMap(payload))
 		dead := br.deadCandidates
+		noSynth := br.noSynthCandidates
 		br.mu.Unlock()
 		services.AgentPeerPunchHandleFrame(payload) // result 按 request_id 进 A 侧 pending
-		if ok, _ := payload["ok"].(bool); ok && punchPortOf(payload) > 0 {
+		if ok, _ := payload["ok"].(bool); ok && punchPortOf(payload) > 0 && !noSynth {
 			// 生产行为等价物:B 把 Classify 学到的公网映射经 candidates 回发
 			// (server 按 session_id 转给 A)。loopback 无 NAT,「映射」=B 的
 			// listener 本地地址;负路径 (d2) 投死候选。
@@ -198,10 +211,17 @@ func (br *punchSignalingBridge) sink(payload map[string]interface{}) error {
 			}))
 		}
 	case models.AgentEventPeerPunchCandidates:
-		// loopback 不变量:恒为 A→B(B 判型必败无映射可发,见结构体注)。
+		// loopback 不变量:恒为 A→B(B 判型必败无映射可发,见结构体注;
+		// public 用例族例外:B 的真实兜底候选帧同经此口,以内容非空区分)。
 		br.mu.Lock()
 		br.aCandidates = append(br.aCandidates, punchCopyMap(payload))
+		dropPeer := br.dropPeerCandidates
 		br.mu.Unlock()
+		if dropPeer {
+			if cands, ok := payload["candidates"].([]interface{}); ok && len(cands) > 0 {
+				return nil // 空候选臂:B 的真实兜底候选被吞(等价「B 判 public 而候选表为空/无效」)
+			}
+		}
 		br.deliverCandidates(payload)
 	}
 	return nil
@@ -324,6 +344,32 @@ func (br *punchSignalingBridge) setDeadCandidates(dead bool) {
 	br.mu.Unlock()
 }
 
+func (br *punchSignalingBridge) setNoSynthCandidates(on bool) {
+	br.mu.Lock()
+	br.noSynthCandidates = on
+	br.mu.Unlock()
+}
+
+func (br *punchSignalingBridge) setDropPeerCandidates(on bool) {
+	br.mu.Lock()
+	br.dropPeerCandidates = on
+	br.mu.Unlock()
+}
+
+// realCandidatesFrames 已过账的非空候选帧(public 用例族=B 侧接口快照兜底
+// 真实候选;A 自身 public 路径的空候选帧不算)——供线上形态断言。
+func (br *punchSignalingBridge) realCandidatesFrames() []map[string]interface{} {
+	br.mu.Lock()
+	defer br.mu.Unlock()
+	var out []map[string]interface{}
+	for _, f := range br.aCandidates {
+		if cands, ok := f["candidates"].([]interface{}); ok && len(cands) > 0 {
+			out = append(out, punchCopyMap(f))
+		}
+	}
+	return out
+}
+
 // ===== 夹具:环境(resolver/config/sink/入口)与拨号件 =====
 
 // punchIngressNode 真 inbound/ssh 入口(reconcile 装配,B 侧 punch 流的
@@ -388,6 +434,38 @@ func punchLoopbackIface() string {
 	}
 }
 
+// punchFirstLanIPv4 复刻 collectAgentNetSnapshot 的接口过滤序(up/非回环/
+// IPv4 非回环非链路本地,net.Interfaces 原序)返回首个命中 IPv4——与 B 侧
+// 兜底候选地址源(firstNonLoopbackIPv4+采集过滤)同一条裁决口径;空串=本机
+// 无非回环 IPv4(public 用例族整体 skip,服务层同款预检)。
+func punchFirstLanIPv4() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, ifc := range ifaces {
+		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok || ipNet.IP == nil {
+				continue
+			}
+			ip4 := ipNet.IP.To4()
+			if ip4 == nil || ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+				continue
+			}
+			return ip4.String()
+		}
+	}
+	return ""
+}
+
 // punchEnv 一次集成用例的全套环境:桥+入口+A 身份。逐用例新建,防共享
 // 单例(services 侧 A/B 编排体、SessionCache)的状态跨用例串味;每用例
 // 用独立 peerID,缓存命中面互不干扰。
@@ -441,6 +519,19 @@ func newPunchEnv(t *testing.T) *punchEnv {
 	return &punchEnv{bridge: bridge, ingress: ingress, aPEM: aPEM}
 }
 
+// punchSetPublicListen 覆摆 customer.mesh(punch_enable 照开 + public_listen
+// 按参,SetGlobalConfig 同款缝)。清理 LIFO:本复位先跑恢复 newPunchEnv 摆的
+// punch-only 态,newPunchEnv 的复位再恢复真原点——逐臂覆摆互不串味。
+func punchSetPublicListen(t *testing.T, on bool) {
+	t.Helper()
+	punchOn, publicOn := true, on
+	old := config.GetGlobalConfig()
+	config.SetGlobalConfig(&config.Config{
+		Customer: &config.CustomerConfig{Mesh: &config.MeshConfig{PunchEnable: &punchOn, PublicListen: &publicOn}},
+	})
+	t.Cleanup(func() { config.SetGlobalConfig(old) })
+}
+
 // newExitClient 造真装配 ExitClient:LAN 恒死(127.0.0.1:1)逼装配序走
 // udp;udp 载体=services.AgentPeerPunchDial(生产同源拨号源);piko 按
 // 用例给桩(d 系)或不给(a/b/c/e 系)。
@@ -456,6 +547,16 @@ func (e *punchEnv) newExitClient(t *testing.T, peerID string, pikoDial mesh.Piko
 		t.Fatalf("NewExitClient: %v", err)
 	}
 	return client
+}
+
+// pikoToIngress 中继腿桩:拨真入口专用口((d1)/(d2) 同款落点),计数供
+// 「回落恰一次」断言((g) 系对照/空候选臂用)。
+func (e *punchEnv) pikoToIngress(calls *atomic.Int32) mesh.PikoDialFunc {
+	return func(ctx context.Context, endpointID string) (net.Conn, error) {
+		calls.Add(1)
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", e.ingress.addr)
+	}
 }
 
 // punchDialBounded 有界 traced 拨号(挂死保护;bound 到点 Fatal)。dns
@@ -1042,4 +1143,159 @@ func TestPunchIntegrationTransferLeg(t *testing.T) {
 	}
 	refused("单次消费后同 transfer_id 重拨", transferID)
 	refused("未注册的 transfer_id", "tr_punchleg02")
+}
+
+// ===== (g) 公网对端直连(public_listen 路径)=====
+
+// TestPunchIntegrationPublicPeer punch-public-peer 批次的 public_listen 集成
+// 面(B 侧声明/A 侧直拨/空候选落中继)。loopback 拓扑下 STUN 判型必败(接口
+// 绑死 lo0 对公网不可达,既有不变量),public_listen=true 即走「B 声明
+// public + 接口快照兜底候选」;本用例族关掉桥的 loopback 合成候选(它是对
+// 「B 经 STUN 学到公网映射」的替身,public 路径不存在该映射——候选回归
+// B 侧真实兜底帧,生产 server 按 session 转发的等价物),三臂:
+//
+//  1. public_listen 开:result 捎带 public:true + B 发接口快照兜底候选
+//     (本机首个非回环 IPv4:监听口;同机自拨实测可拨——lo0 绑定 socket
+//     对本机自身地址走 loopback 交付,utun 点对点地址同样可达)→ A 拿
+//     真实候选真打洞,udp 载体 + DNS echo 往返。
+//  2. 对照臂(public_listen 关,同拓扑):result 无 public 键、B 无候选帧
+//     (判型必败无映射)→ A 候选落空报 no peer candidates,回落 piko
+//     (中继腿数据照通)。注:任务稿原按「candidates 空超时」预估,本拓扑
+//     里 A 自身空候选帧经投递面回投先到(candidates 双端同喂是既有拓扑
+//     等价物),实际错误归类为 no peer candidates——同落中继语义,按实
+//     测锁定。
+//  3. 空候选臂(T3 质量评审转来的补钉义务):result 仍声明 public:true,
+//     但 B 的真实兜底候选被桥丢弃(等价「B 判 public 而候选表为空/无效」)
+//     → A 到手候选为空,照样 no peer candidates 落中继——public 声明不
+//     豁免空候选,fail-closed 不硬拨。
+func TestPunchIntegrationPublicPeer(t *testing.T) {
+	lanIP := punchFirstLanIPv4()
+	if lanIP == "" {
+		t.Skip("本机无非回环 IPv4,接口快照兜底候选无料可验(服务层同款预检)")
+	}
+
+	t.Run("public_listen_on_fallback_candidate_dials", func(t *testing.T) {
+		env := newPunchEnv(t)
+		const peer = "dev-pi-b-pubon"
+		punchSetPublicListen(t, true)
+		env.bridge.setNoSynthCandidates(true)
+
+		// piko 缺席:public 直拨必须自己成(拨不通用 piko 兜底会假绿)。
+		conn, trace := punchDialBounded(t, env.newExitClient(t, peer, nil), 15*time.Second)
+		defer conn.Close()
+
+		// ②A 收到后拨通:udp 载体 + 数据面 echo 往返。
+		if trace.Used != "udp" {
+			t.Fatalf("public 直拨载体 Used=%q, 期望 \"udp\"", trace.Used)
+		}
+		if trace.UDPErr != nil {
+			t.Fatalf("udp 承载成功时 UDPErr 应为 nil, 得到 %v", trace.UDPErr)
+		}
+		punchDNSRoundTrip(t, conn)
+
+		// ①result 帧带 public:true(ok/port 齐)。
+		if got := env.bridge.sessionFramesForPeer(peer); got != 1 {
+			t.Fatalf("对端 %s 的 session 帧数=%d, 期望恰 1", peer, got)
+		}
+		res := env.bridge.resultAt(0)
+		if ok, _ := res["ok"].(bool); !ok {
+			t.Fatalf("result ok=%v, 期望 true: %v", res["ok"], res)
+		}
+		if pub, _ := res["public"].(bool); !pub {
+			t.Fatalf("public_listen=true 时 result 必须捎带 public:true: %v", res)
+		}
+		// 兜底候选线上形态:恰一帧非空候选(B 真实帧;桥合成已关),
+		// host=本机首个非回环 IPv4(与服务层 firstNonLoopbackIPv4 同口径,
+		// punchFirstLanIPv4 预检已保证非空),port=监听口。
+		reals := env.bridge.realCandidatesFrames()
+		if len(reals) != 1 {
+			t.Fatalf("非空候选帧数=%d, 期望恰 1(B 的接口快照兜底候选;桥合成已关): %v", len(reals), reals)
+		}
+		cands, _ := reals[0]["candidates"].([]interface{})
+		if len(cands) != 1 {
+			t.Fatalf("兜底候选应恰一条, 得到 %v", cands)
+		}
+		host, candPort, err := net.SplitHostPort(cands[0].(string))
+		if err != nil {
+			t.Fatalf("兜底候选应为 host:port 形态: %v", cands[0])
+		}
+		if host != lanIP {
+			t.Fatalf("兜底候选地址应为接口快照首个非回环 IPv4 %q, 得到 %q", lanIP, host)
+		}
+		if want := strconv.Itoa(punchPortOf(res)); candPort != want {
+			t.Fatalf("兜底候选端口应等于监听口 %s, 得到 %q", want, candPort)
+		}
+	})
+
+	t.Run("public_listen_off_falls_to_relay_without_public", func(t *testing.T) {
+		env := newPunchEnv(t) // public_listen 缺省关(newPunchEnv 只开 punch_enable)
+		const peer = "dev-pi-b-puboff"
+		env.bridge.setNoSynthCandidates(true)
+
+		var pikoCalls atomic.Int32
+		conn, trace := punchDialBounded(t, env.newExitClient(t, peer, env.pikoToIngress(&pikoCalls)), 20*time.Second)
+		defer conn.Close()
+
+		// 对照面:无 public 声明 → A 候选落空回落中继(留痕+恰一次+数据照通)。
+		if trace.Used != "piko" {
+			t.Fatalf("对照臂载体 Used=%q, 期望 \"piko\"", trace.Used)
+		}
+		if trace.UDPErr == nil || !strings.Contains(trace.UDPErr.Error(), "no peer candidates") {
+			t.Fatalf("UDPErr=%v, 期望含 no peer candidates(候选落空回落留痕)", trace.UDPErr)
+		}
+		if pikoCalls.Load() != 1 {
+			t.Fatalf("piko 拨号次数=%d, 期望恰 1", pikoCalls.Load())
+		}
+		punchDNSRoundTrip(t, conn)
+
+		// 线上形态:result 不带 public 键;无非空候选帧(B 判型必败无映射、
+		// 无 public_listen 兜底)。
+		res := env.bridge.resultAt(0)
+		if ok, _ := res["ok"].(bool); !ok {
+			t.Fatalf("对照臂 result ok=%v, 期望 true: %v", res["ok"], res)
+		}
+		if _, has := res["public"]; has {
+			t.Fatalf("public_listen 未声明时 result 不得带 public 键: %v", res)
+		}
+		if reals := env.bridge.realCandidatesFrames(); len(reals) != 0 {
+			t.Fatalf("对照臂不应有非空候选帧(判型必败且无兜底): %v", reals)
+		}
+	})
+
+	t.Run("public_declared_but_empty_candidates_falls_to_relay", func(t *testing.T) {
+		env := newPunchEnv(t)
+		const peer = "dev-pi-b-pubempty"
+		punchSetPublicListen(t, true)
+		env.bridge.setNoSynthCandidates(true)
+		env.bridge.setDropPeerCandidates(true)
+
+		var pikoCalls atomic.Int32
+		conn, trace := punchDialBounded(t, env.newExitClient(t, peer, env.pikoToIngress(&pikoCalls)), 20*time.Second)
+		defer conn.Close()
+
+		// 声明在、候选空:public 声明不豁免空候选,A fail-closed 落中继。
+		res := env.bridge.resultAt(0)
+		if ok, _ := res["ok"].(bool); !ok {
+			t.Fatalf("空候选臂 result ok=%v, 期望 true: %v", res["ok"], res)
+		}
+		if pub, _ := res["public"].(bool); !pub {
+			t.Fatalf("空候选臂 result 必须仍声明 public(true 判据与候选来源解耦): %v", res)
+		}
+		if trace.Used != "piko" {
+			t.Fatalf("空候选臂载体 Used=%q, 期望 \"piko\"", trace.Used)
+		}
+		if trace.UDPErr == nil || !strings.Contains(trace.UDPErr.Error(), "no peer candidates") {
+			t.Fatalf("UDPErr=%v, 期望含 no peer candidates(空候选 fail-closed 留痕)", trace.UDPErr)
+		}
+		if pikoCalls.Load() != 1 {
+			t.Fatalf("piko 拨号次数=%d, 期望恰 1", pikoCalls.Load())
+		}
+		punchDNSRoundTrip(t, conn)
+
+		// B 侧确曾发出真实兜底候选帧(桥上有账、被吞)——证「判 public
+		// 且发过候选」与「A 到手候选为空」两态并存,行为回归仍落中继。
+		if reals := env.bridge.realCandidatesFrames(); len(reals) != 1 {
+			t.Fatalf("空候选臂应有恰 1 帧被吞的 B 真实候选帧(构造前提对账): %v", reals)
+		}
+	})
 }
