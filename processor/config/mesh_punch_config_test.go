@@ -142,3 +142,24 @@ func TestMeshStunServersValidate(t *testing.T) {
 		t.Fatalf("超 4 条应报错含上限, got %v", err)
 	}
 }
+
+// —— public_listen(transfer-punch-stun 后续优化:公网对端直连)——
+
+func TestMeshPublicListenEffective(t *testing.T) {
+	var nilMesh *MeshConfig
+	if nilMesh.EffectivePublicListen() {
+		t.Fatal("nil receiver EffectivePublicListen 应为 false(让渡型默认关)")
+	}
+	empty := &MeshConfig{}
+	if empty.EffectivePublicListen() {
+		t.Fatal("零值 EffectivePublicListen 应为 false(默认关)")
+	}
+	on := &MeshConfig{PublicListen: boolPtr(true)}
+	if !on.EffectivePublicListen() {
+		t.Fatal("显式 true 应生效")
+	}
+	off := &MeshConfig{PublicListen: boolPtr(false)}
+	if off.EffectivePublicListen() {
+		t.Fatal("显式 false 应为关")
+	}
+}
