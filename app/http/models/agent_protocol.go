@@ -406,7 +406,8 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				// 对端——STUN 公网候选交换，数组字段表内照惯例用裸名。
 				// purpose 缺省=mesh（老版本帧兼容）；transfer 腿显式捎带 transfer_id。
 				{Type: AgentEventPeerPunchSession, Required: []string{"type", "request_id", "session_id", "token", "ttl_seconds"}, Optional: []string{"advertise_ip", "purpose", "transfer_id"}, Emits: []string{AgentEventPeerPunchSessionResult}},
-				{Type: AgentEventPeerPunchSessionResult, Required: []string{"type", "request_id", "ok"}, Optional: []string{"port", "fingerprint", "fail_reason"}},
+				// public=公网直连声明(punch-public-peer):B 判本机候选可直拨。
+				{Type: AgentEventPeerPunchSessionResult, Required: []string{"type", "request_id", "ok"}, Optional: []string{"port", "fingerprint", "fail_reason", "public"}},
 				{Type: AgentEventPeerPunchCandidates, Required: []string{"type", "session_id", "candidates"}},
 			},
 		},

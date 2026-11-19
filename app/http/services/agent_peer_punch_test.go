@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -614,6 +615,11 @@ type punchFakeB struct {
 	a             *agentPeerPunchA
 	mu            sync.Mutex
 	sessionFrames int
+	// public 逐用例 opt-in 开关(punch-public-peer Task 3):置 true 时 result
+	// 帧捎带 public:true 模拟公网直挂 B。默认 false——result 帧不带 public
+	// 键,共享夹具对既有全 Punch 测试族零污染(拨号前置位,send 同步回调
+	// 无竞态)。
+	public bool
 }
 
 func (f *punchFakeB) onFrame(payload map[string]interface{}) error {
@@ -648,13 +654,19 @@ func (f *punchFakeB) onFrame(payload map[string]interface{}) error {
 			f.t.Errorf("假 B 起听失败: %v", err)
 			return nil
 		}
-		f.a.handleResultFrame(map[string]interface{}{
+		result := map[string]interface{}{
 			"type":        models.AgentEventPeerPunchSessionResult,
 			"request_id":  requestID,
 			"ok":          true,
 			"port":        float64(port),
 			"fingerprint": fp,
-		})
+		}
+		if f.public {
+			// 条件键口径与生产 B 侧一致(agentPunchSessionResultPayload:
+			// 成功且声明才出键,缺省不带)。
+			result["public"] = true
+		}
+		f.a.handleResultFrame(result)
 		f.a.handleCandidatesFrame(map[string]interface{}{
 			"type":       models.AgentEventPeerPunchCandidates,
 			"session_id": sessionID,
@@ -1272,4 +1284,277 @@ func TestAgentPunchTransferServeFailurePutsContextBack(t *testing.T) {
 	if transferCalls != 1 {
 		t.Fatalf("transferServe 缝应被求值恰一次(Handler 是 serve 入参): %d", transferCalls)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 公网直挂判据 + result 声明(punch-public-peer Task 2):isPublicMapping
+// 纯函数(snapshot 注入,机器无关)/ firstNonLoopbackIPv4 兜底地址源 /
+// handleSession 的 publicPeer 两点计算(自动判据 ∨ public_listen 配置)与
+// STUN-独立逃生门候选。
+// ---------------------------------------------------------------------------
+
+// TestIsPublicMapping 纯函数三分支:STUN 映射 IP 命中任一非回环接口 IPv4 →
+// 公网直挂;不命中(典型 NAT/DNAT)→ 非公网;空映射 → 非公网。
+func TestIsPublicMapping(t *testing.T) {
+	snap := agentNetSnapshot{Interfaces: []agentNetInterface{
+		{IPv4: "203.0.113.7"},
+		{IPv4: "192.168.1.10"},
+	}}
+	if !isPublicMapping(punch.PublicMapping{IP: net.ParseIP("203.0.113.7"), Port: 3478}, snap) {
+		t.Fatal("映射=接口公网地址应判 public")
+	}
+	if isPublicMapping(punch.PublicMapping{IP: net.ParseIP("198.51.100.9"), Port: 3478}, snap) {
+		t.Fatal("映射≠任何接口地址(典型 NAT)不应判 public")
+	}
+	if isPublicMapping(punch.PublicMapping{IP: nil}, snap) {
+		t.Fatal("空映射不应判 public")
+	}
+}
+
+// TestFirstNonLoopbackIPv4 兜底地址源:有非回环 IPv4 → 返回之(跳过前置
+// 回环项);全回环/空快照 → 空串(调用方留空候选,退化落中继)。
+func TestFirstNonLoopbackIPv4(t *testing.T) {
+	loopbackFirst := agentNetSnapshot{Interfaces: []agentNetInterface{
+		{IPv4: "127.0.0.1"},
+		{IPv4: "192.0.2.10"},
+	}}
+	if got := firstNonLoopbackIPv4(loopbackFirst); got != "192.0.2.10" {
+		t.Fatalf("应跳过回环返回首个非回环 IPv4: 得到 %q", got)
+	}
+	allLoopback := agentNetSnapshot{Interfaces: []agentNetInterface{{IPv4: "127.0.0.1"}}}
+	if got := firstNonLoopbackIPv4(allLoopback); got != "" {
+		t.Fatalf("全回环应返回空串: 得到 %q", got)
+	}
+	if got := firstNonLoopbackIPv4(agentNetSnapshot{}); got != "" {
+		t.Fatalf("空快照应返回空串: 得到 %q", got)
+	}
+}
+
+// punchPublicListenCfg 摆全局 customer.mesh 配置(t.Cleanup 回滚),
+// TestAgentPunchConfiguredServers 同款手法。
+func punchPublicListenCfg(t *testing.T, mesh *config.MeshConfig) {
+	t.Helper()
+	old := config.GetGlobalConfig()
+	config.SetGlobalConfig(&config.Config{Customer: &config.CustomerConfig{Mesh: mesh}})
+	t.Cleanup(func() { config.SetGlobalConfig(old) })
+}
+
+// TestHandleSessionPublicListenFallbackCandidate STUN-独立逃生门(评审
+// Issue-1):public_listen=true 且 classify 失败(STUN 全挂/云 EIP 接口私网)
+// → 自候选回落接口快照(首个非回环 IPv4:监听口),candidates 帧照发且
+// result 捎带 public:true;对照 public_listen=false 同样 classify 失败 →
+// 无候选帧、result 不带 public 键。
+func TestHandleSessionPublicListenFallbackCandidate(t *testing.T) {
+	expectIface := firstNonLoopbackIPv4(collectAgentNetSnapshot())
+	if expectIface == "" {
+		t.Skip("本机无非回环 IPv4,接口快照兜底候选无料可验")
+	}
+
+	t.Run("public_listen_on_falls_back_to_iface_snapshot", func(t *testing.T) {
+		punchPublicListenCfg(t, &config.MeshConfig{PublicListen: boolPtr(true)})
+		b, sink, _ := newPunchBForTest(t, func(bb *agentPeerPunchB) {
+			bb.classify = func(*net.UDPConn, []string) (punch.PublicMapping, bool, error) {
+				return punch.PublicMapping{}, false, fmt.Errorf("stun classify: 全部服务器不可达")
+			}
+			bb.serve = func(_ *net.UDPConn, opts punch.ListenerOpts) (int, <-chan struct{}, error) {
+				done := make(chan struct{})
+				t.Cleanup(func() { close(done) }) // 注入桩 done 永无人关,收摊防 goroutine 泄漏
+				return 45678, done, nil
+			}
+		})
+
+		b.handleSession(punchSessionFrame("pr-pub1", "ps-pub1", "tok", 15), sink.write, "device-b-self")
+
+		result := sink.lastResult()
+		if result == nil || result["ok"] != true {
+			t.Fatalf("public_listen 会话应正常立起: %v", result)
+		}
+		if result["public"] != true {
+			t.Fatalf("public_listen=true 时 result 必须捎带 public 声明: %v", result)
+		}
+		port := int(result["port"].(float64))
+		var candFrame map[string]interface{}
+		for _, f := range sink.snapshot() {
+			if f["type"] == models.AgentEventPeerPunchCandidates {
+				candFrame = f
+			}
+		}
+		if candFrame == nil {
+			t.Fatal("public_listen=true 且判型失败必须有接口快照兜底 candidates 帧")
+		}
+		cands, _ := candFrame["candidates"].([]interface{})
+		if len(cands) != 1 {
+			t.Fatalf("兜底候选应恰一条,得到 %v", cands)
+		}
+		host, candPort, err := net.SplitHostPort(cands[0].(string))
+		if err != nil {
+			t.Fatalf("兜底候选应为 host:port 形态: %v", cands[0])
+		}
+		if host != expectIface {
+			t.Fatalf("兜底候选地址应为接口快照首个非回环 IPv4 %q,得到 %q", expectIface, host)
+		}
+		if candPort != strconv.Itoa(port) {
+			t.Fatalf("兜底候选端口应等于监听口 %d,得到 %q", port, candPort)
+		}
+	})
+
+	t.Run("public_listen_off_no_fallback_frame", func(t *testing.T) {
+		punchPublicListenCfg(t, &config.MeshConfig{}) // 默认关(nil)
+		b, sink, _ := newPunchBForTest(t, func(bb *agentPeerPunchB) {
+			bb.classify = func(*net.UDPConn, []string) (punch.PublicMapping, bool, error) {
+				return punch.PublicMapping{}, false, fmt.Errorf("stun classify: 全部服务器不可达")
+			}
+		})
+
+		b.handleSession(punchSessionFrame("pr-pub0", "ps-pub0", "tok", 15), sink.write, "device-b-self")
+
+		result := sink.lastResult()
+		if result == nil || result["ok"] != true {
+			t.Fatalf("对照会话应正常立起: %v", result)
+		}
+		if _, has := result["public"]; has {
+			t.Fatalf("public_listen 未声明时 result 不得带 public 键: %v", result)
+		}
+		for _, f := range sink.snapshot() {
+			if f["type"] == models.AgentEventPeerPunchCandidates {
+				t.Fatal("public_listen=false 且判型失败不得回兜底 candidates 帧(既有语义零变化)")
+			}
+		}
+	})
+}
+
+// TestAgentPeerPunchSessionResultPublicAutoCriterion 自动判据接线:STUN
+// 映射 IP 命中本机真实接口地址(直挂)→ result 捎带 public:true,无需
+// public_listen 配置;映射不命中(典型 NAT)→ 不带 public 键。
+func TestAgentPeerPunchSessionResultPublicAutoCriterion(t *testing.T) {
+	snap := collectAgentNetSnapshot()
+	if len(snap.Interfaces) == 0 {
+		t.Skip("no non-loopback IPv4 on this host")
+	}
+	punchPublicListenCfg(t, &config.MeshConfig{}) // public_listen 关,纯自动判据
+
+	t.Run("mapping_matches_iface_declares_public", func(t *testing.T) {
+		b, sink, _ := newPunchBForTest(t, func(bb *agentPeerPunchB) {
+			bb.classify = func(*net.UDPConn, []string) (punch.PublicMapping, bool, error) {
+				// 映射=本机真实接口地址(直挂形态)。
+				return punch.PublicMapping{IP: net.ParseIP(snap.Interfaces[0].IPv4), Port: 45000}, false, nil
+			}
+		})
+		b.handleSession(punchSessionFrame("pr-auto1", "ps-auto1", "tok", 15), sink.write, "device-b-self")
+		result := sink.lastResult()
+		if result == nil || result["ok"] != true {
+			t.Fatalf("会话应正常立起: %v", result)
+		}
+		if result["public"] != true {
+			t.Fatalf("映射=接口地址(直挂)时 result 必须捎带 public: %v", result)
+		}
+	})
+
+	t.Run("mapping_off_iface_no_public_key", func(t *testing.T) {
+		b, sink, _ := newPunchBForTest(t) // 默认桩宣告 TEST-NET 映射,不命中任何接口
+		b.handleSession(punchSessionFrame("pr-auto0", "ps-auto0", "tok", 15), sink.write, "device-b-self")
+		result := sink.lastResult()
+		if result == nil || result["ok"] != true {
+			t.Fatalf("会话应正常立起: %v", result)
+		}
+		if _, has := result["public"]; has {
+			t.Fatalf("典型 NAT 映射不得带 public 键: %v", result)
+		}
+	})
+}
+
+// TestAgentPunchDialMissPublicSkipsClassify public=true:A 侧收到 B 的
+// public 声明后跳过自身 classify/自候选组装(bind 照走,Socket 绑定铁律);
+// public 缺省:既有全流程零变化(计划期裁决 1/2)。候选帧口径(评审
+// Issue-2 定稿):public 路径 A 仍恰发一帧空数组候选(最小 diff,B 侧
+// no_valid_candidate 空转既有语义)。
+func TestAgentPunchDialMissPublicSkipsClassify(t *testing.T) {
+	// 候选数组空判定:len 口径,nil 与空数组([]string/[]interface{} 两种
+	// 形态)皆算空——不断言字面形态(评审 Issue-2 明令)。
+	candidatesEmpty := func(raw interface{}) bool {
+		switch v := raw.(type) {
+		case nil:
+			return true
+		case []string:
+			return len(v) == 0
+		case []interface{}:
+			return len(v) == 0
+		default:
+			return false
+		}
+	}
+
+	t.Run("public_declared_skips_classify_and_sends_empty_candidates", func(t *testing.T) {
+		classifyCalls := 0
+		a, fake := newPunchAForTest(t, func(a *agentPeerPunchA) {
+			orig := a.classify
+			a.classify = func(c *net.UDPConn, servers []string) (punch.PublicMapping, bool, error) {
+				classifyCalls++
+				return orig(c, servers)
+			}
+		})
+		fake.public = true // 逐用例 opt-in:result 捎带 public:true(默认 false)
+		// 桥上 A→candidates 帧捕获:沿全链传输测试的 send 包裹手法,
+		// 不碰共享夹具。
+		var candFrames []map[string]interface{}
+		origSend := a.send
+		a.send = func(payload map[string]interface{}) error {
+			if payload["type"] == models.AgentEventPeerPunchCandidates {
+				candFrames = append(candFrames, payload)
+			}
+			return origSend(payload)
+		}
+
+		conn, err := a.dialSource(context.Background(), "dev-b")
+		if err != nil {
+			t.Fatalf("public 直挂拨号应成功: %v", err)
+		}
+		_ = conn.Close()
+
+		if classifyCalls != 0 {
+			t.Fatalf("public 声明下 A 侧不得 classify(直拨省 STUN 判型),实调 %d 次", classifyCalls)
+		}
+		if len(candFrames) != 1 {
+			t.Fatalf("public 路径 A 应恰发一帧候选(空数组口径),实发 %d 帧", len(candFrames))
+		}
+		if !candidatesEmpty(candFrames[0]["candidates"]) {
+			t.Fatalf("public 路径候选数组必须为空(nil/空数组皆算空): %v", candFrames[0]["candidates"])
+		}
+	})
+
+	t.Run("public_absent_keeps_classify_and_self_candidates", func(t *testing.T) {
+		classifyCalls := 0
+		a, _ := newPunchAForTest(t, func(a *agentPeerPunchA) {
+			orig := a.classify
+			a.classify = func(c *net.UDPConn, servers []string) (punch.PublicMapping, bool, error) {
+				classifyCalls++
+				return orig(c, servers)
+			}
+		})
+		// fake.public 缺省 false:result 不带 public 键,既有全流程。
+		var candFrames []map[string]interface{}
+		origSend := a.send
+		a.send = func(payload map[string]interface{}) error {
+			if payload["type"] == models.AgentEventPeerPunchCandidates {
+				candFrames = append(candFrames, payload)
+			}
+			return origSend(payload)
+		}
+
+		conn, err := a.dialSource(context.Background(), "dev-b")
+		if err != nil {
+			t.Fatalf("对照拨号应成功: %v", err)
+		}
+		_ = conn.Close()
+
+		if classifyCalls < 1 {
+			t.Fatalf("public 缺省时 classify 必须照走(既有语义),实调 %d 次", classifyCalls)
+		}
+		if len(candFrames) != 1 {
+			t.Fatalf("对照路径 A 应恰发一帧候选,实发 %d 帧", len(candFrames))
+		}
+		if candidatesEmpty(candFrames[0]["candidates"]) {
+			t.Fatalf("classify 照走时自候选不得为空(默认桩宣告 TEST-NET 映射): %v", candFrames[0]["candidates"])
+		}
+	})
 }

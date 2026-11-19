@@ -1079,6 +1079,9 @@ export default {
   // 打洞直连(transfer-punch-stun):punch 开关 + STUN 列表;en.js 同段须成对
   mesh_punchEnable: '打洞直连（UDP 打洞）',
   mesh_punchEnableHint: '与节点尝试 UDP 打洞直连（本机需对公网开放 UDP 端口，默认关闭）。',
+  // 公网直连声明(punch-public-peer):public_listen 开关;en.js 同段须成对
+  mesh_publicListen: '公网直连声明',
+  mesh_publicListenHint: '本机监听口可被对端公网直连（公网直挂或云 EIP 1:1 NAT 服务器勾选），默认关。',
   mesh_stunServers: 'STUN 服务器',
   mesh_stunServersHint: '留空使用默认档（stun.miwifi.com / Google），自建 coturn 填 host:port 每行一条',
   // -- 依赖与身份提示（G4/SPEC §10.3）：mesh 依赖 SSH 入口的降级警告条 +

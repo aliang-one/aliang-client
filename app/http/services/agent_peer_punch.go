@@ -84,8 +84,10 @@ var (
 )
 
 // agentPunchSessionResultPayload 组 peer.punch.session.result 帧
-// (契约:Required type/request_id/ok,Optional port/fingerprint/fail_reason)。
-func agentPunchSessionResultPayload(requestID string, ok bool, port int, fingerprint, failReason string) map[string]interface{} {
+// (契约:Required type/request_id/ok,Optional port/fingerprint/fail_reason;
+// public 为 punch-public-peer 批次新增声明键——成功且公网直挂才出键,
+// 条件键不出键惯例,失败臂恒传 false)。
+func agentPunchSessionResultPayload(requestID string, ok bool, port int, fingerprint, failReason string, public bool) map[string]interface{} {
 	payload := map[string]interface{}{
 		"type":       models.AgentEventPeerPunchSessionResult,
 		"request_id": requestID,
@@ -94,6 +96,9 @@ func agentPunchSessionResultPayload(requestID string, ok bool, port int, fingerp
 	if ok {
 		payload["port"] = port
 		payload["fingerprint"] = fingerprint
+		if public {
+			payload["public"] = true
+		}
 	} else if failReason != "" {
 		payload["fail_reason"] = failReason
 	}
@@ -175,6 +180,48 @@ func agentPunchConfiguredServers() []string {
 		return append([]string(nil), config.MeshDefaultStunServers...)
 	}
 	return cfg.Customer.Mesh.EffectiveStunServers()
+}
+
+// cfgEffectivePublicListen public_listen 配置读侧(nil 安全,punch-public-peer
+// 批次)。逐调用回读不缓存(保存即生效,agentPunchConfigEnabled 同款哲学);
+// 与 punch 总开关的合取由 handleSession 开头的 b.gate 门结构性兜住。
+func cfgEffectivePublicListen() bool {
+	cfg := config.GetGlobalConfig()
+	if cfg == nil || cfg.Customer == nil {
+		return false
+	}
+	return cfg.Customer.Mesh.EffectivePublicListen()
+}
+
+// isPublicMapping 公网直挂判据(纯函数,snapshot 注入便于机器无关单测):
+// STUN 映射 IP 命中任一非回环接口 IPv4 → 本机无 NAT,候选可直拨。
+// 云 EIP 1:1 NAT 接口只见私网 IP → 不命中 → 不自动声明(显式
+// public_listen 配置覆盖该场景)。DNAT 端口映射场景映射 IP=路由器公网
+// ≠接口地址 → 同样不命中(保守正确)。
+func isPublicMapping(mapping punch.PublicMapping, snap agentNetSnapshot) bool {
+	if mapping.IP == nil {
+		return false
+	}
+	for _, iface := range snap.Interfaces {
+		ip := net.ParseIP(iface.IPv4)
+		if ip != nil && ip.Equal(mapping.IP) {
+			return true
+		}
+	}
+	return false
+}
+
+// firstNonLoopbackIPv4 接口快照兜底候选的地址源(纯函数,机器无关单测)。
+// collectAgentNetSnapshot 采集期已滤回环,这里的 IsLoopback 复核是纯函数
+// 对注入快照的防御(快照无非回环 IPv4 → 空串,调用方留空候选退化落中继)。
+func firstNonLoopbackIPv4(snap agentNetSnapshot) string {
+	for _, iface := range snap.Interfaces {
+		ip := net.ParseIP(iface.IPv4)
+		if ip != nil && !ip.IsLoopback() {
+			return iface.IPv4
+		}
+	}
+	return ""
 }
 
 // agentPeerPunchIngressHandler 生产 Handler:每条过门流=一条「到 ssh 入口」
@@ -270,7 +317,7 @@ func (b *agentPeerPunchB) handleSession(msg map[string]interface{}, writeJSON fu
 		return
 	}
 	fail := func(reason string) {
-		_ = writeJSON(agentPunchSessionResultPayload(requestID, false, 0, "", reason))
+		_ = writeJSON(agentPunchSessionResultPayload(requestID, false, 0, "", reason, false))
 	}
 
 	if !b.gate() {
@@ -334,6 +381,13 @@ func (b *agentPeerPunchB) handleSession(msg map[string]interface{}, writeJSON fu
 			selfCandidates = []string{net.JoinHostPort(mapping.IP.String(), strconv.Itoa(mapping.Port))}
 		}
 	}
+
+	// 公网直连声明(punch-public-peer):自动判据(映射=接口地址,本机
+	// 直挂)∨ 显式 public_listen(云 EIP 场景配置覆盖)。声明后 result 捎带
+	// public,A 侧跳过自身 classify 直拨。classify 失败时自动判据短路
+	// (|| 求值序)不取 mapping——判据两点互不污染。
+	publicPeer := cfgEffectivePublicListen() ||
+		(classifyErr == nil && mapping.IP != nil && isPublicMapping(mapping, collectAgentNetSnapshot()))
 
 	// 传输上下文 serve 前取出(Handler 是 serve 的入参,先于 serve 求值);
 	// serve 失败在下方 listen_failed 分支放回表项,消费语义归成功路径独占。
@@ -412,10 +466,20 @@ func (b *agentPeerPunchB) handleSession(msg map[string]interface{}, writeJSON fu
 	})
 
 	logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH] listening session=%s iface=%s port=%d ttl=%ds", sessionID, iface, port, ttlSeconds))
-	_ = writeJSON(agentPunchSessionResultPayload(requestID, true, port, fingerprint, ""))
+	_ = writeJSON(agentPunchSessionResultPayload(requestID, true, port, fingerprint, "", publicPeer))
+	if publicPeer && len(selfCandidates) == 0 && classifyErr != nil {
+		// public_listen 声明且判型失败(STUN 全挂/云 EIP 接口私网):接口
+		// 快照候选兜底(spec §2.1 STUN-独立逃生门;裁决口径=接口快照,
+		// 非 bind iface 字符串)。落点在 serve 之后(port 此刻才可得)、
+		// candidates 发送 gate 之前。快照无非回环 IPv4 → 留空(退化落中继,
+		// spec §3 精度注记)。
+		if ifaceIP := firstNonLoopbackIPv4(collectAgentNetSnapshot()); ifaceIP != "" {
+			selfCandidates = []string{net.JoinHostPort(ifaceIP, strconv.Itoa(port))}
+		}
+	}
 	if len(selfCandidates) > 0 {
 		// B 自身公网候选回发(server 按 session_id 转给 A);判型失败无映射
-		// 可发则不发——A 侧拿 result 的端口照试。
+		// 可发则不发——A 侧拿 result 的端口照试(public_listen 兜底候选除外)。
 		_ = writeJSON(agentPunchCandidatesPayload(sessionID, selfCandidates))
 	}
 }
@@ -785,8 +849,9 @@ func (a *agentPeerPunchA) tryCached(ctx context.Context, key string) (net.Conn, 
 
 // dialMiss miss 路径(dialMu 串行;transfer miss 同样全程持锁——一次性
 // 拨号后锁内含 DialPeer,与 mesh 同构):重拨检查 → 驱逐旧 socket → memo
-// 预检 → 信令链(session→result→Classify→candidates)→ DialPeer →
-// 成功路径分流(mesh=DialAndPut 同款缓存复用;transfer=一次性出让,裁决 5)。
+// 预检 → 信令链(session→result→Classify→candidates;result 声明 public
+// 时跳过 Classify/自候选,bind 照走)→ DialPeer → 成功路径分流(mesh=
+// DialAndPut 同款缓存复用;transfer=一次性出让,裁决 5)。
 func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string, opts punchDialOpts) (net.Conn, error) {
 	a.dialMu.Lock()
 	defer a.dialMu.Unlock()
@@ -852,6 +917,7 @@ func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string, opts punc
 		return nil, fmt.Errorf("agent punch: send session: %w", err)
 	}
 	var fingerprint string
+	var publicPeer bool
 	select {
 	case res := <-resCh:
 		if ok, _ := res["ok"].(bool); !ok {
@@ -859,6 +925,10 @@ func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string, opts punc
 			return nil, fmt.Errorf("agent punch: peer refused session: %s", reason)
 		}
 		fingerprint = remoteString(res, "fingerprint")
+		// 公网直挂声明(punch-public-peer):B 侧 result 捎带 public 时 A
+		// 跳过自身 classify/自候选——对端直挂无需 NAT 判型,同五元组握手
+		// 直拨。键缺省(老 B/典型 NAT)→ false,既有全流程零变化。
+		publicPeer = remoteBool(res, "public", false)
 	case <-ctx.Done():
 		return nil, fmt.Errorf("agent punch: awaiting result: %w", ctx.Err())
 	case <-time.After(agentPunchResultWait):
@@ -866,30 +936,38 @@ func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string, opts punc
 	}
 
 	// ② 绑 socket + Classify(铁律:先于任何拨号,探测窗口不吞打洞包)。
+	// public 声明(计划期裁决 1/2):bind 保留在条件外(毫秒级成本,Socket
+	// 绑定铁律);classify/symmetric 记账/自候选组装整块跳过——不判型即无
+	// symmetric 分支(skipMemo 不写;对端 NAT 属性与本机判型无关,ShouldSkip
+	// 预检照旧兜既有对称记忆)。
 	socket, _, err := a.bind()
 	if err != nil {
 		// 绑定失败=载体自禁(socket.go 绑定铁律),落 piko。
 		return nil, fmt.Errorf("agent punch: bind: %w", err)
 	}
-	mapping, symmetricSuspect, classifyErr := a.classify(socket, a.servers())
 	var selfCandidates []string
-	if classifyErr != nil {
-		// 铁律:不可达≠symmetric,不写 SkipMemo;打洞照试。
-		logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH-A] classify unavailable peer=%s err=%v", peerID, classifyErr))
-	} else {
-		if symmetricSuspect {
-			// per-peer 记账后拒绝:本对端 5min 内不再尝试(重拨检查前有
-			// ShouldSkip 预检兜住)。
-			a.skipMemo.Record(peerID)
-			_ = socket.Close()
-			return nil, fmt.Errorf("agent punch: peer %s symmetric nat suspect", peerID)
-		}
-		if mapping.IP != nil && mapping.Port > 0 {
-			selfCandidates = []string{net.JoinHostPort(mapping.IP.String(), strconv.Itoa(mapping.Port))}
+	if !publicPeer {
+		mapping, symmetricSuspect, classifyErr := a.classify(socket, a.servers())
+		if classifyErr != nil {
+			// 铁律:不可达≠symmetric,不写 SkipMemo;打洞照试。
+			logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH-A] classify unavailable peer=%s err=%v", peerID, classifyErr))
+		} else {
+			if symmetricSuspect {
+				// per-peer 记账后拒绝:本对端 5min 内不再尝试(重拨检查前有
+				// ShouldSkip 预检兜住)。
+				a.skipMemo.Record(peerID)
+				_ = socket.Close()
+				return nil, fmt.Errorf("agent punch: peer %s symmetric nat suspect", peerID)
+			}
+			if mapping.IP != nil && mapping.Port > 0 {
+				selfCandidates = []string{net.JoinHostPort(mapping.IP.String(), strconv.Itoa(mapping.Port))}
+			}
 		}
 	}
 
-	// ③ candidates 帧 → pending 等 B 候选。
+	// ③ candidates 帧 → pending 等 B 候选。public 路径发送保持无条件
+	// (selfCandidates 为 nil → 空帧,B 侧 no_valid_candidate 空转既有语义,
+	// 评审 Issue-2 最小 diff 口径)。
 	candCh := make(chan []string, 1)
 	a.mu.Lock()
 	a.pendingCandidates[sessionID] = candCh

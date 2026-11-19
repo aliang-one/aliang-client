@@ -863,10 +863,18 @@ type MeshConfig struct {
 	// StunServers 打洞 STUN 服务器列表(transfer-punch-stun 批次)。空/缺 =
 	// 默认档 MeshDefaultStunServers;上限 4 条,host:port 形态(Validate 就地
 	// TrimSpace 规整,与 peers[].lan_addrs 同款纪律)。
-	StunServers []string            `json:"stun_servers,omitempty"`
-	MaxHops     int                 `json:"max_hops,omitempty"` // 链式转发经停上限(via 链长):0=默认,>8 收口;接收端拒绝过长经停链
-	Peers       []MeshPeer          `json:"peers,omitempty"`
-	Fallback    *MeshFallbackConfig `json:"fallback,omitempty"`
+	StunServers []string `json:"stun_servers,omitempty"`
+	// PublicListen 本机监听口可被公网直连声明(punch-public-peer 批次)。
+	// 默认关(nil=false):声明=对公网暴露打洞监听口,让渡型能力,与
+	// PunchEnable 同族。语义:本机公网直挂(接口含公网 IP,B 侧自动判据
+	// 天然命中,无需本字段)或云 EIP 1:1 NAT(接口只见私网 IP,自动判据
+	// 漏判,须显式声明)。声明后候选 STUN-独立:classify 失败回落接口
+	// 快照(首个非回环 IPv4 : 监听口)。消费处与 EffectivePunchEnabled
+	// 合取,保存期不硬拒(手改配置绕过由运行期合取兜住)。
+	PublicListen *bool               `json:"public_listen,omitempty"`
+	MaxHops      int                 `json:"max_hops,omitempty"` // 链式转发经停上限(via 链长):0=默认,>8 收口;接收端拒绝过长经停链
+	Peers        []MeshPeer          `json:"peers,omitempty"`
+	Fallback     *MeshFallbackConfig `json:"fallback,omitempty"`
 	// PrivateKey 本节点的 mesh 身份私钥(PEM,OpenSSH 或 PKCS#8)。
 	// 公钥分发到各对端的 ssh_ingress.mesh_authorized_keys(尾注释=本机 device_id)。
 	// 空 = 本节点不能作为转发发起方(仍可作为被转发方)。
@@ -944,6 +952,12 @@ func (c *MeshConfig) EffectiveStunServers() []string {
 		return append([]string(nil), MeshDefaultStunServers...)
 	}
 	return append([]string(nil), c.StunServers...)
+}
+
+// EffectivePublicListen 公网直连声明开关:三态指针默认关(nil=false),
+// 与 EffectivePunchEnabled 同族。nil receiver 安全。
+func (c *MeshConfig) EffectivePublicListen() bool {
+	return c != nil && c.PublicListen != nil && *c.PublicListen // 默认关
 }
 
 // EffectiveMaxHops 跳数上限:0/负数=默认 5,>8 收口到 8(读取端钳制防御,

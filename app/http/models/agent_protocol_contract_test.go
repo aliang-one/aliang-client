@@ -148,7 +148,7 @@ func TestContractPeerPunchFrames(t *testing.T) {
 		},
 		AgentEventPeerPunchSessionResult: {
 			required: []string{"type", "request_id", "ok"},
-			optional: []string{"port", "fingerprint", "fail_reason"},
+			optional: []string{"port", "fingerprint", "fail_reason", "public"},
 		},
 		AgentEventPeerPunchCandidates: {
 			required: []string{"type", "session_id", "candidates"},
