@@ -2,8 +2,11 @@ package tunnel
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
+
+	"aliang.one/nursorgate/common/logger"
 )
 
 func TestPikoStateFromLog(t *testing.T) {
@@ -83,5 +86,21 @@ func TestWaitConnectedKeepsWaitingThroughReconnecting(t *testing.T) {
 	status, err := manager.WaitConnected(ctx, "dev_test")
 	if err != nil || status.State != "connected" {
 		t.Fatalf("WaitConnected = (%+v, %v)", status, err)
+	}
+}
+
+func TestReportDisabledLinesEnterLogBuffer(t *testing.T) {
+	logger.GetGlobalBuffer().Clear()
+	// 两函数首参是 state 回调,实现体内以 `_` 忽略——传 nil 安全。
+	reportTCPDisabled(nil, "unit-test")
+	reportMeshRelayDisabled(nil, "unit-test")
+	entries := logger.GetBufferEntries(50, logger.INFO, "main") // 与 /api/logs handler 同口径
+	joined := ""
+	for _, e := range entries {
+		joined += e.Message
+	}
+	if !strings.Contains(joined, "tcp bridge disabled: unit-test") ||
+		!strings.Contains(joined, "mesh relay disabled: unit-test") {
+		t.Fatalf("收编后应进 buffer: %s", joined)
 	}
 }

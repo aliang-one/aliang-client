@@ -7,9 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"time"
+
+	"aliang.one/nursorgate/common/logger"
 )
 
 // tcpBridge serves raw TCP mappings on the "<deviceID>.tcp" piko endpoint.
@@ -64,13 +65,13 @@ func (b *tcpBridge) handle(downstream net.Conn) {
 	reader := bufio.NewReader(downstream)
 	header, err := b.readHeader(reader)
 	if err != nil {
-		log.Printf("[AGENT-TCP] header read failed: %v", err)
+		logger.Info(fmt.Sprintf("[AGENT-TCP] header read failed: %v", err))
 		return
 	}
-	log.Printf("[AGENT-TCP] header ok: target=%s:%d", header.TargetHost, header.TargetPort)
+	logger.Info(fmt.Sprintf("[AGENT-TCP] header ok: target=%s:%d", header.TargetHost, header.TargetPort))
 	claims, err := b.verifier.verify(header.Ticket)
 	if err != nil {
-		log.Printf("[AGENT-TCP] ticket verify failed: %v", err)
+		logger.Info(fmt.Sprintf("[AGENT-TCP] ticket verify failed: %v", err))
 		return
 	}
 	if claims.DeviceID != b.deviceID {
@@ -95,10 +96,10 @@ func (b *tcpBridge) handle(downstream net.Conn) {
 	var dialer net.Dialer
 	upstream, err := dialer.DialContext(dialCtx, "tcp", targetAddress(claims.TargetHost, claims.TargetPort))
 	if err != nil {
-		log.Printf("[AGENT-TCP] target dial failed: %v", err)
+		logger.Info(fmt.Sprintf("[AGENT-TCP] target dial failed: %v", err))
 		return
 	}
-	log.Printf("[AGENT-TCP] bridged to target %s:%d", claims.TargetHost, claims.TargetPort)
+	logger.Info(fmt.Sprintf("[AGENT-TCP] bridged to target %s:%d", claims.TargetHost, claims.TargetPort))
 	defer upstream.Close()
 
 	// Either direction finishing must not kill the bridge outright: a client
