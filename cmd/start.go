@@ -134,6 +134,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// 自动组网探针接线(自动组网批次):config.MeshAutoPeerFor 回查 beacon
 	// 同账号自动表。
 	tunnel.WireMeshAutoPeerProbe(services.MeshRosterEntryFor)
+	// roster 同步循环接线(接线孤儿治理,第三例):本函数实现早已存在
+	// (mesh_roster_sync.go,注释声称 boot 两形态各调一次),但两处 boot
+	// 均漏接——roster 缓存永不填充,MeshRosterEntryFor 恒 miss,auto_peers
+	// 恒 fail-closed。sync.Once 幂等 + Mesh==nil 自守卫,失败仅日志不阻断。
+	services.StartMeshRosterSync()
 
 	// 启动服务器
 	logger.Info("Starting aliang server...")

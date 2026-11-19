@@ -197,6 +197,9 @@ func initializeCoreSubsystems() error {
 	// 自动组网探针接线(自动组网批次):config.MeshAutoPeerFor → beacon
 	// 同账号自动表。
 	tunnel.WireMeshAutoPeerProbe(services.MeshRosterEntryFor)
+	// roster 同步循环接线(同 start.go:接线孤儿治理第三例)——漏接则
+	// auto_peers 信任锚永不填充,恒 fail-closed。幂等,失败仅日志不阻断。
+	services.StartMeshRosterSync()
 	// SSH 入口启动恢复:customer 配置已在上方加载完成,按其期望态 reconcile
 	// ——重启后自动恢复已启用入口(平台代理自愈的同款纪律:失败仅日志不
 	// 阻断 boot)。与配置提交协调路径共用 services.ReconcileSSHIngressFromConfig
