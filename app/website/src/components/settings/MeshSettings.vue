@@ -323,8 +323,12 @@
       </div>
     </section>
 
-    <!-- —— 打洞直连(transfer-punch-stun):punch 开关 + STUN 列表。punch_enable
-         三态 nil=false(后端 EffectivePunchEnabled 同源,让渡型默认关);STUN 列表
+    <!-- —— 打洞直连(transfer-punch-stun):punch 开关 + public_listen 公网直连
+         声明开关 + STUN 列表。punch_enable 三态 nil=false(后端
+         EffectivePunchEnabled 同源,让渡型默认关);public_listen(punch-public-peer)
+         同为三态 nil=false 让渡型,勾选后 B 侧打洞 result 帧声明 public、A 侧跳过
+         STUN classify 直拨——仅公网直挂/EIP 1:1 NAT 服务器场景,与 punch 开关
+         逐字同形态(checkbox class 栈/disabled 联动同口径);STUN 列表
          编辑源=configMesh(normalizeMeshConfig 出口,空=[]=后端默认档),
          /api/mesh/status 回读的 stun_servers 只是显示参考——⚠️ 绝不把 status
          预填的默认档写回表单/保存载荷(一开卡片就固化显式列表=失去跟随默认档
@@ -344,6 +348,20 @@
           :disabled="loading || saving"
           data-field="meshPunchEnable"
           @change="form.punchEnable = $event.target.checked"
+        />
+      </label>
+      <label class="flex min-h-11 cursor-pointer items-center justify-between gap-3 border-y border-slate-100 py-3 text-sm text-slate-700 dark:border-slate-800 dark:text-slate-200">
+        <span class="min-w-0">
+          <span class="block text-xs font-semibold">{{ t('mesh_publicListen') }}</span>
+          <span class="mt-0.5 block text-[11px] font-normal leading-4 text-slate-500 dark:text-slate-400">{{ t('mesh_publicListenHint') }}</span>
+        </span>
+        <input
+          type="checkbox"
+          class="h-4 w-4 shrink-0 rounded border-slate-300 text-primary focus:ring-primary/20 dark:border-slate-600 dark:bg-slate-900"
+          :checked="form.publicListen"
+          :disabled="loading || saving"
+          data-field="meshPublicListen"
+          @change="form.publicListen = $event.target.checked"
         />
       </label>
       <label class="block space-y-1">
@@ -870,6 +888,9 @@ export default {
         // configMesh(归一化出口)——status 的 stun_servers 只是显示参考,绝不
         // 预填(固化显式列表=失去跟随默认档演进能力);空列表渲染空 textarea。
         punchEnable: mesh.punch_enable === true,
+        // 公网直连声明(punch-public-peer):public_listen 开关与 punch 开关同
+        // 编辑源口径(configMesh 归一化出口,缺键=false 默认关)。
+        publicListen: mesh.public_listen === true,
         stunServersText: mesh.stun_servers.join('\n'),
         // peer 行:整行拷贝(device_id/lan_addrs/relay 只作透传底座,行内仅
         // host_key 可编辑);无 host_key 的 peer 行也渲染(空输入位)
@@ -952,6 +973,9 @@ export default {
         // 与现值等价 → 父层 diff 为零不进 patch(空列表=回默认档的显式意图经
         // 数组整体替换分支带出 [])。
         punch_enable: this.form.punchEnable === true,
+        // 公网直连声明(punch-public-peer):开关布尔随表单带出,归一化产出显式
+        // 布尔;未编辑时与现值等价 → 不进 patch(与 punch_enable 同族口径)。
+        public_listen: this.form.publicListen === true,
         stun_servers: String(this.form.stunServersText ?? '').split('\n'),
         // peers 以表单行为准（行内 host_key 编辑值必须带出）;未编辑字段整行透传
         peers: this.form.peerRows.map((row) => ({ ...row }))

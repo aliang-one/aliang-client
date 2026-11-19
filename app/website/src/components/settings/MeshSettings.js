@@ -1,7 +1,7 @@
 // mesh 组网卡片纯逻辑模块（与 MeshSettings.vue 同名分层：.js=可纯测的归一化/
 // 解析逻辑，.vue=卡片骨架；import 一律带显式扩展名避免同名解析歧义）。
 // 线格式 customer.mesh 与后端 processor/config types.go MeshConfig 对齐：
-// {enable, forward_enable, punch_enable, max_hops, stun_servers,
+// {enable, forward_enable, punch_enable, public_listen, max_hops, stun_servers,
 //  peers:[{device_id,lan_addrs,relay,host_key?}],
 //  fallback:{enable,next_hop}, private_key?, key_passphrase?}
 // ——带 ? 的密钥字段只透传不默认（空串/缺键不落键,见各函数内注释）。
@@ -12,6 +12,7 @@
 //   enable          nil → true   （mesh 是直连之上的增量出口，升级不许静默关）
 //   forward_enable  nil → false  （被转发是让渡型能力，默认关）
 //   punch_enable    nil → false  （UDP 打洞直连要本机对公网开口，让渡型能力，默认关）
+//   public_listen   nil → false  （公网直连声明,让渡型,仅公网直挂/EIP 1:1 NAT 服务器勾选）
 //   peer.relay      nil → true   （LAN 不可达时允许走中继载体）
 //   fallback.enable nil → false  （出口链路默认关）
 // 读侧恒产出显式布尔（ssh_ingress「恒产出显式」先例）：保存 patch 才不会
@@ -82,6 +83,10 @@ export function normalizeMeshConfig(payload) {
     // punch_enable 透传（nil=false 让渡型默认关）：不透传 = 已配置的 true 值
     // 会被卡片保存整块重写时静默丢掉（「保存 200 但永不落盘」缺陷族）。
     punch_enable: typeof source.punch_enable === 'boolean' ? source.punch_enable : false,
+    // public_listen(punch-public-peer):公网直连声明三态 nil=false。勾选后
+    // B 侧打洞 result 帧声明 public,A 侧跳过 STUN classify 直拨——透传口径
+    // 与 punch_enable 同族(漏透传=卡片整块重写时丢已勾选值)。
+    public_listen: typeof source.public_listen === 'boolean' ? source.public_listen : false,
     max_hops: normalizeMaxHops(source.max_hops),
     peers: normalizeMeshPeers(source.peers),
     fallback: normalizeMeshFallback(source.fallback),

@@ -169,6 +169,9 @@ describe('PlatformProxySettings 卡片（平台流量代理）', () => {
       enable: true,
       forward_enable: false,
       punch_enable: false,
+      // public_listen(punch-public-peer):本卡 mesh 快照走同一
+      // normalizeMeshConfig,读侧恒产出显式布尔(缺键=false 默认关)
+      public_listen: false,
       max_hops: 5,
       peers: [{ device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: false }],
       fallback: { enable: true, next_hop: 'dev-b' },

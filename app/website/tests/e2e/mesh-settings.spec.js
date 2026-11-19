@@ -207,14 +207,16 @@ test('平台流量代理保存：POST /api/config/customer 载荷含 mesh.fallba
   expect(savedFallback.classes).toBeUndefined();
   expect(savedFallback.host_key).toBeUndefined();
   // 载荷是「与当前配置的差异」而非全量：本卡没动的顶层段（proxy_rules）与
-  // 未变的 mesh 开关（enable/forward_enable/punch_enable/max_hops/peers）都不
-  // 出现在 patch 里——父层按顶层段浅合并，多带的键反而会把别人的段覆盖成
-  // 陈旧值。punch_enable 未变动（现值 false=默认关）不得产出伪 diff;
-  // stun_servers 未配置（=后端默认档）同样不得产出 [] 伪 diff。
+  // 未变的 mesh 开关（enable/forward_enable/punch_enable/public_listen/
+  // max_hops/peers）都不出现在 patch 里——父层按顶层段浅合并，多带的键反而
+  // 会把别人的段覆盖成陈旧值。punch_enable 未变动（现值 false=默认关）不得
+  // 产出伪 diff;public_listen 未变动（现值 false=默认关）同款不得产出伪
+  // diff;stun_servers 未配置（=后端默认档）同样不得产出 [] 伪 diff。
   expect(savedBody.customer.proxy_rules).toBeUndefined();
   expect(savedBody.customer.mesh.enable).toBeUndefined();
   expect(savedBody.customer.mesh.forward_enable).toBeUndefined();
   expect(savedBody.customer.mesh.punch_enable).toBeUndefined();
+  expect(savedBody.customer.mesh.public_listen).toBeUndefined();
   expect(savedBody.customer.mesh.stun_servers).toBeUndefined();
   expect(savedBody.customer.mesh.peers).toBeUndefined();
 });

@@ -20,17 +20,19 @@ import en from '../../i18n/en';
 import zh from '../../i18n/zh';
 
 // —— normalizeMeshConfig（线格式归一；SettingsPage 归一化链共用）——
-// 线格式 customer.mesh{enable,forward_enable,punch_enable,max_hops,peers[],
-// fallback}；后端三态指针语义（processor/config types.go MeshConfig.Effective*）：
+// 线格式 customer.mesh{enable,forward_enable,punch_enable,public_listen,max_hops,
+// peers[],fallback}；后端三态指针语义（processor/config types.go MeshConfig.Effective*）：
 // enable nil=true / forward_enable nil=false / punch_enable nil=false /
-// peer.relay nil=true / fallback.enable nil=false——读侧恒产出显式布尔
+// public_listen nil=false / peer.relay nil=true / fallback.enable nil=false
+// ——读侧恒产出显式布尔
 // （ssh_ingress「恒产出显式」先例），保存才不会漏键。
 describe('MeshSettings normalizeMeshConfig', () => {
-  it('缺失段产出全默认：三态布尔恒显式（enable=true/forward=false/punch=false/fallback.enable=false）', () => {
+  it('缺失段产出全默认：三态布尔恒显式（enable=true/forward=false/punch=false/public_listen=false/fallback.enable=false）', () => {
     expect(normalizeMeshConfig(undefined)).toEqual({
       enable: true,
       forward_enable: false,
       punch_enable: false,
+      public_listen: false,
       max_hops: 0,
       peers: [],
       fallback: { enable: false, next_hop: '' },
@@ -41,6 +43,7 @@ describe('MeshSettings normalizeMeshConfig', () => {
     expect(typeof defaults.enable).toBe('boolean');
     expect(typeof defaults.forward_enable).toBe('boolean');
     expect(typeof defaults.punch_enable).toBe('boolean');
+    expect(typeof defaults.public_listen).toBe('boolean');
     expect(typeof defaults.fallback.enable).toBe('boolean');
   });
 
@@ -65,6 +68,12 @@ describe('MeshSettings normalizeMeshConfig', () => {
     expect(out.fallback.next_hop).toBe('dev-b');
     // punch 非布尔（手改配置文件垃圾）→ 归默认关,不透传坏值
     expect(normalizeMeshConfig({ punch_enable: 'yes' }).punch_enable).toBe(false);
+  });
+
+  it('normalizeMeshConfig 归一 public_listen(非布尔归 false)', () => {
+    expect(normalizeMeshConfig({ public_listen: true }).public_listen).toBe(true);
+    expect(normalizeMeshConfig({}).public_listen).toBe(false);
+    expect(normalizeMeshConfig({ public_listen: 'x' }).public_listen).toBe(false);
   });
 
   it('max_hops：[1,8] 保留、>8 钳到 8（对齐后端读侧 EffectiveMaxHops）、≤0/非数归 0（默认 5）', () => {
@@ -648,6 +657,7 @@ describe('MeshSettings 卡片', () => {
       enable: true,
       forward_enable: false,
       punch_enable: false,
+      public_listen: false,
       max_hops: 0,
       peers: [],
       fallback: { enable: false, next_hop: '' },
@@ -692,6 +702,9 @@ describe('MeshSettings 卡片', () => {
       // 打洞直连(transfer-punch-stun):punch 开关 + STUN 列表
       'mesh_punchEnable',
       'mesh_punchEnableHint',
+      // 公网直连声明(punch-public-peer):public_listen 开关
+      'mesh_publicListen',
+      'mesh_publicListenHint',
       'mesh_stunServers',
       'mesh_stunServersHint',
       'mesh_save',
@@ -1362,6 +1375,7 @@ describe('MeshSettings LAN 发现一键入表', () => {
 // 整体替换分支显式落盘 [](=回默认档)。
 describe('MeshSettings 打洞直连与 STUN 列表', () => {
   const punchInput = (el) => el.querySelector('[data-field="meshPunchEnable"]');
+  const publicInput = (el) => el.querySelector('[data-field="meshPublicListen"]');
   const stunInput = (el) => el.querySelector('[data-field="meshStunServers"]');
 
   function setStun(el, text) {
@@ -1372,6 +1386,12 @@ describe('MeshSettings 打洞直连与 STUN 列表', () => {
 
   function togglePunch(el, checked) {
     const node = punchInput(el);
+    node.checked = checked;
+    node.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function togglePublic(el, checked) {
+    const node = publicInput(el);
     node.checked = checked;
     node.dispatchEvent(new Event('change', { bubbles: true }));
   }
@@ -1413,6 +1433,34 @@ describe('MeshSettings 打洞直连与 STUN 列表', () => {
     await flush();
     expect(saved).toHaveLength(1);
     expect(saved[0].mesh.punch_enable).toBe(true);
+    expect(buildCustomerSavePatch(saved[0], current)?.mesh).toBeUndefined();
+  });
+
+  // 公网直连声明(punch-public-peer):public_listen 开关与 punch 开关同族
+  // 用例形态——回显保存态现值/透传进 patch/未编辑不产伪 diff。
+  it('public_listen 开关回显保存态现值;开启 → save 载荷 public_listen=true 且随 patch 带出', async () => {
+    const { el, saved } = mountCard(baseConfig()); // public_listen: false(默认关)
+    await flush();
+    expect(publicInput(el).checked).toBe(false);
+    togglePublic(el, true);
+    await flush();
+    clickSave(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    expect(saved[0].mesh.public_listen).toBe(true);
+    const patch = buildCustomerSavePatch(saved[0], baseConfig());
+    expect(patch.mesh.public_listen).toBe(true);
+  });
+
+  it('配置 public_listen=true → 开关勾选回显;不动它保存不产伪 diff', async () => {
+    const current = baseConfig({ public_listen: true });
+    const { el, saved } = mountCard(current);
+    await flush();
+    expect(publicInput(el).checked).toBe(true);
+    clickSave(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    expect(saved[0].mesh.public_listen).toBe(true);
     expect(buildCustomerSavePatch(saved[0], current)?.mesh).toBeUndefined();
   });
 
