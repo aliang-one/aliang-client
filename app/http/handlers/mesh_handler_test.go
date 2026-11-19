@@ -6,9 +6,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"aliang.one/nursorgate/app/http/services"
 	"aliang.one/nursorgate/app/mesh/lanbeacon"
 	"aliang.one/nursorgate/processor/config"
 )
@@ -371,5 +373,70 @@ func TestMeshStatusHandlerMethodNotAllowed(t *testing.T) {
 	h.HandleStatus(rec, req)
 	if rec.Code != 405 {
 		t.Fatalf("POST code = %d, want 405", rec.Code)
+	}
+}
+
+// TestHandleStatusRuntimeTruthFields 运行态真值三字段(D2):只增不改,
+// 既有字段断言不受影响;nil seam 安全回零值。
+func TestHandleStatusRuntimeTruthFields(t *testing.T) {
+	h := &MeshHandler{
+		beaconRunning: func() bool { return true },
+		lanRunning:    func() bool { return false },
+		rosterSync: func() services.MeshRosterSyncSnapshot {
+			return services.MeshRosterSyncSnapshot{Synced: true, LastSyncAt: "2026-11-19T00:00:00Z", LastError: "boom"}
+		},
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/api/mesh/status", nil)
+	h.HandleStatus(w, r)
+	var body struct {
+		Data struct {
+			BeaconRunning bool                            `json:"beacon_running"`
+			LANRunning    bool                            `json:"lan_running"`
+			RosterSync    services.MeshRosterSyncSnapshot `json:"roster_sync"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !body.Data.BeaconRunning || body.Data.LANRunning {
+		t.Fatalf("seam 注入值未透传: %+v", body.Data)
+	}
+	if !body.Data.RosterSync.Synced || body.Data.RosterSync.LastSyncAt != "2026-11-19T00:00:00Z" || body.Data.RosterSync.LastError != "boom" {
+		t.Fatalf("roster_sync 未透传: %+v", body.Data.RosterSync)
+	}
+
+	// nil seam:零值安全(NewMeshHandler 生产构造不得 nil-panic),
+	// 且 wire 形态钉死——三字段恒在场、值结构体序列化为对象非 null
+	// (阶段1 AI 面消费契约)。
+	h2 := &MeshHandler{}
+	w2 := httptest.NewRecorder()
+	h2.HandleStatus(w2, httptest.NewRequest(http.MethodGet, "/api/mesh/status", nil))
+	if w2.Code != http.StatusOK {
+		t.Fatalf("nil seam 应零值安全, got %d", w2.Code)
+	}
+	var zeroBody struct {
+		Data struct {
+			BeaconRunning bool                            `json:"beacon_running"`
+			LANRunning    bool                            `json:"lan_running"`
+			RosterSync    services.MeshRosterSyncSnapshot `json:"roster_sync"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w2.Body.Bytes(), &zeroBody); err != nil {
+		t.Fatalf("nil seam unmarshal: %v (body=%s)", err, w2.Body.String())
+	}
+	if zeroBody.Data.BeaconRunning || zeroBody.Data.LANRunning {
+		t.Fatalf("nil seam 应回零值: %+v", zeroBody.Data)
+	}
+	if zeroBody.Data.RosterSync != (services.MeshRosterSyncSnapshot{}) {
+		t.Fatalf("nil seam roster_sync 应全零对象: %+v", zeroBody.Data.RosterSync)
+	}
+	// 值结构体恒序列化为对象非 null 且键恒在场(JSON null 解码进 struct 会
+	// 静默跳过,上断言测不出键缺失,须原文钉)。
+	body2 := w2.Body.String()
+	for _, key := range []string{`"beacon_running":false`, `"lan_running":false`, `"roster_sync":{`} {
+		if !strings.Contains(body2, key) {
+			t.Fatalf("nil seam wire 缺键 %s: body=%s", key, body2)
+		}
 	}
 }

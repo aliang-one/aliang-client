@@ -535,3 +535,40 @@ func containsStringTunnel(list []string, want string) bool {
 	}
 	return false
 }
+
+// TestMeshLANRunningReflectsAssembly 生效态真值(D2):未装配恒 false;
+// 装配起后 true;Stop 后 false。正向段镜像 TestMeshLANAssemblyLifecycle
+// 的配置形态,只在测试内起停,不留全局态。
+func TestMeshLANRunningReflectsAssembly(t *testing.T) {
+	t.Cleanup(StopMeshLANAssembly)
+	StopMeshLANAssembly() // 归位:防其他用例遗留装配态污染「未装配」前提
+	if MeshLANRunning() {
+		t.Fatal("未装配时 MeshLANRunning() 应为 false")
+	}
+
+	// —— 正向段:镜像 TestMeshLANAssemblyLifecycle 的配置启用形态 ——
+	deviceID := func() string { return "dev-lan-running" }
+	interval := 15 * time.Millisecond
+	beaconPort := pickFreeUDPForAssembly(t)
+	startMeshLANAssembly(deviceID, interval, beaconPort)
+
+	// 装配器在跑但 Mesh 未配置 → 期望态 false,生效态仍 false。
+	if MeshLANRunning() {
+		t.Fatal("Mesh 未配置时 MeshLANRunning() 应为 false")
+	}
+
+	// Mesh 开(镜像该测试的启用形态:空 MeshConfig 即生效开关开)→ 下个
+	// 对账周期起 beacon,running 翻真。
+	restore := swapGlobalMeshConfig(t, &config.MeshConfig{})
+	defer restore()
+	waitForMeshLAN(t, true)
+	if !MeshLANRunning() {
+		t.Fatal("装配起后 MeshLANRunning() 应为 true")
+	}
+
+	// 显式 Stop 收摊:生效态归 false(与 beacon 注销同一锁段,读侧必见)。
+	StopMeshLANAssembly()
+	if MeshLANRunning() {
+		t.Fatal("StopMeshLANAssembly 后 MeshLANRunning() 应为 false")
+	}
+}
