@@ -217,6 +217,15 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	// 不落盘。无状态,两进程各持等价。双注册另一处 routes.go(缺任一侧=404
 	// 透传,2026-10-21 教训;/api/proxy 前缀 parity 护栏覆盖)。
 	mux.HandleFunc("/api/proxy/ssh/test", handlers.HandleSSHTest)
+	// mesh 面端点(D3 双注册):数据面真值住 core,本侧一律 forward-to-core
+	// (56431)取真值——裸挂 MeshHandler 会恒报 running=false 反向假红。
+	// 方法闸两形态:core 侧 register 裸路径+handler 内手判 405,本侧 mux
+	// 方法前缀——行为等价,parity 提取剥可选前缀兼容两形态(护栏已扩
+	// api/mesh,缺任一侧=404 透传,2026-10-21 教训同族)。
+	// coreBase 走 ownerBaseURL 解析链(override > env > 默认),不做硬编码。
+	meshForward := handlers.NewMeshCoreForwardHandlerWithBase(ownerBaseURL)
+	mux.HandleFunc("GET /api/mesh/lan_peers", meshForward.ServeHTTP)
+	mux.HandleFunc("GET /api/mesh/status", meshForward.ServeHTTP)
 }
 
 func loopbackOnly(next http.Handler) http.Handler {

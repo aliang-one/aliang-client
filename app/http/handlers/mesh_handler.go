@@ -25,6 +25,12 @@ type MeshHandler struct {
 	config   func() *config.Config
 	deviceID func() string
 	lanPort  func() int
+
+	// 运行态真值三缝(D2 假绿治理):Enable/Effective 是配置推导,下面
+	// 三缝才是「活着」事实——开关开而 beacon_running=false 即装配假绿现场。
+	beaconRunning func() bool
+	lanRunning    func() bool
+	rosterSync    func() services.MeshRosterSyncSnapshot
 }
 
 // NewMeshHandler 构造 handler,候选源钉 lanbeacon.Default()(取调用时值,
@@ -35,6 +41,15 @@ func NewMeshHandler() *MeshHandler {
 		config:   config.GetGlobalConfig,
 		deviceID: services.GetSharedAgentService().CurrentDeviceID,
 		lanPort:  tunnel.MeshLANPort,
+
+		beaconRunning: func() bool {
+			if b := lanbeacon.Default(); b != nil {
+				return b.Running()
+			}
+			return false
+		},
+		lanRunning: tunnel.MeshLANRunning,
+		rosterSync: services.MeshRosterSyncStatus,
 	}
 }
 
@@ -79,6 +94,12 @@ type meshStatusResponse struct {
 	LANListenPort int                          `json:"lan_listen_port"`
 	Peers         []config.MeshPeer            `json:"peers"`
 	LANPeers      []lanbeacon.LanPeerCandidate `json:"lan_peers"`
+
+	// 运行态真值三字段(D2 假绿治理):Enable/Effective 是配置推导,下面
+	// 三个才是「活着」事实——开关开而 beacon_running=false 即装配假绿现场。
+	BeaconRunning bool                            `json:"beacon_running"`
+	LANRunning    bool                            `json:"lan_running"`
+	RosterSync    services.MeshRosterSyncSnapshot `json:"roster_sync"`
 }
 
 // HandleStatus GET /api/mesh/status:仪表盘组网页状态聚合——本机 device_id、
@@ -95,6 +116,15 @@ func (h *MeshHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
 		Peers:       []config.MeshPeer{},
 		LANPeers:    []lanbeacon.LanPeerCandidate{},
 		StunServers: []string{},
+		// 运行态真值三缝(nil seam 零值安全:未注入即未装配,不 panic)。
+		BeaconRunning: h.beaconRunning != nil && h.beaconRunning(),
+		LANRunning:    h.lanRunning != nil && h.lanRunning(),
+		RosterSync: func() services.MeshRosterSyncSnapshot {
+			if h.rosterSync != nil {
+				return h.rosterSync()
+			}
+			return services.MeshRosterSyncSnapshot{}
+		}(),
 	}
 	if h.deviceID != nil {
 		resp.DeviceID = h.deviceID()

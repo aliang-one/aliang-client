@@ -551,3 +551,24 @@ func TestMeshAdmissionForPoisoningResilience(t *testing.T) {
 		t.Fatal("账号切换后旧候选应全体不合格")
 	}
 }
+
+// TestBeaconRunningReflectsStartStop 运行位真值(D2 假绿治理):构造即
+// false,Start 成功后 true,Stop 后回到 false。ctx 收摊路径(Broadcast
+// watcher 代调 Stop)同样复位——不单测,同一 started 位。
+func TestBeaconRunningReflectsStartStop(t *testing.T) {
+	b := NewBeacon("self-dev", 56441, pickUDPPort(t))
+	if b.Running() {
+		t.Fatal("未 Start 时 Running() 应为 false")
+	}
+	if err := b.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer b.Stop()
+	if !b.Running() {
+		t.Fatal("Start 成功后 Running() 应为 true")
+	}
+	b.Stop()
+	if b.Running() {
+		t.Fatal("Stop 后 Running() 应为 false")
+	}
+}

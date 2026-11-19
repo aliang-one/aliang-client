@@ -27,7 +27,7 @@ package tunnel
 
 import (
 	"context"
-	"log"
+	"fmt"
 	"net"
 	"path/filepath"
 	"strings"
@@ -37,6 +37,7 @@ import (
 
 	"aliang.one/nursorgate/app/mesh/lanbeacon"
 	"aliang.one/nursorgate/common/cache"
+	"aliang.one/nursorgate/common/logger"
 	sshin "aliang.one/nursorgate/inbound/ssh"
 	tuntun "aliang.one/nursorgate/inbound/tun/tunnel"
 	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
@@ -105,7 +106,7 @@ func (m *Manager) egressPeer() meshproxy.Dialer {
 	spec.Punch = punchWired
 	client, err := meshproxy.NewExitClient(spec, meshCfg.PrivateKey, meshCfg.KeyPassphrase, m.dialMeshEndpoint, punchDial)
 	if err != nil {
-		log.Printf("[MESH-LAN] egress delegate peer %s unavailable: %v", deviceID, err)
+		logger.Info(fmt.Sprintf("[MESH-LAN] egress delegate peer %s unavailable: %v", deviceID, err))
 		return nil
 	}
 	return client
@@ -175,7 +176,7 @@ func (m *Manager) meshDNSForwardPeer() meshproxy.Dialer {
 	spec.Punch = punchWired
 	client, err := meshproxy.NewExitClient(spec, mesh.PrivateKey, mesh.KeyPassphrase, m.dialMeshEndpoint, punchDial)
 	if err != nil {
-		log.Printf("[MESH-LAN] dns forward peer %s unavailable: %v", deviceID, err)
+		logger.Info(fmt.Sprintf("[MESH-LAN] dns forward peer %s unavailable: %v", deviceID, err))
 		return nil
 	}
 	return client
@@ -306,13 +307,13 @@ func startMeshLANLocked(deviceID func() string) {
 		return sig
 	})
 	if berr := beacon.Start(context.Background()); berr != nil {
-		log.Printf("[MESH-LAN] assembly start failed (candidates unavailable, will retry): %v", berr)
+		logger.Info(fmt.Sprintf("[MESH-LAN] assembly start failed (candidates unavailable, will retry): %v", berr))
 		return
 	}
 	lanbeacon.SetDefault(beacon)
 	meshLAN.beacon = beacon
 	meshLAN.running = true
-	log.Printf("[MESH-LAN] assembly started (carrier=%d beacon_port=%d)", config.DefaultHTTPProxyPort, meshLAN.beaconPort)
+	logger.Info(fmt.Sprintf("[MESH-LAN] assembly started (carrier=%d beacon_port=%d)", config.DefaultHTTPProxyPort, meshLAN.beaconPort))
 }
 
 // ingressHostKeyFingerprint 读本机 ssh_ingress host key 的 SHA256 指纹
@@ -486,7 +487,7 @@ func teardownMeshLANLocked() {
 	wasRunning := meshLAN.running
 	meshLAN.running = false
 	if wasRunning {
-		log.Printf("[MESH-LAN] assembly stopped")
+		logger.Info(fmt.Sprintf("[MESH-LAN] assembly stopped"))
 	}
 }
 
@@ -496,6 +497,15 @@ func teardownMeshLANLocked() {
 // 代理运行态决定(D4),两者不再混在一个字段里。
 func MeshLANPort() int {
 	return config.DefaultHTTPProxyPort
+}
+
+// MeshLANRunning mesh LAN 装配当前生效态;/api/mesh/status 运行态真值消费
+// (D2 假绿治理,访问器形态对齐 MeshLANPort)。running 是装配器对账后的
+// 生效态,与配置开关解耦——开关开而 running=false 即假绿现场本身。
+func MeshLANRunning() bool {
+	meshLAN.mu.Lock()
+	defer meshLAN.mu.Unlock()
+	return meshLAN.running
 }
 
 // wireMeshAssemblySeams validateConfig 的装配接线点(与

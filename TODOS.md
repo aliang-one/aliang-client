@@ -130,5 +130,16 @@
 **Effort:** S
 **Priority:** P3
 **Depends on:** 无
+### 组网诊断地基批遗留账(批次 2026-11-19,feat/mesh-diag-foundation)
+
+**What:** 七条非阻塞遗留:①mesh forward coreBase 解析链不覆盖「core 56431 被占回退随机端口」场景(ownerBaseURL 在 56433 进程的生效腿解析落回默认 56431,与旧硬编码同;--host 与 ALIANG_MANAGEMENT_ADDR 两场景已真修);②mesh 诊断日志按 [MESH-*]/[AGENT-TCP] 等 token 查,勿按 level 过滤——约 10 行错误态行按原样等价原则留在 Info 级,显式 level=error 查询漏看、运行时级别升 WARN+ 会静默出 buffer;③日志 sink stderr→stdout:stderr 分流部署(2>err.log)会丢行,journald 合流无影响;④mesh_assembly.go:490 无参 fmt.Sprintf(S1039 味,仓无 lint 有先例);⑤mesh_roster_sync.go 全程无日志,roster 失败仅经 /api/mesh/status 的 roster_sync 三态呈现——写 AI 组网 runbook 时须知;⑥buffer 测试全局态卫生(t.Cleanup 快照恢复更整洁,当前无冲突面);⑦**部署前置:server 侧 roster 端点版本(auto-networking 批 server=4708bd1)须先于/同步部署**,否则 roster_sync 恒 last_error(fail-visible 不假绿,但污染实弹观测)。
+
+**Why:** 均不影响正确性/安全红线/主流程;验收口径=vm220↔liang-dev 打洞实弹(部署后),读面(状态三字段+/api/logs 收编)正是实弹排障仪器。
+
+**Context:** 设计=`docs/superpowers/specs/2026-11-19-mesh-diag-foundation-design.md`;计划=`docs/superpowers/plans/2026-11-19-mesh-diag-foundation.md`(残余账 7 条全录);双评审+终审 Ready to commit。
+
+**Effort:** S(逐条独立)
+**Priority:** P3(⑦为 P1 部署注意项)
+**Depends on:** vm220↔liang-dev 实弹排期;server 侧部署节奏
 
 ## Completed

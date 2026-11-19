@@ -18,10 +18,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"time"
 
+	"aliang.one/nursorgate/common/logger"
 	"github.com/quic-go/quic-go"
 )
 
@@ -170,7 +170,7 @@ func punchServeConn(qconn *quic.Conn, token string, handler func(net.Conn)) {
 				// panic 隔离:Handler 是注入件,炸了只赔本流不赔接收面。
 				// 留一行日志而非静默吞——fail-loud 至少要在日志面现形。
 				if r := recover(); r != nil {
-					log.Printf("[PUNCH-LISTENER] handler panic 已隔离(stream=%d): %v", s.StreamID(), r)
+					logger.Info(fmt.Sprintf("[PUNCH-LISTENER] handler panic 已隔离(stream=%d): %v", s.StreamID(), r))
 				}
 			}()
 			defer s.Close() // Handler 返回后兜底关本流(不关会话)

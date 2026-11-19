@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"net/netip"
@@ -17,6 +16,7 @@ import (
 
 	"github.com/andydunstall/piko/client"
 
+	"aliang.one/nursorgate/common/logger"
 	sshin "aliang.one/nursorgate/inbound/ssh"
 	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
 	"aliang.one/nursorgate/processor/tcp"
@@ -305,7 +305,7 @@ func (m *Manager) validateConfig(config Config) (runConfig, [sha256.Size]byte, e
 	if proxyErr != nil {
 		// Soft-fail: the relay carrier degrades to unavailable; the HTTP
 		// tunnel and LAN carrier are unaffected.
-		log.Printf("[AGENT-TUNNEL] mesh relay carrier disabled: %v", proxyErr)
+		logger.Info(fmt.Sprintf("[AGENT-TUNNEL] mesh relay carrier disabled: %v", proxyErr))
 	}
 	m.setMeshDial(proxyURL, config.TunnelToken)
 	tcp.SetMeshTransportDialSource(func() meshproxy.PikoDialFunc { return m.dialMeshEndpoint }) // 生产装配(同位接线):egress 委托 peer 源 + tcp 本机节点标识缝
@@ -373,12 +373,12 @@ func runTunnel(ctx context.Context, config runConfig, ready func()) error {
 	// not take the HTTP tunnel down — the next renewal carries it.
 	if config.tcpBridge != nil {
 		tcpListener, tcpErr := upstream.Listen(ctx, TCPEndpointID(config.deviceID))
-		log.Printf("[AGENT-TUNNEL] tcp listen %s: err=%v addr=%v", TCPEndpointID(config.deviceID), tcpErr, func() any {
+		logger.Info(fmt.Sprintf("[AGENT-TUNNEL] tcp listen %s: err=%v addr=%v", TCPEndpointID(config.deviceID), tcpErr, func() any {
 			if tcpErr == nil {
 				return tcpListener.Addr().String()
 			}
 			return ""
-		}())
+		}()))
 		if tcpErr != nil {
 			reportTCPDisabled(config.onState, fmt.Sprintf("tcp bridge unavailable: %v", tcpErr))
 		} else {
@@ -398,12 +398,12 @@ func runTunnel(ctx context.Context, config runConfig, ready func()) error {
 	// 无条件尝试 Listen——逐连接门禁归 SSH 入口 form 矩阵,平台白名单放行
 	// 即 B 侧接收生效。
 	meshListener, meshErr := upstream.Listen(ctx, MeshEndpointID(config.deviceID))
-	log.Printf("[AGENT-TUNNEL] mesh listen %s: err=%v addr=%v", MeshEndpointID(config.deviceID), meshErr, func() any {
+	logger.Info(fmt.Sprintf("[AGENT-TUNNEL] mesh listen %s: err=%v addr=%v", MeshEndpointID(config.deviceID), meshErr, func() any {
 		if meshErr == nil {
 			return meshListener.Addr().String()
 		}
 		return ""
-	}())
+	}()))
 	if meshErr != nil {
 		reportMeshRelayDisabled(config.onState, fmt.Sprintf("mesh relay unavailable: %v", meshErr))
 	} else {
@@ -422,7 +422,7 @@ func runTunnel(ctx context.Context, config runConfig, ready func()) error {
 					c = sshin.WithRemoteLabel(c, "piko-"+endpoint) // 无冒号(SPEC §8.2)
 					if !sshin.HandleIngressConn(c) {
 						// false = 入口未配置,SPEC §8.1 WARN 记账。
-						log.Printf("[MESH-RELAY] ingress not running, dropped conn %s", c.RemoteAddr())
+						logger.Info(fmt.Sprintf("[MESH-RELAY] ingress not running, dropped conn %s", c.RemoteAddr()))
 					}
 				}(conn)
 			}

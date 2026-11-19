@@ -1,9 +1,10 @@
 package tunnel
 
 import (
-	"log"
+	"fmt"
 	"strings"
 
+	"aliang.one/nursorgate/common/logger"
 	"go.uber.org/zap"
 )
 
@@ -49,7 +50,7 @@ func (l *pikoStateLogger) report(msg string) {
 // next configure renewal typically carries the "<device>.tcp" endpoint in the
 // token whitelist and succeeds.
 func reportTCPDisabled(_ func(state string), message string) {
-	log.Printf("[AGENT-TUNNEL] tcp bridge disabled: %s", message)
+	logger.Info(fmt.Sprintf("[AGENT-TUNNEL] tcp bridge disabled: %s", message))
 }
 
 // reportMeshRelayDisabled surfaces a non-fatal mesh endpoint startup failure
@@ -58,7 +59,7 @@ func reportTCPDisabled(_ func(state string), message string) {
 // stays unavailable — the LAN Transport and every other SSH ingress form are
 // unaffected until a renewal carries the endpoint in the token whitelist.
 func reportMeshRelayDisabled(_ func(state string), message string) {
-	log.Printf("[AGENT-TUNNEL] mesh relay disabled: %s", message)
+	logger.Info(fmt.Sprintf("[AGENT-TUNNEL] mesh relay disabled: %s", message))
 }
 
 // pikoStateFromLog maps piko client log messages to tunnel states. The

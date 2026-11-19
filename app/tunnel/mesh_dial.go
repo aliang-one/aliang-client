@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"net/url"
 	"strings"
 
 	pikoclient "github.com/andydunstall/piko/client"
 
+	"aliang.one/nursorgate/common/logger"
 	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
 )
 
@@ -89,9 +89,9 @@ func (m *Manager) dialMeshEndpoint(ctx context.Context, endpointID string) (net.
 	conn, err := dialer.Dial(ctx, endpointID)
 	if err != nil {
 		if connID := meshproxy.ConnIDFromContext(ctx); connID != "" {
-			log.Printf("[AGENT-TUNNEL] mesh relay dial conn_id=%s endpoint=%s failed: err=%v", connID, endpointID, err)
+			logger.Info(fmt.Sprintf("[AGENT-TUNNEL] mesh relay dial conn_id=%s endpoint=%s failed: err=%v", connID, endpointID, err))
 		} else {
-			log.Printf("[AGENT-TUNNEL] mesh relay dial endpoint=%s failed: err=%v", endpointID, err)
+			logger.Info(fmt.Sprintf("[AGENT-TUNNEL] mesh relay dial endpoint=%s failed: err=%v", endpointID, err))
 		}
 		return nil, fmt.Errorf("mesh relay carrier dial %s: %w", endpointID, err)
 	}

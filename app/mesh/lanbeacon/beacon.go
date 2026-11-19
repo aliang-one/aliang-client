@@ -25,7 +25,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"sort"
 	"strconv"
@@ -33,6 +32,7 @@ import (
 	"sync"
 	"time"
 
+	"aliang.one/nursorgate/common/logger"
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -358,6 +358,18 @@ func (b *Beacon) Stop() {
 	}
 }
 
+// Running beacon 是否处于运行态(Start 成功至 Stop/父 ctx 收摊之间为真)。
+// /api/mesh/status 运行态真值消费(D2 假绿治理):这是配置推导字段之外的
+// 唯一「活着」事实。nil 接收者对齐 Stop 的防御惯例。
+func (b *Beacon) Running() bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.started
+}
+
 // MeshPort 返回广播载荷里通告的本机承载口(装配层=统一口 56432)。只读
 // 观测面:装配测试钉「广播端口=统一口」用,诊断面板可复用。
 func (b *Beacon) MeshPort() int {
@@ -456,7 +468,7 @@ func (b *Beacon) broadcastOnce() {
 	if werr != nil {
 		if !b.bcastErrLogged {
 			b.bcastErrLogged = true
-			log.Printf("[MESH-BEACON] broadcast to :%d failed (will retry silently): %v", port, werr)
+			logger.Info(fmt.Sprintf("[MESH-BEACON] broadcast to :%d failed (will retry silently): %v", port, werr))
 		}
 	} else {
 		b.bcastErrLogged = false

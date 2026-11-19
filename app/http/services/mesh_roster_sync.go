@@ -38,6 +38,7 @@ var (
 	meshRosterMu        sync.RWMutex
 	meshRosterCache     map[string]meshRosterEntry
 	meshRosterFetchedAt time.Time
+	meshRosterLastError string // 上一轮 roster 拉取失败原因;成功轮清空
 	meshSyncInFlight    atomic.Bool
 	meshSyncStarted     sync.Once
 	meshIdentitySig     string // 上送去重签名(公钥行+NUL+host fp;变化才 POST)
@@ -155,12 +156,14 @@ type meshRosterWireEntry struct {
 func fetchMeshRoster(s *AgentService, cfg *config.Config) {
 	raw, err := s.callAgentServer("GET", cfg.GetAgentMeshRosterURL(), nil, "")
 	if err != nil {
+		recordMeshRosterFetchError(err)
 		return
 	}
 	var resp struct {
 		Roster []meshRosterWireEntry `json:"roster"`
 	}
 	if err := json.Unmarshal(raw, &resp); err != nil {
+		recordMeshRosterFetchError(err)
 		return
 	}
 	next := make(map[string]meshRosterEntry, len(resp.Roster))
@@ -177,7 +180,41 @@ func fetchMeshRoster(s *AgentService, cfg *config.Config) {
 	meshRosterMu.Lock()
 	meshRosterCache = next
 	meshRosterFetchedAt = time.Now()
+	meshRosterLastError = ""
 	meshRosterMu.Unlock()
+}
+
+// recordMeshRosterFetchError 失败记账(保留旧缓存不动——fail-open with
+// cached roster 语义不变);/api/mesh/status 经 MeshRosterSyncStatus 消费。
+func recordMeshRosterFetchError(err error) {
+	meshRosterMu.Lock()
+	meshRosterLastError = err.Error()
+	meshRosterMu.Unlock()
+}
+
+// MeshRosterSyncSnapshot roster 同步运行态快照载荷;/api/mesh/status 消费
+// (D2)。命名拍板:类型带 Snapshot 后缀,与同名查询函数 MeshRosterSyncStatus()
+// 错开(Go 包级类型与函数共用一个标识符命名空间,同名=重声明编译错)。
+// synced=false=从未同步(boot 未接线即此态);synced=true+last_error 非空=
+// 上一轮拉取失败(旧缓存仍在);两者皆空=健康。三态齐全后「roster 空表」
+// 不再被误读成服务端故障——接线孤儿(start.go 漏接线同族)一眼可见。
+// 四态空间讲全:首拉从未成功=synced=false+last_error 非空(接线已通但
+// 服务端自 boot 起不可达,有诊断信息量,勿当作非法态)。
+type MeshRosterSyncSnapshot struct {
+	Synced     bool   `json:"synced"`
+	LastSyncAt string `json:"last_sync_at"` // RFC3339 UTC;synced=false 恒空串
+	LastError  string `json:"last_error"`   // 上一轮拉取失败原因;成功轮清空
+}
+
+func MeshRosterSyncStatus() MeshRosterSyncSnapshot {
+	meshRosterMu.RLock()
+	defer meshRosterMu.RUnlock()
+	st := MeshRosterSyncSnapshot{LastError: meshRosterLastError}
+	if !meshRosterFetchedAt.IsZero() {
+		st.Synced = true
+		st.LastSyncAt = meshRosterFetchedAt.UTC().Format(time.RFC3339)
+	}
+	return st
 }
 
 // MeshRosterEntryFor 自动组网消费方(准入闭包/拨号探针)的 roster 回查:
