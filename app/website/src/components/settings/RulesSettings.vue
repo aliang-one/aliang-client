@@ -40,6 +40,115 @@
       </div>
 
       <form v-else class="space-y-6" @submit.prevent="handleSubmit">
+
+        <section class="rounded-xl border border-slate-200 bg-slate-50/80 p-4 dark:border-slate-800 dark:bg-slate-900/40">
+          <div class="mb-4 flex items-center gap-2">
+            <span class="material-symbols-outlined text-primary">rocket_launch</span>
+            <div>
+              <h3 class="font-semibold text-slate-900 dark:text-white">{{ t('rules_aiRules') }}</h3>
+              <p class="text-xs text-slate-500">{{ t('rules_aiRulesDesc') }}</p>
+            </div>
+          </div>
+
+          <div v-if="!providerOrder.length" class="rounded-lg border border-dashed border-slate-300 bg-white px-4 py-6 text-sm text-slate-500 dark:border-slate-700 dark:bg-background-dark dark:text-slate-400">
+            {{ t('rules_noProviders') }}
+          </div>
+
+          <div v-else class="grid gap-4 xl:grid-cols-2">
+            <template v-for="provider in providerOrder" :key="provider">
+            <article
+              v-if="form.ai_rules[provider]"
+              class="relative rounded-lg border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-background-dark"
+            >
+              <div class="mb-3 flex items-center justify-between gap-3">
+                <div>
+                  <h4 class="font-semibold text-slate-900 dark:text-white">{{ providerLabel(provider, presetProviders) }}</h4>
+                  <p class="text-xs text-slate-500">{{ provider }}</p>
+                </div>
+                <label class="inline-flex min-h-9 cursor-pointer items-center gap-2 text-xs font-semibold text-slate-600 dark:text-slate-200 md:min-h-0">
+                  <!-- LOW#17：可访问名组入 provider 名，避免 N 个开关同名（aria-label 优先于包裹 label 文本） -->
+                  <input v-model="form.ai_rules[provider].enble" class="peer sr-only" type="checkbox" :aria-label="t('rules_enableAiRule') + '：' + providerLabel(provider, presetProviders)" />
+                  <span class="sr-only">{{ t('rules_enableAiRule') }}：{{ providerLabel(provider, presetProviders) }}</span>
+                  <span class="relative h-6 w-11 rounded-full bg-slate-300 transition-colors after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:transition-transform after:content-[''] peer-checked:bg-primary peer-checked:after:translate-x-5 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-primary dark:bg-slate-700"></span>
+                </label>
+              </div>
+
+              <div v-if="providerEditable(provider)" class="relative" :data-provider-editor-root="provider">
+                <button
+                  type="button"
+                  class="flex w-full items-center justify-between gap-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-left transition hover:border-primary/20 hover:bg-primary/5 dark:border-slate-800 dark:bg-slate-900/60 dark:hover:border-primary/30 dark:hover:bg-primary/10"
+                  :aria-expanded="isProviderEditorOpen(provider)"
+                  @click.stop="toggleProviderEditor(provider)"
+                >
+                  <span class="flex min-w-0 flex-col items-start gap-0.5">
+                    <span class="text-xs font-normal text-slate-500 dark:text-slate-400">{{ t('rules_includeDomains') }}</span>
+                    <!-- LOW#16：收起态副文案——空配置提示 / 单条目预览 / first+N more -->
+                    <span v-if="!isProviderEditorOpen(provider)" class="max-w-full truncate text-xs text-slate-400 dark:text-slate-500">
+                      {{ providerIncludeSummary(provider) }}
+                    </span>
+                  </span>
+                  <span class="inline-flex shrink-0 items-center rounded-full bg-white px-2 py-0.5 text-[11px] font-medium text-slate-500 shadow-sm ring-1 ring-slate-200 dark:bg-slate-950 dark:text-slate-400 dark:ring-slate-800">
+                    {{ isProviderEditorOpen(provider) ? t('rules_includeDomainsClose') : t('rules_includeDomainsEdit') }}
+                  </span>
+                </button>
+
+                <div
+                  v-if="isProviderEditorOpen(provider)"
+                  class="mt-2 rounded-2xl border border-slate-200 bg-white p-4 shadow-2xl md:absolute md:inset-x-0 md:top-full md:z-20 dark:border-slate-700 dark:bg-slate-950"
+                  @click.stop
+                >
+                  <div class="mb-3 flex items-start justify-between gap-3">
+                    <h5 class="text-xs font-medium text-slate-600 dark:text-slate-300">
+                      {{ t('rules_includeDomainsDialogTitle', { provider: providerLabel(provider, presetProviders) }) }}
+                      <!-- LOW#16：草稿实时条目数（与保存按钮同口径的 sanitizeList 计数） -->
+                      <span class="ml-2 font-normal text-slate-400">{{ t('rules_includeDomainsCount', { count: providerDraftCount() }) }}</span>
+                    </h5>
+                    <button
+                      type="button"
+                      class="rounded-lg p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-300"
+                      @click="cancelProviderEditor"
+                    >
+                      <span class="material-symbols-outlined text-base">close</span>
+                    </button>
+                  </div>
+
+                  <textarea
+                    :ref="`providerEditor-${provider}`"
+                    v-model="providerEditor.draft"
+                    class="min-h-32 w-full rounded-xl border px-3 py-2 font-mono text-sm text-slate-700 shadow-sm transition focus:outline-none focus:ring-2 dark:text-slate-100"
+                    :class="providerEditorError
+                      ? 'border-red-400 bg-red-50 focus:border-red-500 focus:ring-red-500/20 dark:border-red-500/50 dark:bg-red-900/10'
+                      : 'border-slate-300 bg-white focus:border-primary focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900'"
+                    :placeholder="t('rules_includeDomainsPlaceholder')"
+                  ></textarea>
+
+                  <p v-if="providerEditorError" class="mt-2 text-xs text-red-500">{{ providerEditorError }}</p>
+
+                  <p class="mt-2 text-xs text-slate-500">{{ t('rules_includeDomainsDialogHint') }}</p>
+
+                  <div class="mt-4 flex items-center justify-end gap-2">
+                    <button
+                      type="button"
+                      class="rounded-lg border border-slate-200 px-3 py-2 text-xs md:px-2.5 md:py-1.5 font-normal text-slate-500 transition hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                      @click="cancelProviderEditor"
+                    >
+                      {{ t('rules_includeDomainsCancel') }}
+                    </button>
+                    <button
+                      type="button"
+                      class="rounded-lg bg-primary px-3 py-2 text-xs md:px-2.5 md:py-1.5 font-normal text-white transition hover:bg-primary/90"
+                      @click="saveProviderEditor"
+                    >
+                      {{ t('rules_includeDomainsSave') }}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </article>
+            </template>
+          </div>
+        </section>
+
         <section
           class="rounded-xl border p-4 transition-all"
           :class="form.proxy.enable
@@ -461,114 +570,6 @@
                 {{ t('rules_knownHostsClear') }}
               </button>
             </div>
-          </div>
-        </section>
-
-        <section class="rounded-xl border border-slate-200 bg-slate-50/80 p-4 dark:border-slate-800 dark:bg-slate-900/40">
-          <div class="mb-4 flex items-center gap-2">
-            <span class="material-symbols-outlined text-primary">robot_2</span>
-            <div>
-              <h3 class="font-semibold text-slate-900 dark:text-white">{{ t('rules_aiRules') }}</h3>
-              <p class="text-xs text-slate-500">{{ t('rules_aiRulesDesc') }}</p>
-            </div>
-          </div>
-
-          <div v-if="!providerOrder.length" class="rounded-lg border border-dashed border-slate-300 bg-white px-4 py-6 text-sm text-slate-500 dark:border-slate-700 dark:bg-background-dark dark:text-slate-400">
-            {{ t('rules_noProviders') }}
-          </div>
-
-          <div v-else class="grid gap-4 xl:grid-cols-2">
-            <template v-for="provider in providerOrder" :key="provider">
-            <article
-              v-if="form.ai_rules[provider]"
-              class="relative rounded-lg border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-background-dark"
-            >
-              <div class="mb-3 flex items-center justify-between gap-3">
-                <div>
-                  <h4 class="font-semibold text-slate-900 dark:text-white">{{ providerLabel(provider, presetProviders) }}</h4>
-                  <p class="text-xs text-slate-500">{{ provider }}</p>
-                </div>
-                <label class="inline-flex min-h-9 cursor-pointer items-center gap-2 text-xs font-semibold text-slate-600 dark:text-slate-200 md:min-h-0">
-                  <!-- LOW#17：可访问名组入 provider 名，避免 N 个开关同名（aria-label 优先于包裹 label 文本） -->
-                  <input v-model="form.ai_rules[provider].enble" class="peer sr-only" type="checkbox" :aria-label="t('rules_enableAiRule') + '：' + providerLabel(provider, presetProviders)" />
-                  <span class="sr-only">{{ t('rules_enableAiRule') }}：{{ providerLabel(provider, presetProviders) }}</span>
-                  <span class="relative h-6 w-11 rounded-full bg-slate-300 transition-colors after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:transition-transform after:content-[''] peer-checked:bg-primary peer-checked:after:translate-x-5 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-primary dark:bg-slate-700"></span>
-                </label>
-              </div>
-
-              <div v-if="providerEditable(provider)" class="relative" :data-provider-editor-root="provider">
-                <button
-                  type="button"
-                  class="flex w-full items-center justify-between gap-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-left transition hover:border-primary/20 hover:bg-primary/5 dark:border-slate-800 dark:bg-slate-900/60 dark:hover:border-primary/30 dark:hover:bg-primary/10"
-                  :aria-expanded="isProviderEditorOpen(provider)"
-                  @click.stop="toggleProviderEditor(provider)"
-                >
-                  <span class="flex min-w-0 flex-col items-start gap-0.5">
-                    <span class="text-xs font-normal text-slate-500 dark:text-slate-400">{{ t('rules_includeDomains') }}</span>
-                    <!-- LOW#16：收起态副文案——空配置提示 / 单条目预览 / first+N more -->
-                    <span v-if="!isProviderEditorOpen(provider)" class="max-w-full truncate text-xs text-slate-400 dark:text-slate-500">
-                      {{ providerIncludeSummary(provider) }}
-                    </span>
-                  </span>
-                  <span class="inline-flex shrink-0 items-center rounded-full bg-white px-2 py-0.5 text-[11px] font-medium text-slate-500 shadow-sm ring-1 ring-slate-200 dark:bg-slate-950 dark:text-slate-400 dark:ring-slate-800">
-                    {{ isProviderEditorOpen(provider) ? t('rules_includeDomainsClose') : t('rules_includeDomainsEdit') }}
-                  </span>
-                </button>
-
-                <div
-                  v-if="isProviderEditorOpen(provider)"
-                  class="mt-2 rounded-2xl border border-slate-200 bg-white p-4 shadow-2xl md:absolute md:inset-x-0 md:top-full md:z-20 dark:border-slate-700 dark:bg-slate-950"
-                  @click.stop
-                >
-                  <div class="mb-3 flex items-start justify-between gap-3">
-                    <h5 class="text-xs font-medium text-slate-600 dark:text-slate-300">
-                      {{ t('rules_includeDomainsDialogTitle', { provider: providerLabel(provider, presetProviders) }) }}
-                      <!-- LOW#16：草稿实时条目数（与保存按钮同口径的 sanitizeList 计数） -->
-                      <span class="ml-2 font-normal text-slate-400">{{ t('rules_includeDomainsCount', { count: providerDraftCount() }) }}</span>
-                    </h5>
-                    <button
-                      type="button"
-                      class="rounded-lg p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-300"
-                      @click="cancelProviderEditor"
-                    >
-                      <span class="material-symbols-outlined text-base">close</span>
-                    </button>
-                  </div>
-
-                  <textarea
-                    :ref="`providerEditor-${provider}`"
-                    v-model="providerEditor.draft"
-                    class="min-h-32 w-full rounded-xl border px-3 py-2 font-mono text-sm text-slate-700 shadow-sm transition focus:outline-none focus:ring-2 dark:text-slate-100"
-                    :class="providerEditorError
-                      ? 'border-red-400 bg-red-50 focus:border-red-500 focus:ring-red-500/20 dark:border-red-500/50 dark:bg-red-900/10'
-                      : 'border-slate-300 bg-white focus:border-primary focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900'"
-                    :placeholder="t('rules_includeDomainsPlaceholder')"
-                  ></textarea>
-
-                  <p v-if="providerEditorError" class="mt-2 text-xs text-red-500">{{ providerEditorError }}</p>
-
-                  <p class="mt-2 text-xs text-slate-500">{{ t('rules_includeDomainsDialogHint') }}</p>
-
-                  <div class="mt-4 flex items-center justify-end gap-2">
-                    <button
-                      type="button"
-                      class="rounded-lg border border-slate-200 px-3 py-2 text-xs md:px-2.5 md:py-1.5 font-normal text-slate-500 transition hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
-                      @click="cancelProviderEditor"
-                    >
-                      {{ t('rules_includeDomainsCancel') }}
-                    </button>
-                    <button
-                      type="button"
-                      class="rounded-lg bg-primary px-3 py-2 text-xs md:px-2.5 md:py-1.5 font-normal text-white transition hover:bg-primary/90"
-                      @click="saveProviderEditor"
-                    >
-                      {{ t('rules_includeDomainsSave') }}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </article>
-            </template>
           </div>
         </section>
 

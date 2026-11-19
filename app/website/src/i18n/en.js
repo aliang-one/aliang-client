@@ -626,7 +626,7 @@ export default {
   settings_tabLogs: 'Status',
   settings_live: 'LIVE',
   // Section subtitles (four-section IA reorganisation 2026-11-03: Proxy → Agent → Status → User)
-  settings_sectionProxyDesc: 'Outbound proxy, AI rules, routing rules and model mapping. Applies to new sessions and the proxy layer.',
+  settings_sectionProxyDesc: 'Aliang AI Accelerator, outbound proxy, routing rules and model mapping. Applies to new sessions and the proxy layer.',
   settings_sectionAgentDesc: 'Session records, the user-mode agent, the aliangcode kernel, and device access settings in one place.',
   settings_sectionAccountDesc: 'Account identity and local display preferences.',
   settings_sectionStatusDesc: 'Read-only observation: live logs.',
@@ -852,7 +852,7 @@ export default {
 
   // -- RulesSettings --
   rules_title: 'Proxy & Rules',
-  rules_description: 'Manage the upstream proxy, AI rules, and routing rules.',
+  rules_description: 'Manage Aliang AI Accelerator, the upstream proxy, and routing rules.',
   rules_loading: 'Loading',
   rules_customerOnly: 'Customer-side only',
   rules_version: 'Version {version}',
@@ -873,7 +873,7 @@ export default {
   rules_geoipCommaMulti: 'Use + to separate multiple geoip countries (e.g. geoip:CN+HK); comma-separated lists are not supported',
   rules_geoipCommaMultiProxy: 'Use + to separate multiple geoip countries (e.g. geoip:CN+HK); comma-separated multi-country form is not supported',
   // Soft warnings (amber hints, never block saving): AI-vs-proxy rule overlap and comma-collapse semantics
-  rules_overlapWarning: 'The following entries appear in both AI rules and proxy rules; they will be routed to Aliang as AI rules take precedence, and the proxy rules will not apply to them: {entries}',
+  rules_overlapWarning: 'The following entries appear in both Aliang AI Accelerator and proxy rules; they will be routed to Aliang by the accelerator, and the proxy rules will not apply to them: {entries}',
   rules_commaCollapseHint: 'This line contains multiple comma-separated domains; only the last segment {kept} is kept under legacy compatibility semantics — put each domain on its own line',
   rules_entryErrorItem: 'Entry "{entry}": {message}',
   // LOW#18: line-number prefix (N is 1-based) prepended to the concrete error message
@@ -882,11 +882,11 @@ export default {
   rules_proxyUsernamePlaceholder: 'Optional',
   rules_proxyPassword: 'Password',
   rules_proxyPasswordPlaceholder: 'Optional',
-  rules_aiRules: 'AI Rules',
-  rules_aiRulesDesc: 'Choose which backend AI-rule providers are enabled and list included domains, separated by new lines, commas, or semicolons.',
+  rules_aiRules: 'Aliang AI Accelerator',
+  rules_aiRulesDesc: 'Enable accelerated routing per AI provider and list included domains, separated by new lines, commas, or semicolons.',
   // LOW#17: accessible name for the per-provider enable switch (checkbox aria-label + sr-only text)
   rules_enableAiRule: 'Enable this provider\'s rules',
-  rules_noProviders: 'No AI rule providers were returned by the backend yet.',
+  rules_noProviders: 'No AI providers were returned by the backend yet.',
   rules_includeDomains: 'Include domains',
   rules_includeDomainsEdit: 'Edit',
   rules_includeDomainsClose: 'Collapse',
@@ -905,7 +905,7 @@ export default {
   rules_meshInvalid: 'Invalid mesh tail: expected mesh:nodeID optionally followed by one policy segment (direct / deny / fallback:nodeID).',
   rules_docsLink: 'View rule syntax docs',
   rules_rulesList: 'Rules list',
-  rules_formHint: 'Saving here only affects the upstream proxy, AI rules, and proxy rules — it never changes core settings on this machine and takes effect immediately.',
+  rules_formHint: 'Saving here only affects Aliang AI Accelerator, the upstream proxy, and proxy rules — it never changes core settings on this machine and takes effect immediately.',
   rules_saving: 'Saving\u2026',
   rules_saveConfig: 'Save Configuration',
   rules_configSaved: 'Configuration Saved',
@@ -1041,6 +1041,16 @@ export default {
   mesh_pairDetailTitle: 'Node pair detail',
   mesh_nodeDetailTitle: 'Node detail',
   mesh_nodeSelf: 'This node',
+  // Node card / detail identity rows (2026-11-19 node card expansion): state / address / pinning / relay
+  mesh_nodeStateOnline: 'Online',
+  mesh_nodeStateUnreported: 'Not reported',
+  mesh_nodeStateLabel: 'State',
+  mesh_nodeAddr: 'Address',
+  mesh_nodeAddrEmpty: 'No address',
+  mesh_nodePinnedLabel: 'Pinning',
+  mesh_nodePinnedYes: 'Pinned',
+  mesh_nodeUnpinned: 'Unpinned · unusable',
+  mesh_nodeRelayOff: 'No relay',
   mesh_ruleChipsEmpty: 'No rules for this pair yet',
   mesh_editInRules: 'Rules are maintained under Inbound Routing; this view is read-only.',
   mesh_dependedBy: 'Referencing pairs',

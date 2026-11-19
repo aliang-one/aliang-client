@@ -847,16 +847,108 @@ describe('MeshSettings 拓扑画布', () => {
     expect(ids).toContain('dev-a'); // 本机（mesh status.device_id）
     expect(ids).toContain('dev-b');
     expect(ids).toContain('dev-c');
-    // 本机居中：rect x = 320 - 60, y = 180 - 24
-    expect(nodeRect(el, 'dev-a').getAttribute('x')).toBe('260');
-    expect(nodeRect(el, 'dev-a').getAttribute('y')).toBe('156');
+    // 本机居中：rect x = 320 - 84, y = 180 - 30（2026-11-19 节点卡扩容 168×60）
+    expect(nodeRect(el, 'dev-a').getAttribute('x')).toBe('236');
+    expect(nodeRect(el, 'dev-a').getAttribute('y')).toBe('150');
     // 本机额外显示 LAN 监听口
     expect(el.querySelector('[data-mesh-node="dev-a"]').textContent).toContain('dev-a');
     expect(el.querySelector('[data-mesh-node="dev-a"]').textContent).toContain(':56441');
-    // peers 环绕：第一个 peer 在正上方（angle -π/2 → y = 180-110 = 70 → rect y 46）
-    expect(nodeRect(el, 'dev-b').getAttribute('y')).toBe('46');
-    // dev-c 为第二个 peer（angle π/2 → 正下方 y = 290 → rect y 266）
-    expect(nodeRect(el, 'dev-c').getAttribute('y')).toBe('266');
+    // peers 环绕（2026-11-19 椭圆环 rx=190/ry=130：正上 peer y = 180-130 = 50 → rect y 20）
+    expect(nodeRect(el, 'dev-b').getAttribute('y')).toBe('20');
+    // dev-c 为第二个 peer（正下 y = 180+130 = 310 → rect y 280）
+    expect(nodeRect(el, 'dev-c').getAttribute('y')).toBe('280');
+  });
+
+  it('节点卡身份行：peer 显示地址+在线态+钉扎徽标，长文案截断不出框', async () => {
+    const { el } = mountCard(canvasConfig());
+    await flush();
+    // dev-b 有 lan_addrs → 地址行;无 host_key → 未钉扎徽标;status 已上报 → 在线态
+    const devB = el.querySelector('[data-mesh-node="dev-b"]').textContent;
+    expect(devB).toContain('192.168.1.20:56441');
+    expect(devB).toContain('mesh_nodeUnpinned');
+    expect(devB).toContain('mesh_nodeStateOnline');
+    // dev-c 仅在配置（status 未上报）→ 未上报态 + 地址行
+    const devC = el.querySelector('[data-mesh-node="dev-c"]').textContent;
+    expect(devC).toContain('192.168.1.21:56441');
+    expect(devC).toContain('mesh_nodeStateUnreported');
+    // 长文案在数据侧以 … 截断（本机副行截断预算扣除端口段,subtitle+info 合计
+    // 不超 24 字符;peer 徽标行截 26）,渲染文本不出 140px 文本框
+    const longId = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-b';
+    const longPeer = canvasConfig({
+      peers: [
+        { device_id: 'dev-b', lan_addrs: ['10.255.254.253.252.250:56441-extra-long-addr'], relay: true }
+      ]
+    });
+    stubApi({
+      meshStatus: {
+        ...defaultMeshStatus(),
+        device_id: longId,
+        peers: [{ device_id: longId, lan_addrs: ['10.255.254.253.252.250:56441-extra-long-addr'], relay: true }]
+      }
+    });
+    const second = mountCard(longPeer);
+    await flush();
+    const texts = [...second.el.querySelectorAll('[data-mesh-node] text')].map((t) => t.textContent);
+    for (const text of texts) {
+      expect(text.length).toBeLessThanOrEqual(26);
+    }
+    // 本机副行=device_id 截断 + 端口段,合计仍受 24 字符预算
+    const selfNode = second.el.querySelector('[data-mesh-node]').textContent;
+    expect(selfNode).toContain('…');
+    expect(selfNode).toContain(':56441');
+  });
+
+  it('钉扎/中继徽标与右栏身份行：已钉扎无徽标、禁中继带徽标、beacon 地址兜底', async () => {
+    // dev-b 已钉扎+允许中继 → 无徽标;dev-c 未钉扎+禁中继 → 双徽标(超长截 26);
+    // dev-d 无 lan_addrs,地址走 LAN beacon 候选兜底(lanPeers 按 device_id 匹配)
+    const warnConfig = canvasConfig({
+      peers: [
+        { device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true, host_key: 'SHA256:abc' },
+        { device_id: 'dev-c', lan_addrs: ['192.168.1.21:56441'], relay: false },
+        { device_id: 'dev-d', lan_addrs: [], relay: true }
+      ]
+    });
+    stubApi({
+      meshStatus: defaultMeshStatus(),
+      lanPeers: [{ device_id: 'dev-d', addr: '10.0.0.9:56441', cert_fingerprint: 'SHA256:def' }]
+    });
+    const { el } = mountCard(warnConfig);
+    await flush();
+    const devB = el.querySelector('[data-mesh-node="dev-b"]').textContent;
+    expect(devB).toContain('192.168.1.20:56441');
+    expect(devB).not.toContain('mesh_nodeUnpinned');
+    expect(devB).not.toContain('mesh_nodeRelayOff');
+    const devC = el.querySelector('[data-mesh-node="dev-c"]').textContent;
+    // 双徽标连串超 26 字符会被截断,卡片上只容得下首枚徽标;禁中继全量文案在右栏详情
+    expect(devC).toContain('mesh_nodeUnpinned');
+    // 双徽标连串（key 名拼接 37 字符）在数据侧截 26,以 … 收尾不出框
+    const warnLine = [...el.querySelectorAll('[data-mesh-node="dev-c"] text')]
+      .map((t) => t.textContent)
+      .find((s) => s.includes('mesh_nodeUnpinned'));
+    expect(warnLine.length).toBeLessThanOrEqual(26);
+    expect(warnLine.endsWith('…')).toBe(true);
+    const devD = el.querySelector('[data-mesh-node="dev-d"]').textContent;
+    expect(devD).toContain('10.0.0.9:56441'); // beacon 地址兜底进节点卡
+
+    // 点击 dev-c → 右栏身份行（地址/钉扎/状态,与节点卡徽标同源 peerCanvasInfo）
+    el.querySelector('[data-mesh-node="dev-c"]').dispatchEvent(new Event('click', { bubbles: true }));
+    await flush();
+    const detail = el.querySelector('[data-mesh-detail]').textContent;
+    expect(detail).toContain('mesh_nodeAddr');
+    expect(detail).toContain('192.168.1.21:56441');
+    expect(detail).toContain('mesh_nodePinnedLabel');
+    expect(detail).toContain('mesh_nodeUnpinned');
+    expect(detail).toContain('mesh_nodeStateLabel');
+    expect(detail).toContain('mesh_nodeStateUnreported');
+    expect(detail).toContain('mesh_nodeRelayOff');
+
+    // 点击 dev-b → 已钉扎（无「不可用」徽标,显示已钉扎文案）
+    el.querySelector('[data-mesh-node="dev-b"]').dispatchEvent(new Event('click', { bubbles: true }));
+    await flush();
+    const detailB = el.querySelector('[data-mesh-detail]').textContent;
+    expect(detailB).toContain('mesh_nodePinnedYes');
+    expect(detailB).not.toContain('mesh_nodeUnpinned');
+    expect(detailB).toContain('mesh_nodeStateOnline'); // status 已上报
   });
 
   it('连线徽标=该 peer 的 mesh 规则条数（策略段形式计入、非 mesh 条目不计入）', async () => {
@@ -934,13 +1026,13 @@ describe('MeshSettings 拓扑画布', () => {
     const line = edgeLine(first.el, 'dev-b');
     expect(Number(line.getAttribute('x2'))).toBe(100);
     expect(Number(line.getAttribute('y2'))).toBe(300);
-    expect(nodeRect(first.el, 'dev-b').getAttribute('x')).toBe('40'); // 100 - 60
+    expect(nodeRect(first.el, 'dev-b').getAttribute('x')).toBe('16'); // 100 - 84
 
     // 重新挂载（模拟刷新）：位置同源恢复
     const second = mountCard(canvasConfig());
     await flush();
-    expect(nodeRect(second.el, 'dev-b').getAttribute('x')).toBe('40');
-    expect(nodeRect(second.el, 'dev-b').getAttribute('y')).toBe('276'); // 300 - 24
+    expect(nodeRect(second.el, 'dev-b').getAttribute('x')).toBe('16');
+    expect(nodeRect(second.el, 'dev-b').getAttribute('y')).toBe('270'); // 300 - 30
   });
 
   it('位置超出画布被夹回可视区（含 NaN 兜底）', async () => {
@@ -948,8 +1040,8 @@ describe('MeshSettings 拓扑画布', () => {
     await flush();
     card().setNodePosition('dev-b', -500, 9999);
     await flush();
-    expect(nodeRect(el, 'dev-b').getAttribute('x')).toBe('4'); // 夹到 NODE_HALF_W+4 - 60
-    expect(nodeRect(el, 'dev-b').getAttribute('y')).toBe('308'); // 夹到 332 - 24
+    expect(nodeRect(el, 'dev-b').getAttribute('x')).toBe('4'); // 夹到 NODE_HALF_W+4 - 84 = 4
+    expect(nodeRect(el, 'dev-b').getAttribute('y')).toBe('296'); // 夹到 326 - 30
     card().setNodePosition('dev-b', Number.NaN, Number.NaN);
     await flush();
     expect(Number.isFinite(Number(nodeRect(el, 'dev-b').getAttribute('x')))).toBe(true);
@@ -986,6 +1078,15 @@ describe('MeshSettings 拓扑画布', () => {
       'mesh_pairDetailTitle',
       'mesh_nodeDetailTitle',
       'mesh_nodeSelf',
+      'mesh_nodeStateOnline',
+      'mesh_nodeStateUnreported',
+      'mesh_nodeStateLabel',
+      'mesh_nodeAddr',
+      'mesh_nodeAddrEmpty',
+      'mesh_nodePinnedLabel',
+      'mesh_nodePinnedYes',
+      'mesh_nodeUnpinned',
+      'mesh_nodeRelayOff',
       'mesh_ruleChipsEmpty',
       'mesh_editInRules',
       'mesh_dependedBy',

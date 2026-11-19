@@ -622,7 +622,7 @@ export default {
   settings_tabLogs: '状态',
   settings_live: '在线',
   // 分区副标题（四栏重组 2026-11-03：代理设置 → Agent → 状态 → 用户）
-  settings_sectionProxyDesc: '出站代理、AI 规则、分流规则与模型映射。仅影响新会话与代理层。',
+  settings_sectionProxyDesc: 'Aliang 的 AI 加速、出站代理、分流规则与模型映射。仅影响新会话与代理层。',
   settings_sectionAgentDesc: '会话记录、用户态 Agent、aliangcode 内核与设备互访设置集中地。',
   settings_sectionAccountDesc: '账户身份与本机显示偏好。',
   settings_sectionStatusDesc: '只读观测：实时日志。',
@@ -850,7 +850,7 @@ export default {
 
   // -- RulesSettings --
   rules_title: '代理与规则',
-  rules_description: '管理上游代理、AI 规则和分流规则。',
+  rules_description: '管理 Aliang 的 AI 加速、上游代理和分流规则。',
   rules_loading: '加载中',
   rules_customerOnly: '仅客户侧',
   rules_version: '版本 {version}',
@@ -871,7 +871,7 @@ export default {
   rules_geoipCommaMulti: 'geoip 多国请用 + 分隔（如 geoip:CN+HK），不支持逗号分隔',
   rules_geoipCommaMultiProxy: 'geoip 多国请用 + 分隔（如 geoip:CN+HK）；逗号多国写法不受支持',
   // 软警告（黄色提示，不阻断保存）：AI 规则与代理规则 (kind,cond) 重叠，快照编译时 AI 恒优先
-  rules_overlapWarning: '以下条目同时出现在 AI 规则与代理规则中，将优先按 AI 规则分流到 Aliang，代理规则对其不生效：{entries}',
+  rules_overlapWarning: '以下条目同时出现在 Aliang 的 AI 加速与代理规则中，将优先按加速分流到 Aliang，代理规则对其不生效：{entries}',
   // 软警告（黄色提示，不阻断保存）：逗号多域名行按兼容语义仅保留末段（合法但其余段被静默忽略）
   rules_commaCollapseHint: '该行包含多个逗号分隔的域名，将按兼容语义仅保留末段 {kept}，其余被忽略；多个域名请分多行写入',
   rules_entryErrorItem: '条目「{entry}」：{message}',
@@ -881,11 +881,11 @@ export default {
   rules_proxyUsernamePlaceholder: '可选',
   rules_proxyPassword: '密码',
   rules_proxyPasswordPlaceholder: '可选',
-  rules_aiRules: 'AI 规则',
-  rules_aiRulesDesc: '选择启用的后端 AI 规则提供者，并用换行、逗号或分号分隔包含的域名。',
+  rules_aiRules: 'Aliang 的 AI 加速',
+  rules_aiRulesDesc: '为各 AI 服务商开启加速分流，并用换行、逗号或分号分隔包含的域名。',
   // LOW#17：AI 提供商启用开关的可访问名称（checkbox aria-label + sr-only 文字）
-  rules_enableAiRule: '启用该提供商规则',
-  rules_noProviders: '后端尚未返回任何 AI 规则提供者。',
+  rules_enableAiRule: '启用该服务商规则',
+  rules_noProviders: '后端尚未返回任何 AI 服务商。',
   rules_includeDomains: '包含域名',
   rules_includeDomainsEdit: '编辑',
   rules_includeDomainsClose: '收起',
@@ -904,7 +904,7 @@ export default {
   rules_meshInvalid: '组网尾段格式非法：应为 mesh:节点ID，其后可跟至多一个策略段（direct / deny / fallback:节点ID）。',
   rules_docsLink: '查看规则语法文档',
   rules_rulesList: '规则列表',
-  rules_formHint: '此处保存仅影响上游代理、AI 规则与代理规则，不改变本机核心设置；保存后立即生效。',
+  rules_formHint: '此处保存仅影响 Aliang 的 AI 加速、上游代理与代理规则，不改变本机核心设置；保存后立即生效。',
   rules_saving: '保存中\u2026',
   rules_saveConfig: '保存配置',
   rules_configSaved: '配置已保存',
@@ -1040,6 +1040,16 @@ export default {
   mesh_pairDetailTitle: '节点对详情',
   mesh_nodeDetailTitle: '节点详情',
   mesh_nodeSelf: '本机',
+  // 节点卡/详情面板身份行（2026-11-19 节点卡扩容改版）：在线态/地址/钉扎/中继
+  mesh_nodeStateOnline: '在线',
+  mesh_nodeStateUnreported: '未上报',
+  mesh_nodeStateLabel: '状态',
+  mesh_nodeAddr: '地址',
+  mesh_nodeAddrEmpty: '地址未配置',
+  mesh_nodePinnedLabel: '钉扎',
+  mesh_nodePinnedYes: '已钉扎',
+  mesh_nodeUnpinned: '未钉扎 · 不可用',
+  mesh_nodeRelayOff: '禁中继',
   mesh_ruleChipsEmpty: '该节点对暂无规则',
   mesh_editInRules: '规则在「入站路由」中维护，此处仅做展示。',
   mesh_dependedBy: '被引用的节点对',

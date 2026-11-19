@@ -149,7 +149,9 @@
             </g>
           </g>
 
-          <!-- 节点卡（状态灯 + device_id；本机额外显示 LAN 监听口） -->
+          <!-- 节点卡（2026-11-19 扩容改版：168×60 三行卡——标题/device_id 或
+               地址/在线态,再加钉扎·中继徽标行;本机附 LAN 监听口。状态灯同行。
+               长文案由 truncateNodeText 数据侧截断,防溢出边框。） -->
           <g
             v-for="node in canvasNodes"
             :key="`node-${node.deviceId}`"
@@ -159,10 +161,10 @@
             @pointerdown="beginDrag(node.deviceId, $event)"
           >
             <rect
-              :height="48"
-              :width="120"
-              :x="node.x - 60"
-              :y="node.y - 24"
+              :height="60"
+              :width="168"
+              :x="node.x - 84"
+              :y="node.y - 30"
               :class="selectedNode === node.deviceId
                 ? 'fill-white stroke-primary dark:fill-slate-800'
                 : 'fill-white stroke-slate-300 dark:fill-slate-800 dark:stroke-slate-600'"
@@ -170,26 +172,39 @@
               rx="8"
             />
             <circle
-              :cx="node.x - 46"
-              :cy="node.y - 10"
+              :cx="node.x - 66"
+              :cy="node.y - 17"
               :data-mesh-node-light="node.deviceId"
               :fill="node.stateColor"
               r="4"
             />
             <text
-              :x="node.x - 36"
-              :y="node.y - 6"
+              :x="node.x - 56"
+              :y="node.y - 13"
               fill="#334155"
               font-size="10"
               font-weight="600"
-            >{{ node.label }}</text>
+            >{{ node.title }}</text>
             <text
-              v-if="node.portLabel"
-              :x="node.x - 46"
-              :y="node.y + 12"
+              v-if="node.subtitle"
+              :x="node.x - 56"
+              :y="node.y + 1"
               fill="#94a3b8"
               font-size="9"
-            >{{ node.portLabel }}</text>
+            >{{ node.subtitle }}{{ node.info }}</text>
+            <text
+              :x="node.x - 56"
+              :y="node.y + 13"
+              :fill="node.stateColor"
+              font-size="9"
+            >{{ node.stateText }}</text>
+            <text
+              v-if="node.warnText"
+              :x="node.x - 56"
+              :y="node.y + 23"
+              fill="#d97706"
+              font-size="8.5"
+            >{{ node.warnText }}</text>
           </g>
         </svg>
 
@@ -213,6 +228,13 @@
             <h5 class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('mesh_nodeDetailTitle') }}</h5>
             <p class="font-mono text-sm text-slate-800 dark:text-slate-200">{{ selectedNode }}</p>
             <p class="text-xs text-slate-500">{{ t('mesh_dependedBy') }}: {{ selectedNodeDependedBy }}</p>
+            <!-- peer 身份行（2026-11-19 节点卡扩容改版）：地址/钉扎/在线态与
+                 徽标同源（peerCanvasInfo），节点卡看不全时点节点看这里。 -->
+            <template v-if="selectedNodePeer">
+              <p class="text-xs text-slate-500">{{ t('mesh_nodeAddr') }}: {{ selectedNodePeer.addr || t('mesh_nodeAddrEmpty') }}</p>
+              <p class="text-xs text-slate-500">{{ t('mesh_nodePinnedLabel') }}: {{ selectedNodePeer.pinned ? t('mesh_nodePinnedYes') : t('mesh_nodeUnpinned') }}</p>
+              <p class="text-xs text-slate-500">{{ t('mesh_nodeStateLabel') }}: {{ peerReported(selectedNode) ? t('mesh_nodeStateOnline') : t('mesh_nodeStateUnreported') }}{{ selectedNodePeer.relay ? '' : ' · ' + t('mesh_nodeRelayOff') }}</p>
+            </template>
             <div class="flex flex-wrap gap-1.5">
               <span
                 v-for="rule in selectedNodeRules"
@@ -426,8 +448,8 @@ import {
 // 节点坐标画布几何（viewBox 0 0 640 360）。
 const CANVAS_WIDTH = 640;
 const CANVAS_HEIGHT = 360;
-const NODE_HALF_W = 60;
-const NODE_HALF_H = 24;
+const NODE_HALF_W = 84;
+const NODE_HALF_H = 30;
 // 状态灯语义色（SVG 属性不吃 Tailwind dark: 变体;取 design §9.2 语义色常量）
 const NODE_STATE_COLORS = {
   online: '#22c55e',
@@ -435,6 +457,15 @@ const NODE_STATE_COLORS = {
   offline: '#f59e0b',
   idle: '#94a3b8'
 };
+// 节点卡文案截断（2026-11-19 节点卡扩容改版）：超长 device_id/地址以 … 收尾，
+// 保证不出 168×60 的节点框——SVG text 没有 CSS truncate，须在数据侧截。
+function truncateNodeText(value, max) {
+  const text = String(value || '').trim();
+  if (!text) {
+    return '';
+  }
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
 const NODE_POSITIONS_STORAGE_KEY = 'meshNodePositions';
 // 本机节点在画布上的占位 id（mesh status 未到达/降级时用）与它的位置键——
 // 位置按「本机」而非 device_id 存,status 到达前后拖拽结果连续。
@@ -585,10 +616,6 @@ export default {
     selfDeviceId() {
       return String(this.meshStatus?.device_id || '').trim() || SELF_PLACEHOLDER_ID;
     },
-    selfDeviceLabel() {
-      const raw = String(this.meshStatus?.device_id || '').trim();
-      return raw || this.t('mesh_nodeSelf');
-    },
     // peers:status 聚合（实时可达性）与配置 peers 取并集——配置有但对端未上报
     // 时仍应显示节点（灰灯）,不能因 aggregat 缺项而「配置了却看不见」。
     canvasPeerIds() {
@@ -611,32 +638,63 @@ export default {
         // 本机位置固定存 SELF_POSITION_KEY:占位 id → 真 device_id 过渡时
         // 用户拖出来的位置不能丢（status 到达前后是同一张卡）。
         const pos = this.nodePositionOf(SELF_POSITION_KEY, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2);
+        // LAN 监听口拼在副行尾部(模板 subtitle+info 同一 text 节点)——截断
+        // 预算须扣除端口段,否则长 id + 端口仍溢出节点框(评审实锤)。
+        const selfInfo = this.meshStatus?.lan_listen_port ? `:${this.meshStatus.lan_listen_port}` : '';
         nodes.push({
           deviceId: this.selfDeviceId,
-          label: this.selfDeviceLabel,
+          // 标题恒用「本机」文案:真 device_id 放副行截断展示,长 id 不撑破节点框
+          title: this.t('mesh_nodeSelf'),
+          // 副行=完整 device_id（占位态没有真 id,留空不渲染该行）
+          subtitle: this.selfDeviceId === SELF_PLACEHOLDER_ID
+            ? ''
+            : truncateNodeText(this.selfDeviceId, Math.max(8, 24 - selfInfo.length)),
+          info: selfInfo,
           x: pos.x,
           y: pos.y,
           stateColor: NODE_STATE_COLORS[this.meshState] || NODE_STATE_COLORS.idle,
-          portLabel: this.meshStatus?.lan_listen_port ? `:${this.meshStatus.lan_listen_port}` : ''
+          stateText: this.statusLabel,
+          warnText: ''
         });
       }
       const peers = this.canvasPeerIds;
-      const radius = peers.length <= 4 ? 110 : 140;
+      // 椭圆环 (rx,ry) 按 168×60 节点卡重排（2026-11-19 节点卡扩容,评审后
+      // 对 n=1..7 数值复验无压框,安全裕量:斜对角对中心 dy≥65/89,正交邻对
+      // dx≥168）:≤4 档正东/西 peer 与中心卡同排,须 rx≥168 才不压框(ry=130
+      // 让 n=3 斜对角 dy=65>60,120 会以 59.999 贴线假过);5-6 档 rx=200;
+      // 7 档 rx=230（-38.6° peer 与正上 peer 错开同理,230 贴 x 钳位上限
+      // 552）。ry 不得超过 146——再大正上/下 peer 会被 y 钳位(34/326)钉死
+      // 贴边,反而与斜邻卡贴近。8+ peer 单环压框(旧 120×48 布局首个坏点同为
+      // n=8,同病非回归),多环布局留待后续(TODOS 遗留账)。
+      const ring = peers.length <= 4
+        ? { rx: 190, ry: 130 }
+        : peers.length <= 6
+          ? { rx: 200, ry: 110 }
+          : { rx: 230, ry: 110 };
       peers.forEach((peerId, index) => {
         const angle = -Math.PI / 2 + (2 * Math.PI * index) / Math.max(peers.length, 1);
-        const autoX = CANVAS_WIDTH / 2 + radius * Math.cos(angle);
-        const autoY = CANVAS_HEIGHT / 2 + radius * Math.sin(angle);
+        const autoX = CANVAS_WIDTH / 2 + ring.rx * Math.cos(angle);
+        const autoY = CANVAS_HEIGHT / 2 + ring.ry * Math.sin(angle);
         const pos = this.nodePositionOf(peerId, autoX, autoY);
+        // peer 状态:report 了=在线,否则灰（对端未上报）
+        const reported = this.peerReported(peerId);
+        const info = this.peerCanvasInfo(peerId);
         nodes.push({
           deviceId: peerId,
-          label: peerId,
+          title: truncateNodeText(peerId, 20),
+          subtitle: info.addr ? truncateNodeText(info.addr, 24) : this.t('mesh_nodeAddrEmpty'),
+          info: '',
           x: pos.x,
           y: pos.y,
-          // peer 状态:report 了=在线,否则灰（对端未上报）
-          stateColor: this.canvasPeerIds.includes(peerId) && this.peerReported(peerId)
-            ? NODE_STATE_COLORS.online
-            : NODE_STATE_COLORS.idle,
-          portLabel: ''
+          stateColor: reported ? NODE_STATE_COLORS.online : NODE_STATE_COLORS.idle,
+          stateText: this.t(reported ? 'mesh_nodeStateOnline' : 'mesh_nodeStateUnreported'),
+          // 分不清谁是谁的身份徽标:钉扎(host_key 空=fail-closed 不可用)/中继。
+          // 徽标串不走 truncateNodeText 的字段级截断,这里统一截断兜底
+          // （en 双徽标连串可达 30 字符,超 140px 文本预算;节点详情右栏有全量行）。
+          warnText: truncateNodeText([
+            !info.pinned ? this.t('mesh_nodeUnpinned') : '',
+            !info.relay ? this.t('mesh_nodeRelayOff') : ''
+          ].filter(Boolean).join(' · '), 26)
         });
       });
       return nodes;
@@ -691,6 +749,13 @@ export default {
         return 0;
       }
       return this.meshRuleCounts[this.selectedNode] || 0;
+    },
+    // 右栏节点详情的 peer 身份行（地址/钉扎/状态;仅 peer,本机详情行不重复）
+    selectedNodeIsPeer() {
+      return Boolean(this.selectedNode) && this.selectedNode !== this.selfDeviceId;
+    },
+    selectedNodePeer() {
+      return this.selectedNodeIsPeer ? this.peerCanvasInfo(this.selectedNode) : null;
     }
   },
   watch: {
@@ -843,6 +908,28 @@ export default {
     peerReported(deviceId) {
       const statusPeers = Array.isArray(this.meshStatus?.peers) ? this.meshStatus.peers : [];
       return statusPeers.some((peer) => String(peer?.device_id || '') === deviceId);
+    },
+    // 节点卡/详情面板的 peer 身份信息（2026-11-19 节点卡扩容改版）：
+    // 配置 peers（表单真值）优先，status 聚合兜底；addr 依次取 lan_addrs 首项
+    // → beacon 候选（本机 LAN 发现/聚合 lan_peers 按 device_id 匹配）。
+    // pinned=host_key 非空（fail-closed：空=该 peer 不可用）；relay 缺省=true。
+    peerCanvasInfo(deviceId) {
+      const configPeers = Array.isArray(this.configMesh?.peers) ? this.configMesh.peers : [];
+      const statusPeers = Array.isArray(this.meshStatus?.peers) ? this.meshStatus.peers : [];
+      const record = configPeers.find((peer) => peer.device_id === deviceId)
+        || statusPeers.find((peer) => String(peer?.device_id || '') === deviceId);
+      const lanAddr = Array.isArray(record?.lan_addrs)
+        ? record.lan_addrs.map((addr) => String(addr || '').trim()).find(Boolean)
+        : '';
+      const beaconAddr = (candidates) => (Array.isArray(candidates) ? candidates : [])
+        .filter((peer) => String(peer?.device_id || '') === deviceId)
+        .map((peer) => String(peer?.addr || '').trim())
+        .find(Boolean);
+      return {
+        addr: lanAddr || beaconAddr(this.lanPeers) || beaconAddr(this.meshStatus?.lan_peers) || '',
+        pinned: Boolean(String(record?.host_key || '').trim()),
+        relay: record ? record.relay !== false : true
+      };
     },
     // —— G4/SPEC §10.3 ——
     // 「一并开启」一层确认（RulesSettings clearKnownHosts 的 window.confirm

@@ -119,4 +119,16 @@
 **Priority:** P3
 **Depends on:** 真机实测数据(部署后)
 
+### 组网拓扑画布节点卡 8+ peer 单环压框(节点卡扩容批 2026-11-19)
+
+**What:** MeshSettings.vue 拓扑画布节点卡由 120×48 扩到 168×60(四行:标题/device_id 或地址/在线态/钉扎·中继徽标,防 device_id 溢出+分不清谁是谁)后,椭圆环 rx/ry 分档 190/130、200/110、230/110 对 n=1..7 数值复验无压框;8+ peer 单环相邻卡压框(旧 120×48 布局首个坏点同为 n=8,同病非回归),多环/自适应布局留待后续。同批改版:AI 规则改名「Aliang 的 AI 加速」并置顶(表单序 AI 加速→上游代理→代理规则),本机副行截断预算扣除端口段、徽标行截 26(节点详情右栏有全量行)。
+
+**Why:** 8+ peer 是记账级边缘(现网部署 1-3 peer);压框只损可读性不损数据;评审以双反驳验证确认 n=5/7 曾被 150 半径引入回归,已按椭圆分档修复。
+
+**Context:** 几何推导注释在 `app/website/src/components/settings/MeshSettings.vue` canvasNodes computed;评审过程=3 维度发现+逐条双反驳对抗验证(7 条坐实全修,含本条)。
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** 无
+
 ## Completed
