@@ -197,6 +197,13 @@ func initializeCoreSubsystems() error {
 	// 自动组网探针接线(自动组网批次):config.MeshAutoPeerFor → beacon
 	// 同账号自动表。
 	tunnel.WireMeshAutoPeerProbe(services.MeshRosterEntryFor)
+	// 出口委托 peer 源启动接线(2026-11-19 0.196 登录死锁根治,见
+	// WireMeshAssemblySeams 注):登录恢复要刷新→刷新要出口→出口要接线,
+	// 而接线的原唯一触发点(Configure)被平台下发隧道配置驱动,四环互扣。
+	// selfID 懒解析(身份常驻文件,与上方 StartMeshLANAssembly 同款纪律)。
+	if m := services.GetSharedAgentService().TunnelManager(); m != nil {
+		m.WireMeshAssemblySeams(services.GetSharedAgentService().CurrentDeviceID)
+	}
 	// SSH 入口启动恢复:customer 配置已在上方加载完成,按其期望态 reconcile
 	// ——重启后自动恢复已启用入口(平台代理自愈的同款纪律:失败仅日志不
 	// 阻断 boot)。与配置提交协调路径共用 services.ReconcileSSHIngressFromConfig
