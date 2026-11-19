@@ -288,8 +288,9 @@ func TestAgentCoreSubagentRegistryIncludesPeerTools(t *testing.T) {
 	m := &agentAIManager{coreJournal: newAgentCoreJournal(t.TempDir())}
 	run := agentAIRun{sessionID: "sess-sub-peer"}
 	peerTools := m.agentCorePeerTools(run)
-	if len(peerTools) != 5 {
-		t.Fatalf("peer tools = %d, want 5", len(peerTools))
+	// 5 peer 互访 + 4 mesh 诊断读面(读面批 2026-11-20 同车注入)。
+	if len(peerTools) != 9 {
+		t.Fatalf("peer tools = %d, want 9", len(peerTools))
 	}
 	bridge := &agentCoreSubagentBridge{
 		name:      "reviewer",
@@ -827,9 +828,11 @@ func TestAgentCoreSubagentBuiltinResearcherWindowsHint(t *testing.T) {
 // fakeJournalTool 是 decorator 单测的最小内核工具：固定返回结果。
 type fakeJournalTool struct{ res agentcore.ToolResult }
 
-func (f *fakeJournalTool) Name() string                        { return "Fake" }
-func (f *fakeJournalTool) Description() string                 { return "decorator 单测假工具" }
-func (f *fakeJournalTool) InputSchema() map[string]interface{} { return map[string]interface{}{"type": "object"} }
+func (f *fakeJournalTool) Name() string        { return "Fake" }
+func (f *fakeJournalTool) Description() string { return "decorator 单测假工具" }
+func (f *fakeJournalTool) InputSchema() map[string]interface{} {
+	return map[string]interface{}{"type": "object"}
+}
 func (f *fakeJournalTool) Execute(context.Context, map[string]interface{}, *agentcore.ToolEnv) agentcore.ToolResult {
 	return f.res
 }

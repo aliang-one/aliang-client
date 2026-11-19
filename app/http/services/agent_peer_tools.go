@@ -51,6 +51,18 @@ const (
 	AgentPeerToolEventDeviceList = "peer.device_list"
 )
 
+// mesh 诊断读面工具名（agentcore 面点名，组网诊断读面批 2026-11-20）。
+// 与上面 peer.* 同款点号名空间；无注册表事件（第三面 registry 刻意不收，
+// D-1 拍板）、无 CLI bridge 面（agent_ai_tool_ask_peer.go 不注入）——
+// 只存在于 agentcore 面 + stdio 面（cmd/mcp.go mesh_*），两面语义由
+// PeerMCPContractSpecs 契约测试钉住。
+const (
+	AgentPeerToolEventMeshReadiness     = "mesh.readiness"
+	AgentPeerToolEventMeshIdentity      = "mesh.identity"
+	AgentPeerToolEventMeshStunProbe     = "mesh.stun_probe"
+	AgentPeerToolEventMeshLanCandidates = "mesh.lan_candidates"
+)
+
 const (
 	// agentPeerToolTimeoutMs 是工具层等待服务端编排回包的 ctx 上限。分层刻意
 	// 留裕量：服务端 fence（peer exec 上界 600s）→ 先行结构化裁决；客户端
@@ -1039,6 +1051,75 @@ func peerToolSchema(required []string, props map[string]interface{}) map[string]
 	}
 }
 
+// ---------------------------------------------------------------------------
+// mesh 诊断读面（agentcore 桥,组网诊断读面批 2026-11-20）
+// ---------------------------------------------------------------------------
+
+// agentMeshDiagTimeoutMs 是 mesh 诊断读面工具的 ctx 上限。与 stdio 面
+// timeoutMs 14_000 同值——预算链第三层（probe 8s→forward 10s→tool 14s,
+// mesh_stun_probe_handler.go 预算注释）,ctx 只兜底不抢先。
+const agentMeshDiagTimeoutMs = 14_000
+
+// agentMeshLocalBaseURL 是 mesh 读面回环调用的基址 seam:生产走审批 hook 的
+// 回环 base(core 与 user-agent 两个 HTTP 服务启动时都会 SetAgentAIApprovalHook
+// BaseURL 钉各自监听口)——AI 会话在哪个进程跑,自环就打哪个面的 mesh 端点:
+// core 进程=routes.go 直答,user-agent 进程=56433 meshForward 透传到 core 取
+// 真值(裸挂本侧 handler 会恒报 running=false 反向假红,D3 双注册注释已立档)。
+// 测试换成 httptest 地址。
+var agentMeshLocalBaseURL = currentAgentAIApprovalHookBaseURL
+
+// agentMeshDiagCall 打本机回环 mesh 诊断端点(GET / POST 零体),解
+// {code,msg,data} 信封并把 data 原样透传为 JSON 文本。mesh 读面 data 是
+// 结构化对象(非 peer 编排的 {result:string} 字符串),与 stdio 面 rawData
+// 分支同语义。busy(200+code0+data.busy=true)是合法成功回包不判 isError
+// ——「勿立即重试」契约写在工具描述里,不在传输层判。复用 peer 编排的专用
+// 无 Timeout 客户端(超时完全由 ctx 驱动)与 1MiB 读顶。
+//
+// 1MiB 刻意与 stdio 面的 4MiB 不同:peer exec 是自由 shell 输出(stdout/stderr
+// 各 256KiB 裸字节,JSON 转义可膨胀 1.5-3 倍,故 stdio 面 4MiB),而 diag 载荷
+// 有界(LAN 候选 64 上限 + classify/sessions 快照按 peer 键控,几十 KB 量级),
+// 1MiB 是数倍富余而非贴线;若载荷面将来变大需两面同步。
+func agentMeshDiagCall(ctx context.Context, method, path string) (string, bool) {
+	base := strings.TrimRight(strings.TrimSpace(agentMeshLocalBaseURL()), "/")
+	if base == "" {
+		base = UserAgentBaseURL()
+	}
+	ctx, cancel := context.WithTimeout(ctx, agentMeshDiagTimeoutMs*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, method, base+path, nil)
+	if err != nil {
+		return fmt.Sprintf("build request: %v", err), true
+	}
+	resp, err := agentPeerHTTPClient.Do(req)
+	if err != nil {
+		return fmt.Sprintf("local agent unreachable at %s: %v (is the Aliang agent running?)", base, err), true
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, agentPeerHTTPBodyLimit))
+	if err != nil {
+		return fmt.Sprintf("read local agent response: %v", err), true
+	}
+	var envelope struct {
+		Code int             `json:"code"`
+		Msg  string          `json:"msg"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return fmt.Sprintf("local agent response is not JSON (status %d)", resp.StatusCode), true
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || envelope.Code != 0 {
+		msg := strings.TrimSpace(envelope.Msg)
+		if msg == "" {
+			msg = fmt.Sprintf("local agent returned status %d", resp.StatusCode)
+		}
+		return msg, true
+	}
+	if len(envelope.Data) == 0 || string(envelope.Data) == "null" {
+		return "{}", false
+	}
+	return string(envelope.Data), false
+}
+
 // agentCorePeerTools 构建设备互访工具集（阶段 1 四件）。run.readOnly 由调用方
 // 门控（与 MCP/子 agent 注入同判据）；审批取舍见文件头注释（各工具真实门禁
 // 不同，peer_exec 有 ACL+开关，fetch/note 仅同账号）。
@@ -1168,6 +1249,60 @@ func (m *agentAIManager) agentCorePeerTools(run agentAIRun) []agentcore.Tool {
 					return agentPeerReadableError(err), true
 				}
 				return text, false
+			},
+			journal: journal,
+		},
+		// ---- mesh 诊断读面四件（组网诊断读面批 2026-11-20） ----
+		//
+		// 全零参读工具,直接打本机回环 mesh 端点(agentMeshDiagCall,数据路径与
+		// stdio 面同源:56433 meshForward→core 取真值)。描述与 stdio 面逐字
+		// 同文——语义等价由 PeerMCPContractSpecs Keywords 契约测试钉住,手维护
+		// 副本两侧漂移即红。读面免审(D-2):全只读零副作用,无 ACL/开关门禁。
+		&agentCorePeerToolBridge{
+			name: AgentPeerToolEventMeshReadiness,
+			description: "Aggregate mesh networking diagnostics (idempotent, read-only, timeout ~14s): " +
+				"four-gate enablement verdicts, beacon live counters, roster sync state, " +
+				"carrier buckets (lan/udp/piko), egress delegate state + last failure, " +
+				"punch NAT-classify ledger + session snapshots, stun servers list (static, " +
+				"not live-probed), lan candidates. " +
+				"Single call covers what used to need a whole debugging session.",
+			schema: peerToolSchema(nil, map[string]interface{}{}),
+			execute: func(ctx context.Context, _ map[string]interface{}) (string, bool) {
+				return agentMeshDiagCall(ctx, http.MethodGet, "/api/mesh/diag")
+			},
+			journal: journal,
+		},
+		&agentCorePeerToolBridge{
+			name: AgentPeerToolEventMeshIdentity,
+			description: "Device identity consistency check (idempotent, read-only): state device_id vs " +
+				"identity file vs beacon self vs roster presence, with mismatches[] in plain language. " +
+				"First stop for suspected split-brain (two processes holding different credentials).",
+			schema: peerToolSchema(nil, map[string]interface{}{}),
+			execute: func(ctx context.Context, _ map[string]interface{}) (string, bool) {
+				return agentMeshDiagCall(ctx, http.MethodGet, "/api/mesh/identity")
+			},
+			journal: journal,
+		},
+		&agentCorePeerToolBridge{
+			name: AgentPeerToolEventMeshStunProbe,
+			description: "Explicit live STUN server probe (NOT idempotent — sends UDP packets; budget 8s; " +
+				"may return busy:true in structured result — do NOT retry immediately on busy, check again " +
+				"later). Per-server reachability + NAT type (symmetric is a physical limit, not a fault). " +
+				"Note: many timeouts on the default list are normal, not a fault.",
+			schema: peerToolSchema(nil, map[string]interface{}{}),
+			execute: func(ctx context.Context, _ map[string]interface{}) (string, bool) {
+				return agentMeshDiagCall(ctx, http.MethodPost, "/api/mesh/stun_probe")
+			},
+			journal: journal,
+		},
+		&agentCorePeerToolBridge{
+			name: AgentPeerToolEventMeshLanCandidates,
+			description: "LAN beacon candidates seen (idempotent, read-only). Empty list = no candidates " +
+				"received yet, NOT necessarily a fault (check mesh_readiness beacon counters to " +
+				"distinguish). Candidates are display-only, not auto-paired.",
+			schema: peerToolSchema(nil, map[string]interface{}{}),
+			execute: func(ctx context.Context, _ map[string]interface{}) (string, bool) {
+				return agentMeshDiagCall(ctx, http.MethodGet, "/api/mesh/lan_peers")
 			},
 			journal: journal,
 		},

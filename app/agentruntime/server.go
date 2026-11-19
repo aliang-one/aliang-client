@@ -91,6 +91,12 @@ func StartLocalServer() error {
 	// 注册且 command 最新;关=确保注销)。只 Warn 不阻断启动;应用细节见
 	// services.EnsurePeerMCPMatchesConfig。
 	services.EnsurePeerMCPMatchesConfig()
+	// mesh runbook 自愈安装(D-9):内嵌 SKILL.md → ~/.claude/skills/mesh-runbook/。
+	// 归属用户技能域,非 mesh 装配族(boot 接线审计 bootFiles 只扫 start.go/
+	// core.go,server.go 不在其表,刻意不扩)。挂在 agent(56433)启动位:
+	// core(SYSTEM)可能无用户家目录,装不动也无害。错误仅日志不阻断 boot;
+	// 总闸关时安装器内诚实日志一条。
+	services.EnsureMeshRunbookInstalled()
 	// 持久附件缓存全局帽清扫(1GiB,按会话最旧驱逐):recall/truncateBefore 的
 	// 孤儿文件统一在此收敛。只 Warn 不阻断启动。
 	if err := services.AgentAttachmentSweepStartup(); err != nil {
@@ -226,6 +232,13 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	meshForward := handlers.NewMeshCoreForwardHandlerWithBase(ownerBaseURL)
 	mux.HandleFunc("GET /api/mesh/lan_peers", meshForward.ServeHTTP)
 	mux.HandleFunc("GET /api/mesh/status", meshForward.ServeHTTP)
+	mux.HandleFunc("GET /api/mesh/diag", meshForward.ServeHTTP)
+	mux.HandleFunc("GET /api/mesh/identity", meshForward.ServeHTTP)
+	// mesh STUN 显式活探测(组网诊断读面批 Task 7):POST 零体,真探测在
+	// core 侧 handler(punch socket 出厂绑物理口,56433 侧一律 forward-to-core
+	// 同族),本层只透传。双注册另一处 routes.go(缺任一侧=404 透传,
+	// 2026-10-21 教训同族;/api/mesh 前缀 parity 护栏覆盖)。
+	mux.HandleFunc("POST /api/mesh/stun_probe", meshForward.ServeHTTP)
 }
 
 func loopbackOnly(next http.Handler) http.Handler {

@@ -70,8 +70,9 @@ func TestAgentCoreSubagentBridgeImplementsHintAndParallel(t *testing.T) {
 func TestAgentCorePeerExecBridgeTimeoutHint(t *testing.T) {
 	m := &agentAIManager{coreJournal: newAgentCoreJournal(t.TempDir())}
 	tools := m.agentCorePeerTools(agentAIRun{sessionID: "s-hint"})
-	if len(tools) != 5 {
-		t.Fatalf("peer tools = %d, want 5", len(tools))
+	// 5 peer 互访 + 4 mesh 诊断读面(读面批 2026-11-20 同车注入)。
+	if len(tools) != 9 {
+		t.Fatalf("peer tools = %d, want 9", len(tools))
 	}
 	found := false
 	for _, tool := range tools {

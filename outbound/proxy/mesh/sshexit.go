@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"time"
 
 	M "aliang.one/nursorgate/inbound/tun/metadata"
@@ -40,6 +41,42 @@ func pickErr(errs ...error) error {
 		}
 	}
 	return nil
+}
+
+// 载体分桶(包级 atomic):ExitClient 实例频繁重建(缓存键翻转/egress 每调用
+// 重建),实例字段会蒸发——包级计数是唯一稳定落点;DialTrace 本身保持
+// 「无跨连接状态」定谳不动(trace 是每调用的返回值,见 DialContextTraced
+// 注释)。记账语义:Used 确定即代表该载体打通(transport 级连接成立,SSH
+// 握手成败不回账);UDPErr 只在 udp 尝试失败时记(记后仍会试 piko,故
+// UDPErr ≠ DialFail);全载体拨号聚合失败才记 DialFail(零准入=零拨号,不记)。
+var (
+	carrierLanOK    atomic.Uint64
+	carrierUDPOK    atomic.Uint64
+	carrierPikoOK   atomic.Uint64
+	carrierUDPErr   atomic.Uint64
+	carrierDialFail atomic.Uint64
+)
+
+// CarrierBucketSnapshot 载体分桶快照(全局维度 v1;peer 维度留二期)。
+type CarrierBucketSnapshot struct {
+	LanOK    uint64 `json:"lan_ok"`
+	UDPOK    uint64 `json:"udp_ok"`
+	PikoOK   uint64 `json:"piko_ok"`
+	UDPErr   uint64 `json:"udp_err"`
+	DialFail uint64 `json:"dial_fail"`
+}
+
+// SnapshotCarrierBuckets 取全局载体分桶当前值(诊断读面;进程级累加,不清零)。
+// 注意:计划稿的访问器与类型同名(Go 不允许同名重载),此处以
+// SnapshotCarrierBuckets 落地——类型名 CarrierBucketSnapshot 保持不变。
+func SnapshotCarrierBuckets() CarrierBucketSnapshot {
+	return CarrierBucketSnapshot{
+		LanOK:    carrierLanOK.Load(),
+		UDPOK:    carrierUDPOK.Load(),
+		PikoOK:   carrierPikoOK.Load(),
+		UDPErr:   carrierUDPErr.Load(),
+		DialFail: carrierDialFail.Load(),
+	}
 }
 
 // ExitClient 到单一 mesh 出口节点的 SSH 出口客户端(SPEC §5.1 完整定义)。
@@ -142,10 +179,20 @@ func (c *ExitClient) DialContextTraced(ctx context.Context, md *M.Metadata) (net
 		if err == nil {
 			raw = conn
 			trace.Used = t.Name()
+			// Used 确定即该载体打通:此处一处 switch 即覆盖三载体(非三处)。
+			switch trace.Used {
+			case "lan": // LANTransport.Name()(transport.go)
+				carrierLanOK.Add(1)
+			case "udp": // UDPTransport.Name()(punch.go)
+				carrierUDPOK.Add(1)
+			case "piko": // PikoTransport.Name()(transport.go)
+				carrierPikoOK.Add(1)
+			}
 			break
 		}
 		if _, isUDP := t.(UDPTransport); isUDP {
 			trace.UDPErr = err // 回落成功也要留痕(静默回落排查重点)
+			carrierUDPErr.Add(1)
 		}
 		if t.IsRelay() {
 			relayErr = err
@@ -159,6 +206,7 @@ func (c *ExitClient) DialContextTraced(ctx context.Context, md *M.Metadata) (net
 			// 定位「哪个 peer 的哪类流量没有可用载体」,不再是无来源裸句。
 			return nil, trace, fmt.Errorf("mesh: no transport admits %s (class=%s): %w", c.spec.DeviceID, class, errNoTransportAdmits)
 		}
+		carrierDialFail.Add(1) // 全载体拨号聚合失败才记 DialFail(与 UDPErr 分立)
 		if relayErr != nil && directErr != nil {
 			return nil, trace, fmt.Errorf("mesh: no SSH transport to %s (direct_last_err: %v, relay_last_err: %w)",
 				c.spec.DeviceID, directErr, relayErr)

@@ -127,10 +127,10 @@ func toolCallText(t *testing.T, resp map[string]interface{}) (string, bool) {
 	return text, isErr
 }
 
-func TestPeerMCPToolsList_HasFivePeerToolsAndThreeAIMCPTools(t *testing.T) {
-	// 钉夹具：本用例断言的是「peer 五工具」的份额，而 ai_run_* 的在场与否
-	// 取决于 ai_mcp 门控——不钉的话开发机上若有人关了 ai_mcp，这条会莫名
-	// 从 8 变 5 而看不出是门控还是工具表回归。
+func TestPeerMCPToolsList_HasNinePeerToolsAndThreeAIMCPTools(t *testing.T) {
+	// 钉夹具：本用例断言的是「peer 五工具 + mesh 四读面」的份额，而 ai_run_*
+	// 的在场与否取决于 ai_mcp 门控——不钉的话开发机上若有人关了 ai_mcp，这条
+	// 会莫名从 12 变 9 而看不出是门控还是工具表回归。
 	pinAIMCPGateConfig(t, "") // 文件不存在 = 默认开
 	rec := newMCPTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("tools/list must not touch the local agent")
@@ -143,12 +143,13 @@ func TestPeerMCPToolsList_HasFivePeerToolsAndThreeAIMCPTools(t *testing.T) {
 	}
 	result, _ := resp["result"].(map[string]interface{})
 	tools, _ := result["tools"].([]interface{})
-	// 5 peer + 3 ai_run_*（门控默认开）。
-	if len(tools) != 8 {
-		t.Fatalf("tools = %d, want 8", len(tools))
+	// 9 peer（含 mesh 诊断读面四件）+ 3 ai_run_*（门控默认开）。
+	if len(tools) != 12 {
+		t.Fatalf("tools = %d, want 12", len(tools))
 	}
 	want := map[string]bool{
 		"peer_exec": false, "peer_fetch_file": false, "device_list": false, "device_info": false, "device_note": false,
+		"mesh_readiness": false, "mesh_identity": false, "mesh_stun_probe": false, "mesh_lan_candidates": false,
 		"ai_run_start": false, "ai_run_status": false, "ai_run_approve": false,
 	}
 	for _, item := range tools {
@@ -372,6 +373,10 @@ func TestPeerMCPCall_LargeResultWithin4MiBCap(t *testing.T) {
 // 那条路（bridge 是给 agentcore 内核注入工具用的），而是 stdio 面直打
 // /api/agent/ai/mcp/* 端点。把两者混在一张表里，等于宣称 ai_run_* 也在内核
 // 工具清单里——那是错的，会让后来人照着这张表去 services 侧找不存在的桥。
+//
+// 第 7 组 mesh_* 同理不在映射里：它们是 agentcore 面+stdio 面双面读工具
+// （读面批 2026-11-20），CLI bridge（agent_ai_tool_ask_peer.go）刻意不注入
+// ——两面语义由 PeerMCPContractSpecs 契约测试钉住，与 bridge 无关。
 func TestPeerMCPToolNamesMapBridgeNames(t *testing.T) {
 	// bridge 名(services/agent_ai_tool_ask_peer.go)
 	bridgeNames := map[string]bool{
@@ -386,9 +391,19 @@ func TestPeerMCPToolNamesMapBridgeNames(t *testing.T) {
 		"device_list":     "peer_device_list",
 		"device_note":     "peer_device_note",
 	}
+	// 有 stdio 面但无 bridge 对应物的工具组:在册声明而非静默放行——新增
+	// 此类工具时必须显式入册,否则这条守不住「谁该有 bridge、谁没有」。
+	noBridgeFace := map[string]bool{
+		"mesh_readiness": true, "mesh_identity": true,
+		"mesh_stun_probe": true, "mesh_lan_candidates": true,
+	}
 	seen := map[string]bool{}
 	for _, tool := range peerMCPTools {
 		if isAIMCPToolName(tool.name) {
+			continue
+		}
+		if noBridgeFace[tool.name] {
+			seen[tool.name] = true
 			continue
 		}
 		bridge, ok := mapping[tool.name]
@@ -400,8 +415,8 @@ func TestPeerMCPToolNamesMapBridgeNames(t *testing.T) {
 		}
 		seen[tool.name] = true
 	}
-	if len(seen) != len(mapping) {
-		t.Fatalf("stdio has %d tools, mapping has %d", len(seen), len(mapping))
+	if len(seen) != len(mapping)+len(noBridgeFace) {
+		t.Fatalf("stdio has %d tools, mapping has %d + %d no-bridge-face", len(seen), len(mapping), len(noBridgeFace))
 	}
 }
 

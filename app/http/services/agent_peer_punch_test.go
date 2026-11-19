@@ -1558,3 +1558,451 @@ func TestAgentPunchDialMissPublicSkipsClassify(t *testing.T) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// 判型结果账本(组网诊断读面批 Task 2):recordClassifyOutcome 三态落账 +
+// 快照键语义 + A/B 两侧分支接线 + 聚合访问器
+// ---------------------------------------------------------------------------
+
+// TestAgentPeerPunchClassifyLedgerRecorder 直构 A 侧实例连记三态:map 惰性
+// 初始化(测试直构零值实例不 panic)、同键重判最新一笔顶替、快照按键排序
+// 稳定输出、At 为可解析 RFC3339。
+func TestAgentPeerPunchClassifyLedgerRecorder(t *testing.T) {
+	a := &agentPeerPunchA{} // 直构零值实例:classifyOutcomes 未初始化,record 内惰性建
+	a.recordClassifyOutcome("peer-2", "symmetric")
+	a.recordClassifyOutcome("peer-1", "ok")
+	a.recordClassifyOutcome("peer-2", "unreachable") // 同键顶替(最新一笔胜出)
+
+	snap := a.classifySnapshot()
+	if len(snap) != 2 {
+		t.Fatalf("两键三笔(同键顶替)快照应恰两笔: %v", snap)
+	}
+	if snap[0].PeerID != "peer-1" || snap[0].Outcome != "ok" {
+		t.Fatalf("快照应按键排序输出 peer-1=ok: %v", snap)
+	}
+	if snap[1].PeerID != "peer-2" || snap[1].Outcome != "unreachable" {
+		t.Fatalf("同键重判应以最新一笔顶替(unreachable 胜出): %v", snap)
+	}
+	if _, err := time.Parse(time.RFC3339, snap[1].At); err != nil {
+		t.Fatalf("At 应为可解析 RFC3339: %q %v", snap[1].At, err)
+	}
+}
+
+// TestAgentPeerPunchBClassifyLedgerRules B 侧三分支接线 + 键语义断言:
+// 账本键=本机 device_id(selfPeerID,语义沿 handleSession 的 Record(selfPeerID)
+// 注——线协议 session 帧不携带 A 设备身份,B 判的是自身 NAT);unreachable
+// 分支照铁律③不写 memo(空 memo+账本 unreachable=「STUN 坏」判据点)。
+func TestAgentPeerPunchBClassifyLedgerRules(t *testing.T) {
+	stubServe := func(t *testing.T) func(*net.UDPConn, punch.ListenerOpts) (int, <-chan struct{}, error) {
+		done := make(chan struct{})
+		t.Cleanup(func() { close(done) }) // 注入桩 done 永无人关,收摊防 goroutine 泄漏(memo-rules 同款先例)
+		return func(_ *net.UDPConn, _ punch.ListenerOpts) (int, <-chan struct{}, error) {
+			return 45679, done, nil
+		}
+	}
+
+	t.Run("ok_key_is_self_peer_id", func(t *testing.T) {
+		b, sink, _ := newPunchBForTest(t, func(bb *agentPeerPunchB) { bb.serve = stubServe(t) })
+		b.handleSession(punchSessionFrame("pr-led-ok", "ps-led-ok", "tok", 15), sink.write, "device-b-self")
+
+		snap := b.classifySnapshot()
+		if len(snap) != 1 {
+			t.Fatalf("单会话应恰一笔账: %v", snap)
+		}
+		if snap[0].PeerID != "device-b-self" {
+			t.Fatalf("side=b 键必须是本机 device_id(键语义沿 Record(selfPeerID) 注): %v", snap)
+		}
+		if snap[0].Outcome != "ok" {
+			t.Fatalf("默认桩判型成功应记 ok: %v", snap)
+		}
+	})
+
+	t.Run("symmetric_key_self_and_memo", func(t *testing.T) {
+		b, sink, _ := newPunchBForTest(t, func(bb *agentPeerPunchB) {
+			bb.classify = func(*net.UDPConn, []string) (punch.PublicMapping, bool, error) {
+				return punch.PublicMapping{IP: net.IPv4(203, 0, 113, 7), Port: 45000}, true, nil
+			}
+			bb.serve = stubServe(t)
+		})
+		b.handleSession(punchSessionFrame("pr-led-sym", "ps-led-sym", "tok", 15), sink.write, "device-b-self")
+
+		snap := b.classifySnapshot()
+		if len(snap) != 1 || snap[0].PeerID != "device-b-self" || snap[0].Outcome != "symmetric" {
+			t.Fatalf("symmetric 分支应记 键=本机 device_id 的 symmetric: %v", snap)
+		}
+		if !b.skipMemo.ShouldSkip("device-b-self") {
+			t.Fatal("symmetric 分支仍须写 SkipMemo(铁律②记账职责不变,账本是增量不是替代)")
+		}
+	})
+
+	t.Run("unreachable_ledger_without_memo", func(t *testing.T) {
+		b, sink, _ := newPunchBForTest(t, func(bb *agentPeerPunchB) {
+			bb.classify = func(*net.UDPConn, []string) (punch.PublicMapping, bool, error) {
+				return punch.PublicMapping{}, false, fmt.Errorf("stun classify: 全部 2 台服务器不可达")
+			}
+			bb.serve = stubServe(t)
+		})
+		b.handleSession(punchSessionFrame("pr-led-un", "ps-led-un", "tok", 15), sink.write, "device-b-self")
+
+		snap := b.classifySnapshot()
+		if len(snap) != 1 || snap[0].PeerID != "device-b-self" || snap[0].Outcome != "unreachable" {
+			t.Fatalf("classify 失败应记 键=本机 device_id 的 unreachable: %v", snap)
+		}
+		if b.skipMemo.ShouldSkip("device-b-self") {
+			t.Fatal("铁律③:STUN 不可达不得写 SkipMemo(空 memo+账本 unreachable 才是「STUN 坏」)")
+		}
+	})
+}
+
+// TestAgentPeerPunchAClassifyLedgerWiring A 侧四分支接线(键=对端 device_id):
+// ok/symmetric/unreachable 走 dialMiss classify 块;public_declared 走
+// session.result public 声明跳判型的 skip 分支(punch-public-peer 批)。
+func TestAgentPeerPunchAClassifyLedgerWiring(t *testing.T) {
+	t.Run("ok_after_success", func(t *testing.T) {
+		a, _ := newPunchAForTest(t) // 默认桩:判型成功且非 symmetric
+		conn, err := a.dialSource(context.Background(), "dev-b")
+		if err != nil {
+			t.Fatalf("默认桩全链拨号应成功: %v", err)
+		}
+		_ = conn.Close()
+
+		snap := a.classifySnapshot()
+		if len(snap) != 1 || snap[0].PeerID != "dev-b" || snap[0].Outcome != "ok" {
+			t.Fatalf("拨号成功应记 键=对端 device_id 的 ok: %v", snap)
+		}
+	})
+
+	t.Run("symmetric_suspect_recorded", func(t *testing.T) {
+		a, _ := newPunchAForTest(t, func(a *agentPeerPunchA) {
+			a.classify = func(*net.UDPConn, []string) (punch.PublicMapping, bool, error) {
+				return punch.PublicMapping{}, true, nil
+			}
+		})
+		if _, err := a.dialSource(context.Background(), "dev-b"); err == nil {
+			t.Fatal("symmetric 应拒绝拨号(落 piko)")
+		}
+		snap := a.classifySnapshot()
+		if len(snap) != 1 || snap[0].PeerID != "dev-b" || snap[0].Outcome != "symmetric" {
+			t.Fatalf("symmetric 分支应记 键=对端 device_id 的 symmetric: %v", snap)
+		}
+		if !a.skipMemo.ShouldSkip("dev-b") {
+			t.Fatal("symmetric 分支仍须写 SkipMemo(per-peer 记账职责不变)")
+		}
+	})
+
+	t.Run("unreachable_but_punch_continues", func(t *testing.T) {
+		a, _ := newPunchAForTest(t, func(a *agentPeerPunchA) {
+			a.classify = func(*net.UDPConn, []string) (punch.PublicMapping, bool, error) {
+				return punch.PublicMapping{}, false, context.DeadlineExceeded
+			}
+		})
+		if _, err := a.dialSource(context.Background(), "dev-b"); err != nil {
+			t.Fatalf("铁律:不可达打洞照试,拨号应继续成功: %v", err)
+		}
+		snap := a.classifySnapshot()
+		if len(snap) != 1 || snap[0].PeerID != "dev-b" || snap[0].Outcome != "unreachable" {
+			t.Fatalf("classify 失败应记 键=对端 device_id 的 unreachable: %v", snap)
+		}
+		if a.skipMemo.ShouldSkip("dev-b") {
+			t.Fatal("铁律③:不可达不得写 SkipMemo(账本与 memo 的分界正是本断言)")
+		}
+	})
+
+	t.Run("public_declared_skips_classify", func(t *testing.T) {
+		classifyCalls := 0
+		a, fake := newPunchAForTest(t, func(a *agentPeerPunchA) {
+			orig := a.classify
+			a.classify = func(c *net.UDPConn, servers []string) (punch.PublicMapping, bool, error) {
+				classifyCalls++
+				return orig(c, servers)
+			}
+		})
+		fake.public = true // result 捎带 public:true(逐用例 opt-in,PublicSkipsClassify 同款)
+		conn, err := a.dialSource(context.Background(), "dev-b")
+		if err != nil {
+			t.Fatalf("public 直挂拨号应成功: %v", err)
+		}
+		_ = conn.Close()
+
+		if classifyCalls != 0 {
+			t.Fatalf("public 声明下 A 侧不得 classify,实调 %d 次", classifyCalls)
+		}
+		snap := a.classifySnapshot()
+		if len(snap) != 1 || snap[0].PeerID != "dev-b" || snap[0].Outcome != "public_declared" {
+			t.Fatalf("public 声明应记 键=对端 device_id 的 public_declared: %v", snap)
+		}
+	})
+}
+
+// TestMeshPunchClassifyStatusAggregate 聚合访问器:两侧必须非 nil(未初始化
+// =空数组,nil 安全语义)。只断言非 nil 不断言空——进程级 shared 单例可能
+// 被其他用例的 shared 路径落过账,聚合面只保证「有数组可读」。
+func TestMeshPunchClassifyStatusAggregate(t *testing.T) {
+	snap := MeshPunchClassifyStatus()
+	if snap.SideA == nil || snap.SideB == nil {
+		t.Fatalf("聚合快照两侧必须非 nil(未初始化=空数组): side_a=%v side_b=%v", snap.SideA, snap.SideB)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 会话快照聚合(组网诊断读面批 Task 3)
+// ---------------------------------------------------------------------------
+
+// TestMeshPunchSessionsStatusAggregate 聚合访问器 nil 安全面(与 Task 2 的
+// TestMeshPunchClassifyStatusAggregate 同款口径):各表段/memo 两侧必须非
+// nil——未初始化=空数组,消费方 range/序列化零分支。只断言非 nil 不断言空
+// ——进程级 shared 单例可能被其他用例的 shared 路径落过账。
+func TestMeshPunchSessionsStatusAggregate(t *testing.T) {
+	snap := MeshPunchSessionsStatus()
+	if snap.Cache == nil || snap.Sockets == nil || snap.SideB.Sessions == nil {
+		t.Fatalf("聚合快照各表段必须非 nil: cache=%v sockets=%v side_b.sessions=%v",
+			snap.Cache, snap.Sockets, snap.SideB.Sessions)
+	}
+	if snap.Memo.SideA == nil || snap.Memo.SideB == nil {
+		t.Fatalf("memo 快照两侧必须非 nil: side_a=%v side_b=%v", snap.Memo.SideA, snap.Memo.SideB)
+	}
+}
+
+// TestMeshPunchSessionsStatusASideCounters 真链装配(全注入 A 侧+假 B
+// loopback)下的 A 侧快照断言:逐臂计数锚定+sock 表 purpose 拆解+表态零污染
+// (transfer 一次性拨号不写缓存/sock 表)+开流臂入账(僵尸窗开流失败落
+// dial_fail)。各子测独立实例,计数互不串扰。
+func TestMeshPunchSessionsStatusASideCounters(t *testing.T) {
+	t.Run("success_hit_and_mesh_socket_purpose", func(t *testing.T) {
+		a, _ := newPunchAForTest(t)
+		if _, err := a.dialSource(context.Background(), "dev-b"); err != nil {
+			t.Fatalf("首拨失败: %v", err)
+		}
+		c := a.dialCounters()
+		if c.Miss != 1 || c.Hit != 0 || c.Success != 1 {
+			t.Fatalf("首拨计数应 miss=1/hit=0/success=1: %+v", c)
+		}
+		socks := a.socketsSnapshot()
+		if len(socks) != 1 || socks[0].Key != "dev-b" || socks[0].PeerID != "dev-b" || socks[0].Purpose != "mesh" {
+			t.Fatalf("mesh 裸键应拆解 purpose=mesh/peer=键本身: %+v", socks)
+		}
+		if cs := a.cacheSnapshot(); len(cs) != 1 || cs[0].Key != "dev-b" || cs[0].Refs != 0 || cs[0].InFlight || cs[0].Dead {
+			t.Fatalf("成功拨号后缓存应恰一表项且 refs=0(lease 即取即释)、会话未死: %+v", cs)
+		}
+		if _, err := a.dialSource(context.Background(), "dev-b"); err != nil {
+			t.Fatalf("二拨(缓存)失败: %v", err)
+		}
+		c = a.dialCounters()
+		if c.Miss != 1 || c.Hit != 1 || c.Success != 1 {
+			t.Fatalf("二拨应 hit=1 且 miss/success 不动: %+v", c)
+		}
+	})
+	t.Run("transfer_key_purpose_split", func(t *testing.T) {
+		// purpose 拆解=punchCacheKey 拼装的互逆;transfer 一次性拨号不写表,
+		// 前缀键用真 socket 直填表(快照面读键,不触执行路径)。
+		a, _ := newPunchAForTest(t)
+		sock, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatalf("造测试 socket 失败: %v", err)
+		}
+		t.Cleanup(func() { _ = sock.Close() })
+		a.mu.Lock()
+		a.sockets[punchCacheKey("dev-c", "transfer")] = sock
+		a.mu.Unlock()
+		socks := a.socketsSnapshot()
+		if len(socks) != 1 {
+			t.Fatalf("应恰一 sock 表项: %+v", socks)
+		}
+		e := socks[0]
+		if e.Key != "transfer:dev-c" || e.PeerID != "dev-c" || e.Purpose != "transfer" {
+			t.Fatalf("前缀键应拆解 purpose=transfer/peer=去前缀: %+v", e)
+		}
+	})
+	t.Run("transfer_one_shot_no_table_writes", func(t *testing.T) {
+		a, _ := newPunchAForTest(t)
+		conn, err := a.dialSourceOpts(context.Background(), "dev-b", punchDialOpts{
+			budget:     3 * time.Second,
+			purpose:    "transfer",
+			transferID: "tid-snap-1",
+		})
+		if err != nil {
+			t.Fatalf("transfer 一次性拨号失败: %v", err)
+		}
+		_ = conn.Close()
+		c := a.dialCounters()
+		if c.Miss != 1 || c.Success != 1 || c.Hit != 0 {
+			t.Fatalf("transfer 成功计数应 miss=1/success=1/hit=0: %+v", c)
+		}
+		if cs := a.cacheSnapshot(); len(cs) != 0 {
+			t.Fatalf("transfer 拨号不得写缓存(一次性): %+v", cs)
+		}
+		if socks := a.socketsSnapshot(); len(socks) != 0 {
+			t.Fatalf("transfer 拨号不得写 sock 表(一次性): %+v", socks)
+		}
+	})
+	t.Run("symmetric_then_memo_skip", func(t *testing.T) {
+		a, _ := newPunchAForTest(t, func(a *agentPeerPunchA) {
+			a.classify = func(*net.UDPConn, []string) (punch.PublicMapping, bool, error) {
+				return punch.PublicMapping{}, true, nil
+			}
+		})
+		if _, err := a.dialSource(context.Background(), "dev-b"); err == nil {
+			t.Fatal("symmetric 应失败返回(落 piko)")
+		}
+		if _, err := a.dialSource(context.Background(), "dev-b"); err == nil {
+			t.Fatal("memo 命中应继续拒绝")
+		}
+		c := a.dialCounters()
+		if c.Symmetric != 1 || c.MemoSkip != 1 || c.Miss != 2 || c.Hit != 0 || c.Success != 0 {
+			t.Fatalf("对称链计数应 symmetric=1/memo_skip=1/miss=2/零 hit 零 success: %+v", c)
+		}
+		if memo := agentPunchMemoSnapshot(a.skipMemo); len(memo) != 1 || memo[0].PeerID != "dev-b" || memo[0].Expired {
+			t.Fatalf("memo 快照应恰一条未过期 dev-b: %+v", memo)
+		}
+	})
+	t.Run("send_session_fail", func(t *testing.T) {
+		a, _ := newPunchAForTest(t, func(a *agentPeerPunchA) {
+			a.send = func(map[string]interface{}) error { return fmt.Errorf("测试注入:发送即败") }
+		})
+		if _, err := a.dialSource(context.Background(), "dev-b"); err == nil {
+			t.Fatal("send 失败应透传错误")
+		}
+		if c := a.dialCounters(); c.SendFail != 1 || c.Success != 0 || c.Hit != 0 {
+			t.Fatalf("send 失败臂计数应 send_session_fail=1 其余不动: %+v", c)
+		}
+	})
+	t.Run("dial_fail_short_budget_dead_port", func(t *testing.T) {
+		a, _ := newPunchAForTest(t, func(a *agentPeerPunchA) {
+			// 假 B 短路:回 ok result+指向死口的候选(不起真 listener),
+			// A 侧 DialPeer 短预算打不穿即 dial_fail 臂。
+			a.send = func(payload map[string]interface{}) error {
+				if payload["type"] == models.AgentEventPeerPunchSession {
+					requestID, _ := payload["request_id"].(string)
+					a.handleResultFrame(map[string]interface{}{
+						"type":        models.AgentEventPeerPunchSessionResult,
+						"request_id":  requestID,
+						"ok":          true,
+						"port":        float64(45001),
+						"fingerprint": "fp-snap-dead-port",
+					})
+					a.handleCandidatesFrame(map[string]interface{}{
+						"type":       models.AgentEventPeerPunchCandidates,
+						"session_id": payload["session_id"],
+						"candidates": []interface{}{"127.0.0.1:1"},
+					})
+				}
+				return nil
+			}
+		})
+		if _, err := a.dialSourceOpts(context.Background(), "dev-b", punchDialOpts{budget: 300 * time.Millisecond}); err == nil {
+			t.Fatal("死口短预算拨号应失败")
+		}
+		if c := a.dialCounters(); c.DialFail != 1 || c.Success != 0 || c.Hit != 0 {
+			t.Fatalf("拨号失败臂计数应 dial_fail=1 其余不动: %+v", c)
+		}
+	})
+	t.Run("zombie_open_stream_lands_dial_fail", func(t *testing.T) {
+		// I-1 拍板的开流臂入账:真链打通一条会话后本侧收摊(僵尸窗,Done
+		// 秒级关),开流必败——直调 dialTransferOneShot(transfer 腿锚点同包
+		// 可直达),死会话开流失败应落 dial_fail 而非 success。
+		a, _ := newPunchAForTest(t)
+		const token = "tok-snap-zombie"
+		sCert, sFP, err := generateAgentLanCertificate()
+		if err != nil {
+			t.Fatalf("现签 B 证书失败: %v", err)
+		}
+		cCert, _, err := generateAgentLanCertificate()
+		if err != nil {
+			t.Fatalf("现签 A 证书失败: %v", err)
+		}
+		bSock, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatalf("起 B 侧 socket 失败: %v", err)
+		}
+		t.Cleanup(func() { _ = bSock.Close() })
+		port, bDone, err := punch.ServeListener(bSock, punch.ListenerOpts{
+			TTL:     30 * time.Second,
+			Token:   token,
+			TLS:     punch.PunchTLSConfig{ServerCert: sCert, ExpectedToken: token},
+			Handler: func(c net.Conn) { _, _ = io.Copy(c, c) },
+		})
+		if err != nil {
+			t.Fatalf("起 B 侧 listener 失败: %v", err)
+		}
+		safeGo("punch_snap_zombie_reaper", func() { <-bDone; _ = bSock.Close() })
+		aSock, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatalf("起 A 侧 socket 失败: %v", err)
+		}
+		session, err := punch.DialPeer(aSock, punch.DialOpts{
+			Token:      token,
+			TLS:        punch.PunchTLSConfig{ClientCert: cCert, ServerFingerprint: sFP},
+			Candidates: func() []string { return []string{fmt.Sprintf("127.0.0.1:%d", port)} },
+		})
+		if err != nil {
+			t.Fatalf("真拨打通会话失败: %v", err)
+		}
+		// 僵尸窗制造:本侧收摊→Done 关(本侧自关无对端静默窗)。
+		_ = session.Transport.Close()
+		select {
+		case <-session.Conn.Context().Done():
+		case <-time.After(3 * time.Second):
+			t.Fatal("本侧收摊后会话应死(开流失败前提不成立)")
+		}
+		if _, err := a.dialTransferOneShot(context.Background(), session, aSock, "dev-b", "transfer:dev-b", "tid-zombie"); err == nil {
+			t.Fatal("僵尸窗开流应失败")
+		}
+		if c := a.dialCounters(); c.DialFail != 1 || c.Success != 0 {
+			t.Fatalf("开流失败应落 dial_fail 而非 success(I-1 锚点): %+v", c)
+		}
+	})
+}
+
+// TestMeshPunchSessionsStatusBSideRegistry B 侧在册快照:register 在册会话
+// (可收控 done)→active_count/startedAt+ttlSeconds 派生的 age/remaining/done
+// 逐字段断言,含 M-1 拍板的子 90s TTL 真值面(帧内钳制 TTL 直填→remaining
+// 按真值不超额;漏填走 register 兜底=设计满额);done 关→快照报 done=true
+// (摘表归 reaper,快照只读);removeSession 后零在册且空数组非 nil。
+func TestMeshPunchSessionsStatusBSideRegistry(t *testing.T) {
+	b := newAgentPeerPunchB()
+	done := make(chan struct{})
+	sess := &agentPeerPunchSession{sessionID: "snap-sess-1", done: done}
+	b.register(sess) // 漏填 ttlSeconds→register 兜底设计满额
+	done2 := make(chan struct{})
+	sess2 := &agentPeerPunchSession{sessionID: "snap-sess-2", done: done2, ttlSeconds: 15}
+	b.register(sess2) // 子 90s TTL 真值直填
+
+	snap := b.sessionsSnapshot()
+	if snap.ActiveCount != 2 || len(snap.Sessions) != 2 {
+		t.Fatalf("应恰两条在册会话: %+v", snap)
+	}
+	if snap.Sessions[0].SessionID != "snap-sess-1" || snap.Sessions[1].SessionID != "snap-sess-2" {
+		t.Fatalf("快照必须按 session_id 排序: %+v", snap.Sessions)
+	}
+	e := snap.Sessions[0]
+	if e.SessionID != "snap-sess-1" || e.Done {
+		t.Fatalf("在册会话字段错(session_id/done): %+v", e)
+	}
+	if e.AgeSeconds < 0 || e.AgeSeconds > 5 {
+		t.Fatalf("刚注册会话 age 应≈0: %+v", e)
+	}
+	if e.RemainingSeconds <= agentPunchSessionMaxTTLSeconds-5 || e.RemainingSeconds > agentPunchSessionMaxTTLSeconds {
+		t.Fatalf("兜底 TTL 会话剩余应≈满额(90-age): %+v", e)
+	}
+	e2 := snap.Sessions[1]
+	if e2.Done {
+		t.Fatalf("在册会话不得报 done: %+v", e2)
+	}
+	if e2.RemainingSeconds <= 10 || e2.RemainingSeconds > 15 {
+		t.Fatalf("子 90s TTL 会话剩余应按真值(≈15,非设计满额 90): %+v", e2)
+	}
+
+	// done 关:快照面应报 done=true,表项仍按在册计(摘表是 reaper 的动作面)。
+	close(done)
+	snap = b.sessionsSnapshot()
+	if snap.ActiveCount != 2 || !snap.Sessions[0].Done {
+		t.Fatalf("done 关后快照应报 done=true 且仍按在册计: %+v", snap)
+	}
+
+	b.removeSession(sess)
+	b.removeSession(sess2)
+	snap = b.sessionsSnapshot()
+	if snap.ActiveCount != 0 || snap.Sessions == nil || len(snap.Sessions) != 0 {
+		t.Fatalf("摘表后应零在册且空数组非 nil: %+v", snap)
+	}
+}

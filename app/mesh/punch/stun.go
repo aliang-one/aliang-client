@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"sync"
 	"time"
 
@@ -132,10 +133,138 @@ func Discover(conn *net.UDPConn, server string, timeout time.Duration) (PublicMa
 	return PublicMapping{}, fmt.Errorf("stun discover: %s 在 %v 内无有效应答", server, timeout)
 }
 
-// Classify 逐台 Discover 做端口比对判对称 NAT:任两台应答端口不同即
-// symmetricSuspect=true(返回首台应答的映射);全部不可达报 error;
-// 恰好一台应答则判型降级为非对称返回该映射——端口比对不成立不能冤枉成
-// symmetric,真对称导致的打洞失败由 SkipMemo 失败记忆兜底。
+// stun_probe 逐台探测的判型结论词汇(NAT 三态):symmetric=任两台应答端口
+// 不同;non_symmetric=多台应答且端口一致(端口比对成立、非对称);unknown=
+// 恰一台应答,端口比对不成立(降级不冤枉,真对称由 SkipMemo 失败记忆兜底)。
+// 不可达台 NatType 留空——学不到映射就无从判型,空串即诚实。
+const (
+	NatTypeSymmetric    = "symmetric"
+	NatTypeNonSymmetric = "non_symmetric"
+	NatTypeUnknown      = "unknown"
+)
+
+// StunProbeEntry ClassifyWithBudget 的单台探测记录:server/应答与否/学到的
+// 映射端口/判型结论/失败原因。
+type StunProbeEntry struct {
+	Server string
+	OK     bool
+	// MappedIP 仅供 Classify 薄壳回译 PublicMapping(编排层要 IP:Port 组自
+	// 候选),刻意 json:"-" 冻结「不进诊断输出」意图——未来谁直接 marshal
+	// 本结构也不会把本机公网 IP 以 base64 形态外泄(诊断消费方按端口比对
+	// 读结论,IP 外泄无增益)。
+	MappedIP   net.IP `json:"-"`
+	MappedPort int
+	NatType    string
+	Err        string
+}
+
+// ClassifyResult ClassifyWithBudget 的产出:per-server 结果 + truncated
+// (结果不完整:总预算耗尽,或对称判实即停后余台未测)+ 对称结论。
+// 失败不表达为全局 error——「某台不可达」是诊断的正常结论而非服务端错误
+// (逐台 Err 如实透传,照 status_ssh_test_handler 分层结论口径)。
+type ClassifyResult struct {
+	Results   []StunProbeEntry
+	Truncated bool
+	Symmetric bool
+}
+
+// ClassifyWithBudget 是 Classify 的预算化变体(语义照 Classify,唯一增量是
+// 循环内查总预算):逐台 Discover,每台启动前查剩余预算,耗尽即停并标
+// truncated(已测台数如实——results 只含已测台);单台预算=
+// min(classifyDiscoverTimeout, 剩余)。判 symmetric 的时机与 Classify 同:
+// 任两台应答端口不同即判实——判实即停,结论已定,余台不再消耗预算,余下
+// 未测台以 truncated 如实标注(不假装完整)。语义单点在本包:诊断端点
+// (/api/mesh/stun_probe)与打洞编排(Classify 薄壳)共用同一条循环。
+//
+// 与 Classify 的返回形态差异:失败不是全局 error 而是逐台 Err 记录;全部
+// 不可达也不报错,调用方按 Results 自行判读(「STUN 坏」的判据点=空 memo
+// +账本 unreachable,由编排层各自落账,本函数不掺和)。
+//
+// 防御形态:conn 为 nil 时逐台回 Err 记录不探测(不 panic);servers 为空回
+// 空结果。Classify 薄壳在调用前自做同款守卫,保持其既有 error 契约不变。
+func ClassifyWithBudget(conn *net.UDPConn, servers []string, totalBudget time.Duration) ClassifyResult {
+	result := ClassifyResult{Results: make([]StunProbeEntry, 0, len(servers))}
+	if conn == nil {
+		for _, server := range servers {
+			result.Results = append(result.Results, StunProbeEntry{Server: server, Err: "stun classify: conn 为 nil"})
+		}
+		return result
+	}
+
+	start := time.Now()
+	var (
+		firstPort int
+		haveFirst bool
+	)
+	for i, server := range servers {
+		remaining := totalBudget - time.Since(start)
+		if remaining <= 0 {
+			// 总预算耗尽:停止,余台未测以 truncated 标注。
+			result.Truncated = true
+			break
+		}
+		perServer := classifyDiscoverTimeout
+		if remaining < perServer {
+			perServer = remaining
+		}
+		mapping, err := Discover(conn, server, perServer)
+		if err != nil {
+			result.Results = append(result.Results, StunProbeEntry{Server: server, Err: err.Error()})
+			continue
+		}
+		entry := StunProbeEntry{Server: server, OK: true, MappedIP: mapping.IP, MappedPort: mapping.Port}
+		if !haveFirst {
+			firstPort, haveFirst = mapping.Port, true
+			result.Results = append(result.Results, entry)
+			continue
+		}
+		if mapping.Port != firstPort {
+			// 两台都应答且端口不同:对同一 socket,不同目的地址换来不同
+			// 外部端口,正是对称 NAT 的签名(与 Classify 同判据)。
+			result.Symmetric = true
+			result.Results = append(result.Results, entry)
+			if i < len(servers)-1 {
+				result.Truncated = true // 判实即停,余台未测如实标注
+			}
+			break
+		}
+		result.Results = append(result.Results, entry)
+	}
+
+	// 判型结论按台回填(应答台共享全局结论;不可达台留空=无从判型)。
+	okCount := 0
+	for _, e := range result.Results {
+		if e.OK {
+			okCount++
+		}
+	}
+	nat := ""
+	switch {
+	case result.Symmetric:
+		nat = NatTypeSymmetric
+	case okCount >= 2:
+		nat = NatTypeNonSymmetric
+	case okCount == 1:
+		nat = NatTypeUnknown
+	}
+	for i := range result.Results {
+		if result.Results[i].OK {
+			result.Results[i].NatType = nat
+		}
+	}
+	return result
+}
+
+// Classify 逐台 Discover 做端口比对判对称 NAT(既有编排层契约,返回
+// (首台应答映射, symmetricSuspect, error)):任两台应答端口不同即
+// symmetricSuspect=true;全部不可达报 error;恰好一台应答则判型降级为非对称
+// 返回该映射——端口比对不成立不能冤枉成 symmetric,真对称导致的打洞失败由
+// SkipMemo 失败记忆兜底。
+//
+// 实现自显式活探测批(mesh 诊断 Task 7)起改为 ClassifyWithBudget 薄壳:
+// 总预算=台数×单台预算,每台启动前剩余 ≥ 单台预算(min 不降档),与旧实现
+// 的逐台 classifyDiscoverTimeout 全额预算逐一等价;判实即停(early return)
+// 语义原样保留,探测顺序/判据/早退时机/错误文案全同,调用方零变化。
 //
 // 判型采用「双服务器端口比对」这一简化式:v1 不做 RFC 5780 完整行为
 // 探测(mapping-dependent filtering 等),也不做 Tailscale 式端口预测,
@@ -148,34 +277,27 @@ func Classify(conn *net.UDPConn, servers []string) (PublicMapping, bool, error) 
 	if len(servers) == 0 {
 		return PublicMapping{}, false, errors.New("stun classify: servers 为空")
 	}
-
-	var (
-		first     PublicMapping
-		haveFirst bool
-		errs      []error
-	)
-	for _, server := range servers {
-		mapping, err := Discover(conn, server, classifyDiscoverTimeout)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		if !haveFirst {
-			first, haveFirst = mapping, true
-			continue
-		}
-		if mapping.Port != first.Port {
-			// 两台都应答且端口不同:对同一 socket,不同目的地址换来不同
-			// 外部端口,正是对称 NAT 的签名。
-			return first, true, nil
+	res := ClassifyWithBudget(conn, servers, time.Duration(len(servers))*classifyDiscoverTimeout)
+	var first *StunProbeEntry
+	for i := range res.Results {
+		if res.Results[i].OK {
+			first = &res.Results[i]
+			break
 		}
 	}
-	if !haveFirst {
+	if first == nil {
 		// 全部不可达≠symmetric:按「STUN 不可用」交给调用方落 piko,
 		// 且不该写 SkipMemo(写不写由调用方决定,这里只报 error)。
+		// 错误文案逐台回拼,与旧实现 errors.Join(各 Discover err)逐字同形。
+		errs := make([]error, 0, len(res.Results))
+		for _, e := range res.Results {
+			if e.Err != "" {
+				errs = append(errs, errors.New(e.Err))
+			}
+		}
 		return PublicMapping{}, false, fmt.Errorf("stun classify: 全部 %d 台服务器不可达: %w", len(servers), errors.Join(errs...))
 	}
-	return first, false, nil
+	return PublicMapping{IP: first.MappedIP, Port: first.MappedPort}, res.Symmetric, nil
 }
 
 // skipMemoTTL 失败记忆时长:5min 内不再对该 peer 重复判型打洞,过期
@@ -235,4 +357,29 @@ func (m *SkipMemo) ShouldSkip(peerID string) bool {
 		return false
 	}
 	return true
+}
+
+// SkipMemoEntry 快照单项;Expired=true 表示 remaining<=0(惰性清理仍归
+// Record/ShouldSkip——快照零副作用,绝不删表)。
+type SkipMemoEntry struct {
+	PeerID           string `json:"peer_id"`
+	RemainingSeconds int64  `json:"remaining_seconds"`
+	Expired          bool   `json:"expired"`
+}
+
+// Snapshot memo 表纯读快照;空表≠STUN 健康(不可达不进 memo,见 classify
+// 账本)——消费方必须并排读 classify 账本,勿单读。now 走 m.clock()(零值
+// 兜底约定:生产以 &SkipMemo{} 零值构造,now 可 nil——直呼 m.now() 即生产
+// nil-func panic)。
+func (m *SkipMemo) Snapshot() []SkipMemoEntry {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.clock()
+	out := make([]SkipMemoEntry, 0, len(m.until))
+	for id, until := range m.until {
+		rem := int64(until.Sub(now) / time.Second)
+		out = append(out, SkipMemoEntry{PeerID: id, RemainingSeconds: rem, Expired: rem <= 0})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PeerID < out[j].PeerID })
+	return out
 }

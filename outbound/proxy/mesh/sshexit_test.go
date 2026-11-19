@@ -498,6 +498,151 @@ func TestExitClientOpenChannelDeadline(t *testing.T) {
 // (TestDialMeshAddrRejectsEmptyHostKey 已随 DialMeshAddr 删除——出口链路
 // 改造后无裸地址拨号通道,空钉扎/nil 身份守卫归 ExitClient 同名矩阵。)
 
+// TestCarrierBucketAccounting 钉载体分桶记账(诊断读面):Used 确定一处
+// switch 即覆盖三载体;UDPErr 与 DialFail 分立——记 UDPErr 后仍会试 piko,
+// 故 udp 失败+回落成功只增 UDPErr 不增 DialFail;全载体聚合失败才增
+// DialFail;零准入=零拨号不记 DialFail。包级计数是进程级累加,断言一律用
+// 「前后差值」而非绝对值。
+// 勿加 t.Parallel:包级计数差值断言仅串行安全。
+func TestCarrierBucketAccounting(t *testing.T) {
+	keyPEM, identity := testIdentity(t)
+	sshd := newMeshTestSSHD(t, identity.PublicKey())
+
+	udpFail := errors.New("udp punch carrier down")
+	pikoFail := errors.New("piko carrier down")
+	dialSSHD := func(ctx context.Context, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", sshd.Addr())
+	}
+	self := func() context.Context { return WithClass(context.Background(), meshproto.ClassSelf) }
+
+	// bucketDelta 局部差值断言帮手:mark→now 的逐桶增量。
+	type bucketDelta struct {
+		lanOK, udpOK, pikoOK, udpErr, dialFail uint64
+	}
+	delta := func(mark CarrierBucketSnapshot) bucketDelta {
+		now := SnapshotCarrierBuckets()
+		return bucketDelta{
+			lanOK:    now.LanOK - mark.LanOK,
+			udpOK:    now.UDPOK - mark.UDPOK,
+			pikoOK:   now.PikoOK - mark.PikoOK,
+			udpErr:   now.UDPErr - mark.UDPErr,
+			dialFail: now.DialFail - mark.DialFail,
+		}
+	}
+	wantDelta := func(t *testing.T, mark string, got bucketDelta, want bucketDelta) {
+		t.Helper()
+		if got != want {
+			t.Fatalf("%s 分桶增量 = %+v, want %+v", mark, got, want)
+		}
+	}
+
+	// 场景 1:LAN 载体打通 → LanOK+1,其余零增量(trace.Used="lan")。
+	mark := SnapshotCarrierBuckets()
+	lanClient, err := NewExitClient(PeerSpec{
+		DeviceID: "dev-b",
+		LANAddrs: []string{sshd.Addr()},
+		HostKey:  sshd.HostKeyPinned(),
+	}, keyPEM, "", nil, nil)
+	if err != nil {
+		t.Fatalf("NewExitClient: %v", err)
+	}
+	conn, trace, err := lanClient.DialContextTraced(context.Background(), &M.Metadata{HostName: "x.com:443"})
+	if err != nil {
+		t.Fatalf("lan dial: %v", err)
+	}
+	_ = conn.Close()
+	if trace.Used != "lan" {
+		t.Fatalf("trace.Used = %q, want lan", trace.Used)
+	}
+	wantDelta(t, "lan", delta(mark), bucketDelta{lanOK: 1})
+
+	// 场景 2:udp 载体打通(LAN 空载体不进切片)→ UDPOK+1,UDPErr 零增量。
+	mark = SnapshotCarrierBuckets()
+	udpClient, err := NewExitClient(PeerSpec{
+		DeviceID: "dev-b",
+		HostKey:  sshd.HostKeyPinned(),
+	}, keyPEM, "", nil, dialSSHD)
+	if err != nil {
+		t.Fatalf("NewExitClient(udp): %v", err)
+	}
+	conn, trace, err = udpClient.DialContextTraced(self(), &M.Metadata{HostName: "x.com:443"})
+	if err != nil {
+		t.Fatalf("udp dial: %v", err)
+	}
+	_ = conn.Close()
+	if trace.Used != "udp" {
+		t.Fatalf("trace.Used = %q, want udp", trace.Used)
+	}
+	if trace.UDPErr != nil {
+		t.Fatalf("udp 成功路径 trace.UDPErr = %v, want nil", trace.UDPErr)
+	}
+	wantDelta(t, "udp", delta(mark), bucketDelta{udpOK: 1})
+
+	// 场景 3:udp 失败回落 piko → UDPErr+1 与 PikoOK+1 同时发生,DialFail
+	// 零增量(UDPErr ≠ DialFail 的分立语义)。
+	mark = SnapshotCarrierBuckets()
+	fallClient, err := NewExitClient(PeerSpec{
+		DeviceID: "dev-b",
+		HostKey:  sshd.HostKeyPinned(),
+		Relay:    true,
+	}, keyPEM, "", dialSSHD, func(context.Context, string) (net.Conn, error) {
+		return nil, udpFail
+	})
+	if err != nil {
+		t.Fatalf("NewExitClient(fallback): %v", err)
+	}
+	conn, trace, err = fallClient.DialContextTraced(self(), &M.Metadata{HostName: "x.com:443"})
+	if err != nil {
+		t.Fatalf("udp 失败必须回落 piko: %v", err)
+	}
+	_ = conn.Close()
+	if trace.Used != "piko" {
+		t.Fatalf("trace.Used = %q, want piko", trace.Used)
+	}
+	if !errors.Is(trace.UDPErr, udpFail) {
+		t.Fatalf("trace.UDPErr = %v, want %v", trace.UDPErr, udpFail)
+	}
+	wantDelta(t, "fallback", delta(mark), bucketDelta{udpErr: 1, pikoOK: 1})
+
+	// 场景 4:全载体失败(LAN refused + udp 错 + piko 错)→ DialFail+1;
+	// udp 尝试过且失败,UDPErr 同样+1(两计数分立但可同时命中——UDPErr 记
+	// 载体尝试失败,DialFail 记聚合失败),ok 桶零增量。
+	mark = SnapshotCarrierBuckets()
+	deadClient, err := NewExitClient(PeerSpec{
+		DeviceID: "dev-b",
+		LANAddrs: []string{"127.0.0.1:1"}, // 必然 connection refused
+		HostKey:  sshd.HostKeyPinned(),
+		Relay:    true,
+	}, keyPEM, "", func(context.Context, string) (net.Conn, error) {
+		return nil, pikoFail
+	}, func(context.Context, string) (net.Conn, error) {
+		return nil, udpFail
+	})
+	if err != nil {
+		t.Fatalf("NewExitClient(dead): %v", err)
+	}
+	if _, _, err := deadClient.DialContextTraced(self(), &M.Metadata{HostName: "x.com:443"}); err == nil {
+		t.Fatal("全载体失败必须返回错误")
+	}
+	wantDelta(t, "all-fail", delta(mark), bucketDelta{udpErr: 1, dialFail: 1})
+
+	// 场景 5:零准入(无 LAN/无 udp/relay 未接线)→ 零拨号,五桶全零增量
+	// (errNoTransportAdmits 不算拨号失败)。
+	mark = SnapshotCarrierBuckets()
+	noAdmit, err := NewExitClient(PeerSpec{
+		DeviceID: "dev-b",
+		HostKey:  sshd.HostKeyPinned(),
+	}, keyPEM, "", nil, nil)
+	if err != nil {
+		t.Fatalf("NewExitClient(no-admit): %v", err)
+	}
+	if _, _, err := noAdmit.DialContextTraced(context.Background(), &M.Metadata{HostName: "x.com:443"}); !errors.Is(err, errNoTransportAdmits) {
+		t.Fatalf("want errNoTransportAdmits, got %v", err)
+	}
+	wantDelta(t, "no-admit", delta(mark), bucketDelta{})
+}
+
 // TestExitClientCustomClassDialsLanOnly 矩阵 9:custom 类别 + relay 已接线
 // + LAN 可达 ⇒ 只走 LAN(fake piko 计数 0;custom 禁公共中继,SPEC §4.3/§7.1)。
 func TestExitClientCustomClassDialsLanOnly(t *testing.T) {

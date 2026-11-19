@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -592,4 +593,88 @@ type fakeDialer struct{}
 
 func (fakeDialer) DialContext(context.Context, *M.Metadata) (net.Conn, error) {
 	return nil, errors.New("fakeDialer: unused")
+}
+
+// TestDelegateDiagnosticsAccounting 钉委托记账诊断面(fail-visible):
+// platformDialContext 两失败分支各落一条末次失败;委托成功与 direct 成功都
+// 不清账(末次失败保留到被下一次失败覆盖);Active=门配置判定现值。
+// 勿加 t.Parallel:包级末次失败/快照等值断言仅串行安全。
+func TestDelegateDiagnosticsAccounting(t *testing.T) {
+	// PlatformClient 的 timeout 只作用于 http.Client,直调 Transport.DialContext
+	// 用不到——传 0 即可。
+	dialViaTransport := func(t *testing.T, addr string) (net.Conn, error) {
+		t.Helper()
+		return PlatformClient(0).Transport.(*http.Transport).
+			DialContext(context.Background(), "tcp", addr)
+	}
+
+	// 分支 1:门开 + peer 源未接线 → 落账,Active=门开现值。
+	setGlobalConfigForTest(t, delegateSelfConfig())
+	setPeerSourceForTest(t, nil)
+	if _, err := dialViaTransport(t, "platform.test:443"); err == nil {
+		t.Fatal("门开但 peer 未接线应如实失败")
+	}
+	d1 := SnapshotDelegateDiagnostics()
+	if !d1.Active {
+		t.Fatal("门开时 Active 必须为 true(配置判定现值)")
+	}
+	if d1.LastFailureAt == "" {
+		t.Fatal("失败分支 1 未落账:LastFailureAt 为空")
+	}
+	if !strings.Contains(d1.LastFailureErr, "peer source unavailable") {
+		t.Fatalf("分支 1 落账错误形态不符: %q", d1.LastFailureErr)
+	}
+
+	// 分支 2:门开 + 委托拨号失败(假 peer 指向死端口)→ 覆盖式落账。
+	keyPEM, _ := testIdentityKeyPEM(t)
+	dead := closedPortAddr(t)
+	setPeerSourceForTest(t, func() mesh.Dialer {
+		return newTestExitPeer(t, keyPEM, dead, "SHA256:AAAA", false, nil)
+	})
+	if _, err := dialViaTransport(t, "platform.test:443"); err == nil {
+		t.Fatal("下一跳不可达时委托拨号应如实失败")
+	}
+	d2 := SnapshotDelegateDiagnostics()
+	if !d2.Active {
+		t.Fatal("门开时 Active 必须为 true")
+	}
+	if !strings.Contains(d2.LastFailureErr, "delegate dial via mesh failed") {
+		t.Fatalf("分支 2 落账错误形态不符: %q", d2.LastFailureErr)
+	}
+
+	// 委托成功不清账(fail-visible):换活 peer 走通一次,末次失败原样保留。
+	keyPEM, identity := testIdentityKeyPEM(t) // 同一把钥两侧同源:sshd 准入=客户端身份
+	sshd := startMeshTestSSHD(t, identity.PublicKey(), false)
+	setPeerSourceForTest(t, func() mesh.Dialer {
+		return newTestExitPeer(t, keyPEM, sshd.Addr(), sshd.HostKeyPinned(), false, nil)
+	})
+	conn, err := dialViaTransport(t, "platform.test:443")
+	if err != nil {
+		t.Fatalf("委托成功路径: %v", err)
+	}
+	_ = conn.Close()
+	d3 := SnapshotDelegateDiagnostics()
+	if d3.LastFailureAt != d2.LastFailureAt || d3.LastFailureErr != d2.LastFailureErr {
+		t.Fatalf("委托成功不应清账: before=%+v after=%+v", d2, d3)
+	}
+	if !d3.Active {
+		t.Fatal("门开时 Active 必须保持 true")
+	}
+
+	// 门关 → Active=false;direct 成功同样不落账(不清账)。
+	setGlobalConfigForTest(t, &config.Config{})
+	setPeerSourceForTest(t, nil)
+	echoAddr := startEchoServer(t)
+	conn, err = dialViaTransport(t, echoAddr)
+	if err != nil {
+		t.Fatalf("direct 拨号: %v", err)
+	}
+	_ = conn.Close()
+	d4 := SnapshotDelegateDiagnostics()
+	if d4.Active {
+		t.Fatal("门关时 Active 必须为 false")
+	}
+	if d4.LastFailureAt != d2.LastFailureAt || d4.LastFailureErr != d2.LastFailureErr {
+		t.Fatalf("direct 成功不应动账: before=%+v after=%+v", d2, d4)
+	}
 }

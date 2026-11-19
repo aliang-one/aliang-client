@@ -142,4 +142,16 @@
 **Priority:** P3(⑦为 P1 部署注意项)
 **Depends on:** vm220↔liang-dev 实弹排期;server 侧部署节奏
 
+### 组网诊断读面批遗留账(批次 2026-11-19/20,feat/mesh-diag-tools)
+
+**What:** 阶段 1(读面聚合端点 diag/identity/stun_probe+MCP 四枚 stdio/agentcore 双面+runbook 技能 embed 自愈安装)非阻塞遗留:①mesh gate 语义抽 meshGateSnapshot 公共函数单源化(diag 为闸语义权威超集,status 闸字段降位仪表盘兼容面,双 handler 现整块复制);②MCP 第三面(LLM 注册表 agent_tool_registry)——peer 五件套有三面先例,mesh 暂缓系读面价值排序,rev 漂移重拉机制现成;③组级三态门控键(mesh_diag,现继承 customer.peer_mcp 总闸隐式耦合——关 peer_mcp 连带失去 mesh 读工具);④agent 侧身份对比(56433 进程身份 vs core,/api/agent/status 手动交叉);⑤peer 维度载体分桶(v1 全局);⑥runbook 安装器「运行期开闸→下一进程周期生效」的用户文档;⑦完整 AI 会话回放验收(三案例真机,roster 孤儿/双身份脑裂/utun7——仓内已落 drift 护栏+数据特征测试,LLM 行为回放需真机);⑧classifyLedger A/B 逐字重复 ~60 行可抽小账本类型;⑨CLI bridge 面不含 mesh 四件(ask-peer 对齐已松为映射⊂agentcore,noBridgeFace 显式在册——将来注入 CLI 回合需回补测试)。
+
+**Why:** 均不影响正确性/安全红线/主流程;读面+runbook 已可支撑实弹排障(阶段 2),写面(阶段 3)仍绑死实弹绿。
+
+**Context:** 设计=`docs/superpowers/specs/2026-11-19-mesh-diag-tools-design.md`(拍板记录 D-1~D-11);计划=`docs/superpowers/plans/2026-11-19-mesh-diag-tools.md`;九任务全双评审+多轮修复环;SKILL.md 有 drift 护栏测试(端点引用+承重字段 token 双断言)。
+
+**Effort:** S(逐条独立)
+**Priority:** P3
+**Depends on:** 实弹排期;真机 AI 回放验收
+
 ## Completed

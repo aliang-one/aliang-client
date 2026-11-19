@@ -65,6 +65,54 @@ func meshDelegateActive() bool {
 	return ok
 }
 
+// delegateLastFailure 委托末次失败记账(fail-visible):platformDialContext
+// 两失败分支(下一跳不可达/peer 源未接线)落账;成功路径不清账——末次失败
+// 保留到被下一次失败覆盖为止,让「开了开关却没走链」从注释级不可见升级为
+// 可查询状态(vm220 死螺旋场景的回源需求)。激活态不落账:Active 是
+// meshDelegateActive 配置判定现值,不代表流量真经过链。
+type delegateLastFailure struct {
+	At  string `json:"at"` // RFC3339
+	Err string `json:"err"`
+}
+
+// delegateFailureLog 末次失败存储(atomic.Value,同 peerSource 先例;恒存
+// 同一具体类型 delegateLastFailure,零值 Load 返回 nil = 无失败记录)。
+var delegateFailureLog atomic.Value // delegateLastFailure
+
+// recordDelegateFailure 记一条末次失败(时间 UTC RFC3339,错误取最终包装
+// 形态——含 target 上下文,消费方可直接定位哪类目标走链失败)。
+func recordDelegateFailure(err error) {
+	if err == nil {
+		return // 防御:失败分支必有 err,nil 不落账避免脏记录
+	}
+	delegateFailureLog.Store(delegateLastFailure{
+		At:  time.Now().UTC().Format(time.RFC3339),
+		Err: err.Error(),
+	})
+}
+
+// DelegateDiagnostics 出口委托诊断读面(全局维度 v1):Active=出口链路门
+// 配置判定现值;LastFailureAt/LastFailureErr=末次委托失败(无失败记录时为
+// 空串,成功不清账)。
+type DelegateDiagnostics struct {
+	Active         bool   `json:"active"`
+	LastFailureAt  string `json:"last_failure_at"`
+	LastFailureErr string `json:"last_failure_err"`
+}
+
+// SnapshotDelegateDiagnostics 取出口委托当前诊断状态(与记账同进程内一致)。
+// 注意:计划稿的访问器与类型同名(Go 不允许同名重载),此处以
+// SnapshotDelegateDiagnostics 落地——类型名 DelegateDiagnostics 保持不变,
+// 与 mesh 包 SnapshotCarrierBuckets/CarrierBucketSnapshot 同款解法。
+func SnapshotDelegateDiagnostics() DelegateDiagnostics {
+	d := DelegateDiagnostics{Active: meshDelegateActive()}
+	if f, ok := delegateFailureLog.Load().(delegateLastFailure); ok {
+		d.LastFailureAt = f.At
+		d.LastFailureErr = f.Err
+	}
+	return d
+}
+
 // platformDialContext 出口链路判定(2026-11-12):
 //
 //	开关关/下一跳不合法 → 纯 direct(旧行为零变化);
@@ -83,8 +131,10 @@ func platformDialContext(ctx context.Context, network, addr string) (net.Conn, e
 	if peer == nil {
 		// 门开但 peer 源未接线/构造失败:开关语义=出口完全依赖下一跳,
 		// 不回落 direct(静默绕链会让「开了开关却没走链」不可见),错误
-		// 回源让装配断链立刻暴露(fail-loud)。
-		return nil, fmt.Errorf("egress: delegate active but peer source unavailable (target=%s)", addr)
+		// 回源让装配断链立刻暴露(fail-loud);失败同步落账(诊断读面)。
+		err := fmt.Errorf("egress: delegate active but peer source unavailable (target=%s)", addr)
+		recordDelegateFailure(err)
+		return nil, err
 	}
 	host, portStr := hostPortWithDefault(addr)
 	port, _ := strconv.Atoi(portStr) // 拆分失败/非数字时留 0,由 mesh 侧 443 兜底
@@ -93,7 +143,10 @@ func platformDialContext(ctx context.Context, network, addr string) (net.Conn, e
 		&M.Metadata{HostName: host, DstPort: uint16(port)},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("egress: delegate dial via mesh failed (target=%s): %w", addr, err)
+		// %w 包装在记账前完成:落账错误含 target 上下文,errors.Is 哨兵契约不变。
+		err = fmt.Errorf("egress: delegate dial via mesh failed (target=%s): %w", addr, err)
+		recordDelegateFailure(err)
+		return nil, err
 	}
 	return conn, nil
 }
