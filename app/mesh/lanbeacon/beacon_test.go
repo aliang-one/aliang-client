@@ -572,3 +572,42 @@ func TestBeaconRunningReflectsStartStop(t *testing.T) {
 		t.Fatal("Stop 后 Running() 应为 false")
 	}
 }
+
+// TestBeaconStatsCounters 运行计数(D-8):sent/err 原始计数+实例 started_at;
+// utun7 吞广播的回放数据特征=sendErr 持续增长且 rxPackets=0。
+func TestBeaconStatsCounters(t *testing.T) {
+	b := NewBeacon("self-dev", 56441, pickUDPPort(t))
+	st := b.Stats()
+	if st.BcastSent != 0 || st.BcastSendErr != 0 || st.RxPackets != 0 {
+		t.Fatalf("初始计数应全零: %+v", st)
+	}
+	if st.StartedAt != "" {
+		t.Fatalf("未启动 started_at 应空: %+v", st)
+	}
+	if err := b.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer b.Stop()
+	st = b.Stats()
+	if st.StartedAt == "" {
+		t.Fatal("启动后 started_at 应非空")
+	}
+	// 广播是 3s 周期,首播立即(broadcastLoop 立即首播)——轮询等首次发送落账
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if b.Stats().BcastSent+b.Stats().BcastSendErr > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if b.Stats().BcastSent+b.Stats().BcastSendErr == 0 {
+		t.Fatal("启动后应至少一次发送落账(成功或失败)")
+	}
+	// utun7 特征对齐(T10 验收引用):广播发得出去≠收得到——rx 恒零是本环境
+	// (utun7 吞广播)特征;健康回环环境 rx 全为自见回环(rx_self==rx_packets)。
+	// 断言钉「无对端时 rx 全为自见回环(或恒零)」这一双环境不变量。
+	st = b.Stats()
+	if st.RxPackets != 0 && st.RxSelf != st.RxPackets {
+		t.Fatalf("无对端场景 rx 应全为自见回环: %+v", st)
+	}
+}

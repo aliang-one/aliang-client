@@ -668,3 +668,118 @@ func TestSessionCacheOrphanReleaseClosesReplacedEntry(t *testing.T) {
 		t.Fatalf("新表项 Release 后 ref 应归零,得到 %+v", entry)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// (g) Snapshot 纯读快照(组网诊断读面批 Task 3)
+// ---------------------------------------------------------------------------
+
+// TestSessionCacheSnapshotPureRead 快照的四面:内容面(refs/in_flight/idle/
+// age/dead 逐字段+按键排序)/纯读面(空闲超窗不触发回收、死表项不驱逐、refs
+// 零变更)/时钟面(fakeClock 推进后 age/idle 随钟走)/可用面(快照后 Acquire
+// 仍真、开流往返通)。死表项制造=本侧对会话 Transport.Close(本地 Done 秒级
+// 可观测;session.go 文件头的 ~30s 僵尸窗只对「对端静默关停」成立,本侧自关
+// 无此窗)。
+func TestSessionCacheSnapshotPureRead(t *testing.T) {
+	const peerA = "peer-snap-a"
+	const peerB = "peer-snap-b"
+	s1, _, _ := punchCacheDial(t, "punch-snap-token-a")
+	s2, _, _ := punchCacheDial(t, "punch-snap-token-b")
+	cache := NewSessionCache()
+	clk := newFakeClock()
+	cache.now = clk.Now
+	lease1 := cache.Put(peerA, s1)
+	lease2 := cache.Put(peerB, s2)
+	punchEchoRoundtrip(t, s1.Stream, "tok1")
+	punchEchoRoundtrip(t, s2.Stream, "tok2")
+	lease2.Release() // peerB ref 归零,进空闲计时
+
+	findEntry := func(snap []SessionSnapshotEntry, key string) SessionSnapshotEntry {
+		for _, e := range snap {
+			if e.Key == key {
+				return e
+			}
+		}
+		t.Fatalf("快照缺键 %q: %+v", key, snap)
+		return SessionSnapshotEntry{}
+	}
+
+	// 内容面:两键各一项、按键排序、逐字段与在飞/空闲态吻合。
+	snap := cache.Snapshot()
+	if len(snap) != 2 {
+		t.Fatalf("两键应各出一项,实得 %d: %+v", len(snap), snap)
+	}
+	if snap[0].Key != peerA || snap[1].Key != peerB {
+		t.Fatalf("快照必须按键排序稳定输出: %q %q", snap[0].Key, snap[1].Key)
+	}
+	held := findEntry(snap, peerA)
+	if held.Refs != 1 || !held.InFlight || held.Dead || held.IdleSeconds != 0 || held.AgeSeconds != 0 {
+		t.Fatalf("在飞表项字段错(应 refs=1/in_flight=true/dead=false/idle=0/age=0): %+v", held)
+	}
+	idle := findEntry(snap, peerB)
+	if idle.Refs != 0 || idle.InFlight || idle.Dead || idle.IdleSeconds != 0 || idle.AgeSeconds != 0 {
+		t.Fatalf("空闲表项字段错(应 refs=0/in_flight=false/dead=false/idle=0/age=0): %+v", idle)
+	}
+	// refs 零变更:快照后内部计数原样(快照零 refs 写面)。
+	if cache.sessions[peerA].refs != 1 || cache.sessions[peerB].refs != 0 {
+		t.Fatalf("快照不得动 refs: peerA=%d peerB=%d", cache.sessions[peerA].refs, cache.sessions[peerB].refs)
+	}
+
+	// 纯读面:推进过空闲窗,快照仍报两键——回收只归 Acquire 的惰性扫描,
+	// 快照绝不触发 reapIdleLocked(否则空闲超窗的 peerB 早被删了);age/idle
+	// 随注入时钟推进。
+	clk.Advance(punchSessionIdleTimeout + time.Minute)
+	snap = cache.Snapshot()
+	if len(snap) != 2 {
+		t.Fatalf("Snapshot 纯读:空闲超窗的表项不得被回收删除,实得 %+v", snap)
+	}
+	held = findEntry(snap, peerA)
+	idle = findEntry(snap, peerB)
+	if held.AgeSeconds < int64(punchSessionIdleTimeout/time.Second) {
+		t.Fatalf("age 应随时钟推进(≥%ds): %+v", int64(punchSessionIdleTimeout/time.Second), held)
+	}
+	if idle.IdleSeconds < int64(time.Minute/time.Second) {
+		t.Fatalf("idle 应随时钟推进(≥60s): %+v", idle)
+	}
+
+	// 死表项:本侧 Transport.Close→Done 秒级关闭;快照报 dead=true 且表项
+	// 照常在册(驱逐只归 Acquire/reap 的动作面)。
+	_ = s2.Transport.Close()
+	select {
+	case <-s2.Conn.Context().Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("本侧 Transport.Close 后会话应死(死检测前提不成立)")
+	}
+	snap = cache.Snapshot()
+	if len(snap) != 2 {
+		t.Fatalf("Snapshot 纯读:死表项不得被驱逐,实得 %+v", snap)
+	}
+	if e := findEntry(snap, peerB); !e.Dead {
+		t.Fatalf("死会话应报 dead=true: %+v", e)
+	}
+	if e := findEntry(snap, peerA); e.Dead {
+		t.Fatalf("活会话不得报 dead: %+v", e)
+	}
+
+	// 可用面:快照后 Acquire 仍真——复用同一会话、refs++、开流往返通(快照
+	// 零副作用的最强见证)。此 Acquire 顺带惰性回收 peerB 死表项(既有取用
+	// 语义,非快照动作)。
+	lease := cache.Acquire(peerA)
+	if lease == nil || lease.entry.session != s1 {
+		t.Fatal("快照后 Acquire 必须照常复用缓存会话")
+	}
+	if cache.sessions[peerA].refs != 2 {
+		t.Fatalf("快照后 Acquire 应 refs=2(1+1),得 %d", cache.sessions[peerA].refs)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stream, err := lease.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("快照后开流失败: %v", err)
+	}
+	punchEchoRoundtrip(t, stream, "snap")
+	lease.Release()
+	lease1.Release()
+	if entry := cache.sessions[peerA]; entry.refs != 0 {
+		t.Fatalf("全部 Release 后 ref 应回零,得 %d", entry.refs)
+	}
+}

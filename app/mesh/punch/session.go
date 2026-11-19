@@ -35,6 +35,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sort"
 	"sync"
 	"time"
 
@@ -106,6 +107,7 @@ type cachedSession struct {
 	session   *PunchSession
 	refs      int
 	idleSince time.Time // ref 归零、空闲计时起点;零值=有 ref 在飞
+	createdAt time.Time // 入缓存(Put)时刻;快照面 AgeSeconds 的基准。Put 是唯一构造点
 }
 
 // closeLocked 收摊表项会话:Transport.Close(quic-go 语义:不关调用方
@@ -178,7 +180,7 @@ func (c *SessionCache) Put(peer string, session *PunchSession) *Lease {
 		// refs>0 的分支刻意不动作:见方法注释的孤儿语义。
 		old.closeLocked()
 	}
-	entry := &cachedSession{session: session, refs: 1}
+	entry := &cachedSession{session: session, refs: 1, createdAt: c.clock()}
 	c.sessions[peer] = entry
 	return &Lease{cache: c, peer: peer, entry: entry}
 }
@@ -231,6 +233,54 @@ func (c *SessionCache) reapIdleLocked() {
 			delete(c.sessions, peer)
 		}
 	}
+}
+
+// SessionSnapshotEntry 缓存会话快照单项;纯读——绝不调 reapIdleLocked/
+// closeLocked/delete(Acquire 会 refs++ 也不能用)。IdleSeconds=ref 归零起的
+// 空闲秒数(在飞恒 0),AgeSeconds=入缓存(Put)起的秒数,Dead 用
+// punchSessionDead 的非阻塞 select 读——死表项照常在册(驱逐只归 Acquire/
+// reap 的动作面,快照零副作用)。
+type SessionSnapshotEntry struct {
+	Key         string `json:"key"`
+	Refs        int    `json:"refs"`
+	InFlight    bool   `json:"in_flight"` // refs>0
+	IdleSeconds int64  `json:"idle_seconds"`
+	AgeSeconds  int64  `json:"age_seconds"`
+	Dead        bool   `json:"dead"` // punchSessionDead 非阻塞 select
+}
+
+// Snapshot 缓存表纯读快照;90s 硬寿命语义见 listener.go:32;时钟走 c.clock()
+// (零值兜底约定,与 SkipMemo 同款)。锁内只做遍历+非阻塞 select,绝无写面;
+// 按 Key 排序稳定输出(消费方做差分不必自排)。负秒数(时钟倒拨的理论面)
+// 钳 0,不给诊断面留荒诞数。
+func (c *SessionCache) Snapshot() []SessionSnapshotEntry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.clock()
+	out := make([]SessionSnapshotEntry, 0, len(c.sessions))
+	for peer, entry := range c.sessions {
+		e := SessionSnapshotEntry{
+			Key:      peer,
+			Refs:     entry.refs,
+			InFlight: entry.refs > 0,
+			Dead:     punchSessionDead(entry.session),
+		}
+		if !entry.createdAt.IsZero() {
+			e.AgeSeconds = int64(now.Sub(entry.createdAt) / time.Second)
+		}
+		if !entry.idleSince.IsZero() {
+			e.IdleSeconds = int64(now.Sub(entry.idleSince) / time.Second)
+		}
+		if e.AgeSeconds < 0 {
+			e.AgeSeconds = 0
+		}
+		if e.IdleSeconds < 0 {
+			e.IdleSeconds = 0
+		}
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
 }
 
 // Lease 是一次取用的凭证:持有期间会话不会被空闲回收。OpenStream 开新流

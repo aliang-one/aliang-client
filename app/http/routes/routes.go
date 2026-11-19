@@ -42,6 +42,8 @@ type Handlers struct {
 	Tutorial         *handlers.TutorialHandler
 	Agent            *handlers.AgentHandler
 	Mesh             *handlers.MeshHandler
+	MeshDiag         *handlers.MeshDiagHandler
+	MeshProbe        *handlers.MeshStunProbeHandler
 	Memory           *handlers.AgentMemoryHandler
 
 	statsCollector     *statistic.StatsCollector
@@ -102,6 +104,8 @@ func newHandlers(runService *services.RunService) *Handlers {
 		Tutorial:           handlers.NewTutorialHandler(),
 		Agent:              handlers.NewAgentHandler(agentService),
 		Mesh:               handlers.NewMeshHandler(),
+		MeshDiag:           handlers.NewMeshDiagHandler(),
+		MeshProbe:          handlers.NewMeshStunProbeHandler(),
 		Memory:             handlers.NewAgentMemoryHandler(),
 		statsCollector:     statsCollector,
 		httpStatsCollector: httpStatsCollector,
@@ -365,6 +369,18 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	// beacon 候选,仪表盘组网页数据源;只读——写路径走 /api/config/customer
 	// 的 customer.mesh,不做独立 POST。
 	register("/api/mesh/status", h.Mesh.HandleStatus, http.MethodGet)
+	// mesh 诊断聚合(组网诊断读面批 Task 5):一次取齐四重闸判定组/roster
+	// 三态/beacon 计数+候选/载体五桶/出口委托/打洞 classify+sessions(含
+	// memo),全只读零活探测,AI 组网诊断面单点数据源。
+	register("/api/mesh/diag", h.MeshDiag.HandleDiag, http.MethodGet)
+	// mesh 身份一致性(组网诊断读面批 Task 6):四源只读比对(state/identity
+	// 常驻文件/beacon 广播 self/roster 本机条目),双身份脑裂一眼可见。
+	register("/api/mesh/identity", h.MeshDiag.HandleIdentity, http.MethodGet)
+	// mesh STUN 显式活探测(组网诊断读面批 Task 7):POST 零体,每请求新建
+	// 独立短命 socket(出厂绑物理口,绝不复用生产打洞 conn——互偷包铁律),
+	// 包级 TryLock busy 不排队,预算截断单点在 punch.ClassifyWithBudget。双注册
+	// 另一处 agentruntime server.go(缺任一侧=404 透传,2026-10-21 教训)。
+	register("/api/mesh/stun_probe", h.MeshProbe.HandleStunProbe, http.MethodPost)
 
 	registerDocsRoutes(mux, catalog)
 }

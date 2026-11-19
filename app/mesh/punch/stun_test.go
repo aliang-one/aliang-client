@@ -331,3 +331,213 @@ func TestDiscoverIgnoresWrongTransactionID(t *testing.T) {
 		t.Fatal("噪声 responder 未被触发,测试无效")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ClassifyWithBudget 预算化变体(显式活探测批 Task 7):截断/判实即停/判型
+// 结论词汇。既有 Classify 的语义回归由上方 TestClassify* 全绿钉(薄壳改造
+// 零行为变化),此处只钉变体自身的新面。
+// ---------------------------------------------------------------------------
+
+// TestClassifyWithBudgetImmediateExpiry 总预算 1ns+4 台:一台都测不了,
+// truncated=true、results 空(已测台数如实=0),不 panic。
+func TestClassifyWithBudgetImmediateExpiry(t *testing.T) {
+	conn := testUDPConn(t)
+	res := ClassifyWithBudget(conn, []string{"a", "b", "c", "d"}, time.Nanosecond)
+	if !res.Truncated {
+		t.Fatal("预算开局即死应 truncated=true")
+	}
+	if len(res.Results) != 0 {
+		t.Fatalf("一台未测 results 应空,得到 %d 条: %v", len(res.Results), res.Results)
+	}
+	if res.Symmetric {
+		t.Fatal("零探测不得判 symmetric")
+	}
+}
+
+// TestClassifyWithBudgetMidwayExpiry 预算中途耗尽:4 台全黑洞,总预算 250ms
+// 只够 ~2.5 个 100ms 窗口——第 3 台拿到 min(3s,剩余) 的尾巴窗,第 4 台前
+// 剩余必 ≤0(3 全窗=300ms 已超预算),截断确定性成立:results=3 台、
+// truncated=true、已测台数如实。
+func TestClassifyWithBudgetMidwayExpiry(t *testing.T) {
+	old := classifyDiscoverTimeout
+	classifyDiscoverTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { classifyDiscoverTimeout = old })
+
+	conn := testUDPConn(t)
+	res := ClassifyWithBudget(conn, []string{
+		deadLoopbackAddr(t), deadLoopbackAddr(t), deadLoopbackAddr(t), deadLoopbackAddr(t),
+	}, 250*time.Millisecond)
+	if !res.Truncated {
+		t.Fatal("预算中途耗尽应 truncated=true")
+	}
+	if len(res.Results) != 3 {
+		t.Fatalf("已测台数应 3(第 4 台前剩余必耗尽),得到 %d 条: %v", len(res.Results), res.Results)
+	}
+	for _, e := range res.Results {
+		if e.OK || e.Err == "" || e.NatType != "" {
+			t.Fatalf("黑洞台应 ok=false+err 非空+nat_type 空: %v", e)
+		}
+	}
+}
+
+// TestClassifyWithBudgetSymmetricStopsEarly 判实即停(照 Classify early
+// return 语义):首两台应答端口不同→结论 symmetric,第三台不再探测,余台
+// 未测以 truncated 如实标注;应答台共享 symmetric 结论。
+func TestClassifyWithBudgetSymmetricStopsEarly(t *testing.T) {
+	a := startSTUNResponder(t, net.IPv4(198, 51, 100, 1), 40001)
+	b := startSTUNResponder(t, net.IPv4(198, 51, 100, 2), 40002)
+	c := startSTUNResponder(t, net.IPv4(198, 51, 100, 3), 40003)
+	conn := testUDPConn(t)
+
+	res := ClassifyWithBudget(conn, []string{a, b, c}, 9*time.Second)
+	if !res.Symmetric {
+		t.Fatal("两台端口不同应判 symmetric")
+	}
+	if len(res.Results) != 2 {
+		t.Fatalf("判实即停应只测 2 台,得到 %d 条: %v", len(res.Results), res.Results)
+	}
+	if !res.Truncated {
+		t.Fatal("余台未测应 truncated=true(不假装完整)")
+	}
+	for _, e := range res.Results {
+		if !e.OK || e.MappedPort <= 0 || e.NatType != NatTypeSymmetric || e.Err != "" {
+			t.Fatalf("应答台应 ok+有端口+结论 symmetric: %v", e)
+		}
+	}
+}
+
+// TestClassifyWithBudgetNonSymmetricFullRun 多台同端口:全测完 truncated=
+// false,结论 non_symmetric,逐台映射端口如实。
+func TestClassifyWithBudgetNonSymmetricFullRun(t *testing.T) {
+	a := startSTUNResponder(t, net.IPv4(198, 51, 100, 1), 41000)
+	b := startSTUNResponder(t, net.IPv4(198, 51, 100, 2), 41000)
+	conn := testUDPConn(t)
+
+	res := ClassifyWithBudget(conn, []string{a, b}, 6*time.Second)
+	if res.Truncated {
+		t.Fatal("预算足额全测完不应 truncated")
+	}
+	if res.Symmetric {
+		t.Fatal("两台同端口不应判 symmetric")
+	}
+	if len(res.Results) != 2 {
+		t.Fatalf("应逐台 2 条,得到 %d 条: %v", len(res.Results), res.Results)
+	}
+	for _, e := range res.Results {
+		if !e.OK || e.MappedPort != 41000 || e.NatType != NatTypeNonSymmetric || e.Err != "" {
+			t.Fatalf("同端口应答台应 ok=41000+non_symmetric: %v", e)
+		}
+	}
+}
+
+// TestClassifyWithBudgetSingleResponderUnknown 恰一台应答:结论 unknown
+// (端口比对不成立不冤枉,照 Classify 降级语义);不可达台 err 如实、
+// nat_type 留空。
+func TestClassifyWithBudgetSingleResponderUnknown(t *testing.T) {
+	old := classifyDiscoverTimeout
+	classifyDiscoverTimeout = 150 * time.Millisecond
+	t.Cleanup(func() { classifyDiscoverTimeout = old })
+
+	alive := startSTUNResponder(t, net.IPv4(198, 51, 100, 9), 42000)
+	dead := deadLoopbackAddr(t)
+	conn := testUDPConn(t)
+
+	res := ClassifyWithBudget(conn, []string{alive, dead}, 6*time.Second)
+	if res.Truncated || res.Symmetric {
+		t.Fatalf("预算足额单台应答应完整非对称: %v", res)
+	}
+	if len(res.Results) != 2 {
+		t.Fatalf("应逐台 2 条,得到 %d 条: %v", len(res.Results), res.Results)
+	}
+	if !res.Results[0].OK || res.Results[0].MappedPort != 42000 || res.Results[0].NatType != NatTypeUnknown {
+		t.Fatalf("存活台应 ok+unknown 结论: %v", res.Results[0])
+	}
+	if res.Results[1].OK || res.Results[1].Err == "" || res.Results[1].NatType != "" {
+		t.Fatalf("黑洞台应 err 如实+nat_type 空: %v", res.Results[1])
+	}
+}
+
+// TestClassifyWithBudgetNilConn 防御形态:conn nil 逐台如实回 Err 记录,
+// 不探测不 panic。
+func TestClassifyWithBudgetNilConn(t *testing.T) {
+	res := ClassifyWithBudget(nil, []string{"a", "b"}, time.Second)
+	if len(res.Results) != 2 {
+		t.Fatalf("nil conn 应逐台回 Err 记录,得到 %d 条: %v", len(res.Results), res.Results)
+	}
+	for _, e := range res.Results {
+		if e.OK || e.Err == "" {
+			t.Fatalf("nil conn 台应 ok=false+err 非空: %v", e)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SkipMemo 快照面(组网诊断读面批 Task 2)
+// ---------------------------------------------------------------------------
+
+// TestSkipMemoSnapshotPureRead 快照面三断言:双键入表快照含两者(按键排序,
+// 余量在界内且 Expired=false);注入时钟推过 TTL → 条目仍在表(惰性清理
+// 归 Record/ShouldSkip)且 Expired=true 标注;快照纯读——读后 ShouldSkip
+// 仍真、表未被快照动过;另验零值 &SkipMemo{} 直调 Snapshot 不 panic(now
+// 兜底 clock 约定,now=nil 走 time.Now)。
+func TestSkipMemoSnapshotPureRead(t *testing.T) {
+	base := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	now := base
+	memo := &SkipMemo{now: func() time.Time { return now }}
+	memo.Record("peer-b")
+	memo.Record("peer-a")
+
+	snap := memo.Snapshot()
+	if len(snap) != 2 {
+		t.Fatalf("双键入表快照应含两笔,得到 %d 笔: %v", len(snap), snap)
+	}
+	if snap[0].PeerID != "peer-a" || snap[1].PeerID != "peer-b" {
+		t.Fatalf("快照应按键排序稳定输出: %v", snap)
+	}
+	for _, e := range snap {
+		if e.Expired {
+			t.Fatalf("未过 TTL 的条目不应标注 Expired: %v", e)
+		}
+		if e.RemainingSeconds <= 0 || e.RemainingSeconds > int64(skipMemoTTL/time.Second) {
+			t.Fatalf("余量应在 (0,%d] 秒内: %v", int64(skipMemoTTL/time.Second), e)
+		}
+	}
+
+	// 纯读断言(未过期窗口内):读过快照后 ShouldSkip 仍真——快照零副作用,
+	// 表未被快照动过。
+	if !memo.ShouldSkip("peer-a") || !memo.ShouldSkip("peer-b") {
+		t.Fatal("Snapshot 纯读:读过之后 ShouldSkip 应仍为 true(快照不得删表)")
+	}
+
+	// 时钟推满 TTL:条目仍保留(快照零副作用,绝不删表),标注过期、余量 <=0。
+	// 注:恰满 TTL 按 TestSkipMemoTTL 同一口径视为过期(ShouldSkip=false),
+	// 故纯读断言必须在未过期窗口先做完。
+	now = base.Add(5 * time.Minute)
+	snap = memo.Snapshot()
+	if len(snap) != 2 {
+		t.Fatalf("快照不得删表:推过 TTL 后两笔应仍在,得到 %d 笔", len(snap))
+	}
+	for _, e := range snap {
+		if !e.Expired {
+			t.Fatalf("推过 TTL 后快照应标注 Expired=true: %v", e)
+		}
+		if e.RemainingSeconds > 0 {
+			t.Fatalf("过期条目余量应 <=0: %v", e)
+		}
+	}
+
+	// 惰性清理仍归 ShouldSkip:过期条目由它当场清掉,快照随之只剩 peer-b。
+	if memo.ShouldSkip("peer-a") {
+		t.Fatal("满 TTL 应按过期处理(ShouldSkip=false,TestSkipMemoTTL 同口径)")
+	}
+	if snap = memo.Snapshot(); len(snap) != 1 || snap[0].PeerID != "peer-b" {
+		t.Fatalf("ShouldSkip 惰性清理后快照应只剩 peer-b: %v", snap)
+	}
+
+	// 零值安全:生产以 &SkipMemo{} 零值构造(now=nil),Snapshot 直调不得
+	// panic(直呼 m.now() 即生产 nil-func panic,这正是 clock() 兜底存在的理由)。
+	zero := &SkipMemo{}
+	if got := zero.Snapshot(); got == nil || len(got) != 0 {
+		t.Fatalf("零值 memo 空表快照应得非 nil 空数组: %v", got)
+	}
+}

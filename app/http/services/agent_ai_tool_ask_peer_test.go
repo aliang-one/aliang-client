@@ -34,8 +34,23 @@ func TestAgentPeerMCPBridgeToolNamesMapAgentcoreNames(t *testing.T) {
 	for _, tool := range mgr.agentCorePeerTools(agentAIRun{}) {
 		coreNames[tool.Name()] = true
 	}
-	if len(coreNames) != len(mapping) {
-		t.Fatalf("agentcore bridge has %d peer tools, mapping has %d (mapping stale)", len(coreNames), len(mapping))
+	// 「故意无 CLI 面」显式在册(与 cmd/mcp_test.go 的 noBridgeFace 同款双向
+	// 守卫):mesh 诊断读面四件(mesh.*,读面批 2026-11-20)只在 agentcore 面
+	// +stdio 面双面存在,本桥刻意不注入。agentcore 面总数必须恰好等于
+	// 「有 bridge 面 5 件 + 故意无 bridge 面 4 件」——将来给 agentcore 面加
+	// 第 10 个工具而忘配 CLI 面又忘入册,这里直接红,不许静默漏面。
+	noBridgeFace := map[string]bool{
+		"mesh.readiness": true, "mesh.identity": true,
+		"mesh.stun_probe": true, "mesh.lan_candidates": true,
+	}
+	if len(coreNames) != len(mapping)+len(noBridgeFace) {
+		t.Fatalf("agentcore bridge has %d peer tools, want mapping %d + no-bridge-face %d (mapping stale)",
+			len(coreNames), len(mapping), len(noBridgeFace))
+	}
+	for coreName := range noBridgeFace {
+		if !coreNames[coreName] {
+			t.Fatalf("agentcore bridge missing no-bridge-face tool %q (registry stale)", coreName)
+		}
 	}
 	for bridgeName, coreName := range mapping {
 		if !seen[bridgeName] {

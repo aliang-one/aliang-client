@@ -47,8 +47,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
@@ -118,15 +121,28 @@ func agentPunchCandidatesPayload(sessionID string, candidates []string) map[stri
 // agentPeerPunchSession 是一个打洞会话的 B 侧接收面状态:socket 由本编排
 // 绑定(所有权归注册表,收摊时关);transport 是 listener 与探测 Dial 共用
 // 的单实例(单 Transport 铁律,见 punch.ListenerOpts.Transport);done 由
-// punch.ServeListener 关闭(TTL 到点/accept 报错即收摊);peerCandidates
-// 是收到的 A 候选快照(诊断面,探测在到达时即发)。
+// punch.ServeListener 关闭(TTL 到点/accept 报错即收摊);startedAt/ttlSeconds
+// 是快照面 age/remaining 的基准(TTL 取会话帧钳制真值,构造点+register 兜底
+// 双防线赋值);peerCandidates 是收到的 A 候选快照(诊断面,探测在到达时即发)。
 type agentPeerPunchSession struct {
 	sessionID      string
 	socket         *net.UDPConn
 	transport      *quic.Transport
 	done           <-chan struct{}
 	fingerprint    string
+	startedAt      time.Time // 注册时刻(快照面诊断字段,不参与任何决策)
+	ttlSeconds     int64     // 会话 TTL(帧内钳制真值,快照面 remaining 基准;不参与任何决策)
 	peerCandidates []string
+}
+
+// ClassifyOutcome 单次 STUN 判型结果(扁平三字段:同时作内部 map 值与两侧
+// 快照单项,不另设 SideEntry 重复类型)。side=a 键=对端 device_id;side=b
+// 键=本机 device_id=「本机 NAT」,键语义沿 handleSession 的 Record(selfPeerID)
+// 注(两侧结构体注与落点分支同引该注释防键语义漂移)。
+type ClassifyOutcome struct {
+	PeerID  string `json:"peer_id"`
+	Outcome string `json:"outcome"` // ok|symmetric|unreachable|public_declared
+	At      string `json:"at"`      // RFC3339
 }
 
 // agentPeerPunchB 是 B 侧打洞编排体:跨帧状态表(session 帧立表、
@@ -144,6 +160,11 @@ type agentPeerPunchB struct {
 	mu       sync.Mutex
 	sessions map[string]*agentPeerPunchSession
 	skipMemo *punch.SkipMemo
+	// classify 结果账本(快照面新增):STUN 不可达≠symmetric 不写 memo
+	// (铁律③),不可达只落这里——空 memo+账本 unreachable 才是「STUN 坏」,
+	// 空 memo+账本空=「从未探测」。
+	classifyMu       sync.Mutex
+	classifyOutcomes map[string]ClassifyOutcome // 键=本机 device_id(语义沿 handleSession 的 Record(selfPeerID) 注)
 
 	bind     func() (*net.UDPConn, string, error)
 	servers  func() []string
@@ -254,15 +275,16 @@ func agentPunchTransferServe(transferID string, tctx agentPunchTransferContext) 
 // +配置门+ssh 入口注入。
 func newAgentPeerPunchB() *agentPeerPunchB {
 	return &agentPeerPunchB{
-		sessions:      map[string]*agentPeerPunchSession{},
-		skipMemo:      &punch.SkipMemo{},
-		bind:          func() (*net.UDPConn, string, error) { return punch.NewBoundUDPConn(punch.DefaultResolver) },
-		servers:       agentPunchConfiguredServers,
-		classify:      punch.Classify,
-		serve:         punch.ServeListener,
-		gate:          agentPunchConfigEnabled,
-		handler:       agentPeerPunchIngressHandler,
-		transferServe: agentPunchTransferServe,
+		sessions:         map[string]*agentPeerPunchSession{},
+		skipMemo:         &punch.SkipMemo{},
+		classifyOutcomes: map[string]ClassifyOutcome{},
+		bind:             func() (*net.UDPConn, string, error) { return punch.NewBoundUDPConn(punch.DefaultResolver) },
+		servers:          agentPunchConfiguredServers,
+		classify:         punch.Classify,
+		serve:            punch.ServeListener,
+		gate:             agentPunchConfigEnabled,
+		handler:          agentPeerPunchIngressHandler,
+		transferServe:    agentPunchTransferServe,
 	}
 }
 
@@ -368,14 +390,19 @@ func (b *agentPeerPunchB) handleSession(msg map[string]interface{}, writeJSON fu
 	var selfCandidates []string
 	if classifyErr != nil {
 		// 铁律③:STUN 不可达≠symmetric,不写 SkipMemo;打洞照试——洞开
-		// 与否最终由 A 侧 Initial 重试裁决,B 侧少学映射不碍事。
+		// 与否最终由 A 侧 Initial 重试裁决,B 侧少学映射不碍事。账本记
+		// unreachable(空 memo+账本 unreachable=「STUN 坏」的判据点)。
+		b.recordClassifyOutcome(selfPeerID, "unreachable")
 		logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH] classify unavailable session=%s err=%v", sessionID, classifyErr))
 	} else {
 		if symmetricSuspect {
 			// 铁律②:判 symmetric 记账(键=本机 device_id,语义见结构体注)
 			// 但照常继续——B 侧对称 NAT 仍可能被 A 打通,EIF 判型 v1 不做。
 			b.skipMemo.Record(selfPeerID)
+			b.recordClassifyOutcome(selfPeerID, "symmetric")
 			logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH] symmetric suspect memoized session=%s self=%s(仍照常起听)", sessionID, selfPeerID))
+		} else {
+			b.recordClassifyOutcome(selfPeerID, "ok")
 		}
 		if mapping.IP != nil && mapping.Port > 0 {
 			selfCandidates = []string{net.JoinHostPort(mapping.IP.String(), strconv.Itoa(mapping.Port))}
@@ -458,6 +485,8 @@ func (b *agentPeerPunchB) handleSession(msg map[string]interface{}, writeJSON fu
 		transport:   transport,
 		done:        done,
 		fingerprint: fingerprint,
+		startedAt:   time.Now(),
+		ttlSeconds:  ttlSeconds,
 	}
 	b.register(sess)
 	safeGo("peer_punch_reaper", func() {
@@ -589,6 +618,14 @@ func (b *agentPeerPunchB) register(sess *agentPeerPunchSession) {
 	if b.sessions == nil {
 		b.sessions = map[string]*agentPeerPunchSession{}
 	}
+	if sess.startedAt.IsZero() {
+		// 兜底赋值(handleSession 构造点已填,此为第二防线——测试直构实例
+		// 漏填时快照 age/remaining 不至于报出进程纪元级的荒诞值)。
+		sess.startedAt = time.Now()
+	}
+	if sess.ttlSeconds <= 0 {
+		sess.ttlSeconds = agentPunchSessionMaxTTLSeconds
+	}
 	if old, ok := b.sessions[sess.sessionID]; ok {
 		old.closeLocked()
 		logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH] session=%s replaced, old listener torn down", sess.sessionID))
@@ -669,10 +706,63 @@ func (b *agentPeerPunchB) sessionByID(sessionID string) *agentPeerPunchSession {
 	return b.sessions[sessionID]
 }
 
+// recordClassifyOutcome 落一笔判型结果(同键重判以最新一笔顶替——快照面
+// 是「当前判型结论」不是事件流)。键=本机 device_id(语义沿 handleSession
+// 的 Record(selfPeerID) 注:session 帧不携带 A 设备身份,B 判的是自身 NAT)。
+// 锁纪律:只碰 classifyMu,绝不触 mu 执行路径;map 惰性初始化兜测试直构实例。
+func (b *agentPeerPunchB) recordClassifyOutcome(selfPeerID, outcome string) {
+	b.classifyMu.Lock()
+	defer b.classifyMu.Unlock()
+	if b.classifyOutcomes == nil {
+		b.classifyOutcomes = map[string]ClassifyOutcome{}
+	}
+	b.classifyOutcomes[selfPeerID] = ClassifyOutcome{
+		PeerID:  selfPeerID,
+		Outcome: outcome,
+		At:      time.Now().Format(time.RFC3339),
+	}
+}
+
+// classifySnapshot 判型账本快照(纯读,按键排序稳定输出):键=本机
+// device_id=「本机 NAT 判型结论」。锁纪律同 recordClassifyOutcome。
+func (b *agentPeerPunchB) classifySnapshot() []ClassifyOutcome {
+	b.classifyMu.Lock()
+	defer b.classifyMu.Unlock()
+	out := make([]ClassifyOutcome, 0, len(b.classifyOutcomes))
+	for _, oc := range b.classifyOutcomes {
+		out = append(out, oc)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PeerID < out[j].PeerID })
+	return out
+}
+
 // ---------------------------------------------------------------------------
 // A 侧(Task 10b):cache-first 拨号源 + result/candidates pending 接收 +
 // 平行缝注册。
 // ---------------------------------------------------------------------------
+
+// agentPunchDialCounters A 侧拨号面分类计数(组网诊断读面批 Task 3,I-1 评审
+// 拍板对齐计划口径):全 atomic,快照读侧零锁 Load。落点逐臂锚定现场(诊断
+// 面只计数,不改变任何控制流):hit=tryCached 快路径真交付(含 dialMiss 等
+// 锁后的双重检查命中,此时同一次拨号 miss+hit 各记一笔=「先 miss 后缓存赶
+// 上」的真账);miss=快路径未命中进 miss 链;memo_skip/symmetric/
+// no_candidates/send_session_fail=各失败臂(与 miss 合计即 miss 链全貌);
+// success=开流交付成功(mesh 腿 OpenStream / transfer 腿 OpenStreamSync 各自
+// 成功返回前计一笔);dial_fail=DialPeer 阶段失败(gate 拒/超时/握手败)与
+// 僵尸窗开流失败(两腿开流败)同臂——锚点=计划的 dial fail 失败臂口径,开
+// 流臂入账,单次拨号各臂至多记一笔。余下失败臂(bind/result 等待/candidates
+// 等待/send candidates/cert/残缺会话)按计划锚点清单不入账——超清单加计数
+// 是扩权,残余面由日志与错误返回覆盖。
+type agentPunchDialCounters struct {
+	hit       atomic.Int64
+	miss      atomic.Int64
+	memoSkip  atomic.Int64
+	sendFail  atomic.Int64
+	symmetric atomic.Int64
+	noCands   atomic.Int64
+	dialFail  atomic.Int64
+	success   atomic.Int64
+}
 
 // 信令等待是包变量而非配置项(punch 包 classifyDiscoverTimeout 先例):
 // 生产语义是常量;result 等待须覆盖 B 侧 bind+双 STUN 判型的最坏时延
@@ -705,6 +795,15 @@ type agentPeerPunchA struct {
 	skipMemo          *punch.SkipMemo
 	cache             *punch.SessionCache
 	dialMu            sync.Mutex
+	// 拨号面计数器(组网诊断读面批 Task 3):全 atomic 零锁计数,快照读侧
+	// 经 dialCounters() Load 汇出——不碰 mu/dialMu。落点逐臂锚定见
+	// agentPunchDialCounters 注。
+	stats agentPunchDialCounters
+	// classify 结果账本(快照面新增):STUN 不可达≠symmetric 不写 memo
+	// (铁律③),不可达只落这里——空 memo+账本 unreachable 才是「STUN 坏」,
+	// 空 memo+账本空=「从未探测」。
+	classifyMu       sync.Mutex
+	classifyOutcomes map[string]ClassifyOutcome // 键=对端 device_id(与 B 侧「键=本机」的分工见两侧结构体注)
 
 	gate     func() bool
 	bind     func() (*net.UDPConn, string, error)
@@ -726,6 +825,7 @@ func newAgentPeerPunchA() *agentPeerPunchA {
 		candidateStash:    map[string][]string{},
 		sockets:           map[string]*net.UDPConn{},
 		skipMemo:          &punch.SkipMemo{},
+		classifyOutcomes:  map[string]ClassifyOutcome{},
 		cache:             punch.NewSessionCache(),
 		gate:              agentPunchConfigEnabled,
 		bind:              func() (*net.UDPConn, string, error) { return punch.NewBoundUDPConn(punch.DefaultResolver) },
@@ -827,6 +927,7 @@ func (a *agentPeerPunchA) dialSourceOpts(ctx context.Context, peerID string, opt
 	if conn, ok := a.tryCached(ctx, key); ok {
 		return conn, nil
 	}
+	a.stats.miss.Add(1) // 快路径未命中进 miss 链(计数锚点,不改控制流)
 	return a.dialMiss(ctx, peerID, opts)
 }
 
@@ -844,6 +945,7 @@ func (a *agentPeerPunchA) tryCached(ctx context.Context, key string) (net.Conn, 
 	if err != nil {
 		return nil, false
 	}
+	a.stats.hit.Add(1) // 缓存真交付(计数锚点;双重检查命中同点计数)
 	return conn, true
 }
 
@@ -881,6 +983,7 @@ func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string, opts punc
 	// 90s 与信令一整个来回(评审定谳:NAT 判型/失败记忆,否则对称 NAT
 	// 对端每次拨号白烧 2-3s)。
 	if a.skipMemo.ShouldSkip(peerID) {
+		a.stats.memoSkip.Add(1)
 		return nil, fmt.Errorf("agent punch: peer %s skip memo (symmetric suspect)", peerID)
 	}
 
@@ -914,6 +1017,7 @@ func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string, opts punc
 		"purpose":     purposeOrMesh(opts.purpose),
 		"transfer_id": opts.transferID,
 	}); err != nil {
+		a.stats.sendFail.Add(1)
 		return nil, fmt.Errorf("agent punch: send session: %w", err)
 	}
 	var fingerprint string
@@ -949,20 +1053,29 @@ func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string, opts punc
 	if !publicPeer {
 		mapping, symmetricSuspect, classifyErr := a.classify(socket, a.servers())
 		if classifyErr != nil {
-			// 铁律:不可达≠symmetric,不写 SkipMemo;打洞照试。
+			// 铁律:不可达≠symmetric,不写 SkipMemo;打洞照试。账本记
+			// unreachable(键=对端 device_id;空 memo+账本 unreachable=「STUN 坏」判据点)。
+			a.recordClassifyOutcome(peerID, "unreachable")
 			logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH-A] classify unavailable peer=%s err=%v", peerID, classifyErr))
 		} else {
 			if symmetricSuspect {
 				// per-peer 记账后拒绝:本对端 5min 内不再尝试(重拨检查前有
 				// ShouldSkip 预检兜住)。
 				a.skipMemo.Record(peerID)
+				a.recordClassifyOutcome(peerID, "symmetric")
+				a.stats.symmetric.Add(1)
 				_ = socket.Close()
 				return nil, fmt.Errorf("agent punch: peer %s symmetric nat suspect", peerID)
 			}
+			a.recordClassifyOutcome(peerID, "ok")
 			if mapping.IP != nil && mapping.Port > 0 {
 				selfCandidates = []string{net.JoinHostPort(mapping.IP.String(), strconv.Itoa(mapping.Port))}
 			}
 		}
+	} else {
+		// public 声明(punch-public-peer):跳过自身判型,账本记 public_declared
+		// ——这不是本机判型结果,是对端直挂声明的账面(同键语义=对端 device_id)。
+		a.recordClassifyOutcome(peerID, "public_declared")
 	}
 
 	// ③ candidates 帧 → pending 等 B 候选。public 路径发送保持无条件
@@ -1003,6 +1116,7 @@ func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string, opts punc
 	if len(peerCandidates) == 0 {
 		// B 判型失败无映射可发(v1 线协议无候选)——A 拿 result 端口也
 		// 拼不出公网地址,直连无望,落 piko。
+		a.stats.noCands.Add(1)
 		_ = socket.Close()
 		return nil, errors.New("agent punch: no peer candidates")
 	}
@@ -1034,6 +1148,7 @@ func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string, opts punc
 		KeepAlive: opts.purpose == "",
 	})
 	if err != nil {
+		a.stats.dialFail.Add(1) // DialPeer 阶段失败(gate 拒/超时/握手败同臂)
 		_ = socket.Close()
 		if errors.Is(err, punch.ErrPunchGateRejected) {
 			// token 永久无效,不重试(重试烧的是同一 token)。
@@ -1073,8 +1188,10 @@ func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string, opts punc
 	conn, err := lease.OpenStream(ctx)
 	lease.Release()
 	if err != nil {
+		a.stats.dialFail.Add(1) // 僵尸窗开流失败(计数锚点,I-1 拍板)
 		return nil, fmt.Errorf("agent punch: open stream: %w", err)
 	}
+	a.stats.success.Add(1) // 开流交付成功(mesh 腿,I-1 拍板锚点)
 	logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH-A] punched peer=%s key=%s session=%s", peerID, key, sessionID))
 	return conn, nil
 }
@@ -1089,10 +1206,12 @@ func (a *agentPeerPunchA) dialTransferOneShot(ctx context.Context, session *punc
 	}
 	stream, err := session.Conn.OpenStreamSync(ctx)
 	if err != nil {
+		a.stats.dialFail.Add(1) // 僵尸窗开流失败(计数锚点,I-1 拍板)
 		_ = session.Transport.Close()
 		_ = socket.Close()
 		return nil, fmt.Errorf("agent punch: open stream: %w", err)
 	}
+	a.stats.success.Add(1) // 开流交付成功(transfer one-shot 腿,I-1 拍板锚点)
 	logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH-A] punched peer=%s key=%s session=%s(one-shot)", peerID, key, sessionID))
 	return &oneShotPunchConn{
 		Conn:      &punchStreamConn{stream: stream, conn: session.Conn},
@@ -1199,6 +1318,36 @@ func (a *agentPeerPunchA) closeAll() {
 	}
 }
 
+// recordClassifyOutcome 落一笔判型结果(同键重判以最新一笔顶替)。键=对端
+// device_id(B 侧=本机,两侧键语义分工见各自结构体注与 handleSession 的
+// Record(selfPeerID) 注)。锁纪律:只碰 classifyMu,绝不触 mu/dialMu 执行
+// 路径;map 惰性初始化兜测试直构实例。
+func (a *agentPeerPunchA) recordClassifyOutcome(peerID, outcome string) {
+	a.classifyMu.Lock()
+	defer a.classifyMu.Unlock()
+	if a.classifyOutcomes == nil {
+		a.classifyOutcomes = map[string]ClassifyOutcome{}
+	}
+	a.classifyOutcomes[peerID] = ClassifyOutcome{
+		PeerID:  peerID,
+		Outcome: outcome,
+		At:      time.Now().Format(time.RFC3339),
+	}
+}
+
+// classifySnapshot 判型账本快照(纯读,按键排序稳定输出):键=对端
+// device_id。锁纪律同 recordClassifyOutcome。
+func (a *agentPeerPunchA) classifySnapshot() []ClassifyOutcome {
+	a.classifyMu.Lock()
+	defer a.classifyMu.Unlock()
+	out := make([]ClassifyOutcome, 0, len(a.classifyOutcomes))
+	for _, oc := range a.classifyOutcomes {
+		out = append(out, oc)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PeerID < out[j].PeerID })
+	return out
+}
+
 // agentPunchRandomID 会话/请求标识(crypto/rand hex;rand 失败退化纳秒
 // 36 进制——标识唯一性降级为进程内唯一,不碍信令路由)。
 func agentPunchRandomID() string {
@@ -1297,4 +1446,218 @@ func agentPunchFrameWriter() func(interface{}) error {
 		}
 		return w(v)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 判型账本聚合快照(组网诊断读面批 Task 2):诊断面读侧出口
+// ---------------------------------------------------------------------------
+
+// MeshPunchClassifySnapshot classify 结果账本聚合(A/B 分开报,键语义显式
+// 标注)。命名拍板与 MeshRosterSyncSnapshot 同款先例:类型带 Snapshot 后缀,
+// 与查询函数 MeshPunchClassifyStatus() 错开(Go 包级类型与函数共用一个
+// 标识符命名空间,同名=重声明编译错——计划原文两者同名不可编译)。
+type MeshPunchClassifySnapshot struct {
+	SideA []ClassifyOutcome `json:"side_a"` // 键=对端 device_id
+	SideB []ClassifyOutcome `json:"side_b"` // 键=本机 device_id=本机 NAT
+}
+
+// MeshPunchClassifyStatus 取两侧判型账本聚合快照(诊断面读侧):经 shared
+// 单例取数,nil 安全(未初始化=空数组)。memo 表快照的合并出口已按拍定并入
+// MeshPunchSessionsStatus(Task 3)同级输出,本访问器不重复收 memo——勿另
+// 立第三访问器。锁纪律:两侧快照各自只碰 classifyMu,绝不触 dialMu/mu 执行
+// 路径。
+func MeshPunchClassifyStatus() MeshPunchClassifySnapshot {
+	out := MeshPunchClassifySnapshot{
+		SideA: []ClassifyOutcome{},
+		SideB: []ClassifyOutcome{},
+	}
+	if a := sharedAgentPeerPunchA(); a != nil {
+		out.SideA = a.classifySnapshot()
+	}
+	if b := sharedAgentPeerPunchB(); b != nil {
+		out.SideB = b.classifySnapshot()
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// 会话快照聚合(组网诊断读面批 Task 3):缓存表/sock 表/拨号计数/memo/B 侧
+// 在册会话的诊断面读侧出口
+// ---------------------------------------------------------------------------
+
+// MeshPunchSocketEntry A 侧 sockets 表单项:purpose 拆解自键前缀(与
+// punchCacheKey 的拼装规则互逆)——裸 peerID=mesh,transfer:peerID=transfer。
+// 拨号面 purpose 仅空/"transfer" 两态,键无前缀按 mesh 报(transfer: 前缀
+// 撞键仅理论面——device_id 不含冒号)。
+type MeshPunchSocketEntry struct {
+	Key     string `json:"key"` // punchCacheKey 产物原样
+	PeerID  string `json:"peer_id"`
+	Purpose string `json:"purpose"` // mesh|transfer
+}
+
+// MeshPunchSessionsCounters A 侧拨号面计数快照(逐臂语义见
+// agentPunchDialCounters 注)。
+type MeshPunchSessionsCounters struct {
+	Hit       int64 `json:"hit"`
+	Miss      int64 `json:"miss"`
+	MemoSkip  int64 `json:"memo_skip"`
+	SendFail  int64 `json:"send_session_fail"`
+	Symmetric int64 `json:"symmetric"`
+	NoCands   int64 `json:"no_candidates"`
+	DialFail  int64 `json:"dial_fail"`
+	Success   int64 `json:"success"`
+}
+
+// MeshPunchSessionsMemo 两侧 SkipMemo 快照(键语义分工与 MeshPunchClassify-
+// Snapshot 同源:A=对端 device_id,B=本机 device_id=本机 NAT)。
+type MeshPunchSessionsMemo struct {
+	SideA []punch.SkipMemoEntry `json:"side_a"`
+	SideB []punch.SkipMemoEntry `json:"side_b"`
+}
+
+// MeshPunchBSideSession B 侧在册会话单项:remaining=会话帧钳制 TTL-startedAt
+// 起 age(钳 0)——子 90s TTL 会话按真值报告,不再按设计满额超额;done=true
+// 是「listener 已收摊待 reaper 摘表」的过渡态(摘表后即不在册,快照面只读
+// 不到已摘表项)。
+type MeshPunchBSideSession struct {
+	SessionID        string `json:"session_id"`
+	AgeSeconds       int64  `json:"age_seconds"`
+	RemainingSeconds int64  `json:"remaining_seconds"`
+	Done             bool   `json:"done"`
+}
+
+// MeshPunchBSideSnapshot B 侧在册会话表快照。
+type MeshPunchBSideSnapshot struct {
+	ActiveCount int                     `json:"active_count"`
+	Sessions    []MeshPunchBSideSession `json:"sessions"`
+}
+
+// MeshPunchSessionsSnapshot 会话快照聚合(cache/sockets/拨号计数/memo/B 侧
+// 在册)。命名拍板与 MeshPunchClassifySnapshot 同款先例:类型带 Snapshot
+// 后缀与查询函数 MeshPunchSessionsStatus() 错开(Go 包级类型与函数共用同一
+// 标识符命名空间,同名=重声明编译错);side_b 段 JSON 键沿 Task 2 的
+// side_a/side_b 双侧命名族(计划示例文的 b_side 让位族名一致性)。
+type MeshPunchSessionsSnapshot struct {
+	Cache    []punch.SessionSnapshotEntry `json:"cache"`
+	Sockets  []MeshPunchSocketEntry       `json:"sockets"`
+	Counters MeshPunchSessionsCounters    `json:"counters"`
+	Memo     MeshPunchSessionsMemo        `json:"memo"`
+	SideB    MeshPunchBSideSnapshot       `json:"side_b"`
+}
+
+// cacheSnapshot 缓存表快照透传(nil cache 兜测试直构实例)。
+func (a *agentPeerPunchA) cacheSnapshot() []punch.SessionSnapshotEntry {
+	if a.cache == nil {
+		return []punch.SessionSnapshotEntry{}
+	}
+	return a.cache.Snapshot()
+}
+
+// socketsSnapshot A 侧 sock 表纯读快照(a.mu 锁内遍历;绝不触 dialMu——
+// 执行路径的锁,快照零涉)。purpose 拆解=punchCacheKey 拼装规则的互逆;按键
+// 排序稳定输出。
+func (a *agentPeerPunchA) socketsSnapshot() []MeshPunchSocketEntry {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]MeshPunchSocketEntry, 0, len(a.sockets))
+	for key := range a.sockets {
+		e := MeshPunchSocketEntry{Key: key, PeerID: key, Purpose: "mesh"}
+		if rest, ok := strings.CutPrefix(key, "transfer:"); ok {
+			e.Purpose = "transfer"
+			e.PeerID = rest
+		}
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
+// dialCounters 拨号面计数快照(纯 Load,零锁)。
+func (a *agentPeerPunchA) dialCounters() MeshPunchSessionsCounters {
+	return MeshPunchSessionsCounters{
+		Hit:       a.stats.hit.Load(),
+		Miss:      a.stats.miss.Load(),
+		MemoSkip:  a.stats.memoSkip.Load(),
+		SendFail:  a.stats.sendFail.Load(),
+		Symmetric: a.stats.symmetric.Load(),
+		NoCands:   a.stats.noCands.Load(),
+		DialFail:  a.stats.dialFail.Load(),
+		Success:   a.stats.success.Load(),
+	}
+}
+
+// agentPunchMemoSnapshot memo 表快照透传(nil memo 兜测试直构;A/B 两侧
+// 同款共用一个助手,不另设两侧各一份)。
+func agentPunchMemoSnapshot(m *punch.SkipMemo) []punch.SkipMemoEntry {
+	if m == nil {
+		return []punch.SkipMemoEntry{}
+	}
+	return m.Snapshot()
+}
+
+// sessionsSnapshot B 侧在册会话表纯读快照(b.mu 锁内遍历;done 用非阻塞
+// select 读,绝不触碰执行路径——探测/reaper/handler 均不在快照面)。age/
+// remaining 由 startedAt 派生,负秒数(时钟倒拨的理论面)钳 0。
+func (b *agentPeerPunchB) sessionsSnapshot() MeshPunchBSideSnapshot {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := time.Now()
+	out := MeshPunchBSideSnapshot{
+		ActiveCount: len(b.sessions),
+		Sessions:    make([]MeshPunchBSideSession, 0, len(b.sessions)),
+	}
+	for id, sess := range b.sessions {
+		e := MeshPunchBSideSession{SessionID: id}
+		select {
+		case <-sess.done:
+			e.Done = true
+		default:
+		}
+		ttl := sess.ttlSeconds
+		if ttl <= 0 {
+			// 兜底(理论不可达:构造点+register 双防线):按设计满额报,
+			// 不给快照面留荒诞数。
+			ttl = agentPunchSessionMaxTTLSeconds
+		}
+		age := int64(0)
+		if !sess.startedAt.IsZero() {
+			age = int64(now.Sub(sess.startedAt) / time.Second)
+			if age < 0 {
+				age = 0
+			}
+		}
+		e.AgeSeconds = age
+		e.RemainingSeconds = ttl - age
+		if e.RemainingSeconds < 0 {
+			e.RemainingSeconds = 0
+		}
+		out.Sessions = append(out.Sessions, e)
+	}
+	sort.Slice(out.Sessions, func(i, j int) bool { return out.Sessions[i].SessionID < out.Sessions[j].SessionID })
+	return out
+}
+
+// MeshPunchSessionsStatus 取会话快照聚合(诊断面读侧,与 MeshPunchClassify-
+// Status 同级;memo 快照出口按 Task 2 拍定并入本缝——a/b.skipMemo.Snapshot()
+// 经 agentPunchMemoSnapshot 透传,不另立第三访问器)。nil 安全(各段空数组
+// 兜底)。锁纪律:A 侧只碰 cache 表锁(Snapshot 内)/a.mu/atomic 零锁,
+// B 侧只碰 b.mu;绝不触 dialMu 执行路径。
+func MeshPunchSessionsStatus() MeshPunchSessionsSnapshot {
+	out := MeshPunchSessionsSnapshot{
+		Cache:   []punch.SessionSnapshotEntry{},
+		Sockets: []MeshPunchSocketEntry{},
+		Memo:    MeshPunchSessionsMemo{SideA: []punch.SkipMemoEntry{}, SideB: []punch.SkipMemoEntry{}},
+		SideB:   MeshPunchBSideSnapshot{Sessions: []MeshPunchBSideSession{}},
+	}
+	if a := sharedAgentPeerPunchA(); a != nil {
+		out.Cache = a.cacheSnapshot()
+		out.Sockets = a.socketsSnapshot()
+		out.Counters = a.dialCounters()
+		out.Memo.SideA = agentPunchMemoSnapshot(a.skipMemo)
+	}
+	if b := sharedAgentPeerPunchB(); b != nil {
+		out.SideB = b.sessionsSnapshot()
+		out.Memo.SideB = agentPunchMemoSnapshot(b.skipMemo)
+	}
+	return out
 }

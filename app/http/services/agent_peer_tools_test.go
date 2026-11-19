@@ -507,14 +507,17 @@ func TestAgentCorePeerTools_BridgeSharesHandlers(t *testing.T) {
 
 	m := &agentAIManager{coreJournal: newAgentCoreJournal(t.TempDir())}
 	tools := m.agentCorePeerTools(agentAIRun{sessionID: "sess-bridge"})
-	if len(tools) != 5 {
-		t.Fatalf("tools = %d, want 5", len(tools))
+	// 5 peer 互访 + 4 mesh 诊断读面(读面批 2026-11-20,后四件无注册表事件
+	// 无 CLI bridge 面,见 agent_peer_tools.go mesh 常量块注释)。
+	if len(tools) != 9 {
+		t.Fatalf("tools = %d, want 9", len(tools))
 	}
 	names := map[string]bool{}
 	for _, tool := range tools {
 		names[tool.Name()] = true
 	}
-	for _, want := range []string{"peer.exec", "peer.fetch_file", "peer.device_info", "peer.device_note", "peer.device_list"} {
+	for _, want := range []string{"peer.exec", "peer.fetch_file", "peer.device_info", "peer.device_note", "peer.device_list",
+		"mesh.readiness", "mesh.identity", "mesh.stun_probe", "mesh.lan_candidates"} {
 		if !names[want] {
 			t.Fatalf("missing bridge tool %s (have %v)", want, names)
 		}

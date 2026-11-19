@@ -612,5 +612,25 @@ func PeerMCPContractSpecs() []PeerMCPContractSpec {
 			Optional: []string{"device_id"},
 			Keywords: []string{"max 64 bytes", "max 4096 bytes"},
 		},
+		// mesh 诊断读面四件(组网诊断读面批 2026-11-20):全零参读工具,两面
+		// 描述逐字同文。Keywords 只用稳定词(idempotent / read-only / busy /
+		// NOT idempotent / split-brain 等)——stun_probe 的 NOT idempotent 是
+		// 承重锚:它是唯一非幂等条,漏标会让消费方把 UDP 活探测当读缓存。
+		{
+			CoreName: "mesh.readiness", StdioName: "mesh_readiness",
+			Keywords: []string{"idempotent", "read-only", "carrier buckets", "not live-probed", "roster sync state"},
+		},
+		{
+			CoreName: "mesh.identity", StdioName: "mesh_identity",
+			Keywords: []string{"idempotent", "read-only", "split-brain"},
+		},
+		{
+			CoreName: "mesh.stun_probe", StdioName: "mesh_stun_probe",
+			Keywords: []string{"NOT idempotent", "busy", "budget 8s", "symmetric"},
+		},
+		{
+			CoreName: "mesh.lan_candidates", StdioName: "mesh_lan_candidates",
+			Keywords: []string{"idempotent", "read-only", "not auto-paired"},
+		},
 	}
 }

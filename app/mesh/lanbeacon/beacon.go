@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"aliang.one/nursorgate/common/logger"
@@ -212,6 +213,21 @@ type Beacon struct {
 	// 签名,返回 b64;空串/nil = 广播不带 Sig(旧版形状,自动组网不晋升)。
 	// 签名在 assemblePayload 锁外计算(私钥解析+签名,读盘级成本)。
 	payloadSignerFn func(BeaconSignFields) string
+
+	// 运行计数(atomic,读不需 mu;生命周期=当前实例,装配对账换实例即清零)
+	bcastSent        atomic.Uint64
+	bcastSendErr     atomic.Uint64
+	rxPackets        atomic.Uint64
+	rxMalformed      atomic.Uint64
+	rxSelf           atomic.Uint64
+	rxStale          atomic.Uint64
+	rxAcctRejected   atomic.Uint64 // 跨账号
+	rxSigRejected    atomic.Uint64
+	rxDegradeBlocked atomic.Uint64
+	candAccepted     atomic.Uint64
+	candRefreshed    atomic.Uint64
+	candEvicted      atomic.Uint64
+	startedAt        atomic.Int64 // unix 秒;0=未启动
 }
 
 // SetFingerprintProvider 注入广播指纹源(任务 10b)。nil=清除(恒空)。
@@ -320,6 +336,7 @@ func (b *Beacon) Start(ctx context.Context) error {
 	b.sendConn = sendPacket.(*net.UDPConn)
 	b.cancel = cancel
 	b.started = true
+	b.startedAt.Store(time.Now().Unix())
 	go b.broadcastLoop(runCtx)
 	go b.readLoop(b.listenConn)
 	// ctx 全生命周期收口:父 ctx 取消而调用方未调 Stop 时,监听 conn 由
@@ -374,6 +391,64 @@ func (b *Beacon) Running() bool {
 // 观测面:装配测试钉「广播端口=统一口」用,诊断面板可复用。
 func (b *Beacon) MeshPort() int {
 	return b.meshPort
+}
+
+// SelfID 返回构造期钉入的本机 device_id(beacon 广播 self)。构造后不可变,
+// 无锁只读(与 MeshPort 同款);nil 接收者返空串(未装配=无 self,与
+// Running/Stats 的 nil 防御惯例对齐)。消费方 /api/mesh/identity 身份一致性
+// 比对(读面批 Task 6):beacon 用的 self 与常驻身份文件/进程 state 三源
+// 对账,脑裂现场一眼可见。
+func (b *Beacon) SelfID() string {
+	if b == nil {
+		return ""
+	}
+	return b.selfID
+}
+
+// BeaconStats beacon 运行计数快照(D-8):sent/err 原始计数,消费方算比率
+// (广播是周期节拍非事件驱动);生命周期=当前 beacon 实例。utun7 吞广播的
+// 数据特征=sendErr 增长且 rxPackets 恒零(健康回环环境则 rx 全为自见回环:
+// rx_self==rx_packets)。⚠️ 两点对账边界:TTL 惰性剪枝的移除不计数,
+// cand_accepted+cand_refreshed-cand_evicted 不与候选表数量对账;同实例重启
+// started_at=最近一次 Start、计数器自构造累计,判活须并读 Running()。
+type BeaconStats struct {
+	StartedAt        string `json:"started_at"` // RFC3339;未启动恒空
+	BcastSent        uint64 `json:"bcast_sent"`
+	BcastSendErr     uint64 `json:"bcast_send_err"`
+	RxPackets        uint64 `json:"rx_packets"`
+	RxMalformed      uint64 `json:"rx_malformed"`
+	RxSelf           uint64 `json:"rx_self"`
+	RxStale          uint64 `json:"rx_stale"`
+	RxAcctRejected   uint64 `json:"rx_acct_rejected"`
+	RxSigRejected    uint64 `json:"rx_sig_rejected"`
+	RxDegradeBlocked uint64 `json:"rx_degrade_blocked"`
+	CandAccepted     uint64 `json:"cand_accepted"`
+	CandRefreshed    uint64 `json:"cand_refreshed"`
+	CandEvicted      uint64 `json:"cand_evicted"`
+}
+
+func (b *Beacon) Stats() BeaconStats {
+	if b == nil {
+		return BeaconStats{}
+	}
+	st := BeaconStats{
+		BcastSent:        b.bcastSent.Load(),
+		BcastSendErr:     b.bcastSendErr.Load(),
+		RxPackets:        b.rxPackets.Load(),
+		RxMalformed:      b.rxMalformed.Load(),
+		RxSelf:           b.rxSelf.Load(),
+		RxStale:          b.rxStale.Load(),
+		RxAcctRejected:   b.rxAcctRejected.Load(),
+		RxSigRejected:    b.rxSigRejected.Load(),
+		RxDegradeBlocked: b.rxDegradeBlocked.Load(),
+		CandAccepted:     b.candAccepted.Load(),
+		CandRefreshed:    b.candRefreshed.Load(),
+		CandEvicted:      b.candEvicted.Load(),
+	}
+	if ts := b.startedAt.Load(); ts > 0 {
+		st.StartedAt = time.Unix(ts, 0).UTC().Format(time.RFC3339)
+	}
+	return st
 }
 
 // Candidates 返回未过期候选,按 last_seen 降序(平局按 device_id 稳定)。
@@ -466,11 +541,13 @@ func (b *Beacon) broadcastOnce() {
 	_, werr := send.WriteToUDP(payload, &net.UDPAddr{IP: net.IPv4bcast, Port: port})
 	b.mu.Lock()
 	if werr != nil {
+		b.bcastSendErr.Add(1)
 		if !b.bcastErrLogged {
 			b.bcastErrLogged = true
 			logger.Info(fmt.Sprintf("[MESH-BEACON] broadcast to :%d failed (will retry silently): %v", port, werr))
 		}
 	} else {
+		b.bcastSent.Add(1)
 		b.bcastErrLogged = false
 	}
 	b.mu.Unlock()
@@ -483,7 +560,9 @@ func (b *Beacon) readLoop(conn *net.UDPConn) {
 		if err != nil {
 			return // Stop 关闭 conn 是唯一退出路径
 		}
+		b.rxPackets.Add(1)
 		if n <= 0 || n >= len(buf) {
+			b.rxMalformed.Add(1)
 			continue // 满缓冲=被截断的超限报文,按畸形丢弃
 		}
 		// 来源 IP 是候选可拨地址的唯一可信来源(报文内无地址字段,自报可伪造
@@ -502,20 +581,24 @@ func (b *Beacon) readLoop(conn *net.UDPConn) {
 func (b *Beacon) ingest(data []byte, now time.Time, senderIP string) {
 	var p beaconPayload
 	if err := json.Unmarshal(data, &p); err != nil {
+		b.rxMalformed.Add(1)
 		return
 	}
 	if p.DeviceID == "" || p.MeshPort <= 0 || p.MeshPort > 65535 {
+		b.rxMalformed.Add(1)
 		return // 缺字段/畸形端口:候选要供点选拨号,死端口无价值
 	}
 	// 同账号闸:双方哈希非空且不等=跨账号广播,丢弃(自动组网批次)。
 	// 发送方无哈希(旧版/未登录)=旧版兼容收;本方无哈希(未登录)=全收兼容
 	// ——两个兼容态只影响候选展示,连接面仍被钉扎+握手 fail-closed 挡住。
 	if own := b.ownAccountHash(); own != "" && p.AccountHash != "" && p.AccountHash != own {
+		b.rxAcctRejected.Add(1)
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if p.DeviceID == b.selfID {
+		b.rxSelf.Add(1)
 		return // 本机广播回环自见,忽略
 	}
 	age := now.Unix() - p.TS
@@ -523,6 +606,7 @@ func (b *Beacon) ingest(data []byte, now time.Time, senderIP string) {
 		age = 0 // 对端时钟小幅超前容忍,不因负龄误判超龄
 	}
 	if age > int64(b.maxAge/time.Second) {
+		b.rxStale.Add(1)
 		return
 	}
 	addr := ""
@@ -555,16 +639,19 @@ func (b *Beacon) ingest(data []byte, now time.Time, senderIP string) {
 	// 新钥可顶替条目,信任锚在 mesh.auto_peers 开关+握手(见类型注释)。
 	if p.Sig != "" {
 		if entry.pubKey == nil || !verifyBeaconSignature(entry.pubKey, p.signFields(), p.Sig) {
+			b.rxSigRejected.Add(1)
 			return
 		}
 		entry.sigVerified = true
 	}
-	if cur, ok := b.candidates[p.DeviceID]; ok {
+	cur, ok := b.candidates[p.DeviceID]
+	if ok {
 		// 已验签条目不被无签名报文降级(防降级攻击的**半个补丁**:只挡无
 		// 签名方向;自签新钥的带签名广播仍可顶替——残余风险由 auto_peers
 		// 显式开关+可信 LAN 语义+握手收口,见 beaconPayload 信任边界注释)。
 		// 乱序到达的旧报文不回退 last_seen(展示值跟随对端 ts)。
 		if cur.sigVerified && !entry.sigVerified {
+			b.rxDegradeBlocked.Add(1)
 			return
 		}
 		if cur.LastSeenUnix > entry.LastSeenUnix {
@@ -572,8 +659,14 @@ func (b *Beacon) ingest(data []byte, now time.Time, senderIP string) {
 		}
 	} else if len(b.candidates) >= beaconMaxCandidates {
 		b.evictStalestLocked()
+		b.candEvicted.Add(1)
 	}
 	b.candidates[p.DeviceID] = &entry
+	if ok {
+		b.candRefreshed.Add(1)
+	} else {
+		b.candAccepted.Add(1)
+	}
 }
 
 // pruneLocked 惰性剪枝:距最近一次本机接收超过 dedupTTL 的候选移除(以

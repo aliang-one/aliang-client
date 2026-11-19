@@ -185,6 +185,11 @@ type peerMCPTool struct {
 	method   string
 	path     string
 	buildReq func(args map[string]interface{}) interface{}
+	// rawData 标记「结构化读面」端点：data 载荷是 JSON 对象而非 peer 编排
+	// 的 {result:string} 字符串（mesh 诊断族 /api/mesh/*，读面批 2026-11-20）。
+	// 不加这个标记，invokeTool 的 result 解包会静默解出空串——信封合法、
+	// 模型看到空工具结果，比报错更难排查。true 时 data 原样透传为 JSON 文本。
+	rawData bool
 }
 
 // peerMCPInitializeResult 构造 initialize 响应。instructions 是 MCP 协议的
@@ -535,6 +540,66 @@ var peerMCPTools = []peerMCPTool{
 			}
 		},
 	},
+	// ---- 第 7 工具组：mesh 诊断读面（/api/mesh/*，全零参、读面免审） ----
+	//
+	// 四条全是本机 mesh 诊断读端点：56433 经 meshForward 透传到 core 取真值
+	// （裸挂本侧会恒报 running=false 反向假红，D3 双注册注释已立档）。data
+	// 是结构化对象（非 {result:string}），靠 rawData 标记走原样透传分支。
+	// 描述措辞刻意只用三面保得住的稳定词（idempotent / read-only / timeout /
+	// busy / NOT idempotent），与 services 侧契约测试（PeerMCPContractSpecs
+	// Keywords）共用同一批锚点。
+	{
+		name: "mesh_readiness",
+		description: "Aggregate mesh networking diagnostics (idempotent, read-only, timeout ~14s): " +
+			"four-gate enablement verdicts, beacon live counters, roster sync state, " +
+			"carrier buckets (lan/udp/piko), egress delegate state + last failure, " +
+			"punch NAT-classify ledger + session snapshots, stun servers list (static, " +
+			"not live-probed), lan candidates. " +
+			"Single call covers what used to need a whole debugging session.",
+		schema:    map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+		timeoutMs: 14_000,
+		method:    http.MethodGet,
+		path:      "/api/mesh/diag",
+		buildReq:  func(map[string]interface{}) interface{} { return nil },
+		rawData:   true,
+	},
+	{
+		name: "mesh_identity",
+		description: "Device identity consistency check (idempotent, read-only): state device_id vs " +
+			"identity file vs beacon self vs roster presence, with mismatches[] in plain language. " +
+			"First stop for suspected split-brain (two processes holding different credentials).",
+		schema:    map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+		timeoutMs: 14_000,
+		method:    http.MethodGet,
+		path:      "/api/mesh/identity",
+		buildReq:  func(map[string]interface{}) interface{} { return nil },
+		rawData:   true,
+	},
+	{
+		name: "mesh_stun_probe",
+		description: "Explicit live STUN server probe (NOT idempotent — sends UDP packets; budget 8s; " +
+			"may return busy:true in structured result — do NOT retry immediately on busy, check again " +
+			"later). Per-server reachability + NAT type (symmetric is a physical limit, not a fault). " +
+			"Note: many timeouts on the default list are normal, not a fault.",
+		schema:    map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+		timeoutMs: 14_000,
+		method:    http.MethodPost,
+		path:      "/api/mesh/stun_probe",
+		buildReq:  func(map[string]interface{}) interface{} { return nil },
+		rawData:   true,
+	},
+	{
+		name: "mesh_lan_candidates",
+		description: "LAN beacon candidates seen (idempotent, read-only). Empty list = no candidates " +
+			"received yet, NOT necessarily a fault (check mesh_readiness beacon counters to " +
+			"distinguish). Candidates are display-only, not auto-paired.",
+		schema:    map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+		timeoutMs: 14_000,
+		method:    http.MethodGet,
+		path:      "/api/mesh/lan_peers",
+		buildReq:  func(map[string]interface{}) interface{} { return nil },
+		rawData:   true,
+	},
 }
 
 // invokeTool 执行一个 tools/call：本地路由 → {code:0,data:{result}} 解包；
@@ -617,6 +682,16 @@ func (s *peerMCPServer) invokeTool(name string, rawArgs json.RawMessage) (string
 			msg = fmt.Sprintf("local agent returned status %d", resp.StatusCode)
 		}
 		return msg, true
+	}
+	// 结构化读面（mesh 诊断族）：data 是 JSON 对象而非 {result:string} 字符串，
+	// 原样透传（服务端编码已是紧凑 JSON，diag 载荷量级远小于 4MiB 读顶）。
+	// busy（200+code0+data.busy=true）是合法成功回包——语义判读交给描述里的
+	// 「勿立即重试」契约，这里不判 isError。
+	if tool.rawData {
+		if len(envelope.Data) == 0 || string(envelope.Data) == "null" {
+			return "{}", false
+		}
+		return string(envelope.Data), false
 	}
 	var data struct {
 		Result string `json:"result"`
