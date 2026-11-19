@@ -209,11 +209,13 @@ test('平台流量代理保存：POST /api/config/customer 载荷含 mesh.fallba
   // 载荷是「与当前配置的差异」而非全量：本卡没动的顶层段（proxy_rules）与
   // 未变的 mesh 开关（enable/forward_enable/punch_enable/max_hops/peers）都不
   // 出现在 patch 里——父层按顶层段浅合并，多带的键反而会把别人的段覆盖成
-  // 陈旧值。punch_enable 未变动（现值 false=默认关）不得产出伪 diff。
+  // 陈旧值。punch_enable 未变动（现值 false=默认关）不得产出伪 diff;
+  // stun_servers 未配置（=后端默认档）同样不得产出 [] 伪 diff。
   expect(savedBody.customer.proxy_rules).toBeUndefined();
   expect(savedBody.customer.mesh.enable).toBeUndefined();
   expect(savedBody.customer.mesh.forward_enable).toBeUndefined();
   expect(savedBody.customer.mesh.punch_enable).toBeUndefined();
+  expect(savedBody.customer.mesh.stun_servers).toBeUndefined();
   expect(savedBody.customer.mesh.peers).toBeUndefined();
 });
 
@@ -282,4 +284,35 @@ test('密钥输入位端到端：填 peer host_key + 节点私钥/口令 → 保
   await expect(page.locator('[data-mesh-peer-row="dev-b"] [data-field="meshPeerHostKey"]')).toHaveValue('SHA256:peer-e2e-new');
   await expect(page.locator('[data-field="meshPrivateKey"]')).toHaveValue(/BEGIN OPENSSH PRIVATE KEY/);
   await expect(page.locator('[data-field="meshKeyPassphrase"]')).toHaveValue('ph-e2e');
+});
+
+// 打洞直连端到端（transfer-punch-stun）：punch 开关 + STUN 列表 填 → 保存 →
+// 刷新回显仍在（同款可变 store + deepMerge 复刻后端 deep-merge 语义）。
+test('打洞直连端到端：开 punch 开关 + 填 STUN 列表 → 保存 → 刷新回显仍在', async ({ page }) => {
+  const store = { customer: JSON.parse(JSON.stringify(CUSTOMER)) };
+  let savedCount = 0;
+  await installPageStub(page);
+  await stubApi(page, {
+    customer: () => store.customer,
+    onSave: (body) => {
+      store.customer = deepMerge(store.customer, body.customer);
+      savedCount += 1;
+    }
+  });
+  await openMeshCard(page);
+
+  await page.locator('[data-field="meshPunchEnable"]').check({ force: true });
+  await page.locator('[data-field="meshStunServers"]').fill('stun.example.com:3478\nstun2.example.com:3479');
+  await page.locator('button[data-mesh-save]').click();
+
+  // 保存完成且 stub store 已合并（POST patch 只带两处真实编辑,未变段不进）
+  await expect.poll(() => savedCount).toBe(1);
+  expect(store.customer.mesh.punch_enable).toBe(true);
+  expect(store.customer.mesh.stun_servers).toEqual(['stun.example.com:3478', 'stun2.example.com:3479']);
+
+  // 刷新页面（重新 GET 已合并配置）→ 开关勾选与列表回显保存值
+  await page.reload();
+  await openMeshCard(page);
+  await expect(page.locator('[data-field="meshPunchEnable"]')).toBeChecked();
+  await expect(page.locator('[data-field="meshStunServers"]')).toHaveValue('stun.example.com:3478\nstun2.example.com:3479');
 });

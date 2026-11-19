@@ -19,6 +19,10 @@ package services
 //   - 指纹:B 每次协商现签 ECDSA P-256 自签证书,fingerprint=sha256(DER);
 //     A 拿候选里的指纹钉扎(InsecureSkipVerify+手动比对),防 LAN 内嗅探/仿冒。
 //
+// 协议体拆层(收/发两腿同款):hello→ok→字节流→ACK 的协议体
+// (serveAgentLanPushConn / pushAgentLanStream)载体无关,TLS 只在 TCP 薄壳里
+// 包一次;punch 路径直接喂协议体(punch 流自带 TLS,禁再包一层)。
+//
 // 边界(v1 明确从简,spec §6.3):
 //   - 目录归档不走直连(zip 打包兜不住单用途短时语义,服务端也不会发候选)。
 //   - 不支持续传:partial 已有偏移时直接放弃 LAN 腿走 COS。
@@ -45,6 +49,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -374,9 +379,7 @@ func parseAgentLanPushCandidates(msg map[string]interface{}) *agentLanDirectCand
 }
 
 // agentLanPushServeOnce 是 A 端收件 listener 的服务体:恰好处理一条连接。
-// 协议见本节头注释。收件围栏/落盘/marker 全部复用接收链的既有件(landing
-// fence / .partial 命名 / 重名不覆盖 / done marker);收满 size_bytes 才 ACK,
-// 任何失败:删 partial、回 ok:false、静默断开。
+// TCP+TLS 薄壳:TLS 在这里包一次,协议体交给载体无关的 serveAgentLanPushConn。
 func (s *AgentService) agentLanPushServeOnce(conn net.Conn, tlsCert tls.Certificate, expectedToken, expectedTransferID, filename, targetDir string, maxBytes int64, writeJSON func(interface{}) error) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(agentLanHandshakeTimeout))
@@ -385,7 +388,17 @@ func (s *AgentService) agentLanPushServeOnce(conn net.Conn, tlsCert tls.Certific
 		logger.Info(fmt.Sprintf("[AGENT-PEER-LAN-PUSH] handshake failed: %v", err))
 		return
 	}
-	reader := bufio.NewReader(io.LimitReader(tlsConn, agentLanHeadlineLimit))
+	serveAgentLanPushConn(tlsConn, expectedToken, expectedTransferID, filename, targetDir, maxBytes, writeJSON)
+}
+
+// serveAgentLanPushConn 是 lan_push 接收协议体(载体无关):secConn 已在外层
+// 完成 TLS,本函数只做 hello→ok→定长字节流→ACK。TCP 路径由薄壳喂 tls.Conn,
+// punch 路径直接喂协议体(punch 流自带 TLS,禁再包一层)。收件围栏/落盘/
+// marker 全部复用接收链的既有件(landing fence / .partial 命名 / 重名不覆盖 /
+// done marker);收满 size_bytes 才 ACK,任何失败:删 partial、回 ok:false、
+// 静默断开。
+func serveAgentLanPushConn(secConn net.Conn, expectedToken, expectedTransferID, filename, targetDir string, maxBytes int64, writeJSON func(interface{}) error) {
+	reader := bufio.NewReader(io.LimitReader(secConn, agentLanHeadlineLimit))
 	line, err := reader.ReadBytes('\n')
 	if err != nil || len(line) > agentLanHeadlineLimit {
 		logger.Info("[AGENT-PEER-LAN-PUSH] headline read failed or oversized")
@@ -406,7 +419,7 @@ func (s *AgentService) agentLanPushServeOnce(conn net.Conn, tlsCert tls.Certific
 	}
 	if hello.SizeBytes < 0 || (maxBytes > 0 && hello.SizeBytes > maxBytes) {
 		// 声明大小越限:拒绝收流(虚报 size 的对端兜底),回 ok:false。
-		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"too_large"}`), '\n'))
+		_, _ = secConn.Write(append([]byte(`{"ok":false,"reason":"too_large"}`), '\n'))
 		logger.Info(fmt.Sprintf("[AGENT-PEER-LAN-PUSH] declared size %d exceeds max_bytes %d", hello.SizeBytes, maxBytes))
 		return
 	}
@@ -416,11 +429,11 @@ func (s *AgentService) agentLanPushServeOnce(conn net.Conn, tlsCert tls.Certific
 	// deadline 掐到即刻——读流立即超时失败,走下方失败路径删 partial 不 ACK,
 	// 与接收腿「取消必须完全失效」契约对齐(旧空闸让取消后传输照常完成)。
 	slotCancel := func() {
-		_ = conn.SetDeadline(time.Now())
+		_ = secConn.SetDeadline(time.Now())
 	}
 	ok, duplicate := transferReceiveSlot().acquire(expectedTransferID, slotCancel)
 	if !ok {
-		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"receiver_busy"}`), '\n'))
+		_, _ = secConn.Write(append([]byte(`{"ok":false,"reason":"receiver_busy"}`), '\n'))
 		logger.Info(fmt.Sprintf("[AGENT-PEER-LAN-PUSH] receive slot busy transfer_id=%s duplicate=%t", expectedTransferID, duplicate))
 		return
 	}
@@ -429,39 +442,39 @@ func (s *AgentService) agentLanPushServeOnce(conn net.Conn, tlsCert tls.Certific
 	// 落盘三件套(接收链同款):inbox 收件根 + target_dir 围栏 + .partial 命名。
 	inbox, err := agentTransferInboxDir()
 	if err != nil {
-		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"internal"}`), '\n'))
+		_, _ = secConn.Write(append([]byte(`{"ok":false,"reason":"internal"}`), '\n'))
 		return
 	}
 	safeName, err := sanitizeTransferFileName(filename)
 	if err != nil {
-		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"bad_filename"}`), '\n'))
+		_, _ = secConn.Write(append([]byte(`{"ok":false,"reason":"bad_filename"}`), '\n'))
 		return
 	}
 	landDir, err := agentTransferLandingDir(inbox, targetDir)
 	if err != nil {
-		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"fence_escape"}`), '\n'))
+		_, _ = secConn.Write(append([]byte(`{"ok":false,"reason":"fence_escape"}`), '\n'))
 		return
 	}
 	if err := os.MkdirAll(landDir, 0o755); err != nil {
-		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"internal"}`), '\n'))
+		_, _ = secConn.Write(append([]byte(`{"ok":false,"reason":"internal"}`), '\n'))
 		return
 	}
 	partialPath := agentTransferPartialPath(inbox, expectedTransferID, safeName)
 	partial, err := os.OpenFile(partialPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
-		_, _ = tlsConn.Write(append([]byte(`{"ok":false,"reason":"internal"}`), '\n'))
+		_, _ = secConn.Write(append([]byte(`{"ok":false,"reason":"internal"}`), '\n'))
 		return
 	}
 
 	// token 过、槽到手、落盘就位:回 ok 放 B 开流,传输宽限盖 conn deadline。
-	_, _ = tlsConn.Write(append([]byte(`{"ok":true}`), '\n'))
-	conn.SetDeadline(time.Now().Add(agentLanServeGrace))
+	_, _ = secConn.Write(append([]byte(`{"ok":true}`), '\n'))
+	secConn.SetDeadline(time.Now().Add(agentLanServeGrace))
 
 	hasher := sha256.New()
 	throttle := newAgentTransferThrottle(hello.SizeBytes)
 	var received int64
 	body := &progressReader{
-		r: tlsConn,
+		r: secConn,
 		n: &received,
 		onRead: func() {
 			if throttle.shouldEmit(atomic.LoadInt64(&received), time.Now()) {
@@ -512,7 +525,7 @@ func (s *AgentService) agentLanPushServeOnce(conn net.Conn, tlsCert tls.Certific
 		"size_bytes": written,
 		"path":       finalPath,
 	})
-	if _, err := tlsConn.Write(append(ack, '\n')); err != nil {
+	if _, err := secConn.Write(append(ack, '\n')); err != nil {
 		logger.Warn(fmt.Sprintf("[AGENT-PEER-LAN-PUSH] ack write failed transfer_id=%s err=%v", expectedTransferID, err))
 		return
 	}
@@ -558,6 +571,17 @@ func (s *AgentService) handleAgentPeerLanPushListen(msg map[string]interface{}, 
 		ttlSeconds = 30
 	}
 
+	// 传输腿 punch 接收上下文(transfer-punch-stun):传输参数此刻齐备,
+	// 打洞会话(purpose=transfer)按 transfer_id 查用。TCP listener 与 punch
+	// 会话并行不悖——同网段走 TCP 腿,跨网段走 punch 腿,先到先得。
+	registerAgentPunchTransferContext(transferID, agentPunchTransferContext{
+		token:     token,
+		filename:  filename,
+		targetDir: targetDir,
+		maxBytes:  maxBytes,
+		writeJSON: writeJSON,
+	}, time.Duration(ttlSeconds)*time.Second)
+
 	tlsCert, fingerprint, err := generateAgentLanCertificate()
 	if err != nil {
 		fail("cert_generate_failed")
@@ -597,6 +621,7 @@ func (s *AgentService) handleAgentPeerLanPushListen(msg map[string]interface{}, 
 // 钉扎指纹、声明大小、流文件、核 ACK。成功返回 (size, sha, path, nil)——
 // size/sha 与自算一致已由本函数核过,path 是 A 侧最终落盘路径。任何失败返回
 // 非 nil error,由调用方落回 COS 常规上传——本函数绝不部分成功。
+// TCP+TLS 薄壳:拨号+钉扎 TLS 在这里做,协议体交给载体无关的 pushAgentLanStream。
 func attemptAgentTransferLANPush(ctx context.Context, ident agentTransferIdentity, cand *agentLanDirectCandidate, sourcePath string, totalSize int64, writeJSON func(interface{}) error) (int64, string, string, error) {
 	if totalSize <= 0 {
 		// 归档(zip 流式打包总量未知)与 stat 不到的源:直推腿不参与。
@@ -618,15 +643,24 @@ func attemptAgentTransferLANPush(ctx context.Context, ident agentTransferIdentit
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		return 0, "", "", fmt.Errorf("lan tls handshake failed: %w", err)
 	}
+	return pushAgentLanStream(ctx, tlsConn, ident, cand.Token, sourcePath, totalSize, writeJSON)
+}
+
+// pushAgentLanStream 是 lan_push 发送协议体(载体无关):secConn 已完成 TLS
+// (含指纹钉扎),本函数只做 hello→ok→流文件→核 ACK,成功返回
+// (size, sha, path, nil)——size/sha 与自算一致已由本函数核过,path 是 A 侧
+// 最终落盘路径。TCP 路径由 attemptAgentTransferLANPush 薄壳喂 tls.Client 流;
+// punch 路径直接喂协议体(punch 流自带 TLS,禁再包一层)。
+func pushAgentLanStream(ctx context.Context, secConn net.Conn, ident agentTransferIdentity, token string, sourcePath string, totalSize int64, writeJSON func(interface{}) error) (int64, string, string, error) {
 	hello, _ := json.Marshal(map[string]interface{}{
-		"token":       cand.Token,
+		"token":       token,
 		"transfer_id": ident.TransferID,
 		"size_bytes":  totalSize,
 	})
-	if _, err := tlsConn.Write(append(hello, '\n')); err != nil {
+	if _, err := secConn.Write(append(hello, '\n')); err != nil {
 		return 0, "", "", fmt.Errorf("lan hello write failed: %w", err)
 	}
-	reader := bufio.NewReader(io.LimitReader(tlsConn, agentLanHeadlineLimit))
+	reader := bufio.NewReader(io.LimitReader(secConn, agentLanHeadlineLimit))
 	line, err := reader.ReadBytes('\n')
 	if err != nil {
 		return 0, "", "", fmt.Errorf("lan headline read failed: %w", err)
@@ -641,13 +675,13 @@ func attemptAgentTransferLANPush(ctx context.Context, ident agentTransferIdentit
 	// 开流:传输宽限。ctx 取消真闸(P1 评审修):tls 流式读写不感知 ctx,起
 	// watcher 在 ctx.Done 时把 conn deadline 掐到即刻——流/ACK 读立即超时
 	// 失败,取消语义与 COS 腿对齐(映射 cancelled,不静默完成)。
-	rawConn.SetDeadline(time.Now().Add(agentLanServeGrace))
+	secConn.SetDeadline(time.Now().Add(agentLanServeGrace))
 	stopWatcher := make(chan struct{})
 	defer close(stopWatcher)
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = rawConn.SetDeadline(time.Now())
+			_ = secConn.SetDeadline(time.Now())
 		case <-stopWatcher:
 		}
 	}()
@@ -669,7 +703,7 @@ func attemptAgentTransferLANPush(ctx context.Context, ident agentTransferIdentit
 			}
 		},
 	}
-	written, copyErr := io.Copy(io.MultiWriter(tlsConn, hasher), io.LimitReader(body, totalSize))
+	written, copyErr := io.Copy(io.MultiWriter(secConn, hasher), io.LimitReader(body, totalSize))
 	if copyErr != nil {
 		// ctx 取消(transfer.cancel)优先于包装错误:COS 腿同款语义,取消映射
 		// cancelled 终态而非「落 COS 重传」(取消必须完全失效)。
@@ -687,7 +721,7 @@ func attemptAgentTransferLANPush(ctx context.Context, ident agentTransferIdentit
 	sum := hex.EncodeToString(hasher.Sum(nil))
 
 	// ACK 围栏:A 收满核 sha 后回最终行;给足宽限(A 的 rename/marker 在 ACK 前)。
-	rawConn.SetDeadline(time.Now().Add(agentLanServeGrace))
+	secConn.SetDeadline(time.Now().Add(agentLanServeGrace))
 	ackLine, err := reader.ReadBytes('\n')
 	if err != nil || len(ackLine) > agentLanHeadlineLimit {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -715,6 +749,116 @@ func attemptAgentTransferLANPush(ctx context.Context, ident agentTransferIdentit
 }
 
 // ---------------------------------------------------------------------------
+// 上传腿 punch 载体(transfer-punch-stun §2.2):LAN 直推失败后、COS 兜底
+// 前,经打洞会话直连推流——同 LAN 无法直连(跨网段/NAT)但有 punch 通路
+// 的拓扑里省掉 B→COS 的全量上行广域网段。
+// ---------------------------------------------------------------------------
+
+// agentPunchTransferDialFn punch 拨号缝(测试替身替换;生产=导出入口)。
+// init 内接线而非初始化表达式:依赖分析穿透函数体,直接引用会与上传链
+// 构成初始化环(帧分派→handleAgentTransferUpload→attemptAgentTransferPunchPush→本缝)。
+var agentPunchTransferDialFn func(ctx context.Context, peerID, transferID string) (net.Conn, error)
+
+func init() {
+	agentPunchTransferDialFn = AgentPeerPunchTransferDial
+}
+
+// parseAgentPunchPeerID 提取 upload 帧顶层 punch_peer_id(PhoneServer 下发,
+// 老服务端缺字段=空串=不进 punch 腿,纯 COS 语义不变)。TrimSpace+长度闸。
+func parseAgentPunchPeerID(msg map[string]interface{}) string {
+	peer := strings.TrimSpace(remoteString(msg, "punch_peer_id"))
+	if peer == "" || len(peer) > 128 {
+		return ""
+	}
+	return peer
+}
+
+// attemptAgentTransferPunchPush 上传腿 punch 载体(transfer-punch-stun §2.2):
+// LAN 直推失败后、COS 兜底前,打洞直连推流。协议体与 LAN 腿逐字共用
+// (pushAgentLanStream,punch 流自带 TLS);token 用 lan_push 候选里的
+// 单次凭据(接收侧 listen 上下文同值核验)。任何失败恒错误,调用方落 COS。
+func attemptAgentTransferPunchPush(ctx context.Context, ident agentTransferIdentity, punchPeerID, lanToken, sourcePath string, totalSize int64, writeJSON func(interface{}) error) (int64, string, string, error) {
+	if totalSize <= 0 {
+		return 0, "", "", fmt.Errorf("%w: unknown source size", errAgentTransferLanSkip)
+	}
+	conn, err := agentPunchTransferDialFn(ctx, punchPeerID, ident.TransferID)
+	if err != nil {
+		return 0, "", "", fmt.Errorf("punch dial %s: %w", punchPeerID, err)
+	}
+	defer conn.Close()
+	// 握手窗(T6 质量评审 Important-1 强制):协议体首行读无自带 deadline,
+	// punch conn 未预设——已连通但静默的对端会无限悬挂(TCP 路径 5s 失败
+	// 落 COS,punch 路径必须同款围栏)。
+	_ = conn.SetDeadline(time.Now().Add(agentLanHandshakeTimeout))
+	logger.Info(fmt.Sprintf("[TRANSFER-PUNCH] punched peer=%s transfer_id=%s, streaming", punchPeerID, ident.TransferID))
+	return pushAgentLanStream(ctx, conn, ident, lanToken, sourcePath, totalSize, writeJSON)
+}
+
+// ---------------------------------------------------------------------------
+// 传输腿 punch 接收上下文注册表(transfer-punch-stun)
+// ---------------------------------------------------------------------------
+
+// agentPunchTransferContext 是一个传输腿打洞会话的 B 侧接收上下文:由
+// handleAgentPeerLanPushListen 注册(传输参数在 listen 帧里齐备),B 侧
+// purpose=transfer 会话按 transfer_id 查表。单次消费:第一个打洞会话取走
+// 即删——重拨=新会话查空回 transfer_context_missing,上传链落 COS(v1
+// 不做会话间续借;close 帧系 TODOS ⑦)。
+type agentPunchTransferContext struct {
+	token     string
+	filename  string
+	targetDir string
+	maxBytes  int64
+	writeJSON func(interface{}) error // listen 帧时刻的 WS writer;断连后进度帧静默丢,非致命
+}
+
+var (
+	agentPunchTransferCtxMu sync.Mutex
+	agentPunchTransferCtx   = map[string]agentPunchTransferContext{}
+	// 每条目一个 TTL 定时器(评审 P11):重注册(服务器重发 listen 帧/
+	// listen_failed 放回)必须 Stop 旧定时器——旧 AfterFunc 先到会把
+	// 新条目摘走(堆叠缺陷)。
+	agentPunchTransferTimers = map[string]*time.Timer{}
+)
+
+// registerAgentPunchTransferContext 入表+TTL 摘除(listen TTL + 30s 余量,
+// 覆盖 punch 会话 90s 寿命口径不对齐的窗口——宁可表多活一会,查空由单次
+// 消费语义兜住)。同 transferID 重注册=顶替:旧定时器收回,摘除归新定时器。
+func registerAgentPunchTransferContext(transferID string, tctx agentPunchTransferContext, ttl time.Duration) {
+	agentPunchTransferCtxMu.Lock()
+	defer agentPunchTransferCtxMu.Unlock()
+	agentPunchTransferCtx[transferID] = tctx
+	if old, ok := agentPunchTransferTimers[transferID]; ok {
+		old.Stop() // Stop 只拦未触发的;已触发在途的由回调身份检查兜住
+	}
+	var timer *time.Timer
+	timer = time.AfterFunc(ttl+30*time.Second, func() {
+		agentPunchTransferCtxMu.Lock()
+		defer agentPunchTransferCtxMu.Unlock()
+		// 身份检查:Stop 与回调在途的竞态窗口里,被顶替的旧回调不得摘
+		// 走新条目——只有「仍是当前定时器」才允许摘除。
+		if agentPunchTransferTimers[transferID] != timer {
+			return
+		}
+		delete(agentPunchTransferCtx, transferID)
+		delete(agentPunchTransferTimers, transferID)
+	})
+	agentPunchTransferTimers[transferID] = timer
+}
+
+// takeAgentPunchTransferContext 单次消费取表(无/已摘 → nil)。
+// 消费只摘 ctx 不停定时器——孤儿定时器到点经身份检查自清双表(≤TTL 界内)，
+// 故意设计勿「补对称」。
+func takeAgentPunchTransferContext(transferID string) (agentPunchTransferContext, bool) {
+	agentPunchTransferCtxMu.Lock()
+	defer agentPunchTransferCtxMu.Unlock()
+	tctx, ok := agentPunchTransferCtx[transferID]
+	if ok {
+		delete(agentPunchTransferCtx, transferID)
+	}
+	return tctx, ok
+}
+
+// ---------------------------------------------------------------------------
 // A 端(接收腿):direct_candidates[lan_direct] 直连接收
 // ---------------------------------------------------------------------------
 
@@ -726,6 +870,9 @@ func classifyAgentLanFailStage(err error) string {
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "lan dial"):
+		return "probe"
+	// punch 拨号失败与 lan dial 同理:零字节在流,记 probe 不记 mid_transfer。
+	case strings.Contains(msg, "punch dial"):
 		return "probe"
 	case strings.Contains(msg, "handshake"), strings.Contains(msg, "headline"), strings.Contains(msg, "refused"):
 		return "connect"

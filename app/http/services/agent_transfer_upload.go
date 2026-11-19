@@ -196,8 +196,10 @@ func (s *AgentService) handleAgentTransferUpload(msg map[string]interface{}, wri
 	// 跳过 COS 上传(省全量上行广域网段),一行 via=lan_push 的 result 直接
 	// 终态 done。任何失败静默落回 COS 常规上传,失败阶段经 lan_fail_stage
 	// 回带(接收腿同款语义);「现链路零改动」——无候选/归档/总量未知一律
-	// 直接走 COS。
-	if pushCand := parseAgentLanPushCandidates(msg); pushCand != nil && !ident.IsDirectoryArchive {
+	// 直接走 COS。pushCand 提到两腿外共用:LAN/punch 分支同源取候选(空值
+	// =两腿都不进)。
+	pushCand := parseAgentLanPushCandidates(msg)
+	if pushCand != nil && !ident.IsDirectoryArchive {
 		if info, statErr := os.Stat(sourcePath); statErr == nil && !info.IsDir() {
 			size, sha, finalPath, pushErr := attemptAgentTransferLANPush(ctx, ident, pushCand, sourcePath, info.Size(), writeJSON)
 			if pushErr == nil {
@@ -226,6 +228,41 @@ func (s *AgentService) handleAgentTransferUpload(msg map[string]interface{}, wri
 				stage := classifyAgentLanFailStage(pushErr)
 				logger.Info(fmt.Sprintf("[TRANSFER] lan push failed transfer_id=%s stage=%s err=%v — falling back to COS",
 					ident.TransferID, stage, pushErr))
+				ident.LanPushFailStage = stage
+			}
+		}
+	}
+
+	// 上传腿 punch 载体(transfer-punch-stun):LAN 失败后、COS 兜底前。
+	// 前置=lan_push 候选在手(token 是接收侧核验凭据,listen 失败=无候选
+	// =无 punch,纯 COS)+目标设备 ID(PhoneServer punch_peer_id)+非归档。
+	if punchPeer := parseAgentPunchPeerID(msg); punchPeer != "" && pushCand != nil && !ident.IsDirectoryArchive {
+		if info, statErr := os.Stat(sourcePath); statErr == nil && !info.IsDir() {
+			size, sha, finalPath, punchErr := attemptAgentTransferPunchPush(ctx, ident, punchPeer, pushCand.Token, sourcePath, info.Size(), writeJSON)
+			if punchErr == nil {
+				logger.Info(fmt.Sprintf("[TRANSFER-PUNCH] complete transfer_id=%s bytes=%d path=%s", ident.TransferID, size, finalPath))
+				payload := agentTransferResultPayload(ident.RequestID, ident.TransferID, true)
+				payload["via"] = "punch"
+				payload["size_bytes"] = size
+				payload["sha256"] = sha
+				if finalPath != "" {
+					payload["path"] = finalPath
+				}
+				if err := writeJSON(payload); err != nil {
+					logger.Warn(fmt.Sprintf("[TRANSFER] upload result write failed transfer_id=%s err=%v", ident.TransferID, err))
+				}
+				return
+			}
+			if errors.Is(punchErr, errAgentTransferLanSkip) {
+				// 零字节文件等 skip 形态:记 skip 日志不进失败审计(LAN 腿同款)。
+				logger.Info(fmt.Sprintf("[TRANSFER-PUNCH] skipped transfer_id=%s: %v", ident.TransferID, punchErr))
+			} else if ctx.Err() != nil {
+				// 取消落在 punch 腿:取消必须完全失效,绝不落 COS 重传(LAN 腿同款)。
+				_ = emitAgentTransferFailure(writeJSON, ident.RequestID, ident.TransferID, transferErrCancelled, punchErr)
+				return
+			} else {
+				stage := classifyAgentLanFailStage(punchErr)
+				logger.Info(fmt.Sprintf("[TRANSFER-PUNCH] failed transfer_id=%s stage=%s err=%v — falling back to COS", ident.TransferID, stage, punchErr))
 				ident.LanPushFailStage = stage
 			}
 		}

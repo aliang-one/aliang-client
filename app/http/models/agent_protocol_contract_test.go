@@ -140,7 +140,10 @@ func TestContractPeerPunchFrames(t *testing.T) {
 	}{
 		AgentEventPeerPunchSession: {
 			required: []string{"type", "request_id", "session_id", "token", "ttl_seconds"},
-			optional: []string{"advertise_ip"},
+			// purpose/transfer_id 是传输腿复合键(transfer-punch-stun Task 5):
+			// mesh 会话缺省,transfer 会话显式捎带——缺省=mesh 的帧面语义见
+			// purposeOrMesh。
+			optional: []string{"advertise_ip", "purpose", "transfer_id"},
 			emits:    []string{AgentEventPeerPunchSessionResult},
 		},
 		AgentEventPeerPunchSessionResult: {

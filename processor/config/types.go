@@ -859,10 +859,14 @@ type MeshConfig struct {
 	// 准入/拨号凭据(可信局域网场景);消费面=ingress MeshAdmission 闭包、
 	// MeshDelegateNextHop 回查、tcp 执行回查、规则编译回查。跨信任域硬绑
 	// 定须平台账号级 roster(台账遗留)。
-	AutoPeers *bool               `json:"auto_peers,omitempty"`
-	MaxHops   int                 `json:"max_hops,omitempty"` // 链式转发经停上限(via 链长):0=默认,>8 收口;接收端拒绝过长经停链
-	Peers     []MeshPeer          `json:"peers,omitempty"`
-	Fallback  *MeshFallbackConfig `json:"fallback,omitempty"`
+	AutoPeers *bool `json:"auto_peers,omitempty"`
+	// StunServers 打洞 STUN 服务器列表(transfer-punch-stun 批次)。空/缺 =
+	// 默认档 MeshDefaultStunServers;上限 4 条,host:port 形态(Validate 就地
+	// TrimSpace 规整,与 peers[].lan_addrs 同款纪律)。
+	StunServers []string            `json:"stun_servers,omitempty"`
+	MaxHops     int                 `json:"max_hops,omitempty"` // 链式转发经停上限(via 链长):0=默认,>8 收口;接收端拒绝过长经停链
+	Peers       []MeshPeer          `json:"peers,omitempty"`
+	Fallback    *MeshFallbackConfig `json:"fallback,omitempty"`
 	// PrivateKey 本节点的 mesh 身份私钥(PEM,OpenSSH 或 PKCS#8)。
 	// 公钥分发到各对端的 ssh_ingress.mesh_authorized_keys(尾注释=本机 device_id)。
 	// 空 = 本节点不能作为转发发起方(仍可作为被转发方)。
@@ -920,6 +924,26 @@ func (c *MeshConfig) EffectivePunchEnabled() bool {
 // (消费方各自与总开关合取,此处不重复判)。
 func (c *MeshConfig) EffectiveAutoPeers() bool {
 	return c != nil && c.AutoPeers != nil && *c.AutoPeers // 默认关
+}
+
+// MeshDefaultStunServers 打洞 STUN 默认档(transfer-punch-stun 批次,2026-11-18
+// 本机家宽真 STUN Binding 实测定稿):miwifi 国内可达(111.206.174.2 try1 即答);
+// Google 机会性副档(国内裸网常不可达,可达时补足双台判型)。自托管 coturn
+// 部署后应配置进 customer.mesh.stun_servers 首位(部署手册见 spec §2.3)。
+// 默认档住 config 层而非 punch 包:processor 不得反向依赖 app(punch.Default
+// STUNServers 已删,消费面见 services agentPunchConfiguredServers)。
+// 勿直接改写本切片,读取一律走 EffectiveStunServers(拷贝纪律由其独占)。
+var MeshDefaultStunServers = []string{"stun.miwifi.com:3478", "stun.l.google.com:19302"}
+
+const meshStunServersMax = 4
+
+// EffectiveStunServers 打洞判型/映射发现的服务器列表:配置非空返回配置拷贝,
+// 空/nil(含 nil receiver)回落默认档拷贝——调用方改切片不得污染常量与配置。
+func (c *MeshConfig) EffectiveStunServers() []string {
+	if c == nil || len(c.StunServers) == 0 {
+		return append([]string(nil), MeshDefaultStunServers...)
+	}
+	return append([]string(nil), c.StunServers...)
 }
 
 // EffectiveMaxHops 跳数上限:0/负数=默认 5,>8 收口到 8(读取端钳制防御,
@@ -1021,6 +1045,16 @@ func (c *MeshConfig) Validate() error {
 	}
 	if c.MaxHops < 0 || c.MaxHops > meshproto.MaxHopsCap {
 		return fmt.Errorf("customer.mesh.max_hops 必须在 [1,%d] 内(0=默认 %d), got %d", meshproto.MaxHopsCap, meshproto.DefaultHops, c.MaxHops)
+	}
+	if len(c.StunServers) > meshStunServersMax {
+		return fmt.Errorf("customer.mesh.stun_servers 上限 %d 条, got %d", meshStunServersMax, len(c.StunServers))
+	}
+	for i := range c.StunServers {
+		// 与 peers[].lan_addrs 同款就地规整:校验与落盘同一份值。
+		c.StunServers[i] = strings.TrimSpace(c.StunServers[i])
+		if _, _, err := net.SplitHostPort(c.StunServers[i]); err != nil {
+			return fmt.Errorf("customer.mesh.stun_servers[%d] invalid %q: must be host:port", i, c.StunServers[i])
+		}
 	}
 	for i := range c.Peers {
 		peer := &c.Peers[i]

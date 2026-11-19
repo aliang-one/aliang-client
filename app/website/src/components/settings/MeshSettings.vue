@@ -1,6 +1,7 @@
 <template>
   <!-- mesh 组网卡（design §9;SettingsPage「入口与组网」子 tab 挂载）。
-       顶部状态条 + SVG 拓扑画布 + peers/身份密钥编辑;出口链路开关已于
+       顶部状态条 + SVG 拓扑画布 + peers/打洞直连(punch/STUN)/身份密钥编辑;
+       出口链路开关已于
        2026-11-15 挪至代理设置子 tab（PlatformProxySettings「平台流量代理」卡,
        fallback 唯一 UI 写者）——本卡只读 configMesh.fallback 驱动状态徽标,
        保存载荷显式省缺 fallback 键（deep-merge preserve,见 save 内注释）。
@@ -322,6 +323,43 @@
       </div>
     </section>
 
+    <!-- —— 打洞直连(transfer-punch-stun):punch 开关 + STUN 列表。punch_enable
+         三态 nil=false(后端 EffectivePunchEnabled 同源,让渡型默认关);STUN 列表
+         编辑源=configMesh(normalizeMeshConfig 出口,空=[]=后端默认档),
+         /api/mesh/status 回读的 stun_servers 只是显示参考——⚠️ 绝不把 status
+         预填的默认档写回表单/保存载荷(一开卡片就固化显式列表=失去跟随默认档
+         演进能力),placeholder(hint)负责说明默认档。开关控件形态取
+         AgentCoreSettings 既有开关块(本卡原 mesh 开关已迁代理设置卡,无同卡
+         先例),disabled 联动与兄弟控件同口径(保存中/加载中)。 —— -->
+    <section class="space-y-3" data-mesh-punch>
+      <label class="flex min-h-11 cursor-pointer items-center justify-between gap-3 border-y border-slate-100 py-3 text-sm text-slate-700 dark:border-slate-800 dark:text-slate-200">
+        <span class="min-w-0">
+          <span class="block text-xs font-semibold">{{ t('mesh_punchEnable') }}</span>
+          <span class="mt-0.5 block text-[11px] font-normal leading-4 text-slate-500 dark:text-slate-400">{{ t('mesh_punchEnableHint') }}</span>
+        </span>
+        <input
+          type="checkbox"
+          class="h-4 w-4 shrink-0 rounded border-slate-300 text-primary focus:ring-primary/20 dark:border-slate-600 dark:bg-slate-900"
+          :checked="form.punchEnable"
+          :disabled="loading || saving"
+          data-field="meshPunchEnable"
+          @change="form.punchEnable = $event.target.checked"
+        />
+      </label>
+      <label class="block space-y-1">
+        <span class="text-xs font-semibold text-slate-700 dark:text-slate-200">{{ t('mesh_stunServers') }}</span>
+        <textarea
+          v-model="form.stunServersText"
+          :aria-label="t('mesh_stunServers')"
+          class="min-h-20 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+          data-field="meshStunServers"
+          :disabled="loading || saving"
+          :placeholder="t('mesh_stunServersHint')"
+          spellcheck="false"
+        ></textarea>
+      </label>
+    </section>
+
     <!-- —— 节点身份密钥（G3/SPEC §13.3.4）:私钥 textarea 容 PEM 多行 + 口令密码框,
          autocomplete off 防浏览器记忆凭据（RulesSettings proxy 私钥同款手法）。
          表单不强校验——后端保存期拒绝（peers 非空时 private_key 必填等）经卡片
@@ -474,7 +512,10 @@ export default {
       }
       const peers = Array.isArray(this.meshStatus?.peers) ? this.meshStatus.peers : [];
       const fallbackArmed = this.configMesh.fallback.enable && Boolean(this.configMesh.fallback.next_hop);
-      const unconfigured = peers.length === 0 && !this.meshStatus.forward_enable && !this.configMesh.fallback.enable;
+      // punch 已开也算「已配置」(TODOS ⑤ 收口):peers 空+不转发+无兜底但打洞
+      // 直连在跑时,离线/在线判定才反映真相——未配置灰态会误导用户去配兜底。
+      const unconfigured = peers.length === 0 && !this.meshStatus.forward_enable
+        && !this.meshStatus.punch_enable && !this.configMesh.fallback.enable;
       if (unconfigured) {
         return 'idle';
       }
@@ -825,6 +866,11 @@ export default {
         // 的读侧(刷新=props.config 更新,watch 深度重建表单)。缺键渲染空串。
         privateKey: mesh.private_key || '',
         keyPassphrase: mesh.key_passphrase || '',
+        // 打洞直连(transfer-punch-stun):punch 开关与 STUN 列表的编辑源恒是
+        // configMesh(归一化出口)——status 的 stun_servers 只是显示参考,绝不
+        // 预填(固化显式列表=失去跟随默认档演进能力);空列表渲染空 textarea。
+        punchEnable: mesh.punch_enable === true,
+        stunServersText: mesh.stun_servers.join('\n'),
         // peer 行:整行拷贝(device_id/lan_addrs/relay 只作透传底座,行内仅
         // host_key 可编辑);无 host_key 的 peer 行也渲染(空输入位)
         peerRows: mesh.peers.map((peer) => ({ ...peer, host_key: peer.host_key || '' }))
@@ -901,6 +947,12 @@ export default {
         // 显式带出空串,后端 deep-merge 才会真正清掉旧值——三段接力缺一不可。
         private_key: String(this.form.privateKey ?? ''),
         key_passphrase: String(this.form.keyPassphrase ?? ''),
+        // 打洞直连(transfer-punch-stun):开关布尔与 STUN 列表(每行一条)随表单
+        // 带出;split 后交 normalizeMeshConfig 归一(TrimSpace/剔空行),未编辑时
+        // 与现值等价 → 父层 diff 为零不进 patch(空列表=回默认档的显式意图经
+        // 数组整体替换分支带出 [])。
+        punch_enable: this.form.punchEnable === true,
+        stun_servers: String(this.form.stunServersText ?? '').split('\n'),
         // peers 以表单行为准（行内 host_key 编辑值必须带出）;未编辑字段整行透传
         peers: this.form.peerRows.map((row) => ({ ...row }))
       });

@@ -511,6 +511,65 @@ func TestAgentPeerLanPushListen_SlotCancelKillsConn(t *testing.T) {
 	}
 }
 
+// 协议体拆层测试:net.Pipe 两端直接喂收/发两个协议体(无 TLS——TLS 已拆到
+// TCP 薄壳;punch 路径将来同款喂法)。hello→ok→字节流→ACK 全程走完,断言
+// B 侧返回值、A 侧落盘 sha/size 与 ACK 三方一致。
+func TestAgentLanPushProtocolBodies_NetPipeRoundTrip(t *testing.T) {
+	inbox := newAgentTransferEnv(t)
+	content := deterministicTransferBytes(64*1024 + 7) // 非整 KB,防对齐巧合
+	src := filepath.Join(t.TempDir(), "src.bin")
+	if err := os.WriteFile(src, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wantSHA := sha256HexOf(content)
+
+	bEnd, aEnd := net.Pipe()
+	defer bEnd.Close()
+	defer aEnd.Close()
+	const token = "pipe-token-1234567890"
+	const transferID = "tr_pipepush001"
+	writeProgress := func(interface{}) error { return nil }
+
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		serveAgentLanPushConn(aEnd, token, transferID, "pipe.bin", "", 4<<20, writeProgress)
+	}()
+
+	ident := agentTransferIdentity{RequestID: "req-pipe-1", TransferID: transferID, Filename: "pipe.bin"}
+	size, sha, ackPath, err := pushAgentLanStream(context.Background(), bEnd, ident, token, src, int64(len(content)), writeProgress)
+	if err != nil {
+		t.Fatalf("protocol push over pipe failed: %v", err)
+	}
+	// B 侧返回值:size/sha 已由 pushAgentLanStream 对 ACK 核过(err==nil 即一致)。
+	if size != int64(len(content)) || sha != wantSHA {
+		t.Fatalf("push return mismatch size=%d want=%d sha=%s want=%s", size, len(content), sha, wantSHA)
+	}
+	// ACK 带回的 path 必须落在替换后的 inbox 收件根内。
+	if !strings.HasPrefix(ackPath, inbox+string(os.PathSeparator)) {
+		t.Fatalf("ack path %q must land under inbox %q", ackPath, inbox)
+	}
+	// 落盘 sha/size 与 ACK 一致。
+	landed, err := os.ReadFile(ackPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(landed) != len(content) || sha256HexOf(landed) != wantSHA {
+		t.Fatalf("landed content mismatch len=%d want=%d sha=%s want=%s", len(landed), len(content), sha256HexOf(landed), wantSHA)
+	}
+	marker, err := readAgentTransferMarker(transferID)
+	if err != nil || marker == nil || marker.State != transferMarkerStateDone || marker.Path != ackPath ||
+		marker.SizeBytes != int64(len(content)) || marker.SHA256 != wantSHA {
+		t.Fatalf("done marker mismatch: %+v err=%v", marker, err)
+	}
+	// 收侧协议体必须已返回(不悬在 deadline 等待上)。
+	select {
+	case <-serveDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve protocol body did not return after ack")
+	}
+}
+
 // dialPushTestConn 模拟 B 端真 TLS 拨号(钉扎+hello),供 A 侧取消测试。
 func dialPushTestConn(t *testing.T, addr, fingerprint, token, transferID string, size int64) *tls.Conn {
 	t.Helper()
@@ -531,4 +590,90 @@ func dialPushTestConn(t *testing.T, addr, fingerprint, token, transferID string,
 		t.Fatalf("hello: %v", err)
 	}
 	return tlsConn
+}
+
+// ---------------------------------------------------------------------------
+// 传输腿 punch 接收上下文注册表(transfer-punch-stun Task 7):listen 帧时刻
+// 注册(handleAgentPeerLanPushListen),B 侧 purpose=transfer 打洞会话按
+// transfer_id 单次消费。
+// ---------------------------------------------------------------------------
+
+// TestAgentPunchTransferContextRegistry 注册表三契约:register→take 拿到
+// 完整上下文、再 take 空(单次消费)、TTL 到点摘除后 take 空。
+func TestAgentPunchTransferContextRegistry(t *testing.T) {
+	// 单次消费:register → take 拿到带全字段 → 再 take 空。
+	registerAgentPunchTransferContext("tr_regtest001", agentPunchTransferContext{
+		token:     "tok-reg",
+		filename:  "f.bin",
+		targetDir: "sub",
+		maxBytes:  123,
+		writeJSON: func(interface{}) error { return nil },
+	}, 30*time.Second)
+	got, ok := takeAgentPunchTransferContext("tr_regtest001")
+	if !ok || got.token != "tok-reg" || got.filename != "f.bin" || got.targetDir != "sub" || got.maxBytes != 123 || got.writeJSON == nil {
+		t.Fatalf("take 应拿到注册时的完整上下文: ok=%t got=%+v", ok, got)
+	}
+	if _, ok := takeAgentPunchTransferContext("tr_regtest001"); ok {
+		t.Fatal("第二次 take 必须为空(单次消费:重拨=新会话查空回 transfer_context_missing)")
+	}
+
+	// TTL 摘除:负 TTL 让 AfterFunc(ttl+30s) 即刻到点。摘除是异步 timer,
+	// 轮询内部表见证(take 是单次消费,用它轮询会首轮消费让断言假绿)。
+	registerAgentPunchTransferContext("tr_regtest002", agentPunchTransferContext{token: "tok"}, -40*time.Second)
+	deadline := time.After(3 * time.Second)
+	for {
+		agentPunchTransferCtxMu.Lock()
+		_, still := agentPunchTransferCtx["tr_regtest002"]
+		agentPunchTransferCtxMu.Unlock()
+		if !still {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("TTL 到点后注册表未摘除表项")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if _, ok := takeAgentPunchTransferContext("tr_regtest002"); ok {
+		t.Fatal("TTL 摘除后 take 必须为空")
+	}
+}
+
+// TestAgentPunchTransferContextRegistryReRegisterStopsOldTimer 重注册不堆叠
+// 定时器(评审 P11):服务器重发 listen 帧会让同 transferID 二次注册——旧
+// 实现的旧 AfterFunc 先到会删掉新条目。语义:注册→再注册→旧 TTL 到点→
+// 新条目仍在(由新定时器持有),take 仍能消费到新上下文。
+func TestAgentPunchTransferContextRegistryReRegisterStopsOldTimer(t *testing.T) {
+	// 首注册的定时器定在 ~500ms 后到(ttl+30s 余量=-29.5s+30s);随即以长
+	// TTL 重注册。旧实现不收回旧定时器:500ms 处旧回调把新条目摘走。
+	registerAgentPunchTransferContext("tr_regstack001", agentPunchTransferContext{token: "tok-old"}, -29500*time.Millisecond)
+	registerAgentPunchTransferContext("tr_regstack001", agentPunchTransferContext{token: "tok-new"}, 30*time.Second)
+	// 睡过旧定时器的到点窗口(500ms 到点,1200ms 含调度抖动余量)。
+	time.Sleep(1200 * time.Millisecond)
+	got, ok := takeAgentPunchTransferContext("tr_regstack001")
+	if !ok || got.token != "tok-new" {
+		t.Fatalf("再注册后旧 TTL 到点,新条目必须存活且可消费(定时器堆叠缺陷 P11): ok=%t token=%q", ok, got.token)
+	}
+}
+
+// TestAgentPeerLanPushListen_RegistersPunchTransferContext listen 帧注册接线:
+// handleAgentPeerLanPushListen 成功路径必须把传输参数写入注册表(打洞会话按
+// transfer_id 查用),字段与 listen 帧逐项一致。
+func TestAgentPeerLanPushListen_RegistersPunchTransferContext(t *testing.T) {
+	newAgentTransferEnv(t)
+	svc := peerToolsTestEnv(t, nil)
+	result, token := lanPushServeTestServer(t, svc, "reg.bin", map[string]interface{}{
+		"target_dir": "docs",
+		"max_bytes":  float64(4096),
+	})
+	if result["ok"] != true {
+		t.Fatalf("push listen failed: %+v", result)
+	}
+	tctx, ok := takeAgentPunchTransferContext("tr_lanpusht001")
+	if !ok {
+		t.Fatal("listen 成功后注册表应有该 transfer_id 的接收上下文")
+	}
+	if tctx.token != token || tctx.filename != "reg.bin" || tctx.targetDir != "docs" || tctx.maxBytes != 4096 || tctx.writeJSON == nil {
+		t.Fatalf("注册的上下文字段与 listen 帧不符: %+v", tctx)
+	}
 }

@@ -60,9 +60,12 @@ func (h *MeshHandler) HandleLANPeers(w http.ResponseWriter, r *http.Request) {
 	common.Success(w, lanPeersResponse{Peers: beacon.Candidates()})
 }
 
-// meshStatusResponse GET /api/mesh/status 的 data 载荷。peers/lan_peers 恒
-// 数组(空配置是合法态,null 会逼前端判空);开关取 Effective* 现值(与
-// 运行时读取同一语义:nil 总开关=默认开,nil forward/punch=默认关)。
+// meshStatusResponse GET /api/mesh/status 的 data 载荷。peers/lan_peers/
+// stun_servers 恒数组(空配置是合法态,null 会逼前端判空);开关取 Effective*
+// 现值(与运行时读取同一语义:nil 总开关=默认开,nil forward/punch=默认关);
+// stun_servers 在 mesh 块缺失时 [](未配置不冒充默认,与 peers 同款守卫出位),
+// 块在则给 EffectiveStunServers 现值(空列表=默认档拷贝)——前端 MeshSettings
+// 卡渲染 STUN 现值的数据源(transfer-punch-stun Task 3)。
 // Effective 是 mesh 出口的生效门(= enable ∧ ssh_ingress 可用,SPEC §10.3
 // 依赖降级一处生效)——前端用它区分「开关开了但 SSH 入口关着导致 mesh
 // 未生效」。
@@ -72,23 +75,26 @@ type meshStatusResponse struct {
 	Effective     bool                         `json:"effective"`
 	ForwardEnable bool                         `json:"forward_enable"`
 	PunchEnable   bool                         `json:"punch_enable"`
+	StunServers   []string                     `json:"stun_servers"`
 	LANListenPort int                          `json:"lan_listen_port"`
 	Peers         []config.MeshPeer            `json:"peers"`
 	LANPeers      []lanbeacon.LanPeerCandidate `json:"lan_peers"`
 }
 
 // HandleStatus GET /api/mesh/status:仪表盘组网页状态聚合——本机 device_id、
-// 总开关/forward_enable/punch_enable 现值、LAN 监听口端口(手填对端地址须知
-// 本机端口)、已配 peers、beacon 候选。全只读,写路径走 /api/config/customer。
+// 总开关/forward_enable/punch_enable/stun_servers 现值、LAN 监听口端口(手填
+// 对端地址须知本机端口)、已配 peers、beacon 候选。全只读,写路径走
+// /api/config/customer。
 func (h *MeshHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	resp := meshStatusResponse{
-		Enable:   true, // nil 总开关=默认开,与 MeshConfig.EffectiveEnabled 同语义
-		Peers:    []config.MeshPeer{},
-		LANPeers: []lanbeacon.LanPeerCandidate{},
+		Enable:      true, // nil 总开关=默认开,与 MeshConfig.EffectiveEnabled 同语义
+		Peers:       []config.MeshPeer{},
+		LANPeers:    []lanbeacon.LanPeerCandidate{},
+		StunServers: []string{},
 	}
 	if h.deviceID != nil {
 		resp.DeviceID = h.deviceID()
@@ -108,6 +114,7 @@ func (h *MeshHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
 				resp.Enable = mesh.EffectiveEnabled()
 				resp.ForwardEnable = mesh.EffectiveForwardEnabled()
 				resp.PunchEnable = mesh.EffectivePunchEnabled()
+				resp.StunServers = mesh.EffectiveStunServers()
 				if len(mesh.Peers) > 0 {
 					resp.Peers = mesh.Peers
 				}

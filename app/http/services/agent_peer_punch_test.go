@@ -19,6 +19,7 @@ import (
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/mesh/punch"
+	"aliang.one/nursorgate/processor/config"
 	"github.com/quic-go/quic-go"
 )
 
@@ -108,6 +109,7 @@ func newPunchBForTest(t *testing.T, mods ...func(*agentPeerPunchB)) (*agentPeerP
 		handler: func(string) func(net.Conn) {
 			return func(net.Conn) {}
 		},
+		transferServe: agentPunchTransferServe, // 生产默认(防 purpose=transfer 用例忘注入缝时 nil panic)
 	}
 	for _, mod := range mods {
 		mod(b)
@@ -888,5 +890,386 @@ func TestAgentPeerPunchAGateOff(t *testing.T) {
 	}
 	if n := fake.countSessionFrames(); n != 0 {
 		t.Fatalf("门关不应发任何帧,实发 %d", n)
+	}
+}
+
+// agentPunchConfiguredServers 读配置取 STUN 列表:配置空回落默认档,配置了
+// 原样返回(transfer-punch-stun 批次)。全局配置摆置沿
+// agent_ai_agentcore_skills_test.go 同款:SetGlobalConfig + t.Cleanup 回滚
+// (仓内无 swapGlobalMeshConfig 这类现成缝)。
+func TestAgentPunchConfiguredServers(t *testing.T) {
+	withCfg := func(t *testing.T, mesh *config.MeshConfig) {
+		old := config.GetGlobalConfig()
+		config.SetGlobalConfig(&config.Config{Customer: &config.CustomerConfig{Mesh: mesh}})
+		t.Cleanup(func() { config.SetGlobalConfig(old) })
+	}
+	withCfg(t, &config.MeshConfig{}) // 空 mesh → 回落默认档
+	got := agentPunchConfiguredServers()
+	if len(got) != 2 || got[0] != "stun.miwifi.com:3478" {
+		t.Fatalf("空配置应回落默认档, got %v", got)
+	}
+	// 副档字面锁(评审 P1):Google 副档拍板为主域 stun.l.google.com,勿手滑
+	// 改回 stun1 次域——默认档形态是实测定稿,测试钉死。
+	if got[1] != "stun.l.google.com:19302" {
+		t.Fatalf("默认档副档必须为 stun.l.google.com:19302(勿改回 stun1 次域), got %v", got)
+	}
+	withCfg(t, &config.MeshConfig{StunServers: []string{"stun.custom:3478"}})
+	if got := agentPunchConfiguredServers(); len(got) != 1 || got[0] != "stun.custom:3478" {
+		t.Fatalf("配置了应原样返回, got %v", got)
+	}
+	// nil 全局配置(评审 P2):启动早期/配置未装配时不 panic,回落默认档。
+	// SetGlobalConfig(nil) 先例见 processor/tcp/route_override_test.go。
+	oldNil := config.GetGlobalConfig()
+	config.SetGlobalConfig(nil)
+	t.Cleanup(func() { config.SetGlobalConfig(oldNil) })
+	got = agentPunchConfiguredServers()
+	if len(got) != 2 || got[0] != "stun.miwifi.com:3478" {
+		t.Fatalf("nil 全局配置应回落默认档, got %v", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 传输腿复合键(transfer-punch-stun Task 5):同 peer 的 mesh 会话与传输
+// 会话在缓存/sock 表互不可见——mesh 会话喂传输流=喂错 handler,反之亦然
+// (计划期裁决 4)。
+// ---------------------------------------------------------------------------
+
+// TestAgentPunchTransferCacheKeyIsolation 锁键形态契约:mesh 键=裸 peerID
+// (存量形态不变),transfer 键带前缀;purpose 缺省显式化为 mesh(帧面语义:
+// 老版本 A 侧发的无 purpose 帧 = mesh)。
+func TestAgentPunchTransferCacheKeyIsolation(t *testing.T) {
+	key := punchCacheKey("dev-1", "transfer")
+	if key == "dev-1" {
+		t.Fatal("transfer 键必须带前缀,不得与 mesh 键同形")
+	}
+	if punchCacheKey("dev-1", "") != "dev-1" {
+		t.Fatal("mesh 键形态不变(裸 peerID)")
+	}
+	if purposeOrMesh("") != "mesh" || purposeOrMesh("transfer") != "transfer" {
+		t.Fatal("purposeOrMesh 缺省须显式化为 mesh")
+	}
+}
+
+// TestAgentPunchTransferDialFullChainAndIsolation 全链锁复合键与一次性拨号
+// 的真实隔离行为(键形态之外的机械面):同 peer 先 mesh 拨通,再 transfer
+// 拨——缓存不得命中 mesh 会话(session 帧再起一帧),session 帧须捎带
+// purpose=transfer 与 transfer_id;transfer 拨是一次性拨号(质量评审
+// 裁决 5):不入缓存、二拨必发新 session 帧、echo 照常(每传输独立信令,
+// B 侧接收上下文单次消费);mesh 会话不被 transfer 拨顶替(缓存/顶替类
+// 用例零回归的传输侧对偶)。
+func TestAgentPunchTransferDialFullChainAndIsolation(t *testing.T) {
+	a, fake := newPunchAForTest(t)
+	orig := a.send
+	var transferFrame map[string]interface{}
+	a.send = func(payload map[string]interface{}) error {
+		if payload["type"] == models.AgentEventPeerPunchSession && payload["purpose"] == "transfer" {
+			transferFrame = payload
+		}
+		return orig(payload)
+	}
+
+	// mesh 首拨(裸 peerID 键)。
+	connMesh, err := a.dialSource(context.Background(), "dev-b")
+	if err != nil {
+		t.Fatalf("mesh 首拨失败: %v", err)
+	}
+	_ = connMesh.Close()
+	if n := fake.countSessionFrames(); n != 1 {
+		t.Fatalf("mesh 首拨应恰发一帧 session,实发 %d", n)
+	}
+
+	// transfer 拨:同 peer 不同用途——缓存/sock 表互不可见,必须重开打洞。
+	connTr, err := a.dialSourceOpts(context.Background(), "dev-b", punchDialOpts{
+		budget:     agentTransferPunchBudget,
+		purpose:    "transfer",
+		transferID: "tr-1",
+	})
+	if err != nil {
+		t.Fatalf("transfer 拨失败: %v", err)
+	}
+	_ = connTr.Close()
+	if n := fake.countSessionFrames(); n != 2 {
+		t.Fatalf("transfer 拨不得复用 mesh 会话(session 帧应为 2),实发 %d", n)
+	}
+	if transferFrame == nil {
+		t.Fatal("transfer 拨的 session 帧未捕获")
+	}
+	if transferFrame["purpose"] != "transfer" || transferFrame["transfer_id"] != "tr-1" {
+		t.Fatalf("transfer session 帧缺 purpose/transfer_id: %v", transferFrame)
+	}
+	// 一次性拨号不入缓存(裁决 5 机械面):transfer 键 Acquire 必空。
+	if lease := a.cache.Acquire(punchCacheKey("dev-b", "transfer")); lease != nil {
+		lease.Release()
+		t.Fatal("传输腿一次性拨号不得入缓存(transfer 键 Acquire 应为 nil)")
+	}
+
+	// transfer 二拨:一次性拨号(裁决 5)——不得复用 t-1 会话,必发新
+	// session 帧(frames 2→3);新会话新门禁,数据面(echo)照常工作。
+	connTr2, err := a.dialSourceOpts(context.Background(), "dev-b", punchDialOpts{
+		purpose:    "transfer",
+		transferID: "tr-2",
+	})
+	if err != nil {
+		t.Fatalf("transfer 二拨(一次性)失败: %v", err)
+	}
+	if _, err := connTr2.Write([]byte("tr")); err != nil {
+		t.Fatalf("transfer 二拨写失败: %v", err)
+	}
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(connTr2, buf); err != nil || string(buf) != "tr" {
+		t.Fatalf("transfer 二拨回显错: %q %v", buf, err)
+	}
+	_ = connTr2.Close()
+	if n := fake.countSessionFrames(); n != 3 {
+		t.Fatalf("transfer 二拨必发新 session 帧(应为 3),实发 %d", n)
+	}
+
+	// mesh 二拨:mesh 键缓存未被 transfer 拨顶替(session 帧仍为 3)。
+	connMesh2, err := a.dialSource(context.Background(), "dev-b")
+	if err != nil {
+		t.Fatalf("mesh 二拨(缓存)失败: %v", err)
+	}
+	_ = connMesh2.Close()
+	if n := fake.countSessionFrames(); n != 3 {
+		t.Fatalf("transfer 拨不得顶替 mesh 会话(session 帧应仍为 3),实发 %d", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// purpose 路由(transfer-punch-stun Task 7):session 帧的 purpose 决定过门流
+// 的去向——缺省/mesh=b.handler 缝(ssh 入口,既有语义零变化),transfer=
+// 接收上下文注册表(agent_peer_lan.go)换 transferServe 缝喂 lan_push 协议体。
+// ---------------------------------------------------------------------------
+
+// punchSessionFrameWithPurpose 组带 purpose/transfer_id 的 session 帧
+// (Task 5 契约:新 A 侧恒发显式 purpose;老帧缺省=mesh)。
+func punchSessionFrameWithPurpose(requestID, sessionID, token string, ttlSeconds int64, purpose, transferID string) map[string]interface{} {
+	msg := punchSessionFrame(requestID, sessionID, token, ttlSeconds)
+	if purpose != "" {
+		msg["purpose"] = purpose
+	}
+	if transferID != "" {
+		msg["transfer_id"] = transferID
+	}
+	return msg
+}
+
+// TestAgentPunchPurposeTransferRoutesToTransferServe purpose=transfer 的会话:
+// 注册表里的过门流必须进 transferServe 缝(带上正确 transfer_id 与上下文),
+// 绝不落 b.handler(ssh 入口——用途错配=数据喂错 handler)。
+func TestAgentPunchPurposeTransferRoutesToTransferServe(t *testing.T) {
+	const token = "punch-token-xfer01"
+	const transferID = "tr_punchxfer01"
+	var (
+		mu            sync.Mutex
+		transferCalls int
+		gotTransferID string
+		gotToken      string
+		handlerCalls  int
+	)
+	b, sink, _ := newPunchBForTest(t, func(bb *agentPeerPunchB) {
+		bb.handler = func(string) func(net.Conn) {
+			return func(net.Conn) {
+				mu.Lock()
+				handlerCalls++
+				mu.Unlock()
+			}
+		}
+		bb.transferServe = func(tid string, tctx agentPunchTransferContext) func(net.Conn) {
+			mu.Lock()
+			transferCalls++
+			gotTransferID = tid
+			gotToken = tctx.token
+			mu.Unlock()
+			return func(c net.Conn) {
+				buf := make([]byte, len("data"))
+				if _, err := io.ReadFull(c, buf); err != nil {
+					return
+				}
+				_, _ = c.Write([]byte("served"))
+			}
+		}
+	})
+	registerAgentPunchTransferContext(transferID, agentPunchTransferContext{
+		token:     token,
+		filename:  "x.bin",
+		targetDir: "",
+		maxBytes:  4096,
+		writeJSON: func(interface{}) error { return nil },
+	}, 30*time.Second)
+
+	b.handleSession(punchSessionFrameWithPurpose("pr-xfer", "ps-xfer", token, 15, "transfer", transferID), sink.write, "device-b-self")
+	result := sink.lastResult()
+	if result == nil || result["ok"] != true {
+		t.Fatalf("transfer 会话应正常立起: %v", result)
+	}
+	port := int(result["port"].(float64))
+	fingerprint := result["fingerprint"].(string)
+
+	dial := punchAEnv(t)
+	punchDialEcho(t, dial, fmt.Sprintf("127.0.0.1:%d", port), fingerprint, token, "data", "served")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if transferCalls != 1 || gotTransferID != transferID || gotToken != token {
+		t.Fatalf("过门流必须进 transferServe 缝(transfer_id/token 正确): calls=%d id=%s token=%s", transferCalls, gotTransferID, gotToken)
+	}
+	if handlerCalls != 0 {
+		t.Fatalf("purpose=transfer 不得落 b.handler(ssh 入口),被触 %d 次", handlerCalls)
+	}
+}
+
+// TestAgentPunchPurposeDefaultAndMeshRouteToIngressHandler 缺省与显式 mesh
+// 都走 b.handler 缝(既有语义零变化);transferServe 缝不得被触。
+func TestAgentPunchPurposeDefaultAndMeshRouteToIngressHandler(t *testing.T) {
+	const token = "punch-token-mesh01"
+	var (
+		mu            sync.Mutex
+		handlerCalls  int
+		transferCalls int
+	)
+	b, sink, _ := newPunchBForTest(t, func(bb *agentPeerPunchB) {
+		bb.handler = func(string) func(net.Conn) {
+			return func(c net.Conn) {
+				mu.Lock()
+				handlerCalls++
+				mu.Unlock()
+				buf := make([]byte, len("hi"))
+				if _, err := io.ReadFull(c, buf); err != nil {
+					return
+				}
+				_, _ = c.Write([]byte("ok"))
+			}
+		}
+		bb.transferServe = func(string, agentPunchTransferContext) func(net.Conn) {
+			mu.Lock()
+			transferCalls++
+			mu.Unlock()
+			return func(net.Conn) {}
+		}
+	})
+
+	dial := punchAEnv(t)
+	for i, tc := range []struct{ name, purpose string }{
+		{"absent", ""},
+		{"explicit_mesh", "mesh"},
+	} {
+		sessionID := fmt.Sprintf("ps-mesh-%d", i)
+		b.handleSession(punchSessionFrameWithPurpose("pr-mesh-"+tc.name, sessionID, token, 15, tc.purpose, ""), sink.write, "device-b-self")
+		result := sink.lastResult()
+		if result == nil || result["ok"] != true {
+			t.Fatalf("[%s] 会话应正常立起: %v", tc.name, result)
+		}
+		port := int(result["port"].(float64))
+		fingerprint := result["fingerprint"].(string)
+		punchDialEcho(t, dial, fmt.Sprintf("127.0.0.1:%d", port), fingerprint, token, "hi", "ok")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if handlerCalls != 2 {
+		t.Fatalf("缺省与显式 mesh 各一条流都应进 b.handler,实进 %d", handlerCalls)
+	}
+	if transferCalls != 0 {
+		t.Fatalf("非 transfer 会话不得触 transferServe 缝,被触 %d 次", transferCalls)
+	}
+}
+
+// TestAgentPunchPurposeTransferWithoutContextFails 声明传输用途却无接收
+// 上下文(listen 未发生/已被消费/TTL 摘除):fail-loud 回
+// transfer_context_missing,绝不静默喂 ssh 入口;serve 不得被触。
+func TestAgentPunchPurposeTransferWithoutContextFails(t *testing.T) {
+	var serveCalled bool
+	b, sink, _ := newPunchBForTest(t, func(bb *agentPeerPunchB) {
+		bb.serve = func(*net.UDPConn, punch.ListenerOpts) (int, <-chan struct{}, error) {
+			serveCalled = true
+			return 0, nil, fmt.Errorf("must not be called")
+		}
+	})
+	b.handleSession(punchSessionFrameWithPurpose("pr-ctxmiss", "ps-ctxmiss", "tok", 15, "transfer", "tr_punchmiss01"), sink.write, "self")
+	result := sink.lastResult()
+	if result == nil || result["ok"] != false || result["fail_reason"] != "transfer_context_missing" {
+		t.Fatalf("无上下文的 transfer 会话必须 fail transfer_context_missing: %v", result)
+	}
+	if serveCalled {
+		t.Fatal("上下文缺失须在起听前早退,serve 不得被触")
+	}
+}
+
+// TestAgentPunchPurposeUnknownRejected 未知 purpose 拒帧(缺省=mesh 与显式
+// transfer 之外的用途一律 fail bad_purpose)。
+func TestAgentPunchPurposeUnknownRejected(t *testing.T) {
+	var serveCalled bool
+	b, sink, _ := newPunchBForTest(t, func(bb *agentPeerPunchB) {
+		bb.serve = func(*net.UDPConn, punch.ListenerOpts) (int, <-chan struct{}, error) {
+			serveCalled = true
+			return 0, nil, fmt.Errorf("must not be called")
+		}
+	})
+	b.handleSession(punchSessionFrameWithPurpose("pr-bp", "ps-bp", "tok", 15, "telemetry", ""), sink.write, "self")
+	if result := sink.lastResult(); result == nil || result["ok"] != false || result["fail_reason"] != "bad_purpose" {
+		t.Fatalf("未知 purpose 应拒帧 bad_purpose: %v", result)
+	}
+	if serveCalled {
+		t.Fatal("未知 purpose 须早退,serve 不得被触")
+	}
+}
+
+// TestAgentPunchPurposeTransferBadTransferIDFails purpose=transfer 但
+// transfer_id 非法(路径穿越形态):fail bad_transfer_id,须在取上下文之前
+// 早退(不消费表项),serve 不得被触。
+func TestAgentPunchPurposeTransferBadTransferIDFails(t *testing.T) {
+	var serveCalled bool
+	b, sink, _ := newPunchBForTest(t, func(bb *agentPeerPunchB) {
+		bb.serve = func(*net.UDPConn, punch.ListenerOpts) (int, <-chan struct{}, error) {
+			serveCalled = true
+			return 0, nil, fmt.Errorf("must not be called")
+		}
+	})
+	b.handleSession(punchSessionFrameWithPurpose("pr-btid", "ps-btid", "tok", 15, "transfer", "../evil"), sink.write, "self")
+	if result := sink.lastResult(); result == nil || result["ok"] != false || result["fail_reason"] != "bad_transfer_id" {
+		t.Fatalf("非法 transfer_id 应拒帧 bad_transfer_id: %v", result)
+	}
+	if serveCalled {
+		t.Fatal("非法 transfer_id 须早退,serve 不得被触")
+	}
+}
+
+// TestAgentPunchTransferServeFailurePutsContextBack serve 失败放回:上下文
+// 在 serve 之前取出(Handler 是 serve 入参,先于 serve 求值),serve 失败须
+// 在 listen_failed 分支放回表项——单次消费语义归成功路径独占。
+func TestAgentPunchTransferServeFailurePutsContextBack(t *testing.T) {
+	const transferID = "tr_punchback01"
+	var transferCalls int
+	b, sink, _ := newPunchBForTest(t, func(bb *agentPeerPunchB) {
+		bb.serve = func(*net.UDPConn, punch.ListenerOpts) (int, <-chan struct{}, error) {
+			return 0, nil, fmt.Errorf("serve boom")
+		}
+		bb.transferServe = func(string, agentPunchTransferContext) func(net.Conn) {
+			transferCalls++
+			return func(net.Conn) {}
+		}
+	})
+	registerAgentPunchTransferContext(transferID, agentPunchTransferContext{
+		token:    "tok-back",
+		filename: "back.bin",
+	}, 30*time.Second)
+
+	b.handleSession(punchSessionFrameWithPurpose("pr-back", "ps-back", "tok", 15, "transfer", transferID), sink.write, "self")
+	result := sink.lastResult()
+	if result == nil || result["ok"] != false || result["fail_reason"] != "listen_failed" {
+		t.Fatalf("serve 失败应回 listen_failed: %v", result)
+	}
+	// 放回断言:serve 失败后注册表必须仍能取到同一上下文。
+	tctx, ok := takeAgentPunchTransferContext(transferID)
+	if !ok || tctx.token != "tok-back" || tctx.filename != "back.bin" {
+		t.Fatalf("serve 失败必须放回表项(单次消费归成功路径): ok=%t ctx=%+v", ok, tctx)
+	}
+	// 再取必空:放回的是同一个单次消费表项,不是复制。
+	if _, ok := takeAgentPunchTransferContext(transferID); ok {
+		t.Fatal("放回后的表项仍是单次消费,二次 take 必须为空")
+	}
+	if transferCalls != 1 {
+		t.Fatalf("transferServe 缝应被求值恰一次(Handler 是 serve 入参): %d", transferCalls)
 	}
 }
