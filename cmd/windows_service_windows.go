@@ -5,6 +5,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"aliang.one/nursorgate/common/logger"
@@ -50,6 +51,10 @@ func (s *aliangWindowsService) Execute(args []string, req <-chan svc.ChangeReque
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// 存活心跳:随 Execute 生命周期起停(deferred cancel 兜全部返回路径),
+	// 文件停在最后一次心跳 = 死亡时刻上界。取证协议见 service_heartbeat.go。
+	go runHeartbeat(ctx, filepath.Join(setup.CoreDataDir(), "core.heartbeat"), serviceHeartbeatInterval)
 
 	done := make(chan error, 1)
 	go func() {
