@@ -122,7 +122,8 @@ func TestProxyAIStreamHostPolicyRejectsNonLocalhost(t *testing.T) {
 	defer func() { aiStreamTargetHost = origTarget }()
 
 	// gorilla Dial 的 Host 取自 URL，没法直连又带非 localhost Host；在服务端
-	// mux 里覆写 r.Host 来模拟「经 172.16.222.1:56431 访问仪表盘」。
+	// mux 里覆写 r.Host 来模拟「经 172.16.222.1:56431 访问仪表盘」。无 Origin
+	// 的非 loopback Host（curl/脚本直连）仍按既有底线拒绝。
 	coreSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.Host = "172.16.222.1:56431"
 		proxyAIStream(w, r)
@@ -133,7 +134,7 @@ func TestProxyAIStreamHostPolicyRejectsNonLocalhost(t *testing.T) {
 	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err == nil {
 		conn.Close()
-		t.Fatal("expected non-localhost Host to be rejected, got connection")
+		t.Fatal("expected non-localhost Host (no Origin) to be rejected, got connection")
 	}
 	if resp == nil {
 		t.Fatal("expected 403 HTTP response, got nil")
@@ -141,6 +142,108 @@ func TestProxyAIStreamHostPolicyRejectsNonLocalhost(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", resp.StatusCode)
+	}
+}
+
+// TestProxyAIStreamSameOriginLANAllowed 是 2026-11-19 生产假断线的回归测试：
+// 浏览器经 LAN IP 打开仪表盘（Host=172.16.222.1:56431），aiSocketUrl() 发出
+// 同源 Origin，聊天 WS 必须照常握手透传——旧 localhost-only 白名单在这里
+// 恒 403，每条对话被前端画成「与设备的连接已中断」。
+func TestProxyAIStreamSameOriginLANAllowed(t *testing.T) {
+	agentSrv := startEchoAgent(t)
+	defer agentSrv.Close()
+
+	origTarget := aiStreamTargetHost
+	aiStreamTargetHost = func() string { return strings.TrimPrefix(agentSrv.URL, "http://") }
+	defer func() { aiStreamTargetHost = origTarget }()
+
+	coreSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Host = "172.16.222.1:56431"
+		proxyAIStream(w, r)
+	}))
+	defer coreSrv.Close()
+	wsURL := "ws" + strings.TrimPrefix(coreSrv.URL, "http") + "/api/agent/ai/stream"
+
+	hdr := http.Header{"Origin": []string{"http://172.16.222.1:56431"}}
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, hdr)
+	if err != nil {
+		t.Fatalf("same-origin LAN dial rejected (resp=%v): %v", resp, err)
+	}
+	defer conn.Close()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte("ping")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, data, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if string(data) != "ping" {
+		t.Fatalf("echo = %q, want ping", data)
+	}
+}
+
+// TestProxyAIStreamCrossOriginRejected：第三方页面开着 ws://设备IP 的跨站
+// 连接（Origin=攻击页 ≠ 本机 Host）必须拒绝——真同源闸的核心价值。
+func TestProxyAIStreamCrossOriginRejected(t *testing.T) {
+	agentSrv := startEchoAgent(t)
+	defer agentSrv.Close()
+
+	origTarget := aiStreamTargetHost
+	aiStreamTargetHost = func() string { return strings.TrimPrefix(agentSrv.URL, "http://") }
+	defer func() { aiStreamTargetHost = origTarget }()
+
+	coreSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Host = "172.16.222.1:56431"
+		proxyAIStream(w, r)
+	}))
+	defer coreSrv.Close()
+	wsURL := "ws" + strings.TrimPrefix(coreSrv.URL, "http") + "/api/agent/ai/stream"
+
+	hdr := http.Header{"Origin": []string{"http://evil.example"}}
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, hdr)
+	if err == nil {
+		conn.Close()
+		t.Fatal("expected cross-origin dial to be rejected, got connection")
+	}
+	if resp == nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403, got resp=%v err=%v", resp, err)
+	}
+	defer func() {
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}()
+}
+
+// TestAIStreamHostAllowedTable：aiStreamHostAllowed 的策略表——同源/跨源/
+// 无 Origin×loopback/无 Origin×LAN/Origin=null 逐格钉死。
+func TestAIStreamHostAllowedTable(t *testing.T) {
+	cases := []struct {
+		name   string
+		host   string
+		origin string
+		want   bool
+	}{
+		{"same-origin lan", "172.16.222.1:56431", "http://172.16.222.1:56431", true},
+		{"same-origin port differs", "172.16.222.1:56431", "http://172.16.222.1:9999", false},
+		{"same-origin host differs", "172.16.222.1:56431", "http://10.0.0.5:56431", false},
+		{"cross-origin", "172.16.222.1:56431", "http://evil.example", false},
+		{"loopback localhost no origin", "localhost:56431", "", true},
+		{"loopback 127 no origin", "127.0.0.1:56433", "", true},
+		{"lan no origin", "172.16.222.1:56431", "", false},
+		{"origin null", "172.16.222.1:56431", "null", false},
+		{"origin garbage", "172.16.222.1:56431", "::::", false},
+	}
+	for _, tc := range cases {
+		r := httptest.NewRequest(http.MethodGet, "http://listener/api/agent/ai/stream", nil)
+		r.Host = tc.host
+		if tc.origin != "" {
+			r.Header.Set("Origin", tc.origin)
+		}
+		if got := aiStreamHostAllowed(r); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

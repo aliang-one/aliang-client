@@ -45,20 +45,41 @@ func NewAgentHandler(service *services.AgentService) *AgentHandler {
 	}
 }
 
-// aiStreamUpgrader upgrades the in-app chat WebSocket. Same localhost-only
-// origin policy as the log stream so the bundled web UI can connect directly
-// and drive the local Claude Code / Codex headless run.
+// aiStreamUpgrader upgrades the in-app chat WebSocket. Same-origin policy
+// (see aiStreamHostAllowed) so the bundled web UI can connect directly and
+// drive the local Claude Code / Codex headless run.
 var aiStreamUpgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
 	CheckOrigin:     aiStreamHostAllowed,
 }
 
-// aiStreamHostAllowed 与 aiStreamUpgrader.CheckOrigin 同源同语义（r.Host 的
-// host 段须为 localhost/127.0.0.1）。抽成函数供两处共用，防再漂移。
+// aiStreamHostAllowed 聊天 WS 的同源闸（2026-11-19 重写，生产实证 LAN 假断线）：
+//   - 带 Origin（浏览器恒带）：真同源才放行——Origin 的 host:port 与 r.Host
+//     一致。仪表盘页 aiSocketUrl() 取 window.location.host，与 r.Host 恒同源，
+//     所以 LAN IP 打开仪表盘（172.16.222.1:56431）照常能聊；第三方页面开着
+//     ws://设备IP 的跨站连接（Origin=攻击页 ≠ 本机）在此断掉——比旧实现更严，
+//     旧实现只看 r.Host 是否 localhost，连 Origin 都不看。
+//   - 无 Origin（curl/脚本直连）：仍要求 loopback，保持「聊天面对非浏览器
+//     客户端只在本机暴露」的既有底线。
+//
+// 旧行为（只认 localhost Host）把 LAN 浏览的每条对话变成 403→前端重连失败→
+// 「与设备的连接已中断」假断线（2026-11-19 liang-dev 实证）。Origin 解析失败
+// 或为 "null"（file:// 页）一律拒绝。抽成函数供 Upgrader 与 core 透传路径
+// （ai_stream_proxy.go）共用，防再漂移。
 func aiStreamHostAllowed(r *http.Request) bool {
-	host := strings.Split(r.Host, ":")[0]
-	return host == "localhost" || host == "127.0.0.1"
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		host := strings.Split(r.Host, ":")[0]
+		return host == "localhost" || host == "127.0.0.1" || host == "::1"
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	// 仪表盘端口（56431/56432）非默认端口，浏览器 Origin 恒带端口，
+	// 精确比较 host:port 即可，不做 host-only 宽松匹配。
+	return strings.EqualFold(u.Host, r.Host)
 }
 
 // HandleAIStream is the local chat WebSocket endpoint (/api/agent/ai/stream).

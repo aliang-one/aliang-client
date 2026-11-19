@@ -44,10 +44,11 @@ var errAgentNotWebsocket = errors.New("agent did not upgrade to websocket")
 // 失败语义：完成浏览器侧 Upgrade 后发 close(1011, "device agent offline")——
 // 裸 Close 不发 close 帧，浏览器只会看到 1006，前端无法区分「设备不在线」。
 func proxyAIStream(w http.ResponseWriter, r *http.Request) {
-	// 与 aiStreamUpgrader 同源的 host 策略（CheckOrigin 检查的是 r.Host）：
-	// 透传成功路径是手写 101、不经 Upgrader，必须显式复检，否则经非 localhost
-	// 主机名（如 172.16.222.1:56431）访问的仪表盘会从今天的 403 变成能聊——
-	// 与离线路径（走 rejectBrowserWS→Upgrade，仍 403）语义也不一致。
+	// 与 aiStreamUpgrader 同源的真同源策略（2026-11-19 起，原 localhost-only
+	// 白名单把 LAN IP 浏览的每条对话 403 成假断线）：透传成功路径是手写 101、
+	// 不经 Upgrader，必须显式复检同一 aiStreamHostAllowed，否则策略放行的
+	// 连接（如同源 LAN 访问）会被这里漏挡、离线路径（rejectBrowserWS→Upgrade）
+	// 又会拒掉，两条路径语义分叉。
 	if !aiStreamHostAllowed(r) {
 		rejectBrowserWS(w, r, "origin not allowed")
 		return
