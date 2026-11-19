@@ -849,8 +849,9 @@ func (a *agentPeerPunchA) tryCached(ctx context.Context, key string) (net.Conn, 
 
 // dialMiss miss 路径(dialMu 串行;transfer miss 同样全程持锁——一次性
 // 拨号后锁内含 DialPeer,与 mesh 同构):重拨检查 → 驱逐旧 socket → memo
-// 预检 → 信令链(session→result→Classify→candidates)→ DialPeer →
-// 成功路径分流(mesh=DialAndPut 同款缓存复用;transfer=一次性出让,裁决 5)。
+// 预检 → 信令链(session→result→Classify→candidates;result 声明 public
+// 时跳过 Classify/自候选,bind 照走)→ DialPeer → 成功路径分流(mesh=
+// DialAndPut 同款缓存复用;transfer=一次性出让,裁决 5)。
 func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string, opts punchDialOpts) (net.Conn, error) {
 	a.dialMu.Lock()
 	defer a.dialMu.Unlock()
@@ -916,6 +917,7 @@ func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string, opts punc
 		return nil, fmt.Errorf("agent punch: send session: %w", err)
 	}
 	var fingerprint string
+	var publicPeer bool
 	select {
 	case res := <-resCh:
 		if ok, _ := res["ok"].(bool); !ok {
@@ -923,6 +925,10 @@ func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string, opts punc
 			return nil, fmt.Errorf("agent punch: peer refused session: %s", reason)
 		}
 		fingerprint = remoteString(res, "fingerprint")
+		// 公网直挂声明(punch-public-peer):B 侧 result 捎带 public 时 A
+		// 跳过自身 classify/自候选——对端直挂无需 NAT 判型,同五元组握手
+		// 直拨。键缺省(老 B/典型 NAT)→ false,既有全流程零变化。
+		publicPeer = remoteBool(res, "public", false)
 	case <-ctx.Done():
 		return nil, fmt.Errorf("agent punch: awaiting result: %w", ctx.Err())
 	case <-time.After(agentPunchResultWait):
@@ -930,30 +936,38 @@ func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string, opts punc
 	}
 
 	// ② 绑 socket + Classify(铁律:先于任何拨号,探测窗口不吞打洞包)。
+	// public 声明(计划期裁决 1/2):bind 保留在条件外(毫秒级成本,Socket
+	// 绑定铁律);classify/symmetric 记账/自候选组装整块跳过——不判型即无
+	// symmetric 分支(skipMemo 不写;对端 NAT 属性与本机判型无关,ShouldSkip
+	// 预检照旧兜既有对称记忆)。
 	socket, _, err := a.bind()
 	if err != nil {
 		// 绑定失败=载体自禁(socket.go 绑定铁律),落 piko。
 		return nil, fmt.Errorf("agent punch: bind: %w", err)
 	}
-	mapping, symmetricSuspect, classifyErr := a.classify(socket, a.servers())
 	var selfCandidates []string
-	if classifyErr != nil {
-		// 铁律:不可达≠symmetric,不写 SkipMemo;打洞照试。
-		logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH-A] classify unavailable peer=%s err=%v", peerID, classifyErr))
-	} else {
-		if symmetricSuspect {
-			// per-peer 记账后拒绝:本对端 5min 内不再尝试(重拨检查前有
-			// ShouldSkip 预检兜住)。
-			a.skipMemo.Record(peerID)
-			_ = socket.Close()
-			return nil, fmt.Errorf("agent punch: peer %s symmetric nat suspect", peerID)
-		}
-		if mapping.IP != nil && mapping.Port > 0 {
-			selfCandidates = []string{net.JoinHostPort(mapping.IP.String(), strconv.Itoa(mapping.Port))}
+	if !publicPeer {
+		mapping, symmetricSuspect, classifyErr := a.classify(socket, a.servers())
+		if classifyErr != nil {
+			// 铁律:不可达≠symmetric,不写 SkipMemo;打洞照试。
+			logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH-A] classify unavailable peer=%s err=%v", peerID, classifyErr))
+		} else {
+			if symmetricSuspect {
+				// per-peer 记账后拒绝:本对端 5min 内不再尝试(重拨检查前有
+				// ShouldSkip 预检兜住)。
+				a.skipMemo.Record(peerID)
+				_ = socket.Close()
+				return nil, fmt.Errorf("agent punch: peer %s symmetric nat suspect", peerID)
+			}
+			if mapping.IP != nil && mapping.Port > 0 {
+				selfCandidates = []string{net.JoinHostPort(mapping.IP.String(), strconv.Itoa(mapping.Port))}
+			}
 		}
 	}
 
-	// ③ candidates 帧 → pending 等 B 候选。
+	// ③ candidates 帧 → pending 等 B 候选。public 路径发送保持无条件
+	// (selfCandidates 为 nil → 空帧,B 侧 no_valid_candidate 空转既有语义,
+	// 评审 Issue-2 最小 diff 口径)。
 	candCh := make(chan []string, 1)
 	a.mu.Lock()
 	a.pendingCandidates[sessionID] = candCh

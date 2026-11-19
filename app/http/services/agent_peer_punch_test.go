@@ -615,6 +615,11 @@ type punchFakeB struct {
 	a             *agentPeerPunchA
 	mu            sync.Mutex
 	sessionFrames int
+	// public 逐用例 opt-in 开关(punch-public-peer Task 3):置 true 时 result
+	// 帧捎带 public:true 模拟公网直挂 B。默认 false——result 帧不带 public
+	// 键,共享夹具对既有全 Punch 测试族零污染(拨号前置位,send 同步回调
+	// 无竞态)。
+	public bool
 }
 
 func (f *punchFakeB) onFrame(payload map[string]interface{}) error {
@@ -649,13 +654,19 @@ func (f *punchFakeB) onFrame(payload map[string]interface{}) error {
 			f.t.Errorf("假 B 起听失败: %v", err)
 			return nil
 		}
-		f.a.handleResultFrame(map[string]interface{}{
+		result := map[string]interface{}{
 			"type":        models.AgentEventPeerPunchSessionResult,
 			"request_id":  requestID,
 			"ok":          true,
 			"port":        float64(port),
 			"fingerprint": fp,
-		})
+		}
+		if f.public {
+			// 条件键口径与生产 B 侧一致(agentPunchSessionResultPayload:
+			// 成功且声明才出键,缺省不带)。
+			result["public"] = true
+		}
+		f.a.handleResultFrame(result)
 		f.a.handleCandidatesFrame(map[string]interface{}{
 			"type":       models.AgentEventPeerPunchCandidates,
 			"session_id": sessionID,
@@ -1448,6 +1459,102 @@ func TestAgentPeerPunchSessionResultPublicAutoCriterion(t *testing.T) {
 		}
 		if _, has := result["public"]; has {
 			t.Fatalf("典型 NAT 映射不得带 public 键: %v", result)
+		}
+	})
+}
+
+// TestAgentPunchDialMissPublicSkipsClassify public=true:A 侧收到 B 的
+// public 声明后跳过自身 classify/自候选组装(bind 照走,Socket 绑定铁律);
+// public 缺省:既有全流程零变化(计划期裁决 1/2)。候选帧口径(评审
+// Issue-2 定稿):public 路径 A 仍恰发一帧空数组候选(最小 diff,B 侧
+// no_valid_candidate 空转既有语义)。
+func TestAgentPunchDialMissPublicSkipsClassify(t *testing.T) {
+	// 候选数组空判定:len 口径,nil 与空数组([]string/[]interface{} 两种
+	// 形态)皆算空——不断言字面形态(评审 Issue-2 明令)。
+	candidatesEmpty := func(raw interface{}) bool {
+		switch v := raw.(type) {
+		case nil:
+			return true
+		case []string:
+			return len(v) == 0
+		case []interface{}:
+			return len(v) == 0
+		default:
+			return false
+		}
+	}
+
+	t.Run("public_declared_skips_classify_and_sends_empty_candidates", func(t *testing.T) {
+		classifyCalls := 0
+		a, fake := newPunchAForTest(t, func(a *agentPeerPunchA) {
+			orig := a.classify
+			a.classify = func(c *net.UDPConn, servers []string) (punch.PublicMapping, bool, error) {
+				classifyCalls++
+				return orig(c, servers)
+			}
+		})
+		fake.public = true // 逐用例 opt-in:result 捎带 public:true(默认 false)
+		// 桥上 A→candidates 帧捕获:沿全链传输测试的 send 包裹手法,
+		// 不碰共享夹具。
+		var candFrames []map[string]interface{}
+		origSend := a.send
+		a.send = func(payload map[string]interface{}) error {
+			if payload["type"] == models.AgentEventPeerPunchCandidates {
+				candFrames = append(candFrames, payload)
+			}
+			return origSend(payload)
+		}
+
+		conn, err := a.dialSource(context.Background(), "dev-b")
+		if err != nil {
+			t.Fatalf("public 直挂拨号应成功: %v", err)
+		}
+		_ = conn.Close()
+
+		if classifyCalls != 0 {
+			t.Fatalf("public 声明下 A 侧不得 classify(直拨省 STUN 判型),实调 %d 次", classifyCalls)
+		}
+		if len(candFrames) != 1 {
+			t.Fatalf("public 路径 A 应恰发一帧候选(空数组口径),实发 %d 帧", len(candFrames))
+		}
+		if !candidatesEmpty(candFrames[0]["candidates"]) {
+			t.Fatalf("public 路径候选数组必须为空(nil/空数组皆算空): %v", candFrames[0]["candidates"])
+		}
+	})
+
+	t.Run("public_absent_keeps_classify_and_self_candidates", func(t *testing.T) {
+		classifyCalls := 0
+		a, _ := newPunchAForTest(t, func(a *agentPeerPunchA) {
+			orig := a.classify
+			a.classify = func(c *net.UDPConn, servers []string) (punch.PublicMapping, bool, error) {
+				classifyCalls++
+				return orig(c, servers)
+			}
+		})
+		// fake.public 缺省 false:result 不带 public 键,既有全流程。
+		var candFrames []map[string]interface{}
+		origSend := a.send
+		a.send = func(payload map[string]interface{}) error {
+			if payload["type"] == models.AgentEventPeerPunchCandidates {
+				candFrames = append(candFrames, payload)
+			}
+			return origSend(payload)
+		}
+
+		conn, err := a.dialSource(context.Background(), "dev-b")
+		if err != nil {
+			t.Fatalf("对照拨号应成功: %v", err)
+		}
+		_ = conn.Close()
+
+		if classifyCalls < 1 {
+			t.Fatalf("public 缺省时 classify 必须照走(既有语义),实调 %d 次", classifyCalls)
+		}
+		if len(candFrames) != 1 {
+			t.Fatalf("对照路径 A 应恰发一帧候选,实发 %d 帧", len(candFrames))
+		}
+		if candidatesEmpty(candFrames[0]["candidates"]) {
+			t.Fatalf("classify 照走时自候选不得为空(默认桩宣告 TEST-NET 映射): %v", candFrames[0]["candidates"])
 		}
 	})
 }
