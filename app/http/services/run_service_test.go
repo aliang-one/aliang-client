@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/http/storage"
@@ -828,5 +830,85 @@ func TestStartServiceRechecksSessionAfterWaitingForModeLock(t *testing.T) {
 	}
 	if httpStarts != 0 || rs.IsRunning() {
 		t.Fatalf("logout-racing start escaped session gate: starts=%d running=%t", httpStarts, rs.IsRunning())
+	}
+}
+
+// TestRunServiceLifecycleSerializesStopDuringInFlightStart 2026-11-20 0.196
+// 恢复链 TUN 重建竞态回归钉:StartService 在 modeChangeMutex 锁外执行建造段,
+// 历史 stop(SoftExpired→Restoring 钩子)会中途拆设备,二次 start 的 netsh
+// 撞拆除竞态 → 「TUN 启动失败」代理全瘫。生命周期闸修复后,stop 必须等待
+// in-flight start 完整出完才开始执行(拆的永远是建成的 TUN),顺序为
+// start-begin → start-end → stop。
+func TestRunServiceLifecycleSerializesStopDuringInFlightStart(t *testing.T) {
+	defer resetRunServiceHooksForTest()
+	seedActiveIngressSnapshot(t, string(models.ModeTUN))
+	runtime.ResetGlobalStartupStateForTest()
+	runtime.GetStartupState().SetStatus(runtime.READY)
+
+	runService := NewRunService()
+
+	startEntered := make(chan struct{})
+	releaseStart := make(chan struct{})
+	var orderMu sync.Mutex
+	var order []string
+	record := func(ev string) {
+		orderMu.Lock()
+		order = append(order, ev)
+		orderMu.Unlock()
+	}
+
+	oldStart, oldStop := tunStartRunner, tunStopRunner
+	tunStartRunner = func() map[string]string {
+		record("start-begin")
+		close(startEntered)
+		<-releaseStart
+		record("start-end")
+		return map[string]string{"status": "success"}
+	}
+	tunStopRunner = func() {
+		record("stop")
+	}
+	t.Cleanup(func() { tunStartRunner, tunStopRunner = oldStart, oldStop })
+
+	startDone := make(chan map[string]interface{}, 1)
+	go func() { startDone <- runService.StartService() }()
+
+	<-startEntered // start 已进入建造段(旧代码此处 stop 可无序插入)
+
+	stopDone := make(chan bool, 1)
+	go func() { stopDone <- runService.StopIngressIfActive() }()
+
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-stopDone:
+		t.Fatal("stop must not complete while in-flight start holds the lifecycle gate")
+	default:
+	}
+
+	close(releaseStart)
+	res := <-startDone
+	if status, ok := res["status"].(string); !ok || status != "success" {
+		t.Fatalf("start status = %#v, want success", res["status"])
+	}
+	if !<-stopDone {
+		t.Fatal("StopIngressIfActive should stop the built TUN (wasRunning=true)")
+	}
+
+	orderMu.Lock()
+	defer orderMu.Unlock()
+	startEndIdx, stopIdx := -1, -1
+	for i, ev := range order {
+		if ev == "start-end" {
+			startEndIdx = i
+		}
+		if ev == "stop" {
+			stopIdx = i
+		}
+	}
+	if startEndIdx == -1 || stopIdx == -1 {
+		t.Fatalf("missing events in order: %v", order)
+	}
+	if startEndIdx > stopIdx {
+		t.Fatalf("stop ran before start completed: order=%v, want start-end before stop", order)
 	}
 }

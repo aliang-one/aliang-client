@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"aliang.one/nursorgate/common/logger"
 	utils2 "aliang.one/nursorgate/inbound/tun/runner/utils"
@@ -92,14 +93,32 @@ func configureWindowsTunInterface(ifname string) error {
 		UpdateStartupProgress("starting", "requesting_permission", 52, "Requesting Windows administrator permission to configure the virtual adapter.", "", true)
 	}
 
-	for _, cmd := range commands {
-		if err := runWindowsPrivilegedCommand(cmd[0], cmd[1:]...); err != nil {
-			errStr := fmt.Sprintf("netsh command failed: %v", err)
-			logger.Error(errStr)
-			return errors.New(errStr)
+	// 设备拆除/注册竞态窗兜底(2026-11-20 0.196 恢复链 TUN 重建竞态):并发
+	// stop 的接口拆除与 start 的配置指令交叠时,netsh 会瞬时失败(设备未就绪/
+	// 正被移除)。拆除窗典型 <1s,失败按 2s 间隔整体重试至多三次,重试耗尽才
+	// 如实失败。
+	const configureAttempts = 3
+	const configureRetryDelay = 2 * time.Second
+	for attempt := 1; attempt <= configureAttempts; attempt++ {
+		failed := false
+		var lastErr error
+		for _, cmd := range commands {
+			if err := runWindowsPrivilegedCommand(cmd[0], cmd[1:]...); err != nil {
+				lastErr = err
+				failed = true
+				break
+			}
+		}
+		if !failed {
+			return nil
+		}
+		errStr := fmt.Sprintf("netsh command failed (attempt %d/%d): %v", attempt, configureAttempts, lastErr)
+		logger.Error(errStr)
+		if attempt < configureAttempts {
+			time.Sleep(configureRetryDelay)
 		}
 	}
-	return nil
+	return errors.New(fmt.Sprintf("netsh configure failed after %d attempts", configureAttempts))
 }
 
 func configureDarwinTunInterface(ifname string) error {
