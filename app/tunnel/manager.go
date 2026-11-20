@@ -17,8 +17,10 @@ import (
 	"github.com/andydunstall/piko/client"
 
 	"aliang.one/nursorgate/common/logger"
+	"aliang.one/nursorgate/app/mesh/ingressfwd"
 	sshin "aliang.one/nursorgate/inbound/ssh"
 	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
+	pconfig "aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/tcp"
 )
 
@@ -421,8 +423,10 @@ func runTunnel(ctx context.Context, config runConfig, ready func()) error {
 				}
 				go func(c net.Conn) {
 					c = sshin.WithRemoteLabel(c, "piko-"+endpoint) // 无冒号(SPEC §8.2)
-					if !sshin.HandleIngressConn(c) {
-						// false = 入口未配置,SPEC §8.1 WARN 记账。
+					if !ingressfwd.ServeOrForward(c, pconfig.GetGlobalConfig()) {
+						// false = 本进程无 ingress 单例且无处可转(入口未启用),
+						// SPEC §8.1 WARN 记账。双进程拓扑(数据面住 core)下
+						// ServeOrForward 已 splice 到 core 统一入口,不走此支。
 						logger.Info(fmt.Sprintf("[MESH-RELAY] ingress not running, dropped conn %s", c.RemoteAddr()))
 					}
 				}(conn)
