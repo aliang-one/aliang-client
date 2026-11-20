@@ -37,7 +37,7 @@ func newHandshakeTestService(t *testing.T) *AgentService {
 	svc.mu.Unlock()
 	svc.state.Enabled = true
 	svc.state.Registered = true
-	svc.forwardedUserAuthorization = "Bearer stale_jwt"
+		svc.storeForwardedCredential("Bearer stale_jwt")
 	return svc
 }
 
@@ -60,7 +60,7 @@ func TestHandleHandshakeUnauthorizedSelfHealsWithoutDisable(t *testing.T) {
 	defer svc.mu.Unlock()
 	assert.True(t, svc.state.Enabled, "自愈路径不得禁用 agent")
 	assert.True(t, svc.state.Registered, "自愈路径不得清除注册态")
-	assert.Equal(t, "Bearer stale_jwt", svc.forwardedUserAuthorization, "自愈路径不得清空凭据")
+	assert.Equal(t, "Bearer stale_jwt", svc.loadForwardedCredential(), "自愈路径不得清空凭据")
 	assert.Equal(t, "reauthenticating", svc.state.LastSyncStatus)
 }
 
@@ -71,7 +71,7 @@ func TestHandleHandshakeUnauthorizedHardInvalidLetsLoopExit(t *testing.T) {
 	remoteWSAuthRecovery = func(reason string) {
 		// 模拟 HardInvalid：刷新令牌被永久拒绝，本地会话被清。
 		svc.mu.Lock()
-		svc.forwardedUserAuthorization = ""
+				svc.storeForwardedCredential("")
 		svc.mu.Unlock()
 	}
 	t.Cleanup(func() { remoteWSAuthRecovery = previous })

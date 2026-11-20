@@ -40,7 +40,7 @@ func authorizeAgentPolicyTestService(t *testing.T, svc *AgentService) {
 	defer svc.mu.Unlock()
 	svc.ensureDeviceIdentityLocked()
 	svc.state.Registered = true
-	svc.forwardedUserAuthorization = "Bearer test-user-jwt"
+		svc.storeForwardedCredential("Bearer test-user-jwt")
 }
 
 // ruleIDs returns the ordered rule IDs of a policy — used to assert dangerous-first

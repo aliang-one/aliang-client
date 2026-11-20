@@ -14,7 +14,7 @@ func newTeardownTestService(t *testing.T, registered bool) (*AgentService, *bool
 	t.Helper()
 	t.Setenv(AgentRuntimeEnv, "1")
 	svc := &AgentService{terminal: newAgentTerminalManager(), ai: newAgentAIManager()}
-	svc.forwardedUserAuthorization = "Bearer test-token"
+		svc.storeForwardedCredential("Bearer test-token")
 	svc.state.Enabled = true
 	svc.state.DeviceID = "device-1"
 	svc.state.Registered = registered

@@ -260,3 +260,90 @@ func TestClassifyRegisterFailureKeepsTyped401Fatal(t *testing.T) {
 		t.Fatal("typed 401 必须仍是非瞬时（退避判定不得抢在它前面）")
 	}
 }
+
+// TestCallAgentServerRetriesWithForwardedCredentialWhenStoreTokenRejected
+// 2026-11-20 0.196 inbox 24h 循环终案的回归钉:进程 auth store 头被远端拒
+// (boot 发放 24h TTL 到期),本地续期按「临近过期」记账返回同头(拒转),
+// 此时 owner 推送的转发凭据恒为当前有效会话——必须先于本地续期用它重试。
+func TestCallAgentServerRetriesWithForwardedCredentialWhenStoreTokenRejected(t *testing.T) {
+	agentChannelHealthInstance.reset()
+	oldWriter := agentChannelAlertWriter
+	agentChannelAlertWriter = func(map[string]interface{}) error { return nil }
+	t.Cleanup(func() {
+		agentChannelAlertWriter = oldWriter
+		agentChannelHealthInstance.reset()
+	})
+
+	var acceptedHeader atomic.Value
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		if r.Header.Get("Authorization") == "Bearer expired-store" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		acceptedHeader.Store(r.Header.Get("Authorization"))
+		_, _ = w.Write([]byte(`{"data":{"ok":true}}`))
+	}))
+	defer srv.Close()
+
+	// 拒转场景:续期返回与被拒头相同的头(未临近过期记账)。
+	oldRefresher := agentChannelRefreshHeader
+	agentChannelRefreshHeader = func() (string, error) { return "Bearer expired-store", nil }
+	t.Cleanup(func() { agentChannelRefreshHeader = oldRefresher })
+
+	svc := &AgentService{client: srv.Client()}
+	svc.storeForwardedCredential("Bearer forwarded-fresh")
+	raw, err := svc.callAgentServerWithAuthorization(http.MethodPost, srv.URL, nil, "Bearer expired-store")
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if len(raw) == 0 {
+		t.Fatal("empty response body")
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (401 then forwarded retry)", got)
+	}
+	if got := acceptedHeader.Load(); got != "Bearer forwarded-fresh" {
+		t.Fatalf("successful retry used header %v, want forwarded credential", got)
+	}
+	// 成功必须清账:退避表删除,端点重新可用。
+	if agentChannelHealthInstance.allow(srv.URL, "Bearer forwarded-fresh") != true {
+		t.Fatalf("recordSuccess must clear endpoint backoff; endpoint should be callable again")
+	}
+}
+
+// TestCallAgentServerSkipsForwardedRetryWhenSameHeader:转发凭据与被拒头相同
+// 时不得空转重试(应原样落入本地续期路径,这里续期也返回同头 → 走拒转收尾)。
+func TestCallAgentServerSkipsForwardedRetryWhenSameHeader(t *testing.T) {
+	agentChannelHealthInstance.reset()
+	oldWriter := agentChannelAlertWriter
+	agentChannelAlertWriter = func(map[string]interface{}) error { return nil }
+	t.Cleanup(func() {
+		agentChannelAlertWriter = oldWriter
+		agentChannelHealthInstance.reset()
+	})
+
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	oldRefresher := agentChannelRefreshHeader
+	agentChannelRefreshHeader = func() (string, error) { return "Bearer stale", nil }
+	t.Cleanup(func() { agentChannelRefreshHeader = oldRefresher })
+
+	svc := &AgentService{client: srv.Client()}
+	svc.storeForwardedCredential("Bearer stale")
+	_, err := svc.callAgentServerWithAuthorization(http.MethodGet, srv.URL, nil, "Bearer stale")
+	var rejected agentUserAuthRejectedError
+	if !errors.As(err, &rejected) {
+		t.Fatalf("err = %v, want agentUserAuthRejectedError after exhausted retries", err)
+	}
+	// 初始 401 即终(本地续期同头不重试);转发同头同样不得产生任何额外请求。
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1 (401 only; same-header forwarded retry must be skipped)", got)
+	}
+}

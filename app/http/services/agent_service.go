@@ -156,7 +156,7 @@ type AgentService struct {
 	// Forwarded user credentials are process-local only. The session owner sends
 	// them through /api/agent/sync after login/restore/refresh; the agent never
 	// reads or rotates the persisted refresh token.
-	forwardedUserAuthorization string
+	forwardedUserAuthorization atomic.Value // 存 string;owner 推送写、通道 401 重试读——两侧分别持不同锁,字符串快照用原子值避免跨锁读(2026-11-20 死锁定案:register 路径持 s.mu 走 callAgentServer,401 分支若再取 s.mu 即自锁死)
 	forwardedUserKey           string
 
 	// releaseMu guards lastReleasedAuthHash — the fire-once guard for the
@@ -523,7 +523,7 @@ func (s *AgentService) disableWithReasonMessage(reason string, message string) m
 	s.state.LastSyncAt = time.Now().UTC().Format(time.RFC3339)
 	s.state.LastSyncStatus = reason
 	if isSessionInvalidDisableReason(reason) {
-		s.forwardedUserAuthorization = ""
+		s.storeForwardedCredential("")
 		s.forwardedUserKey = ""
 	}
 	if strings.TrimSpace(message) != "" {
@@ -1883,6 +1883,25 @@ func (s *AgentService) callAgentServerWithAuthorization(method string, endpoint 
 	// 刻意不用 RequestUserAgentSyncAfterAuth：那条路自己会走 callAgentServer 的
 	// 注册路径，同步调用会在这里递归。本地刷新 token 不经过 server 调用，安全。
 	rejectedAuth := authHeader
+	// 转发凭据优先重试(2026-11-20 0.196 inbox 24h 循环终案):通道鉴权头来自
+	// 进程 auth store(boot 发放,24h TTL),到期后下方续期按「临近过期」记账
+	// 拒转已失效 token;而 owner 经 /api/agent/sync 推送的转发凭据恒为当前有
+	// 效会话——同分钟内 status 同步(转发凭据)200 / inbox(进程 store)401
+	// 双实证。与被拒头不同 → 先用转发凭据重试一次;它也被拒才落入本地续期。
+	if forwarded := s.forwardedCredentialIfDifferent(rejectedAuth); forwarded != "" {
+		rawF, errF := s.doCallAgentServer(method, endpoint, payload, forwarded)
+		if errF == nil {
+			agentChannelHealthInstance.recordSuccess(endpoint)
+			logger.Info(fmt.Sprintf("[AGENT-CHANNEL] 401 recovered with forwarded credential endpoint=%s", sanitizeAgentEndpoint(endpoint)))
+			return rawF, nil
+		}
+		var rejectedF agentUserAuthRejectedError
+		if errors.As(errF, &rejectedF) {
+			// 转发凭据同样被远端拒绝:指纹记账以最后一次真实被拒头为准。
+			rejectedAuth = forwarded
+		}
+		// 非凭据类失败(网络/5xx)不清账,继续走下方本地续期重试。
+	}
 	fresh, refreshErr := agentChannelRefreshHeader()
 	if refreshErr == nil && strings.TrimSpace(fresh) != "" && strings.TrimSpace(fresh) != strings.TrimSpace(authHeader) {
 		raw2, err2 := s.doCallAgentServer(method, endpoint, payload, fresh)
@@ -2239,6 +2258,38 @@ func (s *AgentService) currentAgentDeviceIDForChannelNotify() string {
 	return s.state.DeviceID
 }
 
+// forwardedCredentialIfDifferent 返回 owner 推送的转发凭据;与被拒头相同或
+// 为空时返回空串(=无可用替代,调用方维持既有续期路径)。无锁读:register
+// 路径持 s.mu 走到本分支(2026-11-20 死锁教训),字段本身是原子快照。
+func (s *AgentService) forwardedCredentialIfDifferent(rejected string) string {
+	forwarded := strings.TrimSpace(s.loadForwardedCredential())
+	if forwarded == "" || forwarded == strings.TrimSpace(rejected) {
+		return ""
+	}
+	return forwarded
+}
+
+// loadForwardedCredential 读转发凭据快照(atomic.Value,零值安全)。
+func (s *AgentService) loadForwardedCredential() string {
+	if s == nil {
+		return ""
+	}
+	if v := s.forwardedUserAuthorization.Load(); v != nil {
+		if str, ok := v.(string); ok {
+			return str
+		}
+	}
+	return ""
+}
+
+// storeForwardedCredential 写转发凭据快照(仅字符串,atomic.Value 类型一致)。
+func (s *AgentService) storeForwardedCredential(v string) {
+	if s == nil {
+		return
+	}
+	s.forwardedUserAuthorization.Store(v)
+}
+
 // resetOwnerChannelNotifyForTest 复位通道通知的指纹与沿(仅测试使用)。
 func resetOwnerChannelNotifyForTest() {
 	ownerChannelNotifyMu.Lock()
@@ -2377,14 +2428,14 @@ func (s *AgentService) resolveForwardedUserContextLocked(authHeader string, user
 
 	authChanged := false
 	if authHeader != "" {
-		authChanged = authHeader != s.forwardedUserAuthorization
-		s.forwardedUserAuthorization = authHeader
+		authChanged = authHeader != s.loadForwardedCredential()
+		s.storeForwardedCredential(authHeader)
 	}
 	if userKey != "" {
 		s.forwardedUserKey = userKey
 	}
 	if authHeader == "" {
-		authHeader = s.forwardedUserAuthorization
+		authHeader = s.loadForwardedCredential()
 	}
 	if userKey == "" {
 		userKey = s.forwardedUserKey

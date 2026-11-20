@@ -37,7 +37,7 @@ func TestApplyLogoutSessionEventClearsForwardedIdentityAndAgentState(t *testing.
 
 	service := NewAgentService()
 	service.mu.Lock()
-	service.forwardedUserAuthorization = "Bearer stale-access"
+		service.storeForwardedCredential("Bearer stale-access")
 	service.forwardedUserKey = "id:42"
 	service.state.Enabled = true
 	service.state.Registered = true
@@ -47,7 +47,7 @@ func TestApplyLogoutSessionEventClearsForwardedIdentityAndAgentState(t *testing.
 
 	service.mu.Lock()
 	defer service.mu.Unlock()
-	if service.forwardedUserAuthorization != "" || service.forwardedUserKey != "" {
+	if service.loadForwardedCredential() != "" || service.forwardedUserKey != "" {
 		t.Fatal("logout session event retained forwarded user credentials")
 	}
 	if service.state.Enabled || service.state.Registered {
@@ -67,7 +67,7 @@ func TestApplyRefreshInvalidSessionEventClearsForwardedIdentityAndAgentState(t *
 
 	service := NewAgentService()
 	service.mu.Lock()
-	service.forwardedUserAuthorization = "Bearer stale-access"
+		service.storeForwardedCredential("Bearer stale-access")
 	service.forwardedUserKey = "id:42"
 	service.state.Enabled = true
 	service.state.Registered = true
@@ -77,7 +77,7 @@ func TestApplyRefreshInvalidSessionEventClearsForwardedIdentityAndAgentState(t *
 
 	service.mu.Lock()
 	defer service.mu.Unlock()
-	if service.forwardedUserAuthorization != "" || service.forwardedUserKey != "" {
+	if service.loadForwardedCredential() != "" || service.forwardedUserKey != "" {
 		t.Fatal("refresh-invalid session event retained forwarded user credentials")
 	}
 	if service.state.Enabled || service.state.Registered {
