@@ -365,6 +365,22 @@ export function beginRunWindow(conv, ts, { ownPending = false } = {}) {
   return ensureAssistantBubble(conv, ts);
 }
 
+// AI run 终态 status 词表（2026-11-20 审计①）：与后端 agentAIRunEventTerminal
+// （app/http/services/agent_ai.go）逐字对齐。后端对「手动停止/看门狗击杀/
+// 输出限流/进程退场」类终止只发 ai.status 终态帧、不发 ai.done/ai.error
+// （ctx.Err() 分支是唯一终态出口，emitter 终态屏障丢弃其后一切帧）——前端
+// 不按词表收窗则 runActive/sending 永不复位（90s 后被自家看门狗误标 error，
+// 手动停止被画成红色错误条）。'stopping' 是过程态不在词表。
+export const AI_RUN_TERMINAL_STATUSES = new Set([
+  'stopped',
+  'cancelled',
+  'interrupted',
+  'timeout',
+  'idle_timeout',
+  'hard_timeout',
+  'output_limited',
+]);
+
 // 回合终态收窗（纯函数）：runActive/running 复位 + 残留 running 泡关账；
 // 返回是否曾有 running 泡（调用方据此决定终态定谳复订阅）。error 气泡由
 // 调用方先置 error，此处只收剩余 running。
@@ -1135,6 +1151,17 @@ export function useAliangChat() {
   // token-by-token and carries the running -> done status transitions.
   let aiSocket = null;
   let aiSocketPromise = null;
+  // 挂起中建连 Promise 的 settle 句柄（2026-11-20 审计②）：onclose/onopen
+  // 之外的出口此前只有构造器 throw——「CONNECTING 即断」时 Promise 永不落定，
+  // await 方（审批/发送/停止/插话）永久挂死，审批卡卡死 responding、输入区
+  // 锁死，唯一解法刷新页面。落定后各调用方走既有 catch 兜底（复位
+  // pending/sending）。
+  let aiSocketSettle = null;
+  // CONNECTING 黑洞超时：浏览器对连不上的 ws 可能挂数十秒才报错，期间所有
+  // await ensureAISocket() 全部悬挂。10s 上限一到即拒绝挂起 Promise 并主动
+  // close（走 onclose 重连预算，与断线自愈同一收敛面）。
+  const AI_SOCKET_CONNECT_TIMEOUT_MS = 10000;
+  let aiSocketConnectTimer = null;
   // 关窗守卫（后台静默运行，2026-11-04）：onUnmounted 主动 close 是预期生命周期
   // 而非断线——run 在 agent 侧照跑（后端 fanOut 对死 socket 仅忽略写错误，
   // journal 持续落盘），onclose 不得把 running 气泡画成「连接已中断」并持久化
@@ -2064,9 +2091,41 @@ export function useAliangChat() {
         return;
       }
       aiSocket = sock;
+      aiSocketSettle = { sock, resolve, reject };
+      // timer 用 wrapper 挂属主：迟到 close 不得拆新连接的保险丝（2026-11-20
+      // 评审 should——超时 reject+close() 到 close 事件送达之间存在空窗，空窗
+      // 里重建的连接会被旧 socket 的 onclose 无条件清掉 timer 与挂起
+      // Promise，重新退化成永久挂死）。
+      const connectTimer = {
+        sock,
+        handle: setTimeout(() => {
+          if (aiSocketConnectTimer === connectTimer) aiSocketConnectTimer = null;
+          if (sock.readyState !== WebSocket.CONNECTING) return;
+          const pending = aiSocketSettle && aiSocketSettle.sock === sock ? aiSocketSettle : null;
+          if (pending) {
+            aiSocketSettle = null;
+            aiSocketPromise = null;
+            const err = new Error('ai-socket-connect-timeout');
+            err.__aiSocketClosed = true;
+            pending.reject(err);
+          }
+          try { sock.close(); } catch (_) { /* 已死即跳过 */ }
+        }, AI_SOCKET_CONNECT_TIMEOUT_MS),
+      };
+      aiSocketConnectTimer = connectTimer;
       sock.onopen = () => {
         console.log('[aliang-chat] ws open', aiSocketUrl());
-        aiSocketPromise = null;
+        if (aiSocketConnectTimer && aiSocketConnectTimer.sock === sock) {
+          clearTimeout(aiSocketConnectTimer.handle);
+          aiSocketConnectTimer = null;
+        }
+        if (aiSocket === sock) aiSocketPromise = null;
+        // 落定挂起 Promise（句柄即本 Promise 的 resolve）：await 方放行。
+        if (aiSocketSettle && aiSocketSettle.sock === sock) {
+          const settle = aiSocketSettle;
+          aiSocketSettle = null;
+          settle.resolve();
+        }
         // 刻意不在这里归零 reconnectAttempts：「连上就断」的离线环境（agent
         // 离线时浏览器侧照样先 Upgrade 再 close(1011)）每轮重连都会触发
         // open——若 open 即归零，重连预算永远清零、封顶永远到不了，退化成
@@ -2091,11 +2150,31 @@ export function useAliangChat() {
       };
       sock.onclose = (e) => {
         console.log('[aliang-chat] ws close code=', e.code, 'reason=', e.reason);
+        // 本 socket 的超时保险丝自己拆（属主校验——2026-11-20 评审 should：
+        // 迟到 close 不得拆空窗里重建的新连接的 timer）。
+        if (aiSocketConnectTimer && aiSocketConnectTimer.sock === sock) {
+          clearTimeout(aiSocketConnectTimer.handle);
+          aiSocketConnectTimer = null;
+        }
+        // 挂起 Promise 落定（2026-11-20 审计②）：close 是该 Promise 唯一
+        // 不落定的出口——拒绝后 await 方走既有 catch 兜底。陈旧 close（本
+        // socket 已被新连接顶掉）同样要落定：旧 awaiter 还挂着。
+        const pending = aiSocketSettle && aiSocketSettle.sock === sock ? aiSocketSettle : null;
+        if (pending) {
+          aiSocketSettle = null;
+          const err = new Error('ai-socket-closed');
+          err.__aiSocketClosed = true;
+          pending.reject(err);
+        }
+        const stale = !!aiSocket && aiSocket !== sock;
         if (aiSocket === sock) aiSocket = null;
-        aiSocketPromise = null;
+        // 挂起 Promise 句柄只在非陈旧 close 上落位：迟到 close 清掉的是新
+        // 连接的 CONNECTING 去重闸（2026-11-20 评审 should），新连接将失去
+        // 超时保护并重造永久挂死的 awaiter。
+        if (!stale) aiSocketPromise = null;
         // 陈旧 socket 的迟到 close（CLOSING→重连窗口）：aiSocket 已被新连接顶掉，
         // 别解新 run 的看门狗、别给新 run 画错误——让旧 close 静默退场。
-        if (aiSocket && aiSocket !== sock) return;
+        if (stale) return;
         disarmIdleWatchdog();
         // 关窗卸载的主动 close 不是断线：run 在 agent 侧继续跑，重进页经订阅
         // 快照对齐终态（见 resubscribeRestoredRuns / handleDeviceSnapshot 的
@@ -2138,7 +2217,13 @@ export function useAliangChat() {
                   }
                 }
               })
-              .catch(() => markRunsInterrupted(affected, e.code));
+              .catch((err) => {
+                // close 落定的 rejection 不在此定谳：onclose 的重连预算是唯一
+                // 权威（attempts>=2 才 markRunsInterrupted），重连链上的
+                // 「连上又断」要继续走退避重试。构造异常（URL 非法等，无
+                // __aiSocketClosed 标记）维持旧行为立即中断画法。
+                if (!err || !err.__aiSocketClosed) markRunsInterrupted(affected, e.code);
+              });
           }, 800);
           return;
         }
@@ -2604,6 +2689,58 @@ export function useAliangChat() {
   // 客户端预检与 agent 侧对齐：≤8 张/消息、单张 ≤10MiB、仅 jpeg/png/gif/webp。
   // 错误走 createError 面板（下次成功发送清除）；上传串行进行防乱序。
   const ATTACH_IMAGE_EXT = /\.(jpe?g|png|gif|webp)$/i;
+  // 附件 chips 本地唯一 id（2026-11-20 审计⑥）：上传信封的 ref 对同名文件
+  // 是同一路径，作 chips key 会撞 Vue 重复 key、按 ref 移除会双删。
+  let attachmentUidSeq = 0;
+  // 服务端落盘身份（2026-11-20 审计⑥ + 评审 should）：服务端把文件名主体
+  // 净化成 [a-zA-Z0-9-_.]、逐字符截 80、Trim('.')，扩展名取最后一节并转小写，
+  // 落 <session>/<base><ext> 后幂等覆盖写。原始名互异但净化后同身份
+  // （"a b.png"/"ab.png"、80 字符截断同串、"shot.PNG"/"shot.png"）仍会互相
+  // 覆盖——撞名判定与改名必须发生在净化域。以下逐字复刻 Go
+  // sanitizeAgentAttachmentBase + AgentAttachmentUploadFromBytes 的推导律；
+  // base 净化后为空（".png"、纯中文名等）服务端走 up-<nano> 时间戳兜底，
+  // 不参与撞名域。
+  function serverAttachmentKeyOf(name) {
+    const dot = name.lastIndexOf('.');
+    const ext = (dot >= 0 ? name.slice(dot) : '').toLowerCase();
+    const stem = dot >= 0 ? name.slice(0, dot) : name;
+    let s = '';
+    for (const ch of stem) {
+      if (/[a-zA-Z0-9\-_.]/.test(ch)) s += ch;
+      if (s.length >= 80) break;
+    }
+    const base = s.replace(/^\.+/, '').replace(/\.+$/, '');
+    if (!base) return null;
+    return base + ext;
+  }
+  // 改名在净化域出号（"-2" 序号）：候选名本身即净化后形态，发送名=落盘名，
+  // 不会越服务端扩展名白名单（ext 原样保留自原始名）。
+  function uniqueAttachmentUploadName(name, takenKeys) {
+    const key = serverAttachmentKeyOf(name);
+    if (!key) return name;
+    if (!takenKeys.has(key)) {
+      takenKeys.add(key);
+      return name;
+    }
+    const dot = name.lastIndexOf('.');
+    const ext = dot >= 0 ? name.slice(dot) : '';
+    const stem = dot >= 0 ? name.slice(0, dot) : name;
+    let s = '';
+    for (const ch of stem) {
+      if (/[a-zA-Z0-9\-_.]/.test(ch)) s += ch;
+      if (s.length >= 80) break;
+    }
+    const base = s.replace(/^\.+/, '').replace(/\.+$/, '');
+    for (let n = 2; ; n += 1) {
+      const candidate = `${base}-${n}${ext}`;
+      const candidateKey = serverAttachmentKeyOf(candidate);
+      if (candidateKey && !takenKeys.has(candidateKey)) {
+        takenKeys.add(candidateKey);
+        return candidate;
+      }
+    }
+  }
+
   function addPendingAttachments(files) {
     const list = Array.from(files || []);
     if (list.length === 0) return;
@@ -2627,9 +2764,21 @@ export function useAliangChat() {
     attachmentUploading.value = true;
     (async () => {
       try {
+        // 撞名键 = 既有 pending + 本批已用名，全部换算到服务端落盘身份域
+        // （净化 base+小写 ext——评审 should：原始名域判定对净化后撞名失效）。
+        const takenKeys = new Set();
+        for (const a of pendingAttachments.value) {
+          const k = serverAttachmentKeyOf(a.name);
+          if (k) takenKeys.add(k);
+        }
         for (const file of list) {
-          const attachment = await uploadChatAttachment(sessionId, file);
-          pendingAttachments.value.push(attachment);
+          const uploadName = uniqueAttachmentUploadName(file.name, takenKeys);
+          const payload = uploadName === file.name
+            ? file
+            : new File([file], uploadName, { type: file.type });
+          const attachment = await uploadChatAttachment(sessionId, payload);
+          attachmentUidSeq += 1;
+          pendingAttachments.value.push({ ...attachment, uid: 'att-' + attachmentUidSeq });
         }
         createError.value = '';
       } catch (err) {
@@ -2640,8 +2789,10 @@ export function useAliangChat() {
     })();
   }
 
-  function removePendingAttachment(refId) {
-    pendingAttachments.value = pendingAttachments.value.filter(a => a.ref !== refId);
+  // 移除按 uid 优先（ref 对同名文件不唯一，见 addPendingAttachments 注释）；
+  // 旧调用方传 ref 的兼容面保留（uid||ref 双匹配）。
+  function removePendingAttachment(uidOrRef) {
+    pendingAttachments.value = pendingAttachments.value.filter(a => (a.uid || a.ref) !== uidOrRef);
   }
 
   function clearPendingAttachments() {
@@ -3129,7 +3280,14 @@ export function useAliangChat() {
     if (!conv && isApprovalFamily && e.session_id) {
       const shell = findDeviceShellBySessionId(e.session_id);
       if (shell) {
-        conv = shell;
+        // 壳对象来自 useDeviceSessions 的非响应式缓存（shellForEntry 命中即
+        // return cached）：直接续写 raw 对象不触发渲染——activeApprovals 等
+        // computed 依赖经 conversations 池的代理读取，raw 写绕过代理 set
+        // 陷阱（同文件 handleDeviceSnapshot 先例：「已在会话池里就换代理写
+        // 值」）。审批等待期恰好没有 delta/快照帧经代理路径触发重渲染，卡
+        // 永不出现（2026-11-20 审计③）。
+        const pooled = conversations.value.find((c) => c.id === shell.id && c.deviceSession);
+        conv = pooled || shell;
         routedToShell = true;
       } else if (activeConversation.value) {
         // ③ 兜底：只记 id 切片，前缀文案由渲染层经 chat_approvalFromSession 翻译
@@ -3284,7 +3442,33 @@ export function useAliangChat() {
           break;
         }
         const asst = findRunningAssistant(conv);
-        if (asst && !asst.content && e.status) asst.content = e.status;
+        // 终态 ai.status（2026-11-20 审计①）：收尾与 ai.done 同款——关窗
+        // （endRunWindow）+ 清审批卡 + finishRun + 定谳复订阅。matchedById
+        // 门控同 done/error：未命中帧只关账既有泡，不动 flags。
+        if (AI_RUN_TERMINAL_STATUSES.has(String(e.status || '')) && !e.retry_active) {
+          disarmIdleWatchdog();
+          let hadRunning = false;
+          if (matchedById) {
+            hadRunning = endRunWindow(conv);
+          } else if (asst) {
+            asst.status = 'done';
+          }
+          // 终态文案：优先后端人话原因（e.error），否则本地化文案——绝不把
+          // 英文状态词原样写进答案气泡（旧实现空气泡时写 "stopped" 字面量）。
+          if (asst && !asst.content) asst.content = e.error || t('chat_runStopped');
+          clearApprovalsForSession(conv, e.session_id);
+          finishRun(conv);
+          if (matchedById && runDoneNeedsSnapshot(conv, hadRunning)) {
+            sendAI({ type: 'ai.session.subscribe', session_id: conv.aiSessionId });
+          }
+          persist = true;
+          break;
+        }
+        // 非终态（stopping 等过程态）：空气泡只写本地化文案，不透传英文
+        // 状态词；非空泡原样保留，run 不收窗。
+        if (asst && !asst.content && e.status === 'stopping') {
+          asst.content = t('chat_runStopping');
+        }
         persist = true;
         break;
       }
@@ -3734,6 +3918,13 @@ export function useAliangChat() {
       try { aiSocket.close(); } catch (_) {}
       aiSocket = null;
     }
+    if (aiSocketConnectTimer) {
+      clearTimeout(aiSocketConnectTimer.handle);
+      aiSocketConnectTimer = null;
+    }
+    // 关窗即废弃：卸载后定时器到点/迟到 close 不得再驱动任何落定链。
+    aiSocketSettle = null;
+    aiSocketPromise = null;
   });
 
   return {

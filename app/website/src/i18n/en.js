@@ -239,6 +239,8 @@ export default {
   chat_approvalNotFound: 'This approval has expired or was already handled. Send the message again. To auto-approve similar actions in this session, choose "Approve session" next time.',
   chat_thinkingDone: 'Thought process',
   chat_aiError: 'AI response failed, please retry.',
+  chat_runStopped: 'Run stopped.',
+  chat_runStopping: 'Stopping…',
   chat_approvalTitle: 'Approval required',
   chat_approvalTool: 'Tool',
   chat_approvalCwd: 'Directory',

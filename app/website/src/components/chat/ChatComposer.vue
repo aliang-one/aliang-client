@@ -61,7 +61,7 @@
         >
           <span
             v-for="attachment in pendingAttachments"
-            :key="attachment.ref"
+            :key="attachment.uid || attachment.ref"
             class="flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2.5 py-1 text-xs text-slate-600 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300"
           >
             <span class="material-symbols-outlined text-[14px] leading-none text-primary">image</span>
@@ -71,7 +71,7 @@
               :aria-label="t('chat_attachRemove')"
               :title="t('chat_attachRemove')"
               class="flex h-5 w-5 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-700 dark:hover:text-slate-200"
-              @click="emit('remove-attachment', attachment.ref)"
+              @click="emit('remove-attachment', attachment.uid || attachment.ref)"
             >
               <span class="material-symbols-outlined text-[12px] leading-none">close</span>
             </button>
@@ -98,7 +98,7 @@
             :title="t('chat_attachAdd')"
             :disabled="disabled"
             class="mb-0.5 flex h-10 shrink-0 items-center justify-center rounded-xl px-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-primary md:h-9 dark:hover:bg-slate-700"
-            @click="bindFileInputEl && bindFileInputEl.click()"
+            @click="fileInputEl && fileInputEl.click()"
           >
             <span class="material-symbols-outlined text-[18px] leading-none">attach_file</span>
           </button>
