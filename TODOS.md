@@ -117,13 +117,15 @@
 **Effort:** M(首批 7 条);**Priority:** P1
 **Depends on:** 无
 
-### 网页聊天审计二批遗留(生命周期族+Markdown 族,首批后)
+### 网页聊天审计二批遗留(Markdown 族+拍板项,生命周期族已收口)
 
-**What:** 首批之外的 20 条,按族:**生命周期**——删在跑会话帧全量污染活跃会话(`useAliangChat.js:1792`,deleteConversation 不 unsubscribe+fallback 无白名单);重连只重订阅 running 子集(`:2134`,断线窗口外来回合整轮缺失);看门狗单槽被抢靶/done 无条件 disarm(`:3168`,并发挂死回合失自愈);后台会话终态不复位 sending(`:2584`);幽灵 WS 重连定时器不随卸载清理(`:2115`);贴底守卫初值恒 true(`:1102`,长会话恢复落顶+浮钮被抑制);tool_ask/option 漂移卡永滞 pending(`:3342`,缺审批族同款全局扫卡)。**Markdown**——AI 图片无白名单=追踪信标(需拍板:禁远程 or 限同源,`chatMarkdown.js:161`);流式 80ms 全量重解析 300KB 单次 346-442ms(`ChatMarkdown.vue:91`);normalizeCjkMarkdown 围栏跟踪错复制到坏代码(`chatMarkdown.js:56`);行首负数误插空格(`:59`);嵌套围栏 aliang-options 示例被吞(`:100`);expandedPres 序号漂移(`ChatMarkdown.vue:142`);图片异步解码滚动失真(`ChatMessageList.vue:183`)。**其他**——子代理面板未注册 ESC 层按 Esc 整页退出(`ChatPage.vue:314`);撤回重发丢附件(`useAliangChat.js:2975`);LAN 附件上传/取图 loopback+Origin 双闸 403(需拍板对齐聊天 WS 口径,`agent_handler_attachment.go:16`);设备会话刷新定时器泄漏(`useDeviceSessions.js:82`);运行中徽标被系统提示条熄灭(`useAliangChat.js:1207`,双验证员降级 low)。存疑 3 条(openDeviceSession TTL 重入/子代理面板切换复位/localStorage 跨 tab,验证员 1:1 分歧)暂不动。
+**收口记录(2026-11-21,fix/webchat-audit-batch2 已合 master fb016da9):**生命周期族+其他 11 条(B1 重连全量补订/B2 漂移卡全局扫卡/B3 看门狗按会话隔离/B4 sending 归属化/B5 删会话退订+fallback 白名单/B6 锚底/B7 disposeChat 幽灵 WS/B8 尾随刷新 dispose/B9 面板 ESC 层/B10 撤回带附件/B11 系统条不熄灭徽标)全落地,实现后双评审 6 坐实全修(blocker=审批族豁免白名单——③兜底是审批族设计路由,白名单拦下则空闲活跃卡永不渲染;should=resolved 扫卡封键序同键双副本/B1 recency-32 挤出在跑/B5 谓词 sendingConvId 归属;nit=删除收口),782/782 绿。
 
-**Why:** 均有坐实证据但不属首批;生命周期族单点小改可镜像仓内先例(resubscribeRestoredRuns/handleDeviceSnapshot 换代理);两条需拍板项等待用户定口径。
+**What:** 剩余 Markdown 族 6 条——AI 图片无白名单=追踪信标(需拍板:禁远程 or 限同源,`chatMarkdown.js:161`);流式 80ms 全量重解析 300KB 单次 346-442ms(`ChatMarkdown.vue:91`);normalizeCjkMarkdown 围栏跟踪错复制到坏代码(`chatMarkdown.js:56`);行首负数误插空格(`:59`);嵌套围栏 aliang-options 示例被吞(`:100`);expandedPres 序号漂移(`ChatMarkdown.vue:142`);图片异步解码滚动失真(`ChatMessageList.vue:183`)。拍板 2 条(WS 鉴权/LAN 附件 403 口径)与存疑 3 条(openDeviceSession TTL 重入/子代理面板切换复位/localStorage 跨 tab)不动。
 
-**Context:** 全部细节(触发场景+修复方向+双验证员理由)在审计 workflow 输出;首批落地后逐条转正。
+**Why:** 均有坐实证据;Markdown 族为渲染正确性/性能/安全面,逐条独立;两条需拍板项等待用户定口径。
+
+**Context:** 全部细节(触发场景+修复方向+双验证员理由)在审计 workflow 输出;生命周期族收口记录在上。
 
 **Effort:** M(逐条独立);**Priority:** P2(需拍板两条 P2)/P3(其余)
 **Depends on:** 首批(worktree fix/webchat-audit-batch1)
@@ -190,3 +192,20 @@
 **Depends on:** 实弹排期;真机 AI 回放验收
 
 ## Completed
+
+## OpenViking Phase2 遗留拍板/补齐项(2026-11-20,Phase2 spec §13 关联)
+
+### §13.2 卸载数据默认语义拍板(阻塞 UI 删除按钮)
+- 现状:OpenVikingSettings.vue 三态卡已落地,**数据删除按钮挂起**(代码注释锚点=openviking 卡头注释);§11.2-4「删除按钮按用户域抹除」验收项连带挂起
+- 待办:拍板「卸载=保留(建议)还是删除」→ 删除语义下实现按用户域抹除(MCP forget 用户域)+UI 按钮
+
+### §13.4 AGPL「修改」认定(商用前专项审查)
+- 现状:OpenViking v0.5.5 自托管+派生镜像(仅 pip 加 llama-cpp-python 未改 server 源码),倾向不触发 §13;spec §9 原文明写「正式商用前过一次许可证审查」
+- 待办:商用前许可证专项审查(独立小活,不阻塞当前)
+
+### Phase2 审计批补齐队列(2026-11-20 三路对抗审计坐实,代码外/部署类)
+- PhoneServer deployment 加 OPENVIKING_ROOT_KEY env(secretKeyRef→secret `openviking-root-key`,yaml 已带 kubectl 命令注释)= managed 链上线硬前置
+- PhoneServer vitest:credential 端点集成用例(requireAgentIdentity mock+reconcile 路径)——slug 纯函数 5 用例已补
+- integrations 报告 openviking 节的前端消费(AgentIntegrationsSettings.vue 现只直出 notes;openviking 字段已可用)
+- OV 账户探针用户 `ps-cred-probe` 清理(2026-11-20 契约实测残留)
+- litellm spend $0.00:custom_openai 通道定价配置(美元口径)
