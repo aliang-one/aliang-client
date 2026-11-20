@@ -62,6 +62,7 @@ func TestHandleAttachmentUploadRoundTrip(t *testing.T) {
 		Data struct {
 			Attachment struct {
 				Ref   string `json:"ref"`
+				Path  string `json:"path"`
 				Name  string `json:"name"`
 				Bytes int    `json:"bytes"`
 			} `json:"attachment"`
@@ -73,6 +74,16 @@ func TestHandleAttachmentUploadRoundTrip(t *testing.T) {
 	ref := envelope.Data.Attachment.Ref
 	if ref == "" || !strings.HasPrefix(ref, "sess-web") {
 		t.Fatalf("ref = %q", ref)
+	}
+	// path 契约（2026-11-20 审计⑤）：ai.message 载荷的硬依赖——宿主
+	// resolveAgentAIAttachments 要求 path 或 url 二选一。信封缺 path 时网页
+	// 端 uploadChatAttachment 直接「Malformed upload response」（前端契约
+	// 测试同钉）。path 必须是缓存里真实存在的文件。
+	if envelope.Data.Attachment.Path == "" {
+		t.Fatalf("信封缺 path 字段（前端强制校验必拒）: %s", rr.Body.String())
+	}
+	if _, err := os.Stat(envelope.Data.Attachment.Path); err != nil {
+		t.Fatalf("path 不在缓存盘上: %v (path=%q)", err, envelope.Data.Attachment.Path)
 	}
 
 	// 取图：内容逐字节一致 + Content-Type 正确

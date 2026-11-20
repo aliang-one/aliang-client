@@ -722,6 +722,14 @@ func newAgentAIRunEmitter(run agentAIRun, write agentTerminalWriter) *agentAIRun
 	}
 }
 
+// agentAIMessageHasAttachments 报告原始载荷是否带非空附件数组（纯图消息
+// 放行判据，2026-11-20 审计⑦）：只看在场不做实质解析——解析/校验仍归
+// resolveAgentAIAttachments，与消息侧既有的 len(arr)>0 在场判定同款。
+func agentAIMessageHasAttachments(raw interface{}) bool {
+	arr, ok := raw.([]interface{})
+	return ok && len(arr) > 0
+}
+
 func agentAIRunEventTerminal(payload map[string]interface{}) bool {
 	typeName := strings.TrimSpace(fmt.Sprint(payload["type"]))
 	if typeName == models.AgentEventAIDone || typeName == models.AgentEventAIError || typeName == models.AgentEventAISessionClosed {
@@ -2368,7 +2376,12 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 	}
 	emitter := m.runEmitter(messageRun, writeJSON)
 	runWrite := agentTerminalWriter(emitter.emit)
-	if content == "" {
+	// 纯图消息放行（2026-11-20 审计⑦）：content 空+附件在场是合法形态，与
+	// journal 写侧（2026-11-05 已改）「text 空且附件空才拒」同口径。旧守卫
+	// 在解析 attachments 之前开火，纯图消息被英文 ai.error 拒死。此处只看
+	// 原始载荷在场；实质解析/校验仍归 resolveAgentAIAttachments（其错误走
+	// 专门的 ai.error 分支）。
+	if content == "" && !agentAIMessageHasAttachments(msg["attachments"]) {
 		_ = runWrite(agentAIErrorPayload(sessionID, messageID, errors.New("ai.message content is empty")))
 		return
 	}

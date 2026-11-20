@@ -407,6 +407,14 @@ func AgentAttachmentOpenByRef(ref string) (*os.File, os.FileInfo, error) {
 	return f, info, nil
 }
 
+// AgentAttachmentPathByRef 相对引用 → 缓存绝对路径（上传信封 path 字段用，
+// 2026-11-20 审计⑤：ai.message 载荷的硬依赖——宿主 resolveAgentAIAttachments
+// 要求 path 或 url 二选一，信封缺 path 时网页端上传 100% 被前端校验拒绝）。
+// 与 AgentAttachmentOpenByRef 同一解析律：穿越/不存在以 error 返回。
+func AgentAttachmentPathByRef(ref string) (string, error) {
+	return agentAttachmentResolve(ref)
+}
+
 // agentAttachmentSweepCap 可注入帽版本（测试用小帽验证驱逐顺序）。
 func agentAttachmentSweepCap(capBytes int64) error {
 	root, err := agentAttachmentCacheRoot()
