@@ -313,4 +313,8 @@ function onRecallConfirm() {
 // 分支随之退役。
 useEscLayer('page-return', close, () => currentPage.value === 'chat');
 useEscLayer('chat-recall-edit', cancelRecall, () => recallActive.value);
+// 子代理面板全屏抽屉（2026-11-20 审计二批 B9）：面板开着时 Esc 先关面板——
+// 未注册层的漏网面板，Esc 直接命中 page-return 整页退出聊天，浏览上下文
+// 全丢。层序=后激活在顶：面板层晚于 page-return 压栈，先收面板再回页面。
+useEscLayer('chat-subagent-panel', closeSubagentPanel, () => subagentPanelOpen.value);
 </script>
