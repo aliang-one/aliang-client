@@ -694,6 +694,7 @@ export default {
   openViking_statusUnknown: '未探测',
   openViking_statusOff: '已关闭',
   openViking_registered: '已注册',
+  openViking_byoHint: '检测到自有 OpenViking 配置,平台未接管',
   openViking_notRegistered: '未注册',
   openViking_save: '保存',
   openViking_saving: '保存中…',

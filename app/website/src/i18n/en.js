@@ -696,6 +696,7 @@ export default {
   openViking_statusUnknown: 'Not probed',
   openViking_statusOff: 'Off',
   openViking_registered: 'Registered',
+  openViking_byoHint: 'Own OpenViking config detected — not managed by the platform',
   openViking_notRegistered: 'Not registered',
   openViking_save: 'Save',
   openViking_saving: 'Saving…',

@@ -78,6 +78,10 @@
         class="rounded px-2 py-0.5 font-bold"
         :class="status.registered ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300' : 'bg-slate-100 text-slate-500 dark:bg-slate-700/40 dark:text-slate-400'"
       >{{ t(status.registered ? 'openViking_registered' : 'openViking_notRegistered') }}</span>
+      <span
+        v-if="status.byo_detected"
+        class="rounded bg-amber-50 px-2 py-0.5 font-bold text-amber-700 dark:bg-amber-900/30 dark:text-amber-300"
+      >{{ t('openViking_byoHint') }}</span>
       <span v-if="statusError" class="w-full break-words text-amber-600 dark:text-amber-400">{{ statusError }}</span>
     </div>
 
@@ -123,7 +127,7 @@ export default {
       form: this.formFromConfig(this.config),
       // off 态下记住最近的非 off 模式:回开不丢 BYO 输入
       lastOnMode: this.formFromConfig(this.config).mode === 'off' ? 'managed' : this.formFromConfig(this.config).mode,
-      status: { registered: false, probe_healthy: false, probe_fails: 0 },
+      status: { registered: false, probe_healthy: false, probe_fails: 0, byo_detected: false },
       statusError: ''
     };
   },
@@ -187,7 +191,8 @@ export default {
         this.status = {
           registered: !!data?.registered,
           probe_healthy: !!data?.probe_healthy,
-          probe_fails: Number(data?.probe_fails) || 0
+          probe_fails: Number(data?.probe_fails) || 0,
+          byo_detected: !!data?.byo_detected
         };
       } catch (e) {
         // 状态读失败不弹窗(卡主流程是保存);行内黄字透出真实原因。

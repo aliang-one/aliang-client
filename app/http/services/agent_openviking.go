@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"aliang.one/nursorgate/common/logger"
@@ -33,6 +34,11 @@ const (
 	// openVikingCredentialTimeout managed 铸 key 端点单次超时;boot 自愈不许长挂。
 	openVikingCredentialTimeout = 10 * time.Second
 )
+
+// openVikingByoDetected BYO 检测标志(spec §7.2「已有同名条目且非本平台托管
+// 写入→跳过+置报告」):ensure 拒绝覆盖用户自有条目时置位,对齐成功/清理时
+// 复位;integrations 报告与 status 端点消费。
+var openVikingByoDetected atomic.Bool
 
 // openVikingExcludeTools 管理面裁剪清单(spec §7.5):USER 角色 key 服务端本
 // 就调不动 manage 类动作,注册表再裁一层=双保险防误触。
@@ -159,7 +165,16 @@ func openVikingClaudeEntry(endpoint, apiKey string) map[string]interface{} {
 // applyOpenVikingRegistrationLocked 开启态对齐:注册表 upsert → codex 托管块
 // 同步 → claude.json 条目。顺序即 spec §7.1 两段式纪律:注册表先落真值,后续
 // 失败不回滚,自愈下 boot 补齐。
+// BYO 先行(注册表面,审计批补):既有同名条目指向不同 URL → 视为用户自建,
+// 不覆盖(spec §7.2「已有同名条目且非本平台托管写入→跳过」);同名同 URL =
+// 对齐意图一致,照常按真值改写(exclude_tools/headers 随签发刷新)。
 func applyOpenVikingRegistrationLocked(home, endpoint, apiKey string) error {
+	if e, ok := aliangMCPEnabledEntries(mcpRegistryHome())[openVikingManagedServerName]; ok && e.enabled() && strings.TrimSpace(e.URL) != "" && strings.TrimSpace(e.URL) != endpoint {
+		openVikingByoDetected.Store(true)
+		logger.Warn(fmt.Sprintf("openviking: 注册表既有 %s 条目指向 %s,与本平台目标 %s 不同,按 BYO 保留不覆盖(可改配置或删条目后重试)", openVikingManagedServerName, e.URL, endpoint))
+		return nil
+	}
+	openVikingByoDetected.Store(false)
 	if err := upsertAliangMCPServerForTest(home, openVikingManagedServerName, openVikingRegistryEntry(endpoint, apiKey)); err != nil {
 		return fmt.Errorf("registry upsert: %w", err)
 	}
@@ -201,10 +216,12 @@ func applyOpenVikingClaudeEntry(home string, desired map[string]interface{}) err
 		if claudeEntryEqual(cur, desired) {
 			return nil // 幂等
 		}
+		openVikingByoDetected.Store(true)
 		logger.Warn(fmt.Sprintf("openviking: claude.json 既有 %s 条目与本平台形态不同,按 BYO 保留不覆盖", openVikingManagedServerName))
 		return nil
 	}
 	servers[openVikingManagedServerName] = desired
+	openVikingByoDetected.Store(false)
 	return writeOpenVikingClaudeConfig(path, root)
 }
 
@@ -302,6 +319,7 @@ type OpenVikingStatus struct {
 	Registered   bool   `json:"registered"`
 	ProbeHealthy bool   `json:"probe_healthy"`
 	ProbeFails   int32  `json:"probe_fails"`
+	ByoDetected  bool   `json:"byo_detected"`
 }
 
 // OpenVikingStatus 组装卡读点(只读,不加锁;注册表读与写路径的容差同 peer 家族)。
@@ -313,6 +331,7 @@ func (s *AgentService) OpenVikingStatus() OpenVikingStatus {
 		Endpoint:     cfg.EffectiveOpenVikingEndpoint(),
 		ProbeHealthy: OpenVikingProbeHealthy(),
 		ProbeFails:   OpenVikingProbeConsecutiveFails(),
+		ByoDetected:  openVikingByoDetected.Load(),
 	}
 	for name, e := range aliangMCPEnabledEntries(mcpRegistryHome()) {
 		if name == openVikingManagedServerName && e.enabled() {

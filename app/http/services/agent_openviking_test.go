@@ -2,6 +2,7 @@ package services
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -340,5 +341,69 @@ func TestEffectiveOpenVikingHelpers(t *testing.T) {
 	}
 	if ep := cfg.EffectiveOpenVikingEndpoint(); ep != "https://x/mcp" {
 		t.Fatalf("端点必须 trim: %q", ep)
+	}
+}
+
+// deepMerge 专项回归(§11.2-8):patch 只带 openviking.enabled 不丢
+// endpoint/api_key/mode 现值(缺键 preserve)。
+func TestCustomerDeepMergePreservesOpenVikingFields(t *testing.T) {
+	base := map[string]interface{}{
+		"openviking": map[string]interface{}{
+			"enabled":  false,
+			"endpoint": "https://ov.example.com/mcp",
+			"mode":     "byo",
+			"api_key":  "sk-keep",
+		},
+	}
+	patch := map[string]interface{}{
+		"openviking": map[string]interface{}{"enabled": true},
+	}
+	merged := deepMergeJSONObjects(base, patch)
+	ov, _ := merged["openviking"].(map[string]interface{})
+	if ov == nil {
+		t.Fatal("openviking 段丢失")
+	}
+	if v, _ := ov["enabled"].(bool); !v {
+		t.Fatalf("enabled 应翻真: %v", ov)
+	}
+	if ov["endpoint"] != "https://ov.example.com/mcp" || ov["api_key"] != "sk-keep" || ov["mode"] != "byo" {
+		t.Fatalf("缺键必须 preserve: %v", ov)
+	}
+}
+
+// BYO 检测:claude 侧拒覆盖时置位;status 透出。
+func TestOpenVikingByoDetectionFlag(t *testing.T) {
+	home := t.TempDir()
+	writeOpenVikingClaudeRaw(t, home, `{"mcpServers":{"openviking":{"type":"http","url":"https://mine.example/mcp"}}}`)
+	setOpenVikingGlobal(t, &config.OpenVikingConfig{
+		Enabled: boolPtr(true), Endpoint: "https://ov.example.com/mcp", Mode: "byo", APIKey: "k1",
+	})
+	if err := EnsureOpenVikingMatchesConfigForTest(home); err != nil {
+		t.Fatal(err)
+	}
+	if !openVikingByoDetected.Load() {
+		t.Fatal("BYO 拒覆盖必须置检测标志")
+	}
+}
+
+// capture 触发门(§7.3「MCP 建连健康」):拨测判死(连败≥阈值)时静默不上传。
+func TestOpenVikingCaptureGatedByProbeHealth(t *testing.T) {
+	st, srv := startOpenVikingCaptureStub(t)
+	home := t.TempDir()
+	setOpenVikingRegistryEntry(t, home, srv.URL, nil)
+	setOpenVikingGlobal(t, &config.OpenVikingConfig{Enabled: boolPtr(true), Mode: "byo", APIKey: "k"})
+	openVikingProbeFails.Store(int32(openVikingProbeFailMax)) // 判死态
+	if err := openvikingCaptureRun(context.Background(), "s", "u", "a"); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&st.calls); got != 0 {
+		t.Fatalf("拨测判死不得上传, got %d", got)
+	}
+	openVikingProbeFails.Store(0) // 复位,恢复后应续流
+	if err := openvikingCaptureRun(context.Background(), "s", "u", "a"); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&st.calls); got != 1 {
+		t.Fatalf("恢复后应续流, got %d", got)
 	}
 }
