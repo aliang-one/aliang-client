@@ -122,6 +122,15 @@ export async function setPeerMCPRegistration(peerMcp) {
   });
 }
 
+// OpenViking 跨设备记忆卡(spec Phase2 §7.5/§7.7):拨测读点 + 显式 apply。
+export async function getOpenVikingStatus() {
+  return request('/api/agent/openviking/status', { method: 'GET' });
+}
+
+export async function applyOpenVikingNow() {
+  return request('/api/agent/openviking/apply', { method: 'POST' });
+}
+
 // 设备门禁开关(2026-11-07):GET 读本机两枚 peer 门禁现值(真值源=服务端设备
 // 注册表,经 agent 过滤本机),POST 部分更新落库(至少一个显式布尔键)。
 export async function getPeerDeviceGates() {

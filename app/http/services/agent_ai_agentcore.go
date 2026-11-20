@@ -1644,6 +1644,11 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		// 任何失败只 Warn 绝不影响 run(与 journal 同族纪律)。
 		m.agentCoreMemoryExtractAsync(run.projectPath, agentCoreModel(run), run.effort,
 			agentCoreLastUserText(messages), assistantOutput)
+		// OpenViking capture(spec Phase2 §7.3):同门控旁路,把本回合用户消息
+		// 与助手正文沉淀到 OpenViking(remember 受理,服务端后台抽取)。
+		// detached+60s+全兜底,失败只 Warn 绝不影响 run。
+		openvikingCaptureAsync(run.sessionID,
+			agentCoreLastUserText(messages), assistantOutput)
 		// 刻意跳过 ccPeerSessionJSONL / appendLineageMarker：那是 Claude CLI 的
 		// transcript 谱系修补，内核没有对应的 JSONL 文件。
 		//

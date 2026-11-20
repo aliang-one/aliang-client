@@ -91,6 +91,13 @@ func StartLocalServer() error {
 	// 注册且 command 最新;关=确保注销)。只 Warn 不阻断启动;应用细节见
 	// services.EnsurePeerMCPMatchesConfig。
 	services.EnsurePeerMCPMatchesConfig()
+	// OpenViking 跨设备记忆面自愈(spec Phase2 §7.2):按 customer.openviking
+	// 对齐注册表+claude.json+codex 托管块。默认关=清理对齐;managed 凭据端点
+	// 未就绪时按增强层失败语义跳过本 boot。只 Warn 不阻断启动。
+	services.EnsureOpenVikingMatchesConfig()
+	// OpenViking 心跳拨测(spec Phase2 §7.5):每 10 分钟轻探 /health,连续
+	// 3 次失败置「不可达」状态(仪表盘卡消费)。进程级一次;不做自动关停。
+	services.StartOpenVikingProbe()
 	// mesh runbook 自愈安装(D-9):内嵌 SKILL.md → ~/.claude/skills/mesh-runbook/。
 	// 归属用户技能域,非 mesh 装配族(boot 接线审计 bootFiles 只扫 start.go/
 	// core.go,server.go 不在其表,刻意不扩)。挂在 agent(56433)启动位:

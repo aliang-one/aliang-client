@@ -73,6 +73,14 @@
               :success-message="successMessage"
               @save="emitSave"
             />
+            <OpenVikingSettings
+              :config="config"
+              :loading="loading"
+              :saving="saving"
+              :error="error"
+              :success-message="successMessage"
+              @save="emitSave"
+            />
             <div class="grid grid-cols-1 items-stretch gap-5 lg:grid-cols-2">
               <AgentMCPGlobalSettings
                 :config="config"
@@ -135,6 +143,7 @@ import AgentSkillsGlobalSettings from '../AgentSkillsGlobalSettings.vue';
 import AgentMemorySettings from '../AgentMemorySettings.vue';
 import CustomEnvSettings from '../CustomEnvSettings.vue';
 import PeerAccessSettings from './PeerAccessSettings.vue';
+import OpenVikingSettings from './OpenVikingSettings.vue';
 import SystemStatusSettings from '../SystemStatusSettings.vue';
 import AgentFileAccessSettings from '../AgentFileAccessSettings.vue';
 import { useNavigation } from '../../../composables/useNavigation';
@@ -166,7 +175,8 @@ export default {
     CustomEnvSettings,
     PeerAccessSettings,
     SystemStatusSettings,
-    AgentFileAccessSettings
+    AgentFileAccessSettings,
+    OpenVikingSettings
   },
   props: {
     config: { type: Object, default: () => ({}) },
