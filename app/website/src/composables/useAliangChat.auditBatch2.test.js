@@ -158,6 +158,42 @@ describe('B1 断线自愈重连全量补订（不再只订 running 子集）', (
     const ids = subs.map((f) => f.session_id).sort();
     expect(ids).toEqual(['sess-a', 'sess-b']);
   });
+
+  it('在跑会话跌出 recency-32 也被补订（旧重连路径对 running 子集无上限的保证）', async () => {
+    vi.useFakeTimers();
+    const chat = useAliangChat();
+    // 34 个空闲会话（updatedAt 更新）+ 1 个最旧 updatedAt 的在跑会话
+    for (let i = 0; i < 34; i++) {
+      chat.conversations.value.push(makeConv({
+        id: `idle-${i}`,
+        aiSessionId: `sess-idle-${i}`,
+        updatedAt: 100000 + i,
+        messages: [],
+      }));
+    }
+    const stale = makeConv({
+      id: 'c-stale-running',
+      aiSessionId: 'sess-stale-running',
+      updatedAt: 1, // 最旧：recency-32 必然挤不出又挤不出它
+      running: true,
+      runActive: true,
+      messages: [{ role: 'assistant', content: '长跑回合', status: 'running', ts: 1 }],
+    });
+    chat.conversations.value.push(stale);
+    chat.activeId.value = 'idle-33';
+    await openSocket(chat);
+    lastSock().onclose({ code: 1006, reason: '' });
+    vi.advanceTimersByTime(900);
+    await flushMicrotasks();
+    const sock2 = lastSock();
+    sock2.readyState = FakeWebSocket.OPEN;
+    sock2.onopen();
+    await flushMicrotasks();
+    const ids = sentFrames(sock2)
+      .filter((f) => f.type === 'ai.session.subscribe')
+      .map((f) => f.session_id);
+    expect(ids).toContain('sess-stale-running');
+  });
 });
 
 describe('B2 tool_ask/option resolved/cancel 漂移卡全局扫卡', () => {
@@ -231,6 +267,35 @@ describe('B2 tool_ask/option resolved/cancel 漂移卡全局扫卡', () => {
     frame(sock, { type: 'ai.option.cancelled', session_id: 'sess-x', option_ids: ['opt1'] });
     await flushMicrotasks();
     expect(b.optionCards).toHaveLength(0);
+  });
+
+  it('同键双副本（草稿+壳重投）：resolved 扫卡全翻、不留 pending 副本', async () => {
+    const chat = useAliangChat();
+    const a = makeConv({
+      id: 'cA',
+      aiSessionId: 'sess-x',
+      messages: [],
+      toolAsks: [{ key: 'sess-x:ask1', interactionId: 'ask1', sessionId: 'sess-x', status: 'pending' }],
+    });
+    const b = makeConv({
+      id: 'cB',
+      aiSessionId: 'sess-x',
+      messages: [],
+      toolAsks: [{ key: 'sess-x:ask1', interactionId: 'ask1', sessionId: 'sess-x', status: 'pending' }],
+    });
+    chat.conversations.value.push(a, b);
+    chat.activeId.value = 'cA';
+    const sock = await openSocket(chat);
+    frame(sock, {
+      type: 'tool_ask.request',
+      session_id: 'sess-x',
+      interaction_id: 'ask1',
+      status: 'resolved',
+      answer: { selected_option_id: 'o1' },
+    });
+    await flushMicrotasks();
+    expect(a.toolAsks[0].status).toBe('answered');
+    expect(b.toolAsks[0].status).toBe('answered');
   });
 
   it('空 interaction_id 批量作废：跨会话清同 session 全部卡', async () => {
@@ -361,6 +426,25 @@ describe('B5 删在跑会话退订+fallback 白名单', () => {
     expect(chat.conversations.value).toHaveLength(0);
   });
 
+  it('审批族帧豁免白名单：空闲活跃会话上未命中审批请求仍挂卡（③兜底是设计路由）', async () => {
+    const chat = useAliangChat();
+    const c = makeConv({ id: 'cC', aiSessionId: 'sess-c', messages: [] });
+    chat.conversations.value.push(c);
+    chat.activeId.value = 'cC';
+    const sock = await openSocket(chat);
+    frame(sock, {
+      type: 'ai.approval.request',
+      session_id: 'sess-elsewhere',
+      approval_id: 'ap-x',
+      message_id: 'm-1',
+      title: '运行命令',
+    });
+    await flushMicrotasks();
+    const approvals = Array.isArray(c.approvals) ? c.approvals : [];
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0].sourceId).toBe('sess-els'); // 「来自会话 X」来源标
+  });
+
   it('活跃会话空闲时未命中帧只丢弃不污染；在跑时 fallback 照常渲染', async () => {
     const chat = useAliangChat();
     const c = makeConv({ id: 'cC', aiSessionId: 'sess-c', messages: [] });
@@ -376,6 +460,62 @@ describe('B5 删在跑会话退订+fallback 白名单', () => {
     frame(sock, { type: 'ai.delta', session_id: 'sess-x', delta: '本端流' });
     await flushMicrotasks();
     expect(c.messages[c.messages.length - 1].content).toBe('本端流');
+  });
+});
+
+describe('B5 补：白名单谓词用 sendingConvId 归属（评审 should）', () => {
+  it('A 在途发送+切到空闲 B：未命中帧不再挂到 B（页面级 sending 污染门收紧）', async () => {
+    const chat = useAliangChat();
+    const a = makeConv({ id: 'cA', aiSessionId: 'sess-a', model: 'glm-x', messages: [] });
+    const b = makeConv({ id: 'cB', aiSessionId: 'sess-b', messages: [] });
+    chat.conversations.value.push(a, b);
+    chat.activeId.value = 'cA';
+    chat.inputText.value = '你好';
+    const sending = chat.sendMessage();
+    await flushMicrotasks();
+    const sock = lastSock();
+    sock.readyState = FakeWebSocket.OPEN;
+    sock.onopen();
+    await flushMicrotasks();
+    frame(sock, { type: 'ai.session.created', session_id: 'sess-a', status: 'created' });
+    await flushMicrotasks();
+    chat.activeId.value = 'cB';
+    await nextTick();
+    const before = b.messages.length;
+    frame(sock, { type: 'ai.delta', session_id: 'sess-elsewhere', delta: '外来' });
+    await flushMicrotasks();
+    expect(b.messages.length).toBe(before);
+    frame(sock, { type: 'ai.done', session_id: 'sess-a' });
+    await flushMicrotasks();
+    await Promise.race([sending, flushMicrotasks()]);
+  });
+});
+
+describe('B5 补：删除在途发送会话立即收口（评审 nit）', () => {
+  it('删会话清 sendingConvId+复位 sending：输入区不等 90s 看门狗', async () => {
+    const chat = useAliangChat();
+    const a = makeConv({ id: 'cA', aiSessionId: 'sess-a', model: 'glm-x', messages: [] });
+    const b = makeConv({ id: 'cB', aiSessionId: 'sess-b', model: 'glm-x', messages: [] });
+    chat.conversations.value.push(a, b);
+    chat.activeId.value = 'cA';
+    chat.inputText.value = '你好';
+    const sending = chat.sendMessage();
+    await flushMicrotasks();
+    const sock = lastSock();
+    sock.readyState = FakeWebSocket.OPEN;
+    sock.onopen();
+    await flushMicrotasks();
+    frame(sock, { type: 'ai.session.created', session_id: 'sess-a', status: 'created' });
+    await flushMicrotasks();
+    chat.activeId.value = 'cB';
+    await nextTick();
+    chat.activeId.value = 'cA';
+    await nextTick();
+    chat.deleteConversation();
+    await flushMicrotasks();
+    await Promise.race([sending.catch(() => {}), flushMicrotasks()]);
+    expect(chat.sendDisabled.value).toBe(false);
+    expect(chat.conversations.value.some((c) => c.id === 'cA')).toBe(false);
   });
 });
 

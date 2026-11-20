@@ -1057,19 +1057,56 @@ export function chatRecoverySubscribeSessionIds(convList, isSubscribable) {
 // 只翻路由命中的对象会漏（漂移卡永滞 pending，用户可对已作答的卡重复作答）。
 export function sweepResolveToolAsk(convList, event, handledToolAskIds, resolvedAt) {
   if (!Array.isArray(convList)) return false;
+  const interactionId = String(event?.interaction_id || '').trim();
+  if (!interactionId) return false;
+  const sessionId = String(event?.session_id || '');
+  const key = `${sessionId}:${interactionId}`;
+  const answer = event.answer && typeof event.answer === 'object' ? event.answer : {};
+  const picked = Array.isArray(answer.selected_option_ids)
+    ? answer.selected_option_ids.map(v => String(v))
+    : answer.selected_option_id
+      ? [String(answer.selected_option_id)]
+      : [];
   let swept = false;
+  // 逐对象翻卡、循环后一次性封键（评审 should：resolve*Card 的封键检查先于
+  // 查卡，同键多副本（草稿+壳双对象重投）时首个对象封键后其余副本短路永滞
+  // pending——封键只拦 upsert 复活，不拦翻卡）。已 answered 副本幂等跳过。
   for (const conv of convList) {
-    if (resolveToolAskCard(conv, event, handledToolAskIds, resolvedAt)) swept = true;
+    const asks = Array.isArray(conv?.toolAsks) ? conv.toolAsks : [];
+    const card = asks.find(c => c.key === key);
+    if (!card || card.status === 'answered') continue;
+    card.status = 'answered';
+    card.selected = picked;
+    card.customText = typeof answer.message === 'string' ? answer.message : '';
+    card.error = '';
+    card.updatedAt = resolvedAt;
+    swept = true;
   }
+  if (swept) handledToolAskIds.add(key);
   return swept;
 }
 
 export function sweepResolveOption(convList, event, handledOptionIds, resolvedAt) {
   if (!Array.isArray(convList)) return false;
+  const optionId = String(event?.option_id || '').trim();
+  if (!optionId) return false;
+  const sessionId = String(event?.session_id || '');
+  const key = `${sessionId}:${optionId}`;
+  const picked = Array.isArray(event.selected) ? event.selected.map(v => String(v)) : [];
   let swept = false;
+  // 同 sweepResolveToolAsk：翻卡全部副本、循环后一次性封键。
   for (const conv of convList) {
-    if (resolveOptionCard(conv, event, handledOptionIds, resolvedAt)) swept = true;
+    const cards = Array.isArray(conv?.optionCards) ? conv.optionCards : [];
+    const card = cards.find(c => c.key === key);
+    if (!card || card.status === 'answered') continue;
+    card.status = 'answered';
+    card.selected = picked;
+    card.customText = typeof event.custom_text === 'string' ? event.custom_text : '';
+    card.error = '';
+    card.updatedAt = resolvedAt;
+    swept = true;
   }
+  if (swept) handledOptionIds.add(key);
   return swept;
 }
 
@@ -1943,6 +1980,16 @@ export function useAliangChat() {
     if (doomed?.aiSessionId) {
       sendAI({ type: 'ai.session.unsubscribe', session_id: doomed.aiSessionId });
     }
+    if (doomed) {
+      // 收口（评审 nit）：被删会话的看门狗拆掉（挂死 90s 后误标 error 已无
+      // 意义）；在途发送归属随之消失——sendingConvId 不清会让输入区锁死到
+      // 一个永不到来的终态帧。
+      disarmIdleWatchdog(doomed);
+      if (sendingConvId === doomed.id) {
+        sendingConvId = null;
+        sending.value = false;
+      }
+    }
     conversations.value = conversations.value.filter(c => c.id !== activeId.value);
     if (conversations.value.length > 0) {
       activeId.value = conversations.value[0].id;
@@ -2348,9 +2395,21 @@ export function useAliangChat() {
                 // 整体摘除）——重订阅所有需要观察的会话：打开过的可订阅设备
                 // 壳 + 有 running 气泡/发送在途的本地会话，不止 affected 子集
                 // （已打开但无 running 气泡的壳不重订阅会静默失聪）。
+                const reconnected = new Set();
                 for (const c of localSubscribeTargets()) {
                   sendAI({ type: 'ai.session.subscribe', session_id: c.aiSessionId });
                   refreshSubagentsFromDetail(subagentsBySession, c.aiSessionId);
+                  reconnected.add(c.aiSessionId);
+                }
+                // 在跑/在途会话无条件补订（评审 should：recency-32 不挤出在跑
+                // ——updatedAt 不随 delta 抬升，长跑回合会被活跃会话挤出前
+                // 32；旧重连路径对 running 子集无上限，此处保住该保证）。
+                for (const c of conversations.value) {
+                  if (c.deviceSession || !c.aiSessionId || reconnected.has(c.aiSessionId)) continue;
+                  if (!findRunningAssistant(c) && !(c.id === activeId.value && sending.value)) continue;
+                  sendAI({ type: 'ai.session.subscribe', session_id: c.aiSessionId });
+                  refreshSubagentsFromDetail(subagentsBySession, c.aiSessionId);
+                  reconnected.add(c.aiSessionId);
                 }
                 for (const c of conversations.value) {
                   if (c.deviceSession) {
@@ -3485,7 +3544,15 @@ export function useAliangChat() {
     // 回合关账并复位 sending。空闲活跃会话的未命中帧只做日志丢弃。
     if (!conv && activeConversation.value) {
       const active = activeConversation.value;
-      if (sending.value || isConversationRunning(active)) conv = active;
+      // 审批族帧豁免（评审 blocker）：③兜底是审批族的设计路由（②壳未命中
+      // 时挂活跃带来源标）——白名单若拦下广播帧，空闲活跃会话的审批/提问卡
+      // 永不渲染，B2 扫卡连坐致死。在途发送判别用 sendingConvId 归属（评审
+      // should：页面级 sending 会让后台在途发送期间空闲活跃会话的污染门仍开）。
+      if (isApprovalFamily
+        || (sending.value && sendingConvId === active.id)
+        || isConversationRunning(active)) {
+        conv = active;
+      }
     }
     if (!conv) {
       console.debug('[chat] ai event has no target conversation', e);
