@@ -47,13 +47,15 @@ md.renderer.rules.link_open = (tokens, idx, opts, env, self) => {
   return defaultRender(tokens, idx, opts, env, self);
 };
 
-// CommonMark 围栏跟踪（2026-11-21 审计三批 M2/M4 共用）：开栏=行首 0-3 空格
-// + ≥3 个同字符 ` 或 ~（反引号栏的 info string 不得再含 `），闭栏=同字符、
-// 长度≥开栏、其后仅空白。旧实现任意 ```/~~~ 行一律翻转——更长围栏内嵌短围
-// 栏/异字符交叉全部错位，代码内容被误插空格（复制按钮复制到坏代码）。
+// 围栏跟踪（2026-11-21 审计三批 M2/M4 共用；评审 blocker 修订）：开栏=行首
+// 任意缩进 + ≥3 个同字符 ` 或 ~（反引号栏 info 不得再含 `）；闭栏=同字符、
+// 长度≥开栏、其后仅空白。开栏放宽是刻意的：列表项内 4 空格/Tab 缩进的代码
+// 围栏是 markdown-it 实测渲染的真实代码块（GLM 高频输出），0-3 空格收紧会
+// 让这些块失去保护、内容被误插空格（对旧实现回归）。M2 的核心缺陷（嵌套更
+// 长围栏错位翻转）由闭栏强规则解决——嵌套短围栏带 info/长度不足不再闭栏。
 // 返回新状态：null=栏外；{marker}=栏内。
 function nextFenceState(state, line) {
-  const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+  const m = /^\s*(`{3,}|~{3,})(.*)$/.exec(line);
   if (!state) {
     if (!m) return state;
     const marker = m[1];
@@ -130,16 +132,27 @@ function scanAliangOptionSpans(src) {
   while (i < lines.length) {
     const line = lines[i];
     const openIdx = fence === null ? line.indexOf('```aliang-options') : -1;
-    if (openIdx !== -1 && /^```aliang-options\s*$/.test(line.slice(openIdx))) {
-      // 严格形态：开栏独占一行（可带前缀散文？否——带散文走下方黏行分支）。
-      // 行制扫描：嵌套保护（2026-11-21 审计三批 M4：示例/文档代码块里的
-      // options 语法是内容不是开栏，误剥会吞示例并凭空多出静态卡）。
+    // 开栏统一 ≤3 空格缩进口径（评审 should：开栏无视缩进/闭栏 ≤3 不对称，
+    // ≥4 缩进示例被误判真实开栏后其缩进闭栏永找不到——吞示例+腰斩正文）。
+    const openLinePrefix = openIdx !== -1 ? line.slice(0, openIdx) : '';
+    // 前缀规则双口径（评审 should + 黏行实锤）：纯空格缩进须 ≤3（≥4 缩进的
+    // 用法示例不进 span——其缩进闭栏永找不到，吞示例+腰斩正文）；散文前缀
+    // （GLM 黏行实锤「排查完成：```aliang-options」）放行。
+    const openOk = openIdx !== -1
+      && /^```aliang-options\s*$/.test(line.slice(openIdx))
+      && (/^ {0,3}$/.test(openLinePrefix) || /\S/.test(openLinePrefix));
+    if (openOk) {
+      // 独占行开栏（可带 ≤3 空格前缀散文——marker 后须纯空白）。行制扫描：
+      // 嵌套保护（2026-11-21 审计三批 M4：示例/文档代码块里的 options 语法
+      // 是内容不是开栏，误剥会吞示例并凭空多出静态卡）。
       const start = offset + openIdx;
       const bodyStart = offset + line.length + 1;
       let j = i + 1;
       let closedAt = -1;
       while (j < lines.length) {
-        if (/^ {0,3}(`{3,})(\s*)$/.test(lines[j])) { closedAt = j; break; }
+        // 闭栏探测与旧 indexOf('\n```') 同口径：接受带 info 的围栏行（评审
+        // should：退化形态后续 ```python 块可提前收口，body 停在 JSON 末尾）。
+        if (/^ {0,3}(`{3,})/.test(lines[j])) { closedAt = j; break; }
         j++;
       }
       if (closedAt !== -1) {
@@ -160,33 +173,12 @@ function scanAliangOptionSpans(src) {
       break;
     }
     if (openIdx !== -1) {
-      // 黏行形态（GLM 实锤：散文黏着 ```aliang-options，闭合缺失 4/34≈12%）：
-      // 保持旧子串语义逐字节不变（src.indexOf('\n```') 找闭合，缺失走配平）。
-      const start = offset + openIdx;
-      const bodyStart = start + '```aliang-options'.length + 1; // 含 \n
-      // 旧行为要求 marker 后紧跟 \s*\n——marker 后还有别的文字不算开栏
-      if (!/^\s*$/.test(line.slice(openIdx + '```aliang-options'.length))) {
-        offset += line.length + 1;
-        i++;
-        continue;
-      }
-      const closeAt = src.indexOf('\n```', bodyStart);
-      if (closeAt !== -1) {
-        const end = closeAt + '\n```'.length;
-        spans.push({ start, end, body: src.slice(bodyStart, closeAt) });
-        // 推进行游标到闭栏之后
-        let adv = offset + line.length + 1;
-        let j = i + 1;
-        while (j < lines.length && adv <= end) { adv += lines[j].length + 1; j++; }
-        offset = adv;
-        i = j;
-        continue;
-      }
-      const rest = src.slice(bodyStart);
-      const json = aliangBalancedJSONObject(rest);
-      if (json === null) break;
-      spans.push({ start, end: bodyStart + json.length, body: json });
-      break;
+      // marker 后还有别的文字：不是 options 开栏（旧正则同口径），当普通行走
+      // 围栏门。
+      fence = nextFenceState(fence, line);
+      offset += line.length + 1;
+      i++;
+      continue;
     }
     // 普通围栏开闭：栏内的 ```aliang-options 行是内容，不是真实开栏（M4）。
     fence = nextFenceState(fence, line);
@@ -222,6 +214,16 @@ export function stripAliangOptions(src) {
   let out = '';
   let last = 0;
   for (const span of scanAliangOptionSpans(src)) {
+    // body JSON 闸门（评审 should：退化形态闭栏探测放宽后，提前收口的坏
+    // body——JSON 后跟 prose/别的围栏——截出的 span 不参与剔除，杜绝吞正文；
+    // 与 extract 的丢弃口径对齐）。JSON.parse 每气泡仅 AliangOptions 块数量级,
+    // 成本可忽略。
+    let bodyOk = false;
+    try {
+      JSON.parse(span.body);
+      bodyOk = true;
+    } catch (_) { /* 坏 body：不剔除 */ }
+    if (!bodyOk) continue;
     out += src.slice(last, span.start);
     last = span.end;
   }

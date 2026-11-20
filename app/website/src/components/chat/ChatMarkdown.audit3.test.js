@@ -104,6 +104,22 @@ describe('M5 展开态按内容键（序号漂移根治）', () => {
     app.unmount();
   });
 
+  it('流式增长中的已展开块：追加内容不重新折叠（评审 should：快照前缀命中）', async () => {
+    vi.useFakeTimers();
+    const { state, el, app } = mountComponent();
+    state.content = longCode;
+    await flushTicks();
+    el.querySelector('.chat-md-unfold').click();
+    await flushTicks();
+    expect(findFoldWrap(el)).toBeNull();
+    // 流式追加一行：内容增长（快照前缀命中）→ 不重折叠
+    state.content = longCode.replace(/\n```$/, '\nl-24\n```');
+    vi.advanceTimersByTime(200); // trailing 定时器（fake timers 下同步推进）
+    await flushTicks();
+    expect(findFoldWrap(el)).toBeNull();
+    app.unmount();
+  });
+
   it('未展开的其他长代码块照常折叠（回归）', async () => {
     const { state, el } = mountComponent();
     state.content = longCode + '\n\n' + longCode.replace(/l/g, 'm');

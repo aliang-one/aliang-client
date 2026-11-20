@@ -50,14 +50,25 @@ describe('M2 围栏跟踪（CommonMark 规则）', () => {
     expect(out.split('\n').at(-1)).toBe('- 正文');
   });
 
-  it('4 空格缩进的 ``` 不是围栏（CommonMark ≤3 空格）', () => {
+  it('列表项 4 空格/Tab 缩进围栏内的代码受保护（评审 blocker：markdown-it 实测渲染为真实代码块）', () => {
     const src = [
-      '段落',
+      '- 配置项：',
+      '    ```c',
+      '#include <stdio.h>',
+      '*args = 1;',
       '    ```',
-      '-缩进后的正文仍按正文容错',
+      '- 正文待办',
     ].join('\n');
     const out = normalizeCjkMarkdown(src);
-    expect(out).toContain('- 缩进后的正文仍按正文容错');
+    expect(out).toContain('#include <stdio.h>');
+    expect(out).toContain('*args = 1;');
+    expect(out.split('\n').at(-1)).toBe('- 正文待办');
+  });
+
+  it('Tab 缩进围栏同口径', () => {
+    const src = ['- 项：', '\t```bash', '\t#!/bin/sh', '\t```'].join('\n');
+    const out = normalizeCjkMarkdown(src);
+    expect(out).toContain('#!/bin/sh');
   });
 
   it('常规围栏开闭不受影响（回归）', () => {
@@ -131,6 +142,73 @@ describe('M4 aliang-options 嵌套围栏不误吞', () => {
     const stripped = stripAliangOptions(src);
     expect(stripped).not.toContain('aliang-options');
     expect(stripped).toContain('正文');
+  });
+});
+
+describe('M4 评审修订：缩进不对称收敛 + strip JSON 闸门', () => {
+  const sampleJson = '{"title":"示例","options":[{"id":"a","label":"甲"}]}';
+
+  it('≥4 空格纯缩进示例不进 span：不产卡、原文逐字节保留', () => {
+    const src = [
+      '- 用法示例：',
+      '    ```aliang-options',
+      '    ' + sampleJson,
+      '    ```',
+      '正文',
+    ].join('\n');
+    expect(extractAliangOptions(src)).toEqual([]);
+    const stripped = stripAliangOptions(src);
+    expect(stripped).toContain('```aliang-options');
+    expect(stripped).toContain('正文');
+  });
+
+  it('散文前缀黏行形态（GLM 实锤）照常出卡（回归钉：删黏行分支后 strict 须承接）', () => {
+    const src = '排查完成，修复路径你来定：```aliang-options\n' + sampleJson;
+    const cards = extractAliangOptions(src);
+    expect(cards).toHaveLength(1);
+    expect(cards[0].title).toBe('示例');
+  });
+
+  it('退化形态+后续带 info 围栏行（无 prose）：body 停在 JSON 末尾照常出卡', () => {
+    const src = [
+      '```aliang-options',
+      sampleJson,
+      '```python',
+      'print(1)',
+      '```',
+    ].join('\n');
+    const cards = extractAliangOptions(src);
+    expect(cards).toHaveLength(1);
+    expect(cards[0].title).toBe('示例');
+  });
+
+  it('退化形态 JSON 与围栏行之间夹 prose：不产卡且 strip 不吞正文（JSON 闸门）', () => {
+    const src = [
+      '```aliang-options',
+      sampleJson,
+      '……（模型省略闭合行）',
+      '```python',
+      'print(1)',
+      '```',
+    ].join('\n');
+    expect(extractAliangOptions(src)).toEqual([]);
+    const stripped = stripAliangOptions(src);
+    expect(stripped).toContain('```python');
+    expect(stripped).toContain('模型省略闭合行');
+  });
+
+  it('strip JSON 闸门：坏 body（JSON 后跟 prose）不参与剔除、正文保留', () => {
+    const src = [
+      '```aliang-options',
+      '{"options":[{"id":"a","label":"A"}]}',
+      '这行 prose 让 body 非纯 JSON',
+      '```',
+      '正文保留',
+    ].join('\n');
+    expect(extractAliangOptions(src)).toEqual([]); // extract 既有口径：丢坏块
+    const stripped = stripAliangOptions(src);
+    expect(stripped).toContain('正文保留');
+    expect(stripped).toContain('这行 prose');
   });
 });
 

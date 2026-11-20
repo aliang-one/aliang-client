@@ -144,13 +144,19 @@ const rootRef = ref(null);
 let renderTimer = null;
 let lastRenderAt = 0;
 const feedbackTimers = new Set();
-// 用户已展开的折叠代码块(按代码内容键,2026-11-21 审计三批 M5):旧实现按
-// pre 序号记忆——对账替换/增长对齐整泡重排后序号漂移,展开态落到错误代码块
-// 或丢失。内容键 = 长度+前 96 字符,同一块跨重渲染稳定;同内容重复块共享键
-// (内容相同,展开态一致无害)。组件实例存活期间保留。
+// 用户已展开的折叠代码块(按展开时刻完整文本快照,2026-11-21 审计三批 M5;
+// 评审三修订:键含长度使流式增长中的块每 delta 换键重折叠,前 96 字符又有
+// 同前缀碰撞——快照 + 前缀命中一并解决:命中=精确相等(漂移场景:对账替换
+// 后内容复原)或新文本以快照为前缀(流式纯增长场景,序号无关)。旧实现按
+// pre 序号:整泡重排后序号漂移落到错误代码块。组件实例存活期间保留。
 const expandedPres = new Set();
-function preContentKey(text) {
-  return `${(text || '').length}:${(text || '').slice(0, 96)}`;
+function isExpandedSnapshot(text) {
+  const t = text || '';
+  if (expandedPres.has(t)) return true;
+  for (const snap of expandedPres) {
+    if (t.startsWith(snap)) return true;
+  }
+  return false;
 }
 // copyText 返回的 promise 不可取消,卸载后 then 回调不得再回灌按钮文案/
 // 定时器池,disposed 置位后一律丢弃。
@@ -209,8 +215,8 @@ function enhance() {
     // 尾部换行是围栏语法的一部分,计行前剥掉,阈值才是真实行数。用户已
     // 展开过的块(按 pre 序号)不再重新加折叠,保持流式重渲染后仍展开。
     const lines = (code ? code.textContent : pre.textContent).replace(/\n$/, '').split('\n').length;
-    const codeKey = preContentKey(code ? code.textContent : pre.textContent);
-    if (lines > FOLD_LINE_THRESHOLD && !expandedPres.has(codeKey)) {
+    const codeText = code ? code.textContent : pre.textContent;
+    if (lines > FOLD_LINE_THRESHOLD && !isExpandedSnapshot(codeText)) {
       wrap.classList.add('chat-md-fold');
       const unfold = document.createElement('button');
       unfold.type = 'button';
@@ -261,10 +267,11 @@ function onClick(e) {
   if (unfold) {
     const wrapEl = unfold.parentElement;
     if (wrapEl) {
-      // 记下内容键,流式重渲染换子树后 enhance 按键保持展开态(M5)。
+      // 记下展开时刻完整文本快照,流式重渲染换子树后 enhance 按快照/前缀
+      // 保持展开态(M5+评审修订)。
       const preEl = wrapEl.querySelector('pre');
       const codeEl = preEl ? preEl.querySelector('code') : null;
-      expandedPres.add(preContentKey(codeEl ? codeEl.textContent : (preEl ? preEl.textContent : '')));
+      expandedPres.add(codeEl ? codeEl.textContent : (preEl ? preEl.textContent : ''));
       wrapEl.classList.remove('chat-md-fold');
     }
     unfold.remove();
