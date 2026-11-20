@@ -161,4 +161,23 @@ describe('ChatPage 子agent面板接线（Task 8 / M1）', () => {
     expect(el.querySelector('[data-testid="chat-subagent-panel"]')).toBeNull();
     expect(__test.subagentWatchingTaskId.value).toBeNull();
   });
+
+  // B9（2026-11-20 审计二批）：面板开着时 Esc 先关面板——未注册层的漏网面板
+  // 此前直接命中 page-return 整页退出聊天。层序断言：面板层晚于 page-return
+  // 压栈（后激活在顶），Esc 只关面板；页面收口（close）不在本次派发里。
+  it('面板开着按 Esc：只关面板，不整页退出', async () => {
+    const { el } = await mountPage();
+    el.querySelector('button[data-testid="chat-subagent-entry"]').click();
+    await nextTick();
+    expect(el.querySelector('[data-testid="chat-subagent-panel"]')).toBeTruthy();
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    await nextTick();
+    expect(el.querySelector('[data-testid="chat-subagent-panel"]')).toBeNull();
+    expect(__test.subagentWatchingTaskId.value).toBeNull();
+    // 页面本体还在（ChatPage 未被 page-return 拆走）：入口条仍可再次打开面板
+    expect(el.querySelector('button[data-testid="chat-subagent-entry"]')).toBeTruthy();
+    el.querySelector('button[data-testid="chat-subagent-entry"]').click();
+    await nextTick();
+    expect(el.querySelector('[data-testid="chat-subagent-panel"]')).toBeTruthy();
+  });
 });

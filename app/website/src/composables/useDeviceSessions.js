@@ -154,6 +154,15 @@ export function useDeviceSessions() {
     return null;
   }
 
+  // 卸载收口（2026-11-20 审计二批 B8）：2s 节流窗的尾随刷新定时器不随组件
+  // 卸载清理，到点仍会拉清单、写已死实例状态。ChatPage 卸载链调用。
+  function disposeDeviceSessions() {
+    if (refreshTimer) {
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
+    }
+  }
+
   return {
     deviceSessions,
     available,
@@ -161,5 +170,6 @@ export function useDeviceSessions() {
     refreshOnEvent,
     shellForEntry,
     findDeviceShellBySessionId,
+    disposeDeviceSessions,
   };
 }

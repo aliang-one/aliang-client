@@ -1052,6 +1052,124 @@ export function chatRecoverySubscribeSessionIds(convList, isSubscribable) {
 // request 与 resolved 键恒一致但可落不同会话对象（③活跃兜底漂移/②壳三键抢道/
 // ①草稿壳双对象），只清路由命中的那个会话会漏掉原卡；收卡幂等，对全部会话
 // 扫同键一律收走。返回是否扫到（键位照封——迟到重复帧不复活）。
+// 审批族全局扫卡的 tool_ask/option 镜像（2026-11-20 审计二批 B2）：resolved
+// 跨全部会话对象翻卡——request 可经②壳/③兜底落在 A，resolved 却路由到 B，
+// 只翻路由命中的对象会漏（漂移卡永滞 pending，用户可对已作答的卡重复作答）。
+export function sweepResolveToolAsk(convList, event, handledToolAskIds, resolvedAt) {
+  if (!Array.isArray(convList)) return false;
+  const interactionId = String(event?.interaction_id || '').trim();
+  if (!interactionId) return false;
+  const sessionId = String(event?.session_id || '');
+  const key = `${sessionId}:${interactionId}`;
+  const answer = event.answer && typeof event.answer === 'object' ? event.answer : {};
+  const picked = Array.isArray(answer.selected_option_ids)
+    ? answer.selected_option_ids.map(v => String(v))
+    : answer.selected_option_id
+      ? [String(answer.selected_option_id)]
+      : [];
+  let swept = false;
+  // 逐对象翻卡、循环后一次性封键（评审 should：resolve*Card 的封键检查先于
+  // 查卡，同键多副本（草稿+壳双对象重投）时首个对象封键后其余副本短路永滞
+  // pending——封键只拦 upsert 复活，不拦翻卡）。已 answered 副本幂等跳过。
+  for (const conv of convList) {
+    const asks = Array.isArray(conv?.toolAsks) ? conv.toolAsks : [];
+    const card = asks.find(c => c.key === key);
+    if (!card || card.status === 'answered') continue;
+    card.status = 'answered';
+    card.selected = picked;
+    card.customText = typeof answer.message === 'string' ? answer.message : '';
+    card.error = '';
+    card.updatedAt = resolvedAt;
+    swept = true;
+  }
+  if (swept) handledToolAskIds.add(key);
+  return swept;
+}
+
+export function sweepResolveOption(convList, event, handledOptionIds, resolvedAt) {
+  if (!Array.isArray(convList)) return false;
+  const optionId = String(event?.option_id || '').trim();
+  if (!optionId) return false;
+  const sessionId = String(event?.session_id || '');
+  const key = `${sessionId}:${optionId}`;
+  const picked = Array.isArray(event.selected) ? event.selected.map(v => String(v)) : [];
+  let swept = false;
+  // 同 sweepResolveToolAsk：翻卡全部副本、循环后一次性封键。
+  for (const conv of convList) {
+    const cards = Array.isArray(conv?.optionCards) ? conv.optionCards : [];
+    const card = cards.find(c => c.key === key);
+    if (!card || card.status === 'answered') continue;
+    card.status = 'answered';
+    card.selected = picked;
+    card.customText = typeof event.custom_text === 'string' ? event.custom_text : '';
+    card.error = '';
+    card.updatedAt = resolvedAt;
+    swept = true;
+  }
+  if (swept) handledOptionIds.add(key);
+  return swept;
+}
+
+// cancel 同口径：跨全部会话清卡+封键位。askId/option_ids 为空 = 该 session
+// 全量作废（run 终结 unregisterRun 的批量形态，与原本地分支同语义）。
+// 返回清除张数（路由命中会话据此刻系统条）。
+export function sweepCancelToolAsk(convList, sessionId, askId, handledToolAskIds) {
+  if (!Array.isArray(convList)) return 0;
+  const sid = String(sessionId || '');
+  let removed = 0;
+  for (const conv of convList) {
+    const asks = Array.isArray(conv?.toolAsks) ? conv.toolAsks : [];
+    if (!asks.length) continue;
+    const kept = [];
+    let hitCount = 0;
+    for (const card of asks) {
+      const hit = askId
+        ? askId === card.interactionId && card.key === `${sid}:${card.interactionId}`
+        : card.sessionId === sid;
+      if (hit) {
+        handledToolAskIds.add(card.key);
+        hitCount++;
+      } else {
+        kept.push(card);
+      }
+    }
+    if (hitCount) {
+      conv.toolAsks = kept;
+      removed += hitCount;
+    }
+  }
+  return removed;
+}
+
+export function sweepCancelOption(convList, sessionId, optionIds, handledOptionIds) {
+  if (!Array.isArray(convList)) return 0;
+  const sid = String(sessionId || '');
+  const ids = (Array.isArray(optionIds) ? optionIds : []).map(v => String(v));
+  let removed = 0;
+  for (const conv of convList) {
+    const cards = Array.isArray(conv?.optionCards) ? conv.optionCards : [];
+    if (!cards.length) continue;
+    const kept = [];
+    let hitCount = 0;
+    for (const card of cards) {
+      const hit = ids.length
+        ? ids.includes(card.optionId) && card.key === `${sid}:${card.optionId}`
+        : card.sessionId === sid;
+      if (hit) {
+        handledOptionIds.add(card.key);
+        hitCount++;
+      } else {
+        kept.push(card);
+      }
+    }
+    if (hitCount) {
+      conv.optionCards = kept;
+      removed += hitCount;
+    }
+  }
+  return removed;
+}
+
 export function sweepApprovalKey(convList, sessionId, approvalId, handledApprovalIds) {
   if (!approvalId || !Array.isArray(convList)) return false;
   const key = `${String(sessionId || '')}:${String(approvalId)}`;
@@ -1099,12 +1217,17 @@ export function useAliangChat() {
     refreshOnEvent,
     shellForEntry,
     findDeviceShellBySessionId,
+    disposeDeviceSessions,
   } = useDeviceSessions();
 
   const conversations = ref([]);
   const activeId = ref(null);
   const inputText = ref('');
   const sending = ref(false);
+  // 在途发送所属会话（B4）：sending 的复位点 finishRun 据此判定——切走会话
+  // 后终态帧落在后台会话时照样复位。三处置位点（sendMessage/sendRecall/
+  // steer 降级改发）同步落值。
+  let sendingConvId = null;
   // 图片附件（spec 2026-11-05-chat-image-pipeline §3.6）：pending=已上传待随
   // ai.message 发出的引用（{ref,path,name,mime,bytes}）；uploading 期间禁发
   // （防载荷半截）。瞬态：不进 conversationForStorage。
@@ -1124,12 +1247,18 @@ export function useAliangChat() {
   // composable；目录面板/自定义输入等纯 UI 状态已随 ChatSettingsBar 下沉。
   const createError = ref('');
 
-  let idleWatchdogTimer = null;
+  // 无活动看门狗（按会话隔离，2026-11-20 审计二批 B3）：旧实现单槽定时器，
+  // 被任意会话的帧抢靶、被他回合 ai.done 无条件清零——并发跑两个回合时挂死
+  // 回合的自愈通道丢失（rescue 恰在最需要并发的场景失效）。Map 按会话建狗：
+  // 谁挂死谁超时，别人的帧只武装别人的狗，别人的终态只拆别人的狗。
+  const idleWatchdogTimers = new Map(); // conv.id -> timer
 
   function armIdleWatchdog(conv) {
-    disarmIdleWatchdog();
-    idleWatchdogTimer = setTimeout(() => {
-      idleWatchdogTimer = null;
+    if (!conv) return;
+    const prev = idleWatchdogTimers.get(conv.id);
+    if (prev) clearTimeout(prev);
+    const timer = setTimeout(() => {
+      idleWatchdogTimers.delete(conv.id);
       const asst = findRunningAssistant(conv);
       if (!asst) return;
       asst.status = 'error';
@@ -1138,13 +1267,21 @@ export function useAliangChat() {
       finishRun(conv);
       saveToStorage();
     }, CHAT_IDLE_TIMEOUT_MS);
+    idleWatchdogTimers.set(conv.id, timer);
   }
 
-  function disarmIdleWatchdog() {
-    if (idleWatchdogTimer) {
-      clearTimeout(idleWatchdogTimer);
-      idleWatchdogTimer = null;
+  // conv 缺省 = 拆全部（socket 级死亡/收口路径）；带 conv = 只拆该会话的狗。
+  function disarmIdleWatchdog(conv) {
+    if (conv) {
+      const timer = idleWatchdogTimers.get(conv.id);
+      if (timer) {
+        clearTimeout(timer);
+        idleWatchdogTimers.delete(conv.id);
+      }
+      return;
     }
+    for (const timer of idleWatchdogTimers.values()) clearTimeout(timer);
+    idleWatchdogTimers.clear();
   }
 
   // Local agent AI WebSocket: streams the local Claude Code / Codex headless run
@@ -1157,6 +1294,11 @@ export function useAliangChat() {
   // 锁死，唯一解法刷新页面。落定后各调用方走既有 catch 兜底（复位
   // pending/sending）。
   let aiSocketSettle = null;
+  // 断线自愈重连排期句柄 + 卸载旗标（2026-11-20 审计二批 B7）：排期不随组件
+  // 卸载清理会造出幽灵 WebSocket——持续写已死会话状态并落盘、随帧触发已死
+  // 实例的清单轮询。
+  let aiReconnectTimer = null;
+  let chatDisposed = false;
   // CONNECTING 黑洞超时：浏览器对连不上的 ws 可能挂数十秒才报错，期间所有
   // await ensureAISocket() 全部悬挂。10s 上限一到即拒绝挂起 Promise 并主动
   // close（走 onclose 重连预算，与断线自愈同一收敛面）。
@@ -1232,7 +1374,13 @@ export function useAliangChat() {
   const activeRunning = computed(() => {
     const msgs = activeMessages.value;
     for (let i = msgs.length - 1; i >= 0; i--) {
-      if (msgs[i].role === 'assistant') return msgs[i].status === 'running';
+      const m = msgs[i];
+      if (m.role !== 'assistant') continue;
+      // 系统提示条（run_notice/审批取消等，kind=system、status=done）不参与
+      // running 推断（2026-11-20 审计二批 B11）：它排在流式泡之后，参与倒序
+      // 扫描会把运行中徽标/侧栏运行点熄灭。
+      if (m.kind === 'system') continue;
+      return m.status === 'running';
     }
     return false;
   });
@@ -1824,6 +1972,24 @@ export function useAliangChat() {
     // 被删会话挂着撤回编辑态时一并清（recallActive 已随 conv 消失失活，但
     // 悬挂的 targetMessageId 会让下一条同 id 消息误配——直接清态）。
     if (recallState.value?.convId === activeId.value) recallState.value = null;
+    // 退订（2026-11-20 审计二批 B5）：删除后 run 在 agent 侧可能仍在跑，后续
+    // 帧已无归属目标——不退订会经③活跃兜底全量写进切换后的活跃会话（delta
+    // 污染在流答案、外来 done 把活跃回合关账复位 sending）。socket 不在时
+    // sendAI 静默 false（服务端订阅挂 socket 键，重进页不复活）。
+    const doomed = conversations.value.find(c => c.id === activeId.value);
+    if (doomed?.aiSessionId) {
+      sendAI({ type: 'ai.session.unsubscribe', session_id: doomed.aiSessionId });
+    }
+    if (doomed) {
+      // 收口（评审 nit）：被删会话的看门狗拆掉（挂死 90s 后误标 error 已无
+      // 意义）；在途发送归属随之消失——sendingConvId 不清会让输入区锁死到
+      // 一个永不到来的终态帧。
+      disarmIdleWatchdog(doomed);
+      if (sendingConvId === doomed.id) {
+        sendingConvId = null;
+        sending.value = false;
+      }
+    }
     conversations.value = conversations.value.filter(c => c.id !== activeId.value);
     if (conversations.value.length > 0) {
       activeId.value = conversations.value[0].id;
@@ -2017,14 +2183,14 @@ export function useAliangChat() {
         if (!Array.isArray(e.pending_approvals) || e.pending_approvals.length === 0) {
           clearApprovalsForSession(local, sessionId);
         }
-        if (local.id === activeId.value) disarmIdleWatchdog();
+        disarmIdleWatchdog(local); // 按会话拆狗（B3）：不再借 activeId 门
         finishRun(local);
       }
     }
-    // running 快照证实 run 活着 → 看门狗再武装（onclose 的无条件 disarm 清了
-    // 计时器）。只在「本地是活跃会话或当前无看门狗」时武装——单槽看门狗不能
-    // 被后台对账从活跃会话手里抢走。
-    if (snapshotRunning && !inFlight && (local.id === activeId.value || !idleWatchdogTimer)) {
+    // running 快照证实 run 活着 → 看门狗再武装（onclose 的 disarm-all 清了
+    // 计时器）。该会话自己的狗直接重武装——按会话隔离后不存在「抢别人靶」
+    // 的问题（2026-11-20 审计二批 B3）。
+    if (snapshotRunning && !inFlight) {
       armIdleWatchdog(local);
     }
     // pending_approvals 恢复与状态分支解耦（审批等待中关窗重进：running
@@ -2061,6 +2227,7 @@ export function useAliangChat() {
   // 卸载时以 null 落值）。
   function setMessagesContainer(el) {
     messagesContainer.value = el;
+    scheduleAnchorRestore();
   }
 
   // nearBottom 反向同步：滚动容器元素同样在 ChatMessageList，@scroll 几何判定
@@ -2070,6 +2237,32 @@ export function useAliangChat() {
     messagesNearBottom.value = !!v;
   }
 
+  // 进页/切会话一次性锚底（2026-11-20 审计二批 B6）：messagesNearBottom 初值
+  // 恒 true 且进页不置底——恢复的长会话落在最顶、「回到底部」浮钮被
+  // v-if=!nearBottom 抑制（没有任何回底入口），且此后任何被动 scrollToBottom
+  // （快照对账追加/审批卡 upsert）都把阅读视口无故拽底。锚定后旗标清空，
+  // 滚动守卫交还 @scroll 几何判定。
+  let anchorPendingConvId = null;
+  watch(activeId, (id) => {
+    anchorPendingConvId = id || null;
+    scheduleAnchorRestore(); // 切会话即刻锚定（消息数不变时不经 length watch）
+  }, { immediate: true, flush: 'sync' });
+  function scheduleAnchorRestore() {
+    if (!anchorPendingConvId || anchorPendingConvId !== activeId.value) return;
+    const msgs = activeMessages.value;
+    if (!Array.isArray(msgs) || !msgs.length) return;
+    // 容器未就位（进页早期 activeId 先于 ChatMessageList 挂载）：保持 pending，
+    // 旗标不得提前消费——否则 scrollToBottom 的 nextTick 回调因 container 空
+    // 跳过赋值，锚定就此丢失。setMessagesContainer/消息变化会再触发本函数。
+    if (!messagesContainer.value) return;
+    anchorPendingConvId = null;
+    scrollToBottom(true);
+  }
+  watch(
+    () => (Array.isArray(activeMessages.value) ? activeMessages.value.length : 0),
+    () => scheduleAnchorRestore(),
+  );
+
   // --- Local agent AI streaming over WebSocket ---
 
   function aiSocketUrl() {
@@ -2078,6 +2271,7 @@ export function useAliangChat() {
   }
 
   function ensureAISocket() {
+    if (chatDisposed) return Promise.reject(new Error('chat-disposed'));
     if (aiSocket && aiSocket.readyState === WebSocket.OPEN) return Promise.resolve();
     if (aiSocket && aiSocket.readyState === WebSocket.CONNECTING && aiSocketPromise) return aiSocketPromise;
 
@@ -2191,13 +2385,32 @@ export function useAliangChat() {
         // 800ms 退避：重连预算只防死线，不给学生式的瞬时抖动上强度。
         if (reconnectAttempts < 2) {
           reconnectAttempts += 1;
-          setTimeout(() => {
+          if (aiReconnectTimer) clearTimeout(aiReconnectTimer);
+          aiReconnectTimer = setTimeout(() => {
+            aiReconnectTimer = null;
+            if (chatDisposed) return;
             ensureAISocket()
               .then(() => {
                 // 新 socket 的订阅集全灭（Go 侧订阅挂 socket 键，连接结束即
                 // 整体摘除）——重订阅所有需要观察的会话：打开过的可订阅设备
                 // 壳 + 有 running 气泡/发送在途的本地会话，不止 affected 子集
                 // （已打开但无 running 气泡的壳不重订阅会静默失聪）。
+                const reconnected = new Set();
+                for (const c of localSubscribeTargets()) {
+                  sendAI({ type: 'ai.session.subscribe', session_id: c.aiSessionId });
+                  refreshSubagentsFromDetail(subagentsBySession, c.aiSessionId);
+                  reconnected.add(c.aiSessionId);
+                }
+                // 在跑/在途会话无条件补订（评审 should：recency-32 不挤出在跑
+                // ——updatedAt 不随 delta 抬升，长跑回合会被活跃会话挤出前
+                // 32；旧重连路径对 running 子集无上限，此处保住该保证）。
+                for (const c of conversations.value) {
+                  if (c.deviceSession || !c.aiSessionId || reconnected.has(c.aiSessionId)) continue;
+                  if (!findRunningAssistant(c) && !(c.id === activeId.value && sending.value)) continue;
+                  sendAI({ type: 'ai.session.subscribe', session_id: c.aiSessionId });
+                  refreshSubagentsFromDetail(subagentsBySession, c.aiSessionId);
+                  reconnected.add(c.aiSessionId);
+                }
                 for (const c of conversations.value) {
                   if (c.deviceSession) {
                     if (deviceSessionSubscribable(c)) {
@@ -2210,10 +2423,6 @@ export function useAliangChat() {
                       // refreshSubagentsFromDetail 内兜住。
                       refreshSubagentsFromDetail(subagentsBySession, c.aiSessionId || c.deviceSession.id);
                     }
-                  } else if (c.aiSessionId
-                    && (findRunningAssistant(c) || (c.id === activeId.value && sending.value))) {
-                    sendAI({ type: 'ai.session.subscribe', session_id: c.aiSessionId });
-                    refreshSubagentsFromDetail(subagentsBySession, c.aiSessionId);
                   }
                 }
               })
@@ -2666,7 +2875,13 @@ export function useAliangChat() {
 
   function finishRun(conv) {
     conv.updatedAt = now();
-    if (activeId.value === conv.id) sending.value = false;
+    // B4（2026-11-20 审计二批）：sending 跟随「发起发送的会话」而非当前活跃
+    // 会话——发消息后切走会话，run 终态到达后台会话时 sending 也必须复位，
+    // 否则全 app 输入框锁死到刷新。
+    if (activeId.value === conv.id || sendingConvId === conv.id) {
+      sending.value = false;
+      if (sendingConvId === conv.id) sendingConvId = null;
+    }
     saveToStorage();
   }
 
@@ -2915,6 +3130,7 @@ export function useAliangChat() {
     saveToStorage();
     if (conv.id === activeId.value) {
       sending.value = true;
+      sendingConvId = conv.id;
       scrollToBottom(true);
     }
     if (!conv.aiSessionId) conv.aiSessionId = 'local-' + conv.id;
@@ -2928,7 +3144,7 @@ export function useAliangChat() {
         if (asst && !asst.content) conv.messages = conv.messages.filter(m => m !== asst);
         if (conv.id === activeId.value && !createError.value) createError.value = t('chat_serviceUnavailable');
         sending.value = false;
-        disarmIdleWatchdog();
+        disarmIdleWatchdog(conv); // B3：只拆本会话的狗
         saveToStorage();
         return;
       }
@@ -2946,7 +3162,7 @@ export function useAliangChat() {
       item.detail = '';
       saveToStorage();
     } catch (_) {
-      disarmIdleWatchdog();
+      disarmIdleWatchdog(conv); // B3：只拆本会话的狗
       const asst = findRunningAssistant(conv);
       if (asst) {
         asst.status = 'error';
@@ -2979,6 +3195,9 @@ export function useAliangChat() {
       convId: conv.id,
       targetMessageId: msg.messageId,
       originalText: msg.content || '',
+      // 原气泡附件（B10）：重发链据此回带 ai.message attachments 与新气泡
+      // attachments——撤回不丢图（与手机仓「重试不带附件」同族缺陷）。
+      originalAttachments: Array.isArray(msg.attachments) ? msg.attachments : [],
       draftBefore: prev ? prev.draftBefore : inputText.value,
     };
     inputText.value = recallState.value.originalText;
@@ -3038,6 +3257,7 @@ export function useAliangChat() {
 
     recalling.value = true;
     sending.value = true;
+    sendingConvId = conv.id;
     createError.value = '';
     // resent：step③ 的 ai.message 是否已发出——catch 据此分流兜底文案（未发=
     // 链前段失败、编辑态仍在可重试；已发=journal 已截/新气泡已落/编辑态已清，
@@ -3109,9 +3329,18 @@ export function useAliangChat() {
         return;
       }
       const messageId = generateId(); // 重发必换新 id（journal 去重）
+      const resentAttachments = Array.isArray(st.originalAttachments) ? st.originalAttachments : [];
+      const resentBubbleAttachments = resentAttachments.filter(a => a && a.url);
       conv.messages = [
         ...before,
-        { role: 'user', content: edited, messageId, provider: conv.provider, ts: now() },
+        {
+          role: 'user',
+          content: edited,
+          messageId,
+          provider: conv.provider,
+          ts: now(),
+          ...(resentBubbleAttachments.length ? { attachments: resentBubbleAttachments } : {}),
+        },
         { role: 'assistant', content: '', status: 'running', ts: now() },
       ];
       if (!conv.title) conv.title = edited.slice(0, 20);
@@ -3123,15 +3352,19 @@ export function useAliangChat() {
 
       armIdleWatchdog(conv);
       resent = true; // ai.message 发出前置位：此后失败属「已撤回、重发未达」
+      const resentFrameAttachments = resentAttachments
+        .filter(a => a && a.path)
+        .map(a => ({ type: 'image', name: a.name, path: a.path }));
       const ok = sendAI({
         type: 'ai.message',
         session_id: conv.aiSessionId,
         message_id: messageId,
         content: edited,
+        ...(resentFrameAttachments.length ? { attachments: resentFrameAttachments } : {}),
       });
       if (!ok) throw new Error('socket-closed');
     } catch (_) {
-      disarmIdleWatchdog();
+      disarmIdleWatchdog(conv); // B3：只拆本会话的狗
       const asst = findRunningAssistant(conv);
       if (asst) {
         asst.status = 'error';
@@ -3305,8 +3538,21 @@ export function useAliangChat() {
     // (e.g. reloaded localStorage holding a stale id, or an id mismatch), route
     // to the active conversation so the stream still renders instead of being
     // silently dropped.
+    // 活跃兜底白名单（2026-11-20 审计二批 B5）：仅当活跃会话确有本端在途发送
+    // 或在跑回合（三源并集，含 running 泡）时才挂靠——删除在跑会话后的迟到
+    // 帧、他页/他会话的漂移帧否则全量写进活跃会话，外来 ai.done 还会把活跃
+    // 回合关账并复位 sending。空闲活跃会话的未命中帧只做日志丢弃。
     if (!conv && activeConversation.value) {
-      conv = activeConversation.value;
+      const active = activeConversation.value;
+      // 审批族帧豁免（评审 blocker）：③兜底是审批族的设计路由（②壳未命中
+      // 时挂活跃带来源标）——白名单若拦下广播帧，空闲活跃会话的审批/提问卡
+      // 永不渲染，B2 扫卡连坐致死。在途发送判别用 sendingConvId 归属（评审
+      // should：页面级 sending 会让后台在途发送期间空闲活跃会话的污染门仍开）。
+      if (isApprovalFamily
+        || (sending.value && sendingConvId === active.id)
+        || isConversationRunning(active)) {
+        conv = active;
+      }
     }
     if (!conv) {
       console.debug('[chat] ai event has no target conversation', e);
@@ -3323,7 +3569,7 @@ export function useAliangChat() {
     // 断线自愈路径的再武装口：onclose 曾无条件 disarm（计时器为 null，旧门
     // `if (idleWatchdogTimer && ...)` 从此永远假——重连治愈的 run 僵死即永
     // running），活跃会话发送在途时允许从零重新武装。
-    if ((idleWatchdogTimer || (conv.id === activeId.value && sending.value)) && !routedToShell) armIdleWatchdog(conv);
+    if ((idleWatchdogTimers.has(conv.id) || (conv.id === activeId.value && sending.value)) && !routedToShell) armIdleWatchdog(conv);
 
     let persist = false;
     switch (e.type) {
@@ -3446,7 +3692,7 @@ export function useAliangChat() {
         // （endRunWindow）+ 清审批卡 + finishRun + 定谳复订阅。matchedById
         // 门控同 done/error：未命中帧只关账既有泡，不动 flags。
         if (AI_RUN_TERMINAL_STATUSES.has(String(e.status || '')) && !e.retry_active) {
-          disarmIdleWatchdog();
+          if (matchedById) disarmIdleWatchdog(conv); // B3：终态只拆本会话的狗
           let hadRunning = false;
           if (matchedById) {
             hadRunning = endRunWindow(conv);
@@ -3511,9 +3757,10 @@ export function useAliangChat() {
       case 'ai.option.request': {
         // 决策跨端同步（2026-11-08）：resolved 同型帧先翻卡（别端作答，
         // 镜像审批族 status 约定），完整 pending 帧才 upsert——status 缺省
-        // 即 v1 旧 agent 兼容（request 帧本无 status 字段）。
+        // 即 v1 旧 agent 兼容（request 帧本无 status 字段）。翻卡走全局扫卡
+        // （B2）：归属漂移时卡可能落在别的会话对象上。
         if (e && e.status === 'resolved') {
-          resolveOptionCard(conv, e, handledOptionIds, now());
+          sweepResolveOption(conversations.value, e, handledOptionIds, now());
           break;
         }
         upsertOptionCard(conv, e);
@@ -3522,9 +3769,9 @@ export function useAliangChat() {
       case 'tool_ask.request': {
         // 决策跨端同步（2026-11-08）：resolved 同型帧先翻卡（别端作答，镜像
         // ai.option 约定），完整 pending 帧才 upsert——status 缺省即 v1 旧
-        // agent 兼容（request 帧本无 status 字段）。
+        // agent 兼容（request 帧本无 status 字段）。翻卡走全局扫卡（B2）。
         if (e && e.status === 'resolved') {
-          resolveToolAskCard(conv, e, handledToolAskIds, now());
+          sweepResolveToolAsk(conversations.value, e, handledToolAskIds, now());
           break;
         }
         upsertToolAskCard(conv, e);
@@ -3535,25 +3782,11 @@ export function useAliangChat() {
         // 会话。interaction_id 可空（agent 批量 sweep——run 终结 unregisterRun
         // 的收口形态），空则作废该 session 全部待答提问卡。ai.done/ai.error
         // 清审批但绝不清提问卡——卡必须活过 run 终态等 SLA 内作答。
+        // 清卡走全局扫卡（B2）：漂移卡在别的会话对象上也要清+封键位。
         const askId = String(e.interaction_id || '').trim();
-        const asks = Array.isArray(conv.toolAsks) ? conv.toolAsks : [];
         const sid = String(e.session_id || '');
-        const kept = [];
-        let removedAsks = 0;
-        for (const card of asks) {
-          const hit = askId
-            ? askId === card.interactionId && card.key === optionKeyFromValues(sid, card.interactionId)
-            : card.sessionId === sid;
-          if (hit) {
-            // 确认在场被移除的卡才封键位——防作废后迟到重投帧复活。
-            handledToolAskIds.add(card.key);
-            removedAsks++;
-          } else {
-            kept.push(card);
-          }
-        }
+        const removedAsks = sweepCancelToolAsk(conversations.value, sid, askId, handledToolAskIds);
         if (removedAsks) {
-          conv.toolAsks = kept;
           const cancelledText = e.reason
             ? t('chat_toolAskCancelledReason', { reason: e.reason })
             : t('chat_toolAskCancelled');
@@ -3576,26 +3809,11 @@ export function useAliangChat() {
         // （协议 Optional）时作废该 session 全部卡。③兜底时带「来自会话 X」
         // 前缀（与审批取消同构）。注意 ai.done/ai.error 清审批但绝不清卡——
         // option.request 先于 ai.done 到达，卡必须活过 run 终态等用户作答。
+        // 清卡走全局扫卡（B2）：漂移卡在别的会话对象上也要清+封键位。
         const ids = (Array.isArray(e.option_ids) ? e.option_ids : []).map(v => String(v));
-        const cards = Array.isArray(conv.optionCards) ? conv.optionCards : [];
         const sid = String(e.session_id || '');
-        const kept = [];
-        let removed = 0;
-        for (const card of cards) {
-          const hit = ids.length
-            ? ids.includes(card.optionId) && card.key === optionKeyFromValues(sid, card.optionId)
-            : card.sessionId === sid;
-          if (hit) {
-            // 确认在场被移除的卡才封键位（与精确匹配同域；空 option_ids 兜底
-            // 分支同样经 hit 走到这里）——防作废后迟到重投帧复活。
-            handledOptionIds.add(card.key);
-            removed++;
-          } else {
-            kept.push(card);
-          }
-        }
+        const removed = sweepCancelOption(conversations.value, sid, ids, handledOptionIds);
         if (removed) {
-          conv.optionCards = kept;
           const cancelledText = e.reason
             ? t('chat_optionCancelledReason', { reason: e.reason })
             : t('chat_optionCancelled');
@@ -3647,7 +3865,9 @@ export function useAliangChat() {
         return; // 面板状态是瞬态展示数据：不落 localStorage（persist 不置位）
       }
       case 'ai.done': {
-        disarmIdleWatchdog();
+        // B3：终态只拆本会话的狗——matchedById 门控同 endRunWindow，未命中
+        // 帧（活跃兜底挂靠）不得拆活跃会话自己的狗。
+        if (matchedById) disarmIdleWatchdog(conv);
         // 收窗（endRunWindow）：runActive/running 复位 + running 泡关账；
         // hadRunning 供定谳复订阅判定（含外来回合活体补建的答案全文收敛）。
         // matchedById 门控同 run.started：未命中帧只关账既有泡，不动 flags。
@@ -3673,7 +3893,7 @@ export function useAliangChat() {
         return;
       }
       case 'ai.error': {
-        disarmIdleWatchdog();
+        if (matchedById) disarmIdleWatchdog(conv); // B3：同 done 门控
         const asst = findRunningAssistant(conv);
         if (!e.message_id) {
           // create 阶段失败（典型：手输目录不存在）。亮在设置条上、结算确认门；
@@ -3731,7 +3951,15 @@ export function useAliangChat() {
       return;
     }
     const attachments = pendingAttachments.value.map(a => ({ type: 'image', name: a.name, path: a.path }));
-    const bubbleAttachments = pendingAttachments.value.map(a => ({ name: a.name, url: chatAttachmentUrl(a.ref) }));
+    // 气泡附件带 path/ref（2026-11-20 审计二批 B10）：撤回重发链据此重建
+    // ai.message 的 attachments 载荷——旧气泡只存 {name,url}，带图消息撤回
+    // 重发静默变纯文本。多两键的落盘体积可忽略（url 本就落盘）。
+    const bubbleAttachments = pendingAttachments.value.map(a => ({
+      name: a.name,
+      url: chatAttachmentUrl(a.ref),
+      path: a.path,
+      ref: a.ref,
+    }));
 
     // 分流规则（阶段 2 计划钉死）：running（本地气泡推断 OR 设备壳清单/快照
     // status）→ 提交走 ai.steer；非 running → 原链（create 确认门 + ai.message）。
@@ -3783,6 +4011,7 @@ export function useAliangChat() {
     scrollToBottom(true);
 
     sending.value = true;
+    sendingConvId = conv.id;
     if (!conv.aiSessionId) conv.aiSessionId = 'local-' + conv.id;
 
     try {
@@ -3797,7 +4026,7 @@ export function useAliangChat() {
         // 与 ai.error 分支同约定：只在发送会话仍是当前会话时落兜底提示。
         if (conv.id === activeId.value && !createError.value) createError.value = t('chat_serviceUnavailable');
         sending.value = false; // 本函数的 sending=false 在 catch 尾部，早退须自理
-        disarmIdleWatchdog();
+        disarmIdleWatchdog(conv); // B3：只拆本会话的狗
         saveToStorage();
         return;
       }
@@ -3817,7 +4046,7 @@ export function useAliangChat() {
       // 发送落地才清 pending（失败保留，用户重试不丢图）。
       clearPendingAttachments();
     } catch (_) {
-      disarmIdleWatchdog();
+      disarmIdleWatchdog(conv); // B3：只拆本会话的狗
       const asst = findRunningAssistant(conv);
       if (asst) {
         asst.status = 'error';
@@ -3842,11 +4071,19 @@ export function useAliangChat() {
   // 一律订阅，由 Go 侧快照决定前端形态——running 补建运行态、idle+journal
   // 补答案（见 reconcileLocalSnapshot）。设备壳不落盘（重进页不在会话池），
   // 打开时 openDeviceSession 自带订阅，无需此处处理。
-  async function resubscribeRestoredRuns() {
-    const targets = conversations.value
+  // 本地会话订阅集单一来源（2026-11-20 审计二批 B1）：进页恢复与断线重连
+  // 共用同一条目标集——所有有 aiSessionId 的本地会话（按最近活跃截 32）。
+  // 断线自愈只重订「有 running 泡/发送在途」子集会让断线窗口内别端在空闲
+  // 会话发起的回合整轮静默缺失（进页时明明是全量订阅，恢复集单向缩水）。
+  function localSubscribeTargets() {
+    return conversations.value
       .filter((c) => !c.deviceSession && !!c.aiSessionId)
       .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
       .slice(0, 32); // 爆发上限：一次性订阅全量清单,防超大历史刷屏
+  }
+
+  async function resubscribeRestoredRuns() {
+    const targets = localSubscribeTargets();
     if (!targets.length) return;
     try {
       await ensureAISocket();
@@ -3901,6 +4138,28 @@ export function useAliangChat() {
     disposeChatSocketRecovery = wireChatSocketRecovery(document, window, recoverChatSocketAfterInterruption);
   });
 
+  // 卸载收口（2026-11-20 审计二批 B7）：断线自愈的 800ms 重连排期此前不随
+  // 组件卸载清理——「断线中退出恰逢重连窗口」每次漏一枚幽灵 socket。显式
+  // disposeChat 供 onUnmounted 与未来调用点共用。
+  function disposeChat() {
+    chatDisposed = true;
+    if (aiReconnectTimer) {
+      clearTimeout(aiReconnectTimer);
+      aiReconnectTimer = null;
+    }
+    if (aiSocketConnectTimer) {
+      clearTimeout(aiSocketConnectTimer.handle);
+      aiSocketConnectTimer = null;
+    }
+    closingIntentionally = true;
+    try { if (aiSocket) aiSocket.close(); } catch (_) {}
+    aiSocket = null;
+    aiSocketSettle = null;
+    aiSocketPromise = null;
+    disarmIdleWatchdog();
+    disposeDeviceSessions(); // B8：尾随刷新定时器随卸载收口
+  }
+
   onUnmounted(() => {
     if (nowTickTimer) {
       clearInterval(nowTickTimer);
@@ -3910,21 +4169,7 @@ export function useAliangChat() {
       disposeChatSocketRecovery();
       disposeChatSocketRecovery = null;
     }
-    if (aiSocket) {
-      // 主动关窗 ≠ 断线：run 在 agent 侧继续跑。closingIntentionally 让
-      // onclose 的断线画法（重连/「连接已中断」）整体退场，恢复态留给下次
-      // 进页的 resubscribeRestoredRuns 对账。
-      closingIntentionally = true;
-      try { aiSocket.close(); } catch (_) {}
-      aiSocket = null;
-    }
-    if (aiSocketConnectTimer) {
-      clearTimeout(aiSocketConnectTimer.handle);
-      aiSocketConnectTimer = null;
-    }
-    // 关窗即废弃：卸载后定时器到点/迟到 close 不得再驱动任何落定链。
-    aiSocketSettle = null;
-    aiSocketPromise = null;
+    disposeChat();
   });
 
   return {
@@ -4005,6 +4250,7 @@ export function useAliangChat() {
     attachmentUploading,
     addPendingAttachments,
     removePendingAttachment,
+    disposeChat,
     // 子agent面板（spec 2026-11-07-subagent-panel §三）：入口条/面板组件经
     // ChatPage 消费；subagentWatchingTaskId 供 Task 8 面板选中态写入；
     // refetchSubagentsForSession 供面板打开时的详情拉取（只消费 subagents[]）。
