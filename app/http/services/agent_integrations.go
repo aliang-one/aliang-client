@@ -26,6 +26,7 @@ package services
 //   - project 域 skill 需要具体项目路径，本页无项目上下文，不列入。
 
 import (
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -76,11 +77,24 @@ type AgentIntegrationSkill struct {
 	KernelSupported bool `json:"kernel_supported"`
 }
 
+// AgentIntegrationOpenViking 是 OpenViking 跨设备记忆面的只读视图(Phase2
+// spec §7.5「integrations 报告置不可达」+ §7.2 BYO 未接管提示的通道)。
+type AgentIntegrationOpenViking struct {
+	Enabled           bool   `json:"enabled"`
+	Registered        bool   `json:"registered"`
+	ProbeHealthy      bool   `json:"probe_healthy"`
+	ProbeFails        int32  `json:"probe_fails"`
+	ByoDetected       bool   `json:"byo_detected"`
+}
+
 // AgentIntegrationsReport 是「MCP 与技能」页的数据源。
 type AgentIntegrationsReport struct {
 	MCPServers []AgentIntegrationMCPServer `json:"mcp_servers"`
 	Skills     []AgentIntegrationSkill     `json:"skills"`
-	// Notes 是固定边界说明（上限/跳过规则/未支持项），前端直出。
+	// OpenViking 面未启用且无 BYO 检测时省略(不假装绿)。
+	OpenViking *AgentIntegrationOpenViking `json:"openviking,omitempty"`
+	// Notes 是固定边界说明（上限/跳过规则/未支持项）+ 动态告警(不可达/BYO),
+	// 前端直出。
 	Notes []string `json:"notes,omitempty"`
 }
 
@@ -99,7 +113,41 @@ func collectAgentIntegrations(home string) AgentIntegrationsReport {
 			"项目级技能需要具体项目上下文，本页不列入。",
 		},
 	}
+	// OpenViking 面(Phase2 §7.5/§7.2):拨测不可达/BYO 未接管在此可见——
+	// spec「必做」观测通道,审计批补齐。
+	if ov := openVikingIntegrationsView(); ov != nil {
+		report.OpenViking = ov
+		if ov.ProbeFails >= openVikingProbeFailMax {
+			report.Notes = append(report.Notes, fmt.Sprintf("OpenViking 不可达：拨测连续 %d 次失败（不自动关停）。", ov.ProbeFails))
+		}
+		if ov.ByoDetected {
+			report.Notes = append(report.Notes, "检测到用户自有 OpenViking 配置，平台未接管；可在「接入模式」手工切换。")
+		}
+	}
 	return report
+}
+
+// openVikingIntegrationsView 组装 OpenViking 只读视图;整层未启用且无 BYO
+// 检测时返回 nil(报告中省略该节)。
+func openVikingIntegrationsView() *AgentIntegrationOpenViking {
+	cfg := config.GetGlobalConfig()
+	byo := openVikingByoDetected.Load()
+	registered := false
+	for name, e := range aliangMCPEnabledEntries(mcpRegistryHome()) {
+		if name == openVikingManagedServerName && e.enabled() {
+			registered = true
+		}
+	}
+	if !cfg.EffectiveOpenVikingEnabled() && !byo && !registered {
+		return nil
+	}
+	return &AgentIntegrationOpenViking{
+		Enabled:      cfg.EffectiveOpenVikingEnabled(),
+		Registered:   registered,
+		ProbeHealthy: OpenVikingProbeHealthy(),
+		ProbeFails:   OpenVikingProbeConsecutiveFails(),
+		ByoDetected:  byo,
+	}
 }
 
 // collectAgentIntegrationMCPServers 合并 claude（user+plugin）与 codex 两路清单，

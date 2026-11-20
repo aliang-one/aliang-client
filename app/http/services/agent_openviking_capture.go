@@ -43,8 +43,8 @@ const (
 // openVikingContextBlockRe recall 注入标记块(含未闭合首段,防拼接截断漏剥)。
 var openVikingContextBlockRe = regexp.MustCompile(`(?s)<openviking-context>.*?</openviking-context>|<openviking-context>.*$`)
 
-// openVikingProbeState §7.5 拨测状态:连续失败计数 + 当前健康位,供仪表盘卡
-// (§7.7 批次)与 integrations 报告消费。
+// openVikingProbeState §7.5 拨测状态:连续失败计数 + 当前健康位,由仪表盘卡
+// (§7.7)与 integrations 报告(§7.5)消费。
 var (
 	openVikingProbeFails atomic.Int32
 	openVikingProbeOK    atomic.Bool
@@ -79,6 +79,11 @@ func openvikingCaptureRun(ctx context.Context, sessionID, userText, assistantOut
 	if !config.GetGlobalConfig().EffectiveOpenVikingEnabled() {
 		return nil // 未启用:静默,非错误
 	}
+	if OpenVikingProbeConsecutiveFails() >= openVikingProbeFailMax {
+		// spec §7.3 触发门「MCP 建连健康」:拨测判死(连续失败≥阈值)时静默
+		// 跳过,恢复后自动续流。未跑过首探时(fails=0)不拦。
+		return nil
+	}
 	endpoint, headers, ok := openvikingTransportFromRegistry()
 	if !ok {
 		return nil // 注册表无条目(ensure 未接线/已卸载):静默
@@ -100,16 +105,21 @@ func openvikingCaptureRun(ctx context.Context, sessionID, userText, assistantOut
 	return nil
 }
 
-// openvikingCaptureContent 单条消息正文整备:剥 recall 标记块、去空白、按上限
-// 截断(带截断标记,不静默丢尾)。
+// openVikingCaptureContent 单条消息正文整备:剥 recall 标记块、去空白、按上限
+// 截断(带截断标记,不静默丢尾)。截断按 rune 边界切——按字节切会拦腰断
+// UTF-8,把非法字节序列上送服务端(审计批)。
 func openvikingCaptureContent(s string) string {
 	s = openVikingContextBlockRe.ReplaceAllString(s, "")
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return ""
 	}
-	if len(s) > openVikingCaptureMaxContent {
-		s = s[:openVikingCaptureMaxContent] + "\n…[截断]"
+	runes := 0
+	for i := range s {
+		if runes == openVikingCaptureMaxContent {
+			return s[:i] + "\n…[截断]"
+		}
+		runes++
 	}
 	return s
 }
@@ -173,10 +183,12 @@ const (
 
 var openVikingProbeStart sync.Once
 
-// StartOpenVikingProbe 启动拨测循环(boot 挂点;进程级一次)。
+// StartOpenVikingProbe 启动拨测循环(boot 挂点;进程级一次)。首探即时(不等
+// 首个 10m tick——否则前 10 分钟卡面恒「未探测」,审计批补)。
 func StartOpenVikingProbe() {
 	openVikingProbeStart.Do(func() {
 		go func() {
+			openvikingProbeTick()
 			ticker := time.NewTicker(openVikingProbeInterval)
 			defer ticker.Stop()
 			for range ticker.C {
