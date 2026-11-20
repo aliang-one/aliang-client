@@ -375,13 +375,37 @@ func tomlQuote(s string) string {
 	return b.String()
 }
 
-// aliangMCPCodexBlockLines 生成一个托管块的行序列。codex 无 headers 通道,
-// registry headers 不进 codex(spec §6.4);http/sse 只带 url;env 用 inline
-// table 保持块内无子表头(块扫描按「[ 开头的行」定界,子表头会撕开块)。
+// aliangMCPTOMLInlineTable 键排序的 TOML inline table 行:`name = {"k" = "v", ...}`。
+// 键名同样 tomlQuote(quoted key 恒合法,header 名带 - 等也稳);排序保证输出
+// 确定 → 同步的「内容不变即跳写」幂等依赖这份确定性。
+func aliangMCPTOMLInlineTable(name string, m map[string]string) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	pairs := make([]string, 0, len(keys))
+	for _, k := range keys {
+		pairs = append(pairs, tomlQuote(k)+" = "+tomlQuote(m[k]))
+	}
+	return name + " = {" + strings.Join(pairs, ", ") + "}"
+}
+
+// aliangMCPCodexBlockLines 生成一个托管块的行序列。http/sse 条目的 registry
+// headers 以 inline http_headers 透传给 codex(Phase2 spec §7.6 断点解除:
+// codex serde 认 http_headers,本机 config.toml 的 context7/glm-camp 先例即
+// 此形态)。inline table(而非子表头)是硬约束:块扫描按「[ 开头的行」定界,
+// 子表头会撕开块;且孤儿子表 + 新块 inline 会构成重复键定义(写前自检拒写)。
+// stdio 条目无 headers 通道(http_headers 是 HTTP 传输专用字段),registry
+// 误配的 headers 不出块。env 沿用同款 inline 纪律。
 func aliangMCPCodexBlockLines(key string, e aliangMCPServerEntry) []string {
 	lines := []string{"[mcp_servers." + key + "]"}
 	if strings.TrimSpace(e.URL) != "" {
-		return append(lines, "url = "+tomlQuote(e.URL))
+		lines = append(lines, "url = "+tomlQuote(e.URL))
+		if len(e.Headers) > 0 {
+			lines = append(lines, aliangMCPTOMLInlineTable("http_headers", e.Headers))
+		}
+		return lines
 	}
 	lines = append(lines, "command = "+tomlQuote(e.Command))
 	if len(e.Args) > 0 {
@@ -392,16 +416,7 @@ func aliangMCPCodexBlockLines(key string, e aliangMCPServerEntry) []string {
 		lines = append(lines, "args = ["+strings.Join(parts, ", ")+"]")
 	}
 	if len(e.Env) > 0 {
-		keys := make([]string, 0, len(e.Env))
-		for k := range e.Env {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		pairs := make([]string, 0, len(keys))
-		for _, k := range keys {
-			pairs = append(pairs, tomlQuote(k)+" = "+tomlQuote(e.Env[k]))
-		}
-		lines = append(lines, "env = {"+strings.Join(pairs, ", ")+"}")
+		lines = append(lines, aliangMCPTOMLInlineTable("env", e.Env))
 	}
 	return lines
 }

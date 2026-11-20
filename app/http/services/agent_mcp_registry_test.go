@@ -394,11 +394,11 @@ func TestCodexSyncUnparseableConfigRefuses(t *testing.T) {
 	}
 }
 
-func TestCodexSyncHTTPURLOnlyBlock(t *testing.T) {
+func TestCodexSyncHTTPHeaderPassthrough(t *testing.T) {
 	home := t.TempDir()
 	if err := upsertAliangMCPServerForTest(home, "web", aliangMCPServerEntry{
 		Type: "http", URL: "https://api.example.com/mcp",
-		Headers: map[string]string{"Authorization": "secret"},
+		Headers: map[string]string{"Authorization": "secret", "X-Trace": "t1"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -408,13 +408,71 @@ func TestCodexSyncHTTPURLOnlyBlock(t *testing.T) {
 	out := readCodexConfigRaw(t, home)
 	if !strings.Contains(out, "[mcp_servers.aliang-mcp-web]") ||
 		!strings.Contains(out, `url = "https://api.example.com/mcp"`) {
-		t.Fatalf("url-only 托管块缺失: %s", out)
+		t.Fatalf("url 托管块缺失: %s", out)
 	}
-	// http 条目只带 url:command/args/env 不得出现;headers 无通道更不得泄漏
-	for _, leak := range []string{"command =", "args =", "env =", "Authorization"} {
+	// §7.6 断点解除:headers 以 inline http_headers 透传,键排序输出确定
+	if !strings.Contains(out, `http_headers = {"Authorization" = "secret", "X-Trace" = "t1"}`) {
+		t.Fatalf("http_headers inline 透传缺失或键序不定: %s", out)
+	}
+	// http 条目不带 stdio 字段;子表头形态禁止(会撕开块扫描)
+	for _, leak := range []string{"command =", "args =", "env =", "[mcp_servers.aliang-mcp-web.http_headers]"} {
 		if strings.Contains(out, leak) {
 			t.Fatalf("http 条目泄漏 %s: %s", leak, out)
 		}
+	}
+	// 幂等:二次同步无变化不写盘
+	p := filepath.Join(home, ".codex", "config.toml")
+	st := stampAgentMCPFile(p)
+	if err := applyAliangMCPCodexSyncForTest(home); err != nil {
+		t.Fatal(err)
+	}
+	if stampAgentMCPFile(p) != st {
+		t.Fatal("带 headers 的同步必须幂等(无变化不写盘)")
+	}
+}
+
+func TestCodexSyncStdioNoHeadersChannel(t *testing.T) {
+	// http_headers 是 HTTP 传输专用字段:stdio 条目即使 registry 误配
+	// headers 也不得出块(codex stdio 无 headers 语义)。
+	home := t.TempDir()
+	if err := upsertAliangMCPServerForTest(home, "s", aliangMCPServerEntry{
+		Type: "stdio", Command: "x", Headers: map[string]string{"Authorization": "secret"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyAliangMCPCodexSyncForTest(home); err != nil {
+		t.Fatal(err)
+	}
+	out := readCodexConfigRaw(t, home)
+	if strings.Contains(out, "http_headers") || strings.Contains(out, "Authorization") {
+		t.Fatalf("stdio 条目不得透传 headers: %s", out)
+	}
+}
+
+func TestCodexSyncRefusesHeaderOrphanSubtable(t *testing.T) {
+	// 与 env 孤儿子表同款回归:手加的 [..aliang-mcp-x.http_headers] 子表先
+	// 隐式定义父表,新块再显式定义父表+inline headers = 非法 TOML——写前
+	// 自检必须拒写且原文件字节零改动。
+	home := t.TempDir()
+	writeCodexConfig(t, home, "[mcp_servers.aliang-mcp-x]\nurl = \"old\"\n\n[mcp_servers.aliang-mcp-x.http_headers]\nAuthorization = \"legacy\"\n")
+	before, err := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := upsertAliangMCPServerForTest(home, "x", aliangMCPServerEntry{
+		Type: "http", URL: "new", Headers: map[string]string{"Authorization": "v"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyAliangMCPCodexSyncForTest(home); err == nil {
+		t.Fatal("http_headers 孤儿子表与 inline 形态冲突时必须拒写")
+	}
+	after, err := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("拒写时原文件必须字节零改动:\nbefore=%s\nafter=%s", before, after)
 	}
 }
 
