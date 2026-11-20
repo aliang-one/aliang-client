@@ -239,6 +239,8 @@ export default {
   chat_approvalNotFound: '该审批已过期或已被处理，请重新发送消息。若想让本会话内同类操作自动放行，下次审批时选择「本会话批准」。',
   chat_thinkingDone: '思考过程',
   chat_aiError: 'AI 回复出错，请重试。',
+  chat_runStopped: '回合已终止。',
+  chat_runStopping: '正在停止…',
   chat_approvalTitle: '需要授权',
   chat_approvalTool: '工具',
   chat_approvalCwd: '目录',

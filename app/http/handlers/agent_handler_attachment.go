@@ -85,9 +85,19 @@ func (h *AgentHandler) HandleAttachmentUpload(w http.ResponseWriter, r *http.Req
 		common.ErrorBadRequest(w, err.Error(), nil)
 		return
 	}
+	// path 契约（2026-11-20 审计⑤）：前端 uploadChatAttachment 强制校验
+	// attachment.path，ai.message 载荷的 path 也由它供给（宿主
+	// resolveAgentAIAttachments 要求 path 或 url 二选一）。只回 ref 的旧信封
+	// 会让网页发图链路 100% 死在「Malformed upload response」。
+	attPath, err := services.AgentAttachmentPathByRef(ref)
+	if err != nil {
+		common.ErrorBadRequest(w, err.Error(), nil)
+		return
+	}
 	common.Success(w, map[string]interface{}{
 		"attachment": map[string]interface{}{
 			"ref":   ref,
+			"path":  attPath,
 			"name":  header.Filename,
 			"mime":  mime.TypeByExtension(filepath.Ext(header.Filename)),
 			"bytes": len(src),
