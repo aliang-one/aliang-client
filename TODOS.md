@@ -117,11 +117,11 @@
 **Effort:** M(首批 7 条);**Priority:** P1
 **Depends on:** 无
 
-### 网页聊天审计二批遗留(Markdown 族+拍板项,生命周期族已收口)
+### 网页聊天审计遗留(仅剩拍板 2 条+存疑 3 条,三批修复全收口)
 
-**收口记录(2026-11-21,fix/webchat-audit-batch2 已合 master fb016da9):**生命周期族+其他 11 条(B1 重连全量补订/B2 漂移卡全局扫卡/B3 看门狗按会话隔离/B4 sending 归属化/B5 删会话退订+fallback 白名单/B6 锚底/B7 disposeChat 幽灵 WS/B8 尾随刷新 dispose/B9 面板 ESC 层/B10 撤回带附件/B11 系统条不熄灭徽标)全落地,实现后双评审 6 坐实全修(blocker=审批族豁免白名单——③兜底是审批族设计路由,白名单拦下则空闲活跃卡永不渲染;should=resolved 扫卡封键序同键双副本/B1 recency-32 挤出在跑/B5 谓词 sendingConvId 归属;nit=删除收口),782/782 绿。
+**收口记录:**①首批 7 条(2026-11-20,fix/webchat-audit-batch1 已合 master)+双评审 4 坐实全修(迟到 close 属主校验/净化域撞名键/dot-at-0/并发批证伪);②二批 11 条(2026-11-21,fix/webchat-audit-batch2 已合 master fb016da9)+双评审 6 坐实全修(blocker=审批族豁免白名单);③三批 Markdown 族 6 条(2026-11-21,fix/webchat-audit-batch3 已合 master)+双评审 9 坐实(去重 4 根)全修(blocker=列表缩进围栏保护/should=M5 快照前缀+M4 缩进收敛+JSON 闸门/nit=黏行死分支)。终态前端 813/813 绿。
 
-**What:** 剩余 Markdown 族 6 条——AI 图片无白名单=追踪信标(需拍板:禁远程 or 限同源,`chatMarkdown.js:161`);流式 80ms 全量重解析 300KB 单次 346-442ms(`ChatMarkdown.vue:91`);normalizeCjkMarkdown 围栏跟踪错复制到坏代码(`chatMarkdown.js:56`);行首负数误插空格(`:59`);嵌套围栏 aliang-options 示例被吞(`:100`);expandedPres 序号漂移(`ChatMarkdown.vue:142`);图片异步解码滚动失真(`ChatMessageList.vue:183`)。拍板 2 条(WS 鉴权/LAN 附件 403 口径)与存疑 3 条(openDeviceSession TTL 重入/子代理面板切换复位/localStorage 跨 tab)不动。
+**What:** 仅剩两类不动账:①拍板 2 条——聊天 WS 零登录鉴权/Origin 伪造(见 Security 节,P1 拍板后动);LAN 附件上传/取图 loopback+Origin 双闸 403(需拍板对齐聊天 WS 真同源口径,`agent_handler_attachment.go:16`,注意取图端点服务 <img> 无 Origin GET 需 Host 对齐)。②存疑 3 条(验证员 1:1 分歧,挂账):openDeviceSession 5min TTL 重入丢流式前缀/子代理面板状态不随会话切换复位/localStorage 跨 tab 覆盖。另有 AI 图片无白名单=追踪信标(需拍板:禁远程 or 限同源,`chatMarkdown.js:161` DOMPurify 配置)。
 
 **Why:** 均有坐实证据;Markdown 族为渲染正确性/性能/安全面,逐条独立;两条需拍板项等待用户定口径。
 
