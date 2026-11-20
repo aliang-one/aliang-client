@@ -39,7 +39,11 @@ type CompanionApp struct {
 	ipcClient *ipc.Client
 	httpURL   string
 	isRunning bool
-	done      chan struct{}
+	// lastViewKey 记录上次实际落到 GDI 面的可见面签名(签名构造见
+	// state_gate.go):周期轮询撞到相同签名即整轮跳过,止血 systray
+	// MenuItem.SetIcon 每次新建 HBITMAP 不销毁的泄漏(~83min 耗尽 10k 配额)。
+	lastViewKey string
+	done        chan struct{}
 }
 
 func NewCompanionApp() *CompanionApp {
@@ -94,12 +98,12 @@ func (a *CompanionApp) onReady() {
 
 	a.mQuit = systray.AddMenuItem("Quit Aliang", "Stop the background proxy and quit the companion")
 
-	go func() {
+	goWithCompanionTrace("connectAndStartHTTP", func() {
 		a.connectAndStartHTTP()
-		go a.handleMenuEvents()
-		go a.syncStateLoop()
-		go a.agentWatchdogLoop()
-	}()
+		goWithCompanionTrace("handleMenuEvents", a.handleMenuEvents)
+		goWithCompanionTrace("syncStateLoop", a.syncStateLoop)
+		goWithCompanionTrace("agentWatchdogLoop", a.agentWatchdogLoop)
+	})
 }
 
 func (a *CompanionApp) onExit() {
@@ -283,17 +287,17 @@ func (a *CompanionApp) syncStateLoop() {
 func (a *CompanionApp) syncState() {
 	result, err := a.ipcClient.Send(ipc.ActionGetStatus, nil)
 	if err != nil {
-		a.applyUnavailableState("background service unavailable")
+		a.syncUnavailableGated("background service unavailable")
 		return
 	}
 	if !result.OK {
-		a.applyUnavailableState("background service error")
+		a.syncUnavailableGated("background service error")
 		return
 	}
 
 	data, ok := result.Data.(map[string]interface{})
 	if !ok {
-		a.applyUnavailableState("invalid service state")
+		a.syncUnavailableGated("invalid service state")
 		return
 	}
 
@@ -311,9 +315,19 @@ func (a *CompanionApp) syncState() {
 		startBlockCode, startBlockMsg = a.proxyStartBlockedReason()
 	}
 
+	// 可见面变更检测:签名不变即整轮跳过,不再触碰 GDI 面(state_gate.go
+	// 头注释记录了 0.196 GDI 泄漏事故的完整机理)。isRunning 仍须记账,
+	// quit 闸与菜单点击路径读它。
+	providers := BuildAIStatusFromIPCData(data)
+	viewKey := buildTrayViewKey(mode, running, startBlockCode, providers)
+	if viewKey == a.lastViewKey {
+		a.isRunning = running
+		return
+	}
+	a.lastViewKey = viewKey
+
 	a.isRunning = running
 	a.syncModeMenu(mode)
-	aiStatus := BuildAIStatusFromIPCData(data)
 	if running {
 		systray.SetIcon(GetIcon())
 		systray.SetTooltip(trayProxyTooltip(mode, true))
@@ -343,12 +357,42 @@ func (a *CompanionApp) syncState() {
 	if running {
 		a.mStop.Enable()
 		a.mRestart.Enable()
-		a.updateAIStatusMenu(aiStatus)
+		a.updateAIStatusMenu(providers)
 	} else {
 		a.mStop.Disable()
 		a.mRestart.Disable()
 		a.hideAIStatus()
 	}
+}
+
+// syncUnavailableGated 对 IPC 不可达态做变更检测后再落 applyUnavailableState:
+// 周期轮询每 2s 撞一次错误,同一 reason 反复出现时不再触碰 GDI 面。点击路径
+// (startProxy 等)仍直走 applyUnavailableState,立即反馈不受此门控。
+func (a *CompanionApp) syncUnavailableGated(reason string) {
+	key := buildTrayUnavailableViewKey(reason)
+	if key == a.lastViewKey {
+		return
+	}
+	a.lastViewKey = key
+	a.applyUnavailableState(reason)
+}
+
+// goWithCompanionTrace 以带取证落盘的方式启动 goroutine:panic 时先写
+// companion trace 再原样 re-panic(崩溃语义不变,只补证据)。companion 是
+// windowsgui 构建,panic 栈默认写进无处可去的 stderr,默认 GOTRACEBACK 下
+// 也不产 WER 事件——进程会无痕消失(2026-11-20 0.196 今晨实例即此形态),
+// 本函数就是给这条死亡路径补的取证口。
+func goWithCompanionTrace(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				writeWindowsCompanionTrace("panic in %s: %v", name, r)
+				logger.Error("Windows companion goroutine panicked", "where", name, "panic", r)
+				panic(r)
+			}
+		}()
+		fn()
+	}()
 }
 
 // proxyStartBlockedReason queries the core's login gate for starting the proxy.
