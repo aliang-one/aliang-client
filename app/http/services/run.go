@@ -84,6 +84,7 @@ type aliangLinkStatusProvider interface {
 
 // RunService handles run/mode operations
 type RunService struct {
+	lifecycleMu     sync.Mutex // ingress 生命周期串行闸:恒为最外层锁(本锁→modeChangeMutex),见各入口注释
 	modeChangeMutex sync.RWMutex
 	currentMode     models.RunMode
 	isRunning       bool // 统一使用 isRunning 字段
@@ -152,6 +153,13 @@ func (rs *RunService) SetRunning(running bool) {
 
 // StartService starts the service for the current mode
 func (rs *RunService) StartService() map[string]interface{} {
+	// 生命周期串行闸(2026-11-20 0.196 恢复链 TUN 重建竞态):StartService 在
+	// modeChangeMutex 锁外执行 startTUN 建造段,历史上一段并发 StopIngress
+	// (SoftExpired→Restoring 钩子)会在建造中拆设备,二次 start 的 netsh 撞上
+	// 设备拆除竞态 → 「TUN 启动失败」→ 代理全瘫。本锁使 stop 等待 in-flight
+	// start 出完再执行,拆的永远是建成的 TUN。
+	rs.lifecycleMu.Lock()
+	defer rs.lifecycleMu.Unlock()
 	if result := proxySessionStartFailure(); result != nil {
 		return result
 	}
@@ -227,7 +235,7 @@ func (rs *RunService) StartService() map[string]interface{} {
 
 	switch startMode {
 	case models.ModeTUN:
-		return rs.startTUN()
+		return rs.startTUNLocked()
 	case models.ModeHTTP:
 		// HTTP 服务内部也有检查，但我们需要先设置状态
 		startHTTP := httpStartRunner
@@ -293,7 +301,17 @@ func ProxyStartBlockedReason() (string, string) {
 }
 
 // startTUN handles TUN mode startup
+// startTUN 生命周期闸入口:不经 StartService 的调用方(回滚异步 goroutine)
+// 经此取闸;StartService 自身已持闸,走 startTUNLocked(禁止重入,2026-11-20
+// 开发实锤:持闸调取闸=非重入自锁死,60s 超时复现)。
 func (rs *RunService) startTUN() map[string]interface{} {
+	rs.lifecycleMu.Lock()
+	defer rs.lifecycleMu.Unlock()
+	return rs.startTUNLocked()
+}
+
+// startTUNLocked 建造段主体,须已持 lifecycleMu。
+func (rs *RunService) startTUNLocked() map[string]interface{} {
 	res := tunStartRunner()
 
 	rs.modeChangeMutex.Lock()
@@ -305,6 +323,8 @@ func (rs *RunService) startTUN() map[string]interface{} {
 
 // StopService stops the current running service
 func (rs *RunService) StopService() map[string]interface{} {
+	rs.lifecycleMu.Lock()
+	defer rs.lifecycleMu.Unlock()
 	rs.modeChangeMutex.Lock()
 
 	if !rs.isRunning {
@@ -349,6 +369,8 @@ func (rs *RunService) StopService() map[string]interface{} {
 // has desynced to false after a mode switch, daemon restart, or activation
 // rollback. Returns whether anything was stopped.
 func (rs *RunService) StopIngressIfActive() bool {
+	rs.lifecycleMu.Lock()
+	defer rs.lifecycleMu.Unlock()
 	rs.modeChangeMutex.Lock()
 	mode := rs.resolveAuthoritativeModeLocked()
 	wasRunning := rs.isRunning
@@ -381,6 +403,8 @@ func (rs *RunService) StopIngressIfActive() bool {
 // logout is a security boundary, but an already inactive TUN must not receive a
 // stop signal that could leak into its next lifecycle.
 func (rs *RunService) StopIngressForLogout() (models.RunMode, bool) {
+	rs.lifecycleMu.Lock()
+	defer rs.lifecycleMu.Unlock()
 	rs.modeChangeMutex.Lock()
 	mode := rs.resolveAuthoritativeModeLocked()
 	wasRunning := rs.isRunning
@@ -471,6 +495,10 @@ func GetTUNStartupStatus() map[string]interface{} {
 
 // SwitchMode switches the operating mode
 func (rs *RunService) SwitchMode(targetMode string) map[string]interface{} {
+	// 持闸语境:本函数在 modeChangeMutex 全程持锁下调 stopServiceSync,因此
+	// 生命周期闸必须最先取得(恒外层锁序:本锁→modeChangeMutex)。
+	rs.lifecycleMu.Lock()
+	defer rs.lifecycleMu.Unlock()
 	rs.modeChangeMutex.Lock()
 	defer rs.modeChangeMutex.Unlock()
 
@@ -635,7 +663,8 @@ func (rs *RunService) persistModeLocked(mode models.RunMode) error {
 	})
 }
 
-// stopServiceSync synchronously stops a service
+// stopServiceSync synchronously stops a service. 仅可经 SwitchMode(持
+// lifecycleMu 语境)调用——禁止在其他未持闸语境新增调用方。
 func (rs *RunService) stopServiceSync(mode models.RunMode) {
 	switch mode {
 	case models.ModeHTTP:
