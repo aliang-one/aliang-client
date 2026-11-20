@@ -2,6 +2,17 @@
 
 ## Security
 
+### 聊天 WS 零登录鉴权:Origin 同源闸可被非浏览器客户端伪造绕过(审计 2026-11-20,需拍板)
+
+**What:** `HandleAIStream`(app/http/handlers/agent_handler.go:70)握手仅过 aiStreamHostAllowed 同源闸(Orgin.Host==r.Host 即放行)——该闸只能拦浏览器跨站 CSRF,拦不住任何可自定义请求头的客户端:LAN 内任意进程带 `Origin: http://<设备IP>:56431` 握手即入,可经 DispatchLocalAI 驱动任意 prompt 并代答工具审批(ai.approval.response/option/tool_ask=命令执行面),dashboard 登录态完全不参与此通道。修复方向:握手前加 dashboard session 校验(至少对写语义帧 create/message/steer/approval/option/tool_ask),或 WS 握手引入登录后签发的一次性 ticket,让「Origin 同源」回归纯 CSRF 防线。
+
+**Why:** 2026-11-19 LAN WS 同源闸重写(用户拍板 B)解决的是浏览器 LAN 可用性,本条是其留下的非对抗盲区——与「addr 闸=非对抗防线」既有口径一致,但审批面开放给 LAN 的后果比当初评估的重,须用户拍板后动。
+
+**Context:** 审计=workflow critic 盲区维度发现,双验证员坐实 high;设计须兼顾 LAN 无登录使用场景(若 LAN 浏览本就要求已登录则纯加 session 校验即可,若允许匿名 LAN 只读则按帧语义分闸)。
+
+**Effort:** M;**Priority:** P1(拍板后)
+**Depends on:** 用户拍板(LAN 聊天是否要求登录态)
+
 ### Extend request-bound management authentication to all sensitive APIs
 
 **What:** Apply the local management-session boundary introduced for auth snapshots and session events to every sensitive management endpoint.
@@ -92,6 +103,30 @@
 **Effort:** S
 **Priority:** P3
 **Depends on:** 无
+
+## Web Chat
+
+### 网页聊天缺陷审计 27 条定案(批次 2026-11-20,workflow 7 维+逐条双对抗验证)
+
+**What:** 网页聊天(app/website)全量审计产出 33 候选→坐实 27(去重后)→**首批 7 条修复进行中 worktree `fix/webchat-audit-batch1`**:①ai.status 终态不收窗(`useAliangChat.js:3286`,后端 ctx 取消只发 status 帧,前端气泡写字面量 "stopping"+输入区卡 90s+误标 error,修复=终态词表走 ai.done 同款收尾);②ensureAISocket close 永不落定(`:2057`,审批卡永久 responding+输入锁死只能刷新,修复=onclose reject 挂起 Promise);③审批帧写非响应式 raw 壳(`:3130`,已打开设备壳审批卡永不渲染,同文件 1922 行已有换代理先例,双验证员降级 medium);④附件按钮死键(`ChatComposer.vue:101`,bindFileInputEl 是函数 ref 注册函数,click 抛 TypeError);⑤上传契约错位(`agentApi.js:201`↔`agent_handler_attachment.go:88`,前端强制 path/Go 只回 ref,name,mime,bytes);⑥同名图片覆盖+chips 重复 key(`ChatComposer.vue:64`,伴生);⑦纯图消息客户端放行/服务端拒(`agent_ai.go:2370`,伴生,修复=服务端镜像 journal 写侧「content 空且附件空才拒」)。
+
+**Why:** 前四条是用户日常必撞的 high(点停止必触发/断线点审批只能刷新/发图链路整条是死的);终态词表/换代理两处仓库内均有现成先例可镜像;⑥⑦在④⑤修好后立即转必现须同批带上。
+
+**Context:** 审计=7 维并行(WS流式/审批运行/输入交互/Markdown-XSS/列表渲染/状态竞态/前后端契约)+每条 2 对抗验证员,84 agent 零误报率红线(5 条真实证伪剔除账在案:看门狗审批期误杀/pendingAttachments 串扰/多 tab 清史/回底徽标残留/localStorage 配额,均有具体证伪理由)。首批实现后双评审(正确性+契约两镜,发现即对抗验证):4 坐实全修——①迟到 close 无属主校验拆新连接的超时保险丝/挂起 Promise(timer 改 wrapper 挂 sock+onclose 重排,promise 清理进陈旧判定之后)②改名碰撞键换服务端净化域(逐字复刻 sanitizeAgentAttachmentBase+小写 ext,"a b.png"/"ab.png" 净化后撞名/大小写扩展名/80 截断全覆盖)③dot-at-0 ".png" 不再改名越白名单(base 空=服务端时间戳兜底不参与撞名域)④并发批次同名失效被证伪驳回(file input 受 attachmentUploading 闸控);评审新用例 4 枚(迟到 close 保险丝/净化域撞名/大小写 ext/dot-at-0)先红后绿,stash 回退实测判别力 18 红。
+
+**Effort:** M(首批 7 条);**Priority:** P1
+**Depends on:** 无
+
+### 网页聊天审计二批遗留(生命周期族+Markdown 族,首批后)
+
+**What:** 首批之外的 20 条,按族:**生命周期**——删在跑会话帧全量污染活跃会话(`useAliangChat.js:1792`,deleteConversation 不 unsubscribe+fallback 无白名单);重连只重订阅 running 子集(`:2134`,断线窗口外来回合整轮缺失);看门狗单槽被抢靶/done 无条件 disarm(`:3168`,并发挂死回合失自愈);后台会话终态不复位 sending(`:2584`);幽灵 WS 重连定时器不随卸载清理(`:2115`);贴底守卫初值恒 true(`:1102`,长会话恢复落顶+浮钮被抑制);tool_ask/option 漂移卡永滞 pending(`:3342`,缺审批族同款全局扫卡)。**Markdown**——AI 图片无白名单=追踪信标(需拍板:禁远程 or 限同源,`chatMarkdown.js:161`);流式 80ms 全量重解析 300KB 单次 346-442ms(`ChatMarkdown.vue:91`);normalizeCjkMarkdown 围栏跟踪错复制到坏代码(`chatMarkdown.js:56`);行首负数误插空格(`:59`);嵌套围栏 aliang-options 示例被吞(`:100`);expandedPres 序号漂移(`ChatMarkdown.vue:142`);图片异步解码滚动失真(`ChatMessageList.vue:183`)。**其他**——子代理面板未注册 ESC 层按 Esc 整页退出(`ChatPage.vue:314`);撤回重发丢附件(`useAliangChat.js:2975`);LAN 附件上传/取图 loopback+Origin 双闸 403(需拍板对齐聊天 WS 口径,`agent_handler_attachment.go:16`);设备会话刷新定时器泄漏(`useDeviceSessions.js:82`);运行中徽标被系统提示条熄灭(`useAliangChat.js:1207`,双验证员降级 low)。存疑 3 条(openDeviceSession TTL 重入/子代理面板切换复位/localStorage 跨 tab,验证员 1:1 分歧)暂不动。
+
+**Why:** 均有坐实证据但不属首批;生命周期族单点小改可镜像仓内先例(resubscribeRestoredRuns/handleDeviceSnapshot 换代理);两条需拍板项等待用户定口径。
+
+**Context:** 全部细节(触发场景+修复方向+双验证员理由)在审计 workflow 输出;首批落地后逐条转正。
+
+**Effort:** M(逐条独立);**Priority:** P2(需拍板两条 P2)/P3(其余)
+**Depends on:** 首批(worktree fix/webchat-audit-batch1)
 
 ## Networking
 
