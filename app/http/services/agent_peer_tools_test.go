@@ -80,7 +80,7 @@ func peerToolsTestEnv(t *testing.T, ts *peerToolsTestServer) *AgentService {
 	svc.mu.Lock()
 	svc.state.Registered = true
 	svc.state.DeviceID = "device-b"
-	svc.forwardedUserAuthorization = "Bearer peer-test-token"
+		svc.storeForwardedCredential("Bearer peer-test-token")
 	svc.mu.Unlock()
 
 	origProvider := agentPeerServiceProvider
@@ -145,7 +145,7 @@ func TestDoAgentServerPOST_RequiresAuthAndRegistration(t *testing.T) {
 	svc := peerToolsTestEnv(t, ts)
 
 	svc.mu.Lock()
-	svc.forwardedUserAuthorization = ""
+		svc.storeForwardedCredential("")
 	svc.mu.Unlock()
 	if _, err := svc.doAgentServerPOST(context.Background(), ts.srv.URL+"/x", nil); err == nil ||
 		!strings.Contains(err.Error(), "authorization") {
@@ -153,7 +153,7 @@ func TestDoAgentServerPOST_RequiresAuthAndRegistration(t *testing.T) {
 	}
 
 	svc.mu.Lock()
-	svc.forwardedUserAuthorization = "Bearer x"
+		svc.storeForwardedCredential("Bearer x")
 	svc.state.Registered = false
 	svc.mu.Unlock()
 	if _, err := svc.doAgentServerPOST(context.Background(), ts.srv.URL+"/x", nil); err == nil ||
@@ -587,7 +587,7 @@ func TestDoAgentServerPOST_DedicatedClientWaitsPastEightSeconds(t *testing.T) {
 	svc.mu.Lock()
 	svc.state.Registered = true
 	svc.state.DeviceID = "device-b"
-	svc.forwardedUserAuthorization = "Bearer t"
+		svc.storeForwardedCredential("Bearer t")
 	svc.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

@@ -3103,7 +3103,7 @@ func TestAgentServiceRemoteAIApprovalResponseUnblocksCodexAppServer(t *testing.T
 	svc.state.Enabled = true
 	svc.state.Registered = true
 	svc.state.DeviceID = "dev_test"
-	svc.forwardedUserAuthorization = "Bearer test-user-jwt"
+		svc.storeForwardedCredential("Bearer test-user-jwt")
 	svc.mu.Unlock()
 	defer svc.ai.closeAll()
 

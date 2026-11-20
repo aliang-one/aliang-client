@@ -22,6 +22,7 @@ import (
 	M "aliang.one/nursorgate/inbound/tun/metadata"
 	"aliang.one/nursorgate/outbound"
 	"aliang.one/nursorgate/processor/config"
+	"aliang.one/nursorgate/processor/egress"
 	"aliang.one/nursorgate/processor/mirror"
 	"aliang.one/nursorgate/processor/routing"
 	"aliang.one/nursorgate/processor/rules"
@@ -184,7 +185,15 @@ func (s *CustomerConfigService) UpdateCommittedCustomerConfig(payload []byte) (*
 				return fmt.Errorf("decode snapshot content for memory commit: %w", err)
 			}
 			previousCfg := config.GetGlobalConfig()
+			// 出口委托门翻转检测须在换配置前采样(SetGlobalConfig 后门态即新值);
+			// 门只在拨号时刻逐连接判定,池内既有连接不经过门——翻转后不排空,
+			// 在途/池内旧直连会让开关「开了像没开」(2026-11-19 0.196 终案)。
+			prevDelegateGate := egress.PlatformEgressGateActive()
 			config.SetGlobalConfig(&committedCfg)
+			if egress.PlatformEgressGateActive() != prevDelegateGate {
+				egress.DrainPlatformConnections()
+				logger.Info("egress delegate gate state changed; drained platform connection pool")
+			}
 			if err := outbound.GetRegistry().RefreshCustomerProxy(&committedCfg); err != nil {
 				return fmt.Errorf("refresh customer proxy registry: %w", err)
 			}

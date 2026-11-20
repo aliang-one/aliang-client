@@ -151,6 +151,22 @@ func platformDialContext(ctx context.Context, network, addr string) (net.Conn, e
 	return conn, nil
 }
 
+// PlatformEgressGateActive 读出口委托门现值(导出给配置提交路径做翻转检测:
+// 门在拨号时刻逐连接判定,池内既有连接不经过门——配置翻转时须配合
+// DrainPlatformConnections 排空池,新拨号才会按新门态改道)。
+func PlatformEgressGateActive() bool {
+	return meshDelegateActive()
+}
+
+// DrainPlatformConnections 清空平台 Transport 的空闲连接池(不拦截使用中
+// 连接,在途请求走完后自然回归门控判定)。出口委托门在拨号时刻逐连接读取,
+// 池内既有连接复用时门不被咨询——池热期间翻转开关等于没翻(2026-11-19
+// 0.196「开关 ON 却不走链」终案实锤:5 条常驻直连持续复用,门从未执行)。
+// 配置提交路径检测到门态翻转即调本函数,下一次请求立刻按新门态新拨。
+func DrainPlatformConnections() {
+	platformTransport.CloseIdleConnections()
+}
+
 // hostPortWithDefault 拆 addr 的 host:port;无端口形态按 443 兜底(自身
 // 流量主体是平台 https)。http.Transport 恒传带端口的地址(scheme 已折算:
 // https→443/http→80),443 兜底仅是防御。

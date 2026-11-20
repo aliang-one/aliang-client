@@ -678,3 +678,19 @@ func TestDelegateDiagnosticsAccounting(t *testing.T) {
 		t.Fatalf("direct 成功不应动账: before=%+v after=%+v", d2, d4)
 	}
 }
+
+// TestPlatformEgressGateActiveReflectsConfigFlip 出口委托门读取器随全局配置
+// 翻转(2026-11-19 0.196 终案的提交路径消费契约:翻转检测须在换配置前后各
+// 采样一次,变更即排空平台连接池)。附带 DrainPlatformConnections 冒烟
+// (stdlib CloseIdleConnections,不 panics 即约)。
+func TestPlatformEgressGateActiveReflectsConfigFlip(t *testing.T) {
+	setGlobalConfigForTest(t, &config.Config{})
+	if PlatformEgressGateActive() {
+		t.Fatal("empty config must not activate the delegate gate")
+	}
+	setGlobalConfigForTest(t, delegateSelfConfig())
+	if !PlatformEgressGateActive() {
+		t.Fatal("delegate-enabled config must activate the gate")
+	}
+	DrainPlatformConnections()
+}
