@@ -47,16 +47,43 @@ md.renderer.rules.link_open = (tokens, idx, opts, env, self) => {
   return defaultRender(tokens, idx, opts, env, self);
 };
 
+// CommonMark 围栏跟踪（2026-11-21 审计三批 M2/M4 共用）：开栏=行首 0-3 空格
+// + ≥3 个同字符 ` 或 ~（反引号栏的 info string 不得再含 `），闭栏=同字符、
+// 长度≥开栏、其后仅空白。旧实现任意 ```/~~~ 行一律翻转——更长围栏内嵌短围
+// 栏/异字符交叉全部错位，代码内容被误插空格（复制按钮复制到坏代码）。
+// 返回新状态：null=栏外；{marker}=栏内。
+function nextFenceState(state, line) {
+  const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+  if (!state) {
+    if (!m) return state;
+    const marker = m[1];
+    const info = m[2] || '';
+    if (marker[0] === '`' && info.includes('`')) return state;
+    return { marker };
+  }
+  if (m && m[1][0] === state.marker[0] && m[1].length >= state.marker.length && !/\S/.test(m[2] || '')) {
+    return null;
+  }
+  return state;
+}
+
 // GLM 中文容错第一批(spec §E):行首 #/-/+/* 后紧跟非空白非换行字符 → 补空格。
-// 逐行扫描并跟踪 ``` 围栏开闭,围栏内不动。
+// 逐行扫描并按 CommonMark 规则跟踪围栏(M2),围栏内不动。
 export function normalizeCjkMarkdown(src) {
   if (typeof src !== 'string' || !src) return src || '';
-  let fenced = false;
+  let fenced = null;
   return src.split('\n').map((line) => {
-    if (/^\s*(```|~~~)/.test(line)) { fenced = !fenced; return line; }
-    if (fenced) return line;
-    // lookahead 排除 #*+- 防 ##/**/-- 连写被误插空格,勿简化成 [^\s]
-    return line.replace(/^(\s*)(#{1,6}|[-+*])(?=[^\s#*+-])/y, (m, ind, mark) => `${ind}${mark} `);
+    const prev = fenced;
+    fenced = nextFenceState(fenced, line);
+    if (prev || fenced) return line; // 开栏/闭栏行与栏内内容一律不动
+    // lookahead 排除 #*+- 防 ##/**/-- 连写被误插空格,勿简化成 [^\s]。
+    // M3(2026-11-21 审计):『-5°C』负数不是列表(-/+ 后跟数字不插);
+    // 『*注意*x』行内还有第二个 * 是强调对,不作列表拆坏。
+    return line.replace(/^(\s*)(#{1,6}|[-+*])(?=([^\s#*+-]))/y, (m, ind, mark, next) => {
+      if ((mark === '-' || mark === '+') && /\d/.test(next)) return m;
+      if (mark === '*' && line.slice(ind.length + 1).includes('*')) return m;
+      return `${ind}${mark} `;
+    });
   }).join('\n');
 }
 
@@ -95,23 +122,76 @@ function aliangBalancedJSONObject(s) {
 // (维持旧行为,半截代码块由 ChatMarkdown enhance 兜底隐藏)。
 function scanAliangOptionSpans(src) {
   const spans = [];
-  const openRe = /```aliang-options\s*\n/g;
-  let m;
-  while ((m = openRe.exec(src)) !== null) {
-    const start = m.index;
-    const bodyStart = start + m[0].length;
-    const closeAt = src.indexOf('\n```', bodyStart);
-    if (closeAt !== -1) {
-      const end = closeAt + '\n```'.length;
-      spans.push({ start, end, body: src.slice(bodyStart, closeAt) });
-      openRe.lastIndex = end;
-      continue;
+  if (typeof src !== 'string') return spans;
+  const lines = src.split('\n');
+  let fence = null; // 普通围栏态（与 normalizeCjkMarkdown 同一跟踪器）
+  let offset = 0;   // 当前行在 src 中的起始偏移
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    const openIdx = fence === null ? line.indexOf('```aliang-options') : -1;
+    if (openIdx !== -1 && /^```aliang-options\s*$/.test(line.slice(openIdx))) {
+      // 严格形态：开栏独占一行（可带前缀散文？否——带散文走下方黏行分支）。
+      // 行制扫描：嵌套保护（2026-11-21 审计三批 M4：示例/文档代码块里的
+      // options 语法是内容不是开栏，误剥会吞示例并凭空多出静态卡）。
+      const start = offset + openIdx;
+      const bodyStart = offset + line.length + 1;
+      let j = i + 1;
+      let closedAt = -1;
+      while (j < lines.length) {
+        if (/^ {0,3}(`{3,})(\s*)$/.test(lines[j])) { closedAt = j; break; }
+        j++;
+      }
+      if (closedAt !== -1) {
+        const bodyLines = lines.slice(i + 1, closedAt);
+        const body = bodyLines.join('\n');
+        const closeLineStart = bodyStart + (bodyLines.length ? body.length + 1 : 0);
+        const end = closeLineStart + lines[closedAt].length;
+        spans.push({ start, end, body });
+        offset = end + 1;
+        i = closedAt + 1;
+        continue;
+      }
+      // 退化形态（独占行但闭合缺失）：括号配平兜底，其后不再扫（旧终止语义）。
+      const rest = lines.slice(i + 1).join('\n');
+      const json = aliangBalancedJSONObject(rest);
+      if (json === null) break;
+      spans.push({ start, end: bodyStart + json.length, body: json });
+      break;
     }
-    const rest = src.slice(bodyStart);
-    const json = aliangBalancedJSONObject(rest);
-    if (json === null) break;
-    spans.push({ start, end: bodyStart + json.length, body: json });
-    break;
+    if (openIdx !== -1) {
+      // 黏行形态（GLM 实锤：散文黏着 ```aliang-options，闭合缺失 4/34≈12%）：
+      // 保持旧子串语义逐字节不变（src.indexOf('\n```') 找闭合，缺失走配平）。
+      const start = offset + openIdx;
+      const bodyStart = start + '```aliang-options'.length + 1; // 含 \n
+      // 旧行为要求 marker 后紧跟 \s*\n——marker 后还有别的文字不算开栏
+      if (!/^\s*$/.test(line.slice(openIdx + '```aliang-options'.length))) {
+        offset += line.length + 1;
+        i++;
+        continue;
+      }
+      const closeAt = src.indexOf('\n```', bodyStart);
+      if (closeAt !== -1) {
+        const end = closeAt + '\n```'.length;
+        spans.push({ start, end, body: src.slice(bodyStart, closeAt) });
+        // 推进行游标到闭栏之后
+        let adv = offset + line.length + 1;
+        let j = i + 1;
+        while (j < lines.length && adv <= end) { adv += lines[j].length + 1; j++; }
+        offset = adv;
+        i = j;
+        continue;
+      }
+      const rest = src.slice(bodyStart);
+      const json = aliangBalancedJSONObject(rest);
+      if (json === null) break;
+      spans.push({ start, end: bodyStart + json.length, body: json });
+      break;
+    }
+    // 普通围栏开闭：栏内的 ```aliang-options 行是内容，不是真实开栏（M4）。
+    fence = nextFenceState(fence, line);
+    offset += line.length + 1;
+    i++;
   }
   return spans;
 }
@@ -147,6 +227,16 @@ export function stripAliangOptions(src) {
   }
   out += src.slice(last);
   return out.trim();
+}
+
+// 大内容自适应渲染间隔（2026-11-21 审计三批 M1）：全量 markdown+hljs+
+// DOMPurify 渲染成本随长度线性增长（300KB 实测 346-442ms/次），固定 80ms
+// 间隔=流式期间主线程持续冻结。分档放宽；组件的 trailing 定时器保证最终
+// 内容总在间隔内渲染。导出供组件与测试单源。
+export function chatMdRenderInterval(contentLength) {
+  if (contentLength >= 120000) return 800;
+  if (contentLength >= 40000) return 300;
+  return 80;
 }
 
 // 渲染+消毒一步到位;任何异常回退为转义纯文本(流式半截内容永不白屏)。

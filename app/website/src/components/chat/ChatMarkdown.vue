@@ -58,7 +58,15 @@ const { t } = useI18n();
 // 0 会被 || 回退到默认(与 __CHAT_IDLE_TIMEOUT_MS__ 手法一致);测试需要
 // 同步渲染路径时走初始 ref 渲染。未闭合围栏由 markdown-it 天然按代码块
 // 处理,半截内容不闪错。
+import { chatMdRenderInterval } from '../../utils/chatMarkdown';
 const CHAT_MD_RENDER_INTERVAL_MS = Number(globalThis.__CHAT_MD_DEBOUNCE_MS__) || 80;
+// 大内容自适应（2026-11-21 审计三批 M1）：间隔由 utils 分档函数给（测试单源），
+// 测试钩子保留覆盖能力。
+function renderIntervalFor(len) {
+  const hook = Number(globalThis.__CHAT_MD_DEBOUNCE_MS__);
+  if (hook) return hook;
+  return chatMdRenderInterval(len);
+}
 const FOLD_LINE_THRESHOLD = 20;
 // 复制成功反馈在按钮上的停留时长,超时还原为「复制」,避免长期占位误导。
 const FEEDBACK_RESET_MS = 1500;
@@ -136,10 +144,14 @@ const rootRef = ref(null);
 let renderTimer = null;
 let lastRenderAt = 0;
 const feedbackTimers = new Set();
-// 用户已展开的折叠代码块(pre 序号)。v-html 重渲染会整体换子树,enhance
-// 按序号恢复展开态(不再加折叠类);序号以 querySelectorAll('pre') 顺序
-// 为准,组件实例存活期间保留,跨流式重渲染生效。
+// 用户已展开的折叠代码块(按代码内容键,2026-11-21 审计三批 M5):旧实现按
+// pre 序号记忆——对账替换/增长对齐整泡重排后序号漂移,展开态落到错误代码块
+// 或丢失。内容键 = 长度+前 96 字符,同一块跨重渲染稳定;同内容重复块共享键
+// (内容相同,展开态一致无害)。组件实例存活期间保留。
 const expandedPres = new Set();
+function preContentKey(text) {
+  return `${(text || '').length}:${(text || '').slice(0, 96)}`;
+}
 // copyText 返回的 promise 不可取消,卸载后 then 回调不得再回灌按钮文案/
 // 定时器池,disposed 置位后一律丢弃。
 let disposed = false;
@@ -151,6 +163,16 @@ let disposed = false;
 function enhance() {
   const root = rootRef.value;
   if (!root) return;
+  // markdown 图片异步解码撑高内容后不回锚(M6,2026-11-21 审计):load 在
+  // img 上不冒泡,这里转发成可冒泡的 chat-md-img-load,祖先滚动容器
+  // (ChatMessageList)按贴底态决定回底——上翻阅读不被劫持。
+  root.querySelectorAll('img').forEach((img) => {
+    if (img.dataset.chatMdImgBound) return;
+    img.dataset.chatMdImgBound = '1';
+    img.addEventListener('load', () => {
+      img.dispatchEvent(new Event('chat-md-img-load', { bubbles: true }));
+    });
+  });
   root.querySelectorAll('pre').forEach((pre, preIndex) => {
     const code = pre.querySelector('code');
     // ```aliang-options 围栏的原文代码块永不露出(Task 14 静态卡实现的唯一
@@ -187,7 +209,8 @@ function enhance() {
     // 尾部换行是围栏语法的一部分,计行前剥掉,阈值才是真实行数。用户已
     // 展开过的块(按 pre 序号)不再重新加折叠,保持流式重渲染后仍展开。
     const lines = (code ? code.textContent : pre.textContent).replace(/\n$/, '').split('\n').length;
-    if (lines > FOLD_LINE_THRESHOLD && !expandedPres.has(preIndex)) {
+    const codeKey = preContentKey(code ? code.textContent : pre.textContent);
+    if (lines > FOLD_LINE_THRESHOLD && !expandedPres.has(codeKey)) {
       wrap.classList.add('chat-md-fold');
       const unfold = document.createElement('button');
       unfold.type = 'button';
@@ -238,11 +261,10 @@ function onClick(e) {
   if (unfold) {
     const wrapEl = unfold.parentElement;
     if (wrapEl) {
-      // 记下 pre 序号,流式重渲染换子树后 enhance 按序号保持展开态。
+      // 记下内容键,流式重渲染换子树后 enhance 按键保持展开态(M5)。
       const preEl = wrapEl.querySelector('pre');
-      const pres = rootRef.value ? rootRef.value.querySelectorAll('pre') : [];
-      const idx = Array.prototype.indexOf.call(pres, preEl);
-      if (idx >= 0) expandedPres.add(idx);
+      const codeEl = preEl ? preEl.querySelector('code') : null;
+      expandedPres.add(preContentKey(codeEl ? codeEl.textContent : (preEl ? preEl.textContent : '')));
       wrapEl.classList.remove('chat-md-fold');
     }
     unfold.remove();
@@ -252,8 +274,9 @@ function onClick(e) {
 watch(
   () => props.content,
   (v) => {
+    const interval = renderIntervalFor((v || '').length);
     const elapsed = Date.now() - lastRenderAt;
-    if (elapsed >= CHAT_MD_RENDER_INTERVAL_MS) {
+    if (elapsed >= interval) {
       // leading:距上次渲染已超阈值,立即渲染;挂起的 trailing 定时器
       // 内容已过期,一并清掉。
       if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
@@ -267,7 +290,7 @@ watch(
       renderTimer = null;
       lastRenderAt = Date.now();
       html.value = render(v);
-    }, CHAT_MD_RENDER_INTERVAL_MS - elapsed);
+    }, interval - elapsed);
   },
 );
 

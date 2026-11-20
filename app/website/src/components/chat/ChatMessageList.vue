@@ -7,6 +7,7 @@
       :ref="setContainer"
       class="h-full overflow-y-auto bg-slate-50 dark:bg-slate-800/40"
       @scroll.passive="onScroll"
+        @chat-md-img-load="onContentImageLoad"
     >
       <div class="mx-auto w-full max-w-3xl px-4 py-6">
         <!-- deviceLoadError 独立于空态渲染（首页失败 =「空转录 + 错误条」并存） -->
@@ -176,6 +177,13 @@ watch(feedTotal, (n, o) => {
   if (o === undefined || n <= o) return;
   if (!props.nearBottom) unseenCount.value += n - o;
 });
+
+// markdown 图片异步解码撑高内容后的回锚（2026-11-21 审计三批 M6）：
+// ChatMarkdown 把 img load 转发成可冒泡的 chat-md-img-load，这里按贴底态
+// 决定回底——上翻阅读不被劫持（守卫与 scrollToBottom 既有口径一致）。
+function onContentImageLoad() {
+  if (props.nearBottom) props.scrollToBottom(false);
+}
 
 function onScroll(e) {
   const el = e?.target;
