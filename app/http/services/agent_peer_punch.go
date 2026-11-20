@@ -55,6 +55,7 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
+	"aliang.one/nursorgate/app/mesh/ingressfwd"
 	"aliang.one/nursorgate/app/mesh/punch"
 	"aliang.one/nursorgate/common/logger"
 	sshin "aliang.one/nursorgate/inbound/ssh"
@@ -248,10 +249,13 @@ func firstNonLoopbackIPv4(snap agentNetSnapshot) string {
 // agentPeerPunchIngressHandler 生产 Handler:每条过门流=一条「到 ssh 入口」
 // 的连接,喂 sshin.HandleIngressConn(app/tunnel/manager.go mesh relay 的
 // 同款喂法);remote label 带 punch- 前缀+session 供入口审计区分载体来源。
+// 双进程拓扑(数据面住 core)下本进程无 ingress 单例,ServeOrForward 会把
+// 过门流 splice 到 core 统一入口——与 mesh relay 同款回退,双进程打洞
+// B 侧不再结构性丢弃。
 func agentPeerPunchIngressHandler(sessionID string) func(net.Conn) {
 	return func(conn net.Conn) {
 		labeled := sshin.WithRemoteLabel(conn, "punch-"+sessionID)
-		if !sshin.HandleIngressConn(labeled) {
+		if !ingressfwd.ServeOrForward(labeled, config.GetGlobalConfig()) {
 			logger.Warn(fmt.Sprintf("[AGENT-PEER-PUNCH] ssh ingress not running, dropped punch stream session=%s remote=%s", sessionID, conn.RemoteAddr()))
 		}
 	}
