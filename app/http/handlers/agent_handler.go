@@ -745,6 +745,36 @@ func (h *AgentHandler) HandlePeerMcp(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// HandleOpenVikingStatus GET 读取 OpenViking 卡读点(配置态+注册态+拨测态,
+// spec Phase2 §7.7)。经 proxyIfNeeded 落到 user-agent 进程(状态在 agent 侧)。
+func (h *AgentHandler) HandleOpenVikingStatus(w http.ResponseWriter, r *http.Request) {
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	common.Success(w, h.service.OpenVikingStatus())
+}
+
+// HandleOpenVikingApply POST 显式 apply(spec §6 双通道):开关切换后即对齐
+// 三处,不必等下个 boot。失败原因原样透出(spec 诚实回显)。
+func (h *AgentHandler) HandleOpenVikingApply(w http.ResponseWriter, r *http.Request) {
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := h.service.ApplyOpenVikingNow(); err != nil {
+		common.Error(w, http.StatusInternalServerError, err.Error(), nil)
+		return
+	}
+	common.Success(w, h.service.OpenVikingStatus())
+}
+
 // HandleFileAccess GET 读取「文件访问授权」状态快照。
 //
 // 必须经 proxyIfNeeded 落到 user-agent 进程：tccguard 的 grant 以可执行文件的

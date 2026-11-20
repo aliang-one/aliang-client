@@ -2469,6 +2469,14 @@ func (s *AgentService) currentAccessToken() string {
 	return authHeader
 }
 
+// UserAccessToken exposes the platform access token of the currently logged-in
+// user (the raw HS256 JWT) for outbound calls to cloud endpoints authenticated
+// by agent identity (OpenViking credential endpoint family, Phase2 spec §7.1).
+// Empty when no session is loaded. Must never be logged.
+func (s *AgentService) UserAccessToken() string {
+	return s.currentAccessToken()
+}
+
 // PushSessionRefresh signals the remote-agent session loop to push the current
 // access_token to PhoneServer (agent.session.refresh). Non-blocking and bounded:
 // at most one update is queued until the loop drains it. Invoked after the

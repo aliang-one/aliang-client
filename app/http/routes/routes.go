@@ -316,6 +316,9 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/peer/note", h.Agent.HandlePeerNote, http.MethodPost)
 	// aliang-peer 跨设备 MCP 平台托管注册/状态(GET 读状态,POST 应用)。
 	register("/api/agent/peer/mcp", h.Agent.HandlePeerMcp, http.MethodGet, http.MethodPost)
+	// OpenViking 跨设备记忆面(spec Phase2 §7.5/§7.7):拨测读点 + 显式 apply。
+	register("/api/agent/openviking/status", h.Agent.HandleOpenVikingStatus, http.MethodGet)
+	register("/api/agent/openviking/apply", h.Agent.HandleOpenVikingApply, http.MethodPost)
 	// 设备门禁开关(GET 读本机现值,POST 部分更新落库)。
 	register("/api/agent/peer/gates", h.Agent.HandlePeerGates, http.MethodGet, http.MethodPost)
 	register("/api/agent/ai/stream", h.Agent.HandleAIStream, http.MethodGet)

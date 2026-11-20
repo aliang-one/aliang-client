@@ -599,6 +599,11 @@ type CustomerConfig struct {
 	// SSHIngress 是 SSH 入口服务面(customer.ssh_ingress)。nil 时服务关闭——
 	// 默认关,升级零回退。与组网分支的 MeshConfig 为相邻行合并关系(双方尾部追加)。
 	SSHIngress *SSHIngressConfig `json:"ssh_ingress,omitempty"`
+	// OpenViking 是 OpenViking 跨设备记忆面(customer.openviking,Phase2 spec
+	// docs/superpowers/specs/2026-11-17-openviking-integration-phase2.md §6)。
+	// nil 时整层关——新增强化层显式开启才生效,升级零回退。门控 ensure 自注册
+	// (统一 MCP 注册表 + claude.json 双写 + codex 托管块)与后续 capture。
+	OpenViking *OpenVikingConfig `json:"openviking,omitempty"`
 }
 
 // CustomerGeoIPSettings 自定义 GeoIP 国家库下载源（customer.geoip）。
@@ -841,6 +846,75 @@ func (c *Config) EffectivePeerMCPCodexEnabled() bool {
 		return true
 	}
 	return c.effectivePeerMCPSub(c.Customer.PeerMCP.CodexEnabled)
+}
+
+// OpenVikingConfig 控制 OpenViking 跨设备记忆面(customer.openviking,Phase2
+// spec §6)。Enabled 默认关:与 peer_mcp(默认开)相反——OpenViking 是新增
+// 增强层,装了不等于要用,显式开启才接线;关闭=托管条目自动移除(spec §2
+// 干净卸载语义)。
+type OpenVikingConfig struct {
+	// Enabled 总开关:开启后 boot 自愈按 Mode 对齐三处(注册表/claude.json/
+	// codex 托管块)。
+	Enabled *bool `json:"enabled,omitempty"`
+	// Endpoint MCP 入口;空=平台默认。BYO 自带部署可覆盖。仅 http 形态。
+	Endpoint string `json:"endpoint,omitempty"`
+	// Mode "managed"(默认,凭据由云端铸 key 端点下发,密钥永不落配置)|
+	// "byo"(APIKey 用户自带)。
+	Mode string `json:"mode,omitempty"`
+	// APIKey 仅 byo 模式:用户自带 Bearer key。
+	APIKey string `json:"api_key,omitempty"`
+}
+
+const (
+	// OpenVikingDefaultEndpoint 平台默认 MCP 入口(spec §6;BYO 缺省回落)。
+	OpenVikingDefaultEndpoint = "https://openviking.aliang.xin/mcp"
+	// OpenVikingModeManaged 云端铸 key 托管模式;OpenVikingModeBYO 自带凭据。
+	OpenVikingModeManaged = "managed"
+	OpenVikingModeBYO     = "byo"
+)
+
+// effectiveOpenViking 返回启用态配置段;未启用(nil/Enabled 未设/显式关)
+// 返回 nil。
+func (c *Config) effectiveOpenViking() *OpenVikingConfig {
+	if c == nil || c.Customer == nil || c.Customer.OpenViking == nil {
+		return nil
+	}
+	if c.Customer.OpenViking.Enabled == nil || !*c.Customer.OpenViking.Enabled {
+		return nil
+	}
+	return c.Customer.OpenViking
+}
+
+// EffectiveOpenVikingEnabled OpenViking 跨设备记忆面总开关。默认关(nil=关),
+// 显式 enabled=true 才生效——方向与 peer_mcp 相反,理由见 OpenVikingConfig。
+func (c *Config) EffectiveOpenVikingEnabled() bool {
+	return c.effectiveOpenViking() != nil
+}
+
+// EffectiveOpenVikingEndpoint trim 后的 MCP 入口;未配置回落平台默认。
+func (c *Config) EffectiveOpenVikingEndpoint() string {
+	ov := c.effectiveOpenViking()
+	if ov == nil {
+		return ""
+	}
+	if ep := strings.TrimSpace(ov.Endpoint); ep != "" {
+		return ep
+	}
+	return OpenVikingDefaultEndpoint
+}
+
+// EffectiveOpenVikingMode 归一后的模式:"managed"(默认)|"byo"。未知值按
+// managed 走:managed 的凭据来自云端下发,不会把 mode 笔误当 byo 拿空 key
+// 出块。
+func (c *Config) EffectiveOpenVikingMode() string {
+	ov := c.effectiveOpenViking()
+	if ov == nil {
+		return OpenVikingModeManaged
+	}
+	if strings.EqualFold(strings.TrimSpace(ov.Mode), OpenVikingModeBYO) {
+		return OpenVikingModeBYO
+	}
+	return OpenVikingModeManaged
 }
 
 // MeshConfig 节点转发网(design docs/mesh-forwarding-network-design.md)。
