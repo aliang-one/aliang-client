@@ -8,40 +8,41 @@ package handlers
 import (
 	"io"
 	"mime"
-	"net"
 	"net/http"
-	"net/url"
 	"path/filepath"
 	"strings"
 
 	"aliang.one/nursorgate/app/http/common"
+	"aliang.one/nursorgate/app/http/middleware"
 	"aliang.one/nursorgate/app/http/services"
 )
 
-// guardAttachmentLoopbackOrigin 复刻 transfers D13 的本地入口加固：强制
-// loopback + 拒绝跨源 Origin（浏览器跨源 POST 恒带 Origin，text/plain 免
-// 预检的 CSRF 盲触发在此断掉；同源 GET 不带 Origin 不受影响）。
-func guardAttachmentLoopbackOrigin(w http.ResponseWriter, r *http.Request) bool {
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err != nil ||
-		(host != "127.0.0.1" && host != "::1") {
-		common.Error(w, common.CodeForbidden, "Loopback only", nil)
+// guardAttachmentOrigin 附件两端点鉴权（2026-11-21 审计拍板「对齐聊天 WS
+// 口径」+评审 should 修订：与 S1 同门同治「有效 dashboard session ∥ loopback
+// 来源」——旧 loopback 双闸把 LAN 浏览的图片收发整体 403（同页文字能聊、图
+// 片全裂）；首版「有 Origin 仅同源比对」被评审证伪：LAN 非浏览器伪造
+// Origin+Host 即可上传。统一门下：LAN 浏览器带 SameSite=Strict cookie 放行
+// （同站 <img> GET 照发 cookie）；伪造 Origin/无 cookie 的 LAN 进程 403；
+// 本机进程 loopback 豁免（既有「只在本机暴露」不变量）。ref 穿越守卫不变。
+func guardAttachmentOrigin(w http.ResponseWriter, r *http.Request) bool {
+	// ① 浏览器（同站请求恒带 SameSite=Strict cookie）：cookie 有效即放行——
+	//    LAN 同源页上传/取图不再裂；跨源恶意页带不上 Strict cookie → 到不了
+	//    ②（本机恶意页面的 CSRF 面一并覆盖，旧 CSRF 断言保留）。
+	if middleware.ValidateDashboardSession(r) {
+		return true
+	}
+	// ② 跨源 Origin 一律 403。
+	if r.Header.Get("Origin") != "" {
+		common.Error(w, common.CodeForbidden, "Cross-origin requests are not allowed", nil)
 		return false
 	}
-	if origin := r.Header.Get("Origin"); origin != "" {
-		u, err := url.Parse(origin)
-		if err != nil {
-			common.Error(w, common.CodeForbidden, "Invalid origin", nil)
-			return false
-		}
-		switch u.Hostname() {
-		case "127.0.0.1", "localhost", "::1":
-			// 本机仪表盘页面，放行
-		default:
-			common.Error(w, common.CodeForbidden, "Cross-origin requests are not allowed", nil)
-			return false
-		}
+	// ③ 无 Origin：loopback 放行（本机 TUI/透传腿「只在本机暴露」不变量），
+	//    非 loopback 403（LAN 非浏览器进程零鉴权面收回）。
+	if middleware.IsLoopbackRequest(r) {
+		return true
 	}
-	return true
+	common.Error(w, common.CodeForbidden, "Loopback only", nil)
+	return false
 }
 
 // HandleAttachmentUpload POST /api/agent/ai/attachment/upload——multipart：
@@ -52,7 +53,7 @@ func (h *AgentHandler) HandleAttachmentUpload(w http.ResponseWriter, r *http.Req
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
 		return
 	}
-	if !guardAttachmentLoopbackOrigin(w, r) {
+	if !guardAttachmentOrigin(w, r) {
 		return
 	}
 	if err := r.ParseMultipartForm(12 << 20); err != nil {
@@ -112,7 +113,7 @@ func (h *AgentHandler) HandleAttachmentGet(w http.ResponseWriter, r *http.Reques
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
 		return
 	}
-	if !guardAttachmentLoopbackOrigin(w, r) {
+	if !guardAttachmentOrigin(w, r) {
 		return
 	}
 	ref := strings.TrimSpace(r.URL.Query().Get("ref"))

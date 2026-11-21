@@ -44,6 +44,10 @@ var errAgentNotWebsocket = errors.New("agent did not upgrade to websocket")
 // 失败语义：完成浏览器侧 Upgrade 后发 close(1011, "device agent offline")——
 // 裸 Close 不发 close 帧，浏览器只会看到 1006，前端无法区分「设备不在线」。
 func proxyAIStream(w http.ResponseWriter, r *http.Request) {
+	// 浏览器 Cookie 原样捕获（评审 blocker 修订）：同用户单二进制部署下 core
+	// 与 agent 共享 session 存储，转发后 agent 侧握手门可验；分路径部署
+	// （daemon/user 异权）验不过走 loopback 豁免，不受影响。
+	browserCookie := r.Header.Get("Cookie")
 	// 与 aiStreamUpgrader 同源的真同源策略（2026-11-19 起，原 localhost-only
 	// 白名单把 LAN IP 浏览的每条对话 403 成假断线）：透传成功路径是手写 101、
 	// 不经 Upgrader，必须显式复检同一 aiStreamHostAllowed，否则策略放行的
@@ -64,7 +68,7 @@ func proxyAIStream(w http.ResponseWriter, r *http.Request) {
 	}
 	if err == nil {
 		var agentReader io.Reader
-		agentReader, err = handshakeAgent(agentConn, host, r.URL.RequestURI())
+		agentReader, err = handshakeAgent(agentConn, host, r.URL.RequestURI(), browserCookie)
 		if err != nil {
 			logger.Warn(fmt.Sprintf("ai stream proxy: agent %q websocket handshake failed: %v", host, err))
 		}
@@ -142,7 +146,7 @@ func completeBrowserHandshake(bw *bufio.ReadWriter, r *http.Request) error {
 // handshakeAgent 与 agent 侧独立完成 WS 握手（自造新 key；浏览器↔core 的握手
 // 由 completeBrowserHandshake 负责，core 只在 TCP 层架桥）。返回 agent 侧读取
 // 源——MultiReader 前置 bufio，握手期间已到的早期帧不丢。
-func handshakeAgent(conn net.Conn, host, requestURI string) (io.Reader, error) {
+func handshakeAgent(conn net.Conn, host, requestURI, browserCookie string) (io.Reader, error) {
 	key := make([]byte, 16)
 	if _, err := rand.Read(key); err != nil {
 		return nil, err
@@ -152,7 +156,11 @@ func handshakeAgent(conn net.Conn, host, requestURI string) (io.Reader, error) {
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
 		"Sec-WebSocket-Key: " + base64.StdEncoding.EncodeToString(key) + "\r\n" +
-		"Sec-WebSocket-Version: 13\r\n\r\n"
+		"Sec-WebSocket-Version: 13\r\n"
+	if browserCookie != "" {
+		req += "Cookie: " + browserCookie + "\r\n"
+	}
+	req += "\r\n"
 	if _, err := conn.Write([]byte(req)); err != nil {
 		return nil, err
 	}

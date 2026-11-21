@@ -258,6 +258,12 @@ function closeSubagentPanel() {
 function onSubagentPanelSelect(taskId) {
   subagentWatchingTaskId.value = taskId || null;
 }
+// D2（2026-11-21 审计四批拍板修）：面板开着切会话——面板展示旧会话的子代理
+// 内容、watchingTaskId 跨会话泄漏。切会话即收面板（open watch 的 else 分支
+// 顺带清 watching，复用同一收口）。
+watch(activeId, () => {
+  if (subagentPanelOpen.value) closeSubagentPanel();
+});
 watch(subagentPanelOpen, (open) => {
   if (open) {
     const sid = activeConversation.value?.aiSessionId || '';

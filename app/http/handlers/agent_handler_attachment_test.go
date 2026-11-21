@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"aliang.one/nursorgate/app/http/middleware"
 )
 
 func attachmentTestEnv(t *testing.T) string {
@@ -179,13 +181,26 @@ func TestHandleAttachmentGetGuards(t *testing.T) {
 		t.Fatalf("missing ref = %d", rr.Code)
 	}
 
-	// 非 loopback → 403
+	// 非 loopback 无 Origin 无 cookie GET → 403（统一门：无 session 的 LAN 进
+	// 程零鉴权读图面收回——ref 可预测不可裸奔；LAN 同源页带 session 放行，
+	// 见 TestAttachmentGetAllowsLANSameOrigin）
 	get = httptest.NewRequest(http.MethodGet, "/api/agent/ai/attachment?ref=s/a.png", nil)
 	get.RemoteAddr = "10.0.0.5:1234"
 	rr = httptest.NewRecorder()
 	h.HandleAttachmentGet(rr, get)
 	if rr.Code != http.StatusForbidden {
-		t.Fatalf("non-loopback get = %d", rr.Code)
+		t.Fatalf("LAN 无 Origin 无 cookie 取图应 403，got %d", rr.Code)
+	}
+
+	// 带 Origin 的跨源取图 → 仍 403（真同源闸）
+	get = httptest.NewRequest(http.MethodGet, "/api/agent/ai/attachment?ref=s/a.png", nil)
+	get.Header.Set("Origin", "http://evil.example")
+	get.Host = "192.168.1.50:56431"
+	get.RemoteAddr = "10.0.0.5:1234"
+	rr = httptest.NewRecorder()
+	h.HandleAttachmentGet(rr, get)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin get = %d", rr.Code)
 	}
 
 	// 跨源 GET → 403
@@ -196,5 +211,147 @@ func TestHandleAttachmentGetGuards(t *testing.T) {
 	h.HandleAttachmentGet(rr, get)
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("cross-origin get = %d", rr.Code)
+	}
+}
+
+// ===== LAN 同源口径（2026-11-21 审计拍板：附件对齐聊天 WS 真同源）=====
+// 旧口径 loopback+Origin 双闸把 LAN 浏览的图片收发整体 403（文字能聊、图片
+// 全裂）。新口径：有 Origin → 真同源（aiStreamHostAllowed 同判定）；无
+// Origin 的写语义保持 loopback 底线（非浏览器直写）；无 Origin 的读语义
+// （<img> 取图天然无 Origin）放行——ref 穿越守卫不变。
+
+func attachmentRequestWithOrigin(t *testing.T, method, rawURL, origin, remoteAddr string) *http.Request {
+	t.Helper()
+	req := httptest.NewRequest(method, rawURL, nil)
+	if origin != "" {
+		req.Header.Set("Origin", origin)
+	}
+	req.RemoteAddr = remoteAddr
+	return req
+}
+
+func mintDashboardCookie(t *testing.T) *http.Cookie {
+	t.Helper()
+	mint := httptest.NewRecorder()
+	mintReq := httptest.NewRequest(http.MethodPost, "/x", nil)
+	mintReq.RemoteAddr = "127.0.0.1:55555"
+	if err := middleware.IssueDashboardSession(mint, mintReq); err != nil {
+		t.Fatalf("签发 session: %v", err)
+	}
+	for _, c := range mint.Result().Cookies() {
+		if c.Name == middleware.DashboardSessionCookieName {
+			return c
+		}
+	}
+	t.Fatal("未签发 session cookie")
+	return nil
+}
+
+func TestAttachmentUploadAllowsLANSameOriginWithSession(t *testing.T) {
+	_ = attachmentTestEnv(t)
+	h := NewAgentHandler(nil)
+	// 统一门（评审 should 修订）：LAN 上传须持有效 dashboard session cookie
+	// （同站浏览器自动携带）；伪造 Origin 无 cookie 一律拒。
+	cookie := mintDashboardCookie(t)
+	upload := attachmentUploadRequest(t, "sess-lan", "lan.png", []byte("lan-bytes"))
+	upload.Header.Set("Origin", "http://192.168.1.50:56431")
+	upload.Host = "192.168.1.50:56431"
+	upload.RemoteAddr = "192.168.1.50:54321"
+	upload.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	h.HandleAttachmentUpload(rec, upload)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("LAN 同源带 session 上传应放行，got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 同形态无 cookie（LAN 伪造 Origin 的非浏览器进程）→ 拒（评审 should 坐实面）
+	upload2 := attachmentUploadRequest(t, "sess-lan2", "lan2.png", []byte("lan2"))
+	upload2.Header.Set("Origin", "http://192.168.1.50:56431")
+	upload2.Host = "192.168.1.50:56431"
+	upload2.RemoteAddr = "192.168.1.50:54321"
+	rec2 := httptest.NewRecorder()
+	h.HandleAttachmentUpload(rec2, upload2)
+	if rec2.Code == http.StatusOK {
+		t.Fatal("LAN 伪造 Origin 无 cookie 上传应拒")
+	}
+}
+
+func TestAttachmentGetAllowsLANSameOrigin(t *testing.T) {
+	root := attachmentTestEnv(t)
+	_ = root
+	h := NewAgentHandler(nil)
+	content := []byte("lan-img")
+	upload := attachmentUploadRequest(t, "sess-lan2", "img.png", content)
+	upload.Header.Set("Origin", "http://192.168.1.50:56431")
+	upload.Host = "192.168.1.50:56431"
+	upload.RemoteAddr = "192.168.1.50:54321"
+	upload.AddCookie(mintDashboardCookie(t))
+	rec := httptest.NewRecorder()
+	h.HandleAttachmentUpload(rec, upload)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("上传失败: %d", rec.Code)
+	}
+	var envelope struct {
+		Data struct {
+			Attachment struct {
+				Ref string `json:"ref"`
+			} `json:"attachment"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	ref := envelope.Data.Attachment.Ref
+
+	// LAN 取图：同站 <img> GET 照发 SameSite cookie——带 session 放行
+	get := httptest.NewRequest(http.MethodGet, "/api/agent/ai/attachment?ref="+url.QueryEscape(ref), nil)
+	get.Host = "192.168.1.50:56431"
+	get.RemoteAddr = "192.168.1.50:54321"
+	get.AddCookie(mintDashboardCookie(t))
+	rec2 := httptest.NewRecorder()
+	h.HandleAttachmentGet(rec2, get)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("LAN 带 session 取图应放行，got %d", rec2.Code)
+	}
+	if !bytes.Equal(rec2.Body.Bytes(), content) {
+		t.Fatal("内容不一致")
+	}
+
+	// 无 cookie 的 LAN GET（跨源 <img> 嵌入天然无 session）→ 拒（评审 should：
+	// 零鉴权读图面收回——ref 可预测不可裸奔）
+	get2 := httptest.NewRequest(http.MethodGet, "/api/agent/ai/attachment?ref="+url.QueryEscape(ref), nil)
+	get2.Host = "192.168.1.50:56431"
+	get2.RemoteAddr = "192.168.1.50:54321"
+	rec3 := httptest.NewRecorder()
+	h.HandleAttachmentGet(rec3, get2)
+	if rec3.Code == http.StatusOK {
+		t.Fatal("LAN 无 cookie 取图应拒")
+	}
+}
+
+func TestAttachmentUploadStillRejectsCrossOrigin(t *testing.T) {
+	_ = attachmentTestEnv(t)
+	h := NewAgentHandler(nil)
+	upload := attachmentUploadRequest(t, "sess-x", "x.png", []byte("x"))
+	upload.Header.Set("Origin", "http://evil.example")
+	upload.Host = "192.168.1.50:56431"
+	upload.RemoteAddr = "192.168.1.50:54321"
+	rec := httptest.NewRecorder()
+	h.HandleAttachmentUpload(rec, upload)
+	if rec.Code == http.StatusOK {
+		t.Fatal("跨源上传仍应拒绝")
+	}
+}
+
+func TestAttachmentUploadNoOriginNonLoopbackStillRejected(t *testing.T) {
+	_ = attachmentTestEnv(t)
+	h := NewAgentHandler(nil)
+	upload := attachmentUploadRequest(t, "sess-nb", "n.png", []byte("n"))
+	// 无 Origin（非浏览器直写）+ LAN 地址：写语义保持 loopback 底线
+	upload.RemoteAddr = "192.168.1.50:54321"
+	rec := httptest.NewRecorder()
+	h.HandleAttachmentUpload(rec, upload)
+	if rec.Code == http.StatusOK {
+		t.Fatal("无 Origin 非 loopback 上传仍应拒绝")
 	}
 }

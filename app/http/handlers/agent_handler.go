@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/http/common"
+	"aliang.one/nursorgate/app/http/middleware"
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/http/services"
 	"aliang.one/nursorgate/processor/config"
@@ -89,6 +90,21 @@ func aiStreamHostAllowed(r *http.Request) bool {
 // is written straight back over the same socket, giving the page a live,
 // token-by-token stream plus the running -> done status transitions.
 func (h *AgentHandler) HandleAIStream(w http.ResponseWriter, r *http.Request) {
+	// 握手鉴权双闸（2026-11-21 审计拍板「握手要登录态」+评审 blocker 修订）：
+	// 有效 dashboard session cookie ∥ loopback 来源。
+	// ① cookie 闸堵原威胁：Origin 同源闸只能拦浏览器跨站 CSRF，LAN 非浏览器
+	//    进程伪造 Origin+Host 但无有效 cookie → 401（审批面=命令执行，此前
+	//    dashboard 登录态完全不参与此通道）。cookie（SameSite=Strict）随同站
+	//    WS 握手自动携带。
+	// ② loopback 豁免覆盖：core→agent 透传腿恒 127.0.0.1（两进程 session 存
+	//    储分路径且内存隔离——runtimepath ResolveStateDir 按 daemon/user 分叉，
+	//    cookie 单向转发到 agent 不可验），本机 TUI 等既有「聊天面对非浏览器
+	//    客户端只在本机暴露」不变量。handshakeAgent 另行原样转发浏览器
+	//    Cookie（同用户单二进制部署两进程共享 session 存储时可验）。
+	if !middleware.ValidateDashboardSession(r) && !middleware.IsLoopbackRequest(r) {
+		middleware.RequireDashboardSession(w, r)
+		return
+	}
 	// 2026-10-28 统一：仪表盘聊天必须在 agent 进程跑（journal/统一清单与手机
 	// 同源）。core 角色一律 TCP 透传到 56433，绝不本地兜底——本地跑的会话进不
 	// 了任何记录（2026-10-27 liang-dev 事故）。

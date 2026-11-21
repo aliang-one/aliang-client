@@ -241,6 +241,55 @@ export function chatMdRenderInterval(contentLength) {
   return 80;
 }
 
+// 图片 src 白名单（2026-11-21 审计拍板「限同源」）：同源（相对路径/同 host
+// 绝对 URL）+ data:image 放行；其余（远程图）降级为可点击链接文本。旧实现
+// 放行任意远程 src——提示注入可让仪表盘零交互自动向第三方发追踪信标、URL
+// 拼会话敏感内容构成外传通道（IP/UA 泄露面）。降级而非删除：合法图示保留
+// 入口（点开才出网）。本机附件图走同源端点，不受影响。
+function isAllowedImageSrc(src) {
+  const t = String(src || '').trim();
+  if (!t) return false;
+  // 协议相对（//evil.com/pixel）是跨源请求（评审 blocker：两字符绕穿让信标
+  // 通道原样复活），显式拒绝后再放行同源根相对路径。
+  if (t.startsWith('//')) return false;
+  if (t.startsWith('/') || t.startsWith('#')) return true;
+  if (/^data:image\//i.test(t)) return true;
+  try {
+    if (typeof window === 'undefined' || !window.location) return false;
+    return new URL(t, window.location.href).origin === window.location.origin;
+  } catch (_) {
+    return false;
+  }
+}
+
+// 远程 <img> → <a>（alt 文本兜底）。二次 DOM 解析仅在消毒产物含 <img> 时
+// 发生（indexOf 廉价短路，纯文本/无图气泡零开销）；入参已是消毒后 HTML，
+// DOMParser 往返不引入未消毒内容。
+function demoteRemoteImages(html) {
+  if (!html.includes('<img')) return html;
+  let doc;
+  try {
+    doc = new DOMParser().parseFromString(html, 'text/html');
+  } catch (_) {
+    return html;
+  }
+  let changed = false;
+  doc.querySelectorAll('img').forEach((img) => {
+    const src = img.getAttribute('src') || '';
+    if (isAllowedImageSrc(src)) return;
+    const a = doc.createElement('a');
+    try {
+      a.setAttribute('href', src);
+      a.setAttribute('target', '_blank');
+      a.setAttribute('rel', 'noopener');
+    } catch (_) { /* 危险 src：DOMPurify 已剥，链接退化为纯文本 */ }
+    a.textContent = img.getAttribute('alt') || src || '[图片]';
+    img.replaceWith(a);
+    changed = true;
+  });
+  return changed ? doc.body.innerHTML : html;
+}
+
 // 渲染+消毒一步到位;任何异常回退为转义纯文本(流式半截内容永不白屏)。
 export function renderMarkdownSafe(src) {
   const input = normalizeCjkMarkdown(String(src ?? ''));
@@ -250,8 +299,9 @@ export function renderMarkdownSafe(src) {
   } catch (_) {
     html = md.utils.escapeHtml(input);
   }
-  return DOMPurify.sanitize(html, {
+  const safe = DOMPurify.sanitize(html, {
     ADD_ATTR: ['target', 'rel'],
     FORBID_TAGS: ['style', 'iframe', 'form'],
   });
+  return demoteRemoteImages(safe);
 }
