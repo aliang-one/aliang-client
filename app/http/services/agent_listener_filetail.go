@@ -95,8 +95,10 @@ func init() {
 	// Task 8 生命周期钩子接线(选择 init() 显式接线而非声明处初始化:自动生效、
 	// 无 boot 依赖,Task 10 只需调 StartEventListenerWatchers;测试 swap 后还原
 	// 即回到本接线)。语义见 syncListenerWatcherForMirror / stopListenerWatcher。
+	// 1b:upsert 路由内含 process_exit 分发;remove 停双注册表
+	// (stopAnyListenerWatcher,id 源类型无关)。
 	listenerUpsertHook = syncListenerWatcherForMirror
-	listenerRemoveHook = func(id string) { stopListenerWatcher(id) }
+	listenerRemoveHook = func(id string) { stopAnyListenerWatcher(id) }
 	listenerLocalDeviceID = func() string {
 		svc := GetSharedAgentService()
 		if svc == nil {
@@ -123,14 +125,24 @@ var (
 // StartEventListenerWatchers 遍历本地镜像,为每个有效且 active 的
 // file_tail 行启动 watcher(幂等:已在跑的 id 跳过;非 active/无效行跳过,
 // 在跑的停止)。boot(Task 10)与测试的统一入口。
+//
+// 1b 起 process_exit 行走独立处置:boot 发现 = agent 重启后发现的「重启前
+// 在跑」行,不重建 watcher、本地置 error(agent_restarted,spec §3 重启风暴
+// 防线);live 注册经 upsert 钩子照常 spawn——语义与实现在
+// agent_listener_processexit.go(markListenerProcessExitRestartedAtBoot)。
 func StartEventListenerWatchers() {
 	for _, m := range listListenerMirrors() {
+		if m.SourceType == listenerSourceTypeProcessExit {
+			markListenerProcessExitRestartedAtBoot(m)
+			continue
+		}
 		syncListenerWatcherForMirror(m)
 	}
 }
 
 // StopEventListenerWatchers 停止全部在跑 watcher 并清空注册表(幂等)。
-// 测试助手 + Task 10 boot 复用(全量拉取前清场)。
+// 测试助手 + Task 10 boot 复用(全量拉取前清场)。1b 起覆盖双注册表
+// (file_tail + process_exit)。
 func StopEventListenerWatchers() {
 	listenerWatcherMu.Lock()
 	ids := make([]string, 0, len(listenerWatchers))
@@ -138,14 +150,26 @@ func StopEventListenerWatchers() {
 		ids = append(ids, id)
 	}
 	listenerWatcherMu.Unlock()
+	listenerProcExitMu.Lock()
+	pids := make([]string, 0, len(listenerProcExitWatchers))
+	for id := range listenerProcExitWatchers {
+		pids = append(pids, id)
+	}
+	listenerProcExitMu.Unlock()
 	for _, id := range ids {
 		stopListenerWatcher(id)
+	}
+	for _, id := range pids {
+		stopProcessExitWatcher(id)
 	}
 }
 
 // syncListenerWatcherForMirror 单行镜像 → watcher 生命周期(Task 8
 // listenerUpsertHook 的真身)。规则:
-//   - 非 file_tail 行(source_type 变更)→ 停在跑 watcher(幂等);
+//   - process_exit 行(1b)→ 转发 process_exit 管理器(独立注册表,语义见
+//     agent_listener_processexit.go);
+//   - 其余非 file_tail 行(http_poll/webhook = server 侧源)→ 停本地旧
+//     watcher(幂等;双注册表——source_type 自 process_exit 漂移而来的收敛);
 //   - 无效行(空 id/updated_at/path/match)→ Warn 跳过;在跑旧 watcher 一并停
 //     (镜像已换新参数,旧 watcher 依据已失效);
 //   - status 非 active(paused/fired/expired/error)→ 不起;在跑则停
@@ -156,8 +180,12 @@ func StopEventListenerWatchers() {
 // 「变更」判定对 watcher 管理器自己在册的启动参数做 diff(Task 8 评审注记①:
 // 钩子只收新镜像,不反推旧镜像)。
 func syncListenerWatcherForMirror(m ListenerMirror) {
+	if m.SourceType == listenerSourceTypeProcessExit {
+		syncProcessExitWatcherForMirror(m)
+		return
+	}
 	if m.SourceType != "file_tail" {
-		stopListenerWatcher(m.ID)
+		stopAnyListenerWatcher(m.ID)
 		return
 	}
 	// 跨设备行不入本地 watch;镜像仍保留(供本机 UI 展示)。file_tail 的
@@ -169,17 +197,17 @@ func syncListenerWatcherForMirror(m ListenerMirror) {
 	if localID := listenerLocalDeviceID(); m.SourceDeviceID != localID {
 		logger.Debug(fmt.Sprintf("[AGENT-LISTENER] file_tail 行属设备 %q(本机 %q),不入本地 watch id=%s",
 			m.SourceDeviceID, localID, m.ID))
-		stopListenerWatcher(m.ID)
+		stopAnyListenerWatcher(m.ID)
 		return
 	}
 	path, match, maxBytes, ok := parseFileTailParams(m)
 	if !ok {
 		logger.Warn(fmt.Sprintf("[AGENT-LISTENER] file_tail 行无效,跳过 watcher(id=%s updated_at=%q 需非空 id/updated_at/path/match)", m.ID, m.UpdatedAt))
-		stopListenerWatcher(m.ID)
+		stopAnyListenerWatcher(m.ID)
 		return
 	}
 	if m.Status != "active" {
-		stopListenerWatcher(m.ID)
+		stopAnyListenerWatcher(m.ID)
 		return
 	}
 	listenerWatcherMu.Lock()
@@ -195,6 +223,9 @@ func syncListenerWatcherForMirror(m ListenerMirror) {
 	if running {
 		stopListenerWatcher(m.ID)
 	}
+	// 对侧注册表残留收敛(source_type 自 process_exit 漂移而来的常态 no-op;
+	// 同 id 双注册表并存是非法态)。
+	stopProcessExitWatcher(m.ID)
 	startListenerWatcher(m.ID, path, match, maxBytes)
 }
 
@@ -882,13 +913,13 @@ func handleListenerEventRejectFrame(msg map[string]interface{}) {
 	permanent := remoteBool(msg, "permanent", false)
 	switch note {
 	case "fired", "expired":
-		stopListenerWatcher(id)
+		stopAnyListenerWatcher(id)
 		mutateListenerMirrorLocal(id, func(m *ListenerMirror) {
 			m.Status = note
 		})
 		logger.Info(fmt.Sprintf("[AGENT-LISTENER] reject(note=%s) watcher 终态停止 id=%s", note, id))
 	case "deleted", "paused":
-		stopListenerWatcher(id)
+		stopAnyListenerWatcher(id)
 		logger.Info(fmt.Sprintf("[AGENT-LISTENER] reject(note=%s) watcher 停止(不计数) id=%s", note, id))
 	case "device_unregistered":
 		if !remoteBool(msg, "counted", false) {
@@ -905,7 +936,7 @@ func handleListenerEventRejectFrame(msg map[string]interface{}) {
 			}
 		})
 		if reachedLimit {
-			stopListenerWatcher(id)
+			stopAnyListenerWatcher(id)
 			logger.Warn(fmt.Sprintf("[AGENT-LISTENER] reject 计数达 %d 上限,本地置 error 停 watcher id=%s", listenerRejectLimit, id))
 			return
 		}
