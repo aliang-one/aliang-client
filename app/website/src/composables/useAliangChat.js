@@ -89,7 +89,8 @@ import { applySubagentEvent, hasActiveSubagents } from '../utils/subagentPanel';
 
 const STORAGE_KEY = 'aliang-chat-data';
 
-// 重连预算的归零帧型（模块级常量）：只认「run 数据面」帧——纯订阅握手快照
+// 重连预算的归零帧型（模块级常量）：只认「run 数据面 + 真实推帧广播」（listener.triggered
+// 是触发瞬时的账号级广播，非重连重放，计入）——纯订阅握手快照
 // 不算（防「连上→回一帧快照→立刻断」的代理假活环境把预算洗白成无限重连）。
 const AGENT_AI_RECONNECT_RESET_TYPES = new Set([
   'ai.session.created', 'ai.run.started', 'ai.delta', 'ai.status', 'ai.run.progress',
@@ -101,6 +102,8 @@ const AGENT_AI_RECONNECT_RESET_TYPES = new Set([
   // 子agent活动也是 run 数据面（spec 2026-11-07-subagent-panel §三）：回合主体静默、
   // 子agent干活期间帧流不断——收到即证明管道活，重连预算随之归零（有利副作用）。
   'ai.subagent',
+  // 监听器命中帧（Task 17）：账号级广播同为真实服务端推帧——证明管道活。
+  'listener.triggered',
 ]);
 
 // 无活动看门狗阈值：模块顶层读取（E2E 经 window.__CHAT_IDLE_TIMEOUT_MS__
@@ -973,6 +976,27 @@ export function resolveToolAskCard(conv, event, handledToolAskIds, resolvedAt) {
   card.error = '';
   card.updatedAt = resolvedAt;
   handledToolAskIds.add(key);
+  return true;
+}
+
+// 监听器命中帧消费（specs/005-event-listener §2/Task 17，模块级导出供单测
+// 注入，resolveToolAskCard 同范式）：listener.triggered 是账号级广播 best-effort
+// 展示帧（无回执），载荷 {listener_id, title, summary}。①轻通知：仓内无全局
+// toast 系统（useErrorDialog 明示成功类反馈不入其通道），取本文件既有
+// 「背景事实→转录系统条」通道（ai.run.notice 同款）；②窗事件
+// listener-panel-refresh（aliang:tun-progress-* 同惯例）驱动面板实时刷新。
+// 畸形帧（缺 listener_id）静默丢弃：无 id 无法联动面板，且广播面无回执可纠。
+export function handleListenerTriggeredEvent(e, ctx) {
+  const listenerId = typeof e?.listener_id === 'string' ? e.listener_id.trim() : '';
+  if (!listenerId) return false;
+  const title = (typeof e?.title === 'string' && e.title.trim()) || listenerId;
+  const summary = typeof e?.summary === 'string' ? e.summary : '';
+  if (typeof ctx?.pushSystemNote === 'function') {
+    ctx.pushSystemNote(typeof ctx.t === 'function' ? ctx.t('listener_triggeredToast', { title }) : title);
+  }
+  if (typeof ctx?.dispatchDetail === 'function') {
+    ctx.dispatchDetail({ listener_id: listenerId, title, summary });
+  }
   return true;
 }
 
@@ -3071,6 +3095,31 @@ export function useAliangChat() {
         // 归因就不误清任何桶，只放行重试旗标——下次打开面板按需重发，幂等。
         for (const key of Object.keys(slashPending)) slashPending[key] = false;
       }
+      return;
+    }
+
+    // 监听器命中帧（specs/005-event-listener §2/Task 17）：账号级广播展示帧，
+    // 不挂会话——早退消费（防 fallback 链挂上活跃会话）；逻辑在纯函数
+    // handleListenerTriggeredEvent（单测在彼）：轻通知落活跃会话转录 + 窗事件
+    // 驱动 ListenerSettings 面板实时刷新。
+    if (e.type === 'listener.triggered') {
+      handleListenerTriggeredEvent(e, {
+        t,
+        pushSystemNote: (text) => {
+          const conv = activeConversation.value;
+          if (!conv) return;
+          conv.messages.push({
+            role: 'assistant', kind: 'system', note: 'listener_triggered',
+            content: text, status: 'done', ts: now(),
+          });
+          scrollToBottom();
+          saveToStorage();
+        },
+        dispatchDetail: (detail) => {
+          if (typeof window === 'undefined') return;
+          window.dispatchEvent(new CustomEvent('listener-panel-refresh', { detail }));
+        },
+      });
       return;
     }
 

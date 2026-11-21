@@ -218,3 +218,49 @@ export async function saveRoutingConfig(payload) {
     body: JSON.stringify(payload),
   });
 }
+
+// —— 事件监听器(specs/005-event-listener):agent 本地 REST 代理 /api/listeners,
+// C1 评审定案=代理信封化转发——2xx 走 common.Success 重裹 {code:0,msg,data}
+// (data=云端对象,201/204 拍平 200),非 2xx 保留云端状态码且 msg 携带云端
+// error/detail 文案(I1:业务错误在浏览器是可读的 thrown Error),离线=502
+// {code:"listener_cloud_offline"}(msg 带哨兵前缀)。request() 抛出的 Error
+// 只带 envelope.msg(不带 code)——离线判定用 utils/listenerFormat 的
+// isListenerCloudOffline,勿在此做错误映射。返回值在此处解包到消费面直取
+// 的形状(list/listener/events),调用方不再碰信封。──
+export { LISTENER_CLOUD_OFFLINE } from '../utils/listenerFormat';
+
+// → listeners 数组(云端 {listeners:[…]} 经代理落进 data;FR-11 归一后
+//   缺键/非数组在此兜 [])。
+export async function getListeners() {
+  const data = await request('/api/listeners', { method: 'GET' });
+  return Array.isArray(data?.listeners) ? data.listeners : [];
+}
+
+// → 云端回传的 listener 对象(缺省 null)。
+export async function listenerCreate(payload) {
+  const data = await request('/api/listeners', {
+    method: 'POST',
+    body: JSON.stringify(payload || {}),
+  });
+  return data?.listener ?? null;
+}
+
+// → 云端回传的 listener 对象(缺省 null;复活撞 LWW 时这里 throw 可读错误)。
+export async function listenerPatch(id, payload) {
+  const data = await request(`/api/listeners/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload || {}),
+  });
+  return data?.listener ?? null;
+}
+
+// → 直通 data(云端 DELETE 回空对象,无消费字段)。
+export async function listenerDelete(id) {
+  return request(`/api/listeners/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+// → events 数组(最近 20 条由面板再截;缺键/非数组兜 [])。
+export async function getListenerEvents(id) {
+  const data = await request(`/api/listeners/${encodeURIComponent(id)}/events`, { method: 'GET' });
+  return Array.isArray(data?.events) ? data.events : [];
+}
