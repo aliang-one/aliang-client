@@ -119,7 +119,18 @@ type agentRaceProbe struct {
 	ttfbMs int64 // -1 = 探败
 }
 
-var agentRaceClient = &http.Client{Timeout: time.Duration(agentRaceProbeTimeoutMs) * time.Millisecond}
+// agentRaceNewClient 每次探测新建 client:DisableKeepAlives 强制每样本走全新
+// TCP+TLS 握手(与网页端全握手探测同语义,避免样本2复用连接偏乐观);
+// CheckRedirect 禁跟随(3xx 计探败,不给重定向目标投票)。
+func agentRaceNewClient() *http.Client {
+	return &http.Client{
+		Timeout: time.Duration(agentRaceProbeTimeoutMs) * time.Millisecond,
+		Transport: &http.Transport{DisableKeepAlives: true},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
 
 // probeAgentServer 对候选基址做真实 GET {base}/healthz,samples 次串行取非空均值;
 // 全败返回 -1。样本=开始→响应首字节(DNS/TCP/TLS/服务端一竿到底)。
@@ -127,16 +138,19 @@ func probeAgentServer(base string, samples int) int64 {
 	if samples <= 0 {
 		samples = agentRaceSamples
 	}
+	client := agentRaceNewClient()
 	var total, hits int64
 	for i := 0; i < samples; i++ {
 		start := time.Now()
-		resp, err := agentRaceClient.Get(strings.TrimRight(base, "/") + agentRaceProbePath)
+		resp, err := client.Get(strings.TrimRight(base, "/") + agentRaceProbePath)
 		if err != nil {
 			continue
 		}
 		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-		if resp.StatusCode < 200 || resp.StatusCode >= 500 {
+		// 只认 2xx:3xx(重定向被禁跟随)/4xx(停放页/误配 404)一律探败,
+		// 防止把流量选到不能服务 /api 的主机(审计 #10)。
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			continue
 		}
 		total += time.Since(start).Milliseconds()
@@ -154,7 +168,10 @@ func StartAgentServerRacer() {
 	go agentServerRaceLoop()
 }
 
-var agentServerRaceOnce sync.Once
+var (
+	agentServerRaceOnce         sync.Once
+	agentServerDisabledLogged   atomic.Bool
+)
 
 // StartAgentServerRacerOnce 进程级幂等入口(NewAgentService 装配调用)。
 func StartAgentServerRacerOnce() {
@@ -168,9 +185,19 @@ func agentServerRaceLoop() {
 		cfg := GetGlobalConfig()
 		candidates := cfg.AgentServerCandidates()
 		if len(candidates) < 2 {
+			// 停摆态也必须清 stale override(审计 #2):运维删数组回退单通道后,
+			// 旧胜者若不清,AgentBaseURL 永远指旧地址,配置改动零生效。
+			if stale := AgentServerOverride(); stale != "" {
+				SetAgentServerOverride("")
+				logger.Info(fmt.Sprintf("[AGENT-SERVER-RACE] disabled (candidates<2), cleared stale override=%s", stale))
+			} else if !agentServerDisabledLogged.Swap(false) {
+				logger.Info("[AGENT-SERVER-RACE] disabled (candidates<2), racing off")
+			}
+			agentServerDisabledLogged.Store(true)
 			time.Sleep(30 * time.Second)
 			continue
 		}
+		agentServerDisabledLogged.Store(false)
 		incumbent := AgentServerOverride()
 		if incumbent == "" {
 			// 首轮:现任=配置实际基座(AgentBaseURL 在 override 为空时返回配置
@@ -179,10 +206,18 @@ func agentServerRaceLoop() {
 			// (liang-dev 首轮 kept)导致胜者永不落 override、流量原地踏步。
 			incumbent = cfg.AgentBaseURL()
 		}
-		probes := make([]agentRaceProbe, 0, len(candidates))
-		for _, base := range candidates {
-			probes = append(probes, agentRaceProbe{base: base, ttfbMs: probeAgentServer(base, agentRaceSamples)})
+		// 并行探测(与网页端 Promise.all 同语义;串行时单个黑洞候选拖满
+		// 6s×N 会把整轮拖到数十秒——审计 #12)。
+		probes := make([]agentRaceProbe, len(candidates))
+		var wg sync.WaitGroup
+		for i, base := range candidates {
+			wg.Add(1)
+			go func(i int, base string) {
+				defer wg.Done()
+				probes[i] = agentRaceProbe{base: base, ttfbMs: probeAgentServer(base, agentRaceSamples)}
+			}(i, base)
 		}
+		wg.Wait()
 		winner := pickAgentServer(probes, incumbent)
 		ttfbLog := make([]string, 0, len(probes))
 		for _, p := range probes {

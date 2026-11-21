@@ -2007,6 +2007,14 @@ func (c *Config) AgentBaseURL() string {
 		if server := strings.TrimSpace(c.Core.AliangServer.AgentServer); server != "" {
 			return strings.TrimRight(server, "/")
 		}
+		// 数组-only 配置回落首候选(审计 #1):否则 AgentBaseURL 落到
+		// DefaultAgentServerURL(localhost:4000),全败轮的「粘滞」粘的是
+		// 一个不在候选表里的死地址。
+		for _, s := range c.Core.AliangServer.AgentServers {
+			if s = strings.TrimSpace(s); s != "" {
+				return strings.TrimRight(s, "/")
+			}
+		}
 	}
 	return DefaultAgentServerURL
 }
