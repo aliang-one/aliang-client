@@ -86,6 +86,13 @@ func StartLocalServer() error {
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] local_server listening url=http://%s routes_registered=true", config.DefaultUserAgentAddr))
 	services.StartUsageTrackerRuntime()
 	services.StartAgentRegistrationKeepalive()
+	// listener 镜像与 watcher 归 WS 持有进程(user-agent);cmd 侧不接——
+	// 分裂身份/共享 home 拓扑下双进程共写 offset 文件会丢事件(Task 10 评审
+	// C1 定案)。先镜像后 watcher(1b8c36b 教训);拉取失败 Warn 降级回落
+	// 本地文件,不阻断启动;cmd/boot_wiring_audit_test.go 的
+	// TestListenerWiringAudit 拦 exactly-once。
+	services.LoadListenerMirror()
+	services.StartEventListenerWatchers()
 	services.WarmAgentAuthorizedExecutionDirectories()
 	// aliang-peer 注册自愈:按 customer.peer_mcp 对齐内核配置文件(开=确保
 	// 注册且 command 最新;关=确保注销)。只 Warn 不阻断启动;应用细节见
@@ -164,6 +171,15 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/agent/ai/mcp/start", agentHandler.HandleAIMCPStart)
 	mux.HandleFunc("POST /api/agent/ai/mcp/status", agentHandler.HandleAIMCPStatus)
 	mux.HandleFunc("POST /api/agent/ai/mcp/approve", agentHandler.HandleAIMCPApprove)
+	// 监听器 stdio MCP 面四端点(监听器批 plan Task 13,spec §5):`aliang mcp`
+	// 的 listener_* 工具照 ai_run_* 同款经本地路由到本 runtime,再复用 Task 12
+	// 共享处理器——云端凭据住本进程,冷子进程直调恒失败。双注册纪律:core 侧
+	// routes.go 同名注册只做 proxy 透传(proxyIfNeeded),缺任一侧=404
+	// (2026-10-21 教训,ai_run_* 同族)。
+	mux.HandleFunc("POST /api/agent/listeners/mcp/create", agentHandler.HandleListenerMCPCreate)
+	mux.HandleFunc("POST /api/agent/listeners/mcp/list", agentHandler.HandleListenerMCPList)
+	mux.HandleFunc("POST /api/agent/listeners/mcp/update", agentHandler.HandleListenerMCPUpdate)
+	mux.HandleFunc("POST /api/agent/listeners/mcp/delete", agentHandler.HandleListenerMCPDelete)
 	// 仪表盘聊天 WS（2026-10-28 统一）：core 把 /api/agent/ai/stream 透传到本
 	// runtime，由本地 AI 管理器跑（journal/清单与手机同源）。缺注册=404 透传
 	// （2026-10-21 liang-dev 双注册教训）。
