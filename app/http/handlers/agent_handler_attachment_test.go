@@ -179,13 +179,25 @@ func TestHandleAttachmentGetGuards(t *testing.T) {
 		t.Fatalf("missing ref = %d", rr.Code)
 	}
 
-	// 非 loopback → 403
+	// 非 loopback 无 Origin GET → 200（2026-11-21 拍板：取图对齐真同源口径，
+	// <img> 天然无 Origin，LAN 页图片不再裂；ref 穿越守卫上面已单测）
 	get = httptest.NewRequest(http.MethodGet, "/api/agent/ai/attachment?ref=s/a.png", nil)
 	get.RemoteAddr = "10.0.0.5:1234"
 	rr = httptest.NewRecorder()
 	h.HandleAttachmentGet(rr, get)
+	if rr.Code == http.StatusForbidden {
+		t.Fatalf("LAN 无 Origin 取图不应 403（拍板新口径），got %d", rr.Code)
+	}
+
+	// 带 Origin 的跨源取图 → 仍 403（真同源闸）
+	get = httptest.NewRequest(http.MethodGet, "/api/agent/ai/attachment?ref=s/a.png", nil)
+	get.Header.Set("Origin", "http://evil.example")
+	get.Host = "192.168.1.50:56431"
+	get.RemoteAddr = "10.0.0.5:1234"
+	rr = httptest.NewRecorder()
+	h.HandleAttachmentGet(rr, get)
 	if rr.Code != http.StatusForbidden {
-		t.Fatalf("non-loopback get = %d", rr.Code)
+		t.Fatalf("cross-origin get = %d", rr.Code)
 	}
 
 	// 跨源 GET → 403
@@ -196,5 +208,103 @@ func TestHandleAttachmentGetGuards(t *testing.T) {
 	h.HandleAttachmentGet(rr, get)
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("cross-origin get = %d", rr.Code)
+	}
+}
+
+// ===== LAN 同源口径（2026-11-21 审计拍板：附件对齐聊天 WS 真同源）=====
+// 旧口径 loopback+Origin 双闸把 LAN 浏览的图片收发整体 403（文字能聊、图片
+// 全裂）。新口径：有 Origin → 真同源（aiStreamHostAllowed 同判定）；无
+// Origin 的写语义保持 loopback 底线（非浏览器直写）；无 Origin 的读语义
+// （<img> 取图天然无 Origin）放行——ref 穿越守卫不变。
+
+func attachmentRequestWithOrigin(t *testing.T, method, rawURL, origin, remoteAddr string) *http.Request {
+	t.Helper()
+	req := httptest.NewRequest(method, rawURL, nil)
+	if origin != "" {
+		req.Header.Set("Origin", origin)
+	}
+	req.RemoteAddr = remoteAddr
+	return req
+}
+
+func TestAttachmentUploadAllowsLANSameOrigin(t *testing.T) {
+	_ = attachmentTestEnv(t)
+	h := NewAgentHandler(nil)
+	upload := attachmentUploadRequest(t, "sess-lan", "lan.png", []byte("lan-bytes"))
+	// attachmentUploadRequest 默认 Origin 空 + 回环地址——改造成 LAN 同源形态
+	upload.Header.Set("Origin", "http://192.168.1.50:56431")
+	upload.Host = "192.168.1.50:56431"
+	upload.RemoteAddr = "192.168.1.50:54321"
+	rec := httptest.NewRecorder()
+	h.HandleAttachmentUpload(rec, upload)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("LAN 同源上传应放行，got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAttachmentGetAllowsLANSameOrigin(t *testing.T) {
+	root := attachmentTestEnv(t)
+	_ = root
+	h := NewAgentHandler(nil)
+	content := []byte("lan-img")
+	upload := attachmentUploadRequest(t, "sess-lan2", "img.png", content)
+	upload.Header.Set("Origin", "http://192.168.1.50:56431")
+	upload.Host = "192.168.1.50:56431"
+	upload.RemoteAddr = "192.168.1.50:54321"
+	rec := httptest.NewRecorder()
+	h.HandleAttachmentUpload(rec, upload)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("上传失败: %d", rec.Code)
+	}
+	var envelope struct {
+		Data struct {
+			Attachment struct {
+				Ref string `json:"ref"`
+			} `json:"attachment"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	ref := envelope.Data.Attachment.Ref
+
+	// LAN 取图：<img> 无 Origin 头、RemoteAddr 为 LAN IP——放行（ref 守卫不变）
+	get := httptest.NewRequest(http.MethodGet, "/api/agent/ai/attachment?ref="+url.QueryEscape(ref), nil)
+	get.Host = "192.168.1.50:56431"
+	get.RemoteAddr = "192.168.1.50:54321"
+	rec2 := httptest.NewRecorder()
+	h.HandleAttachmentGet(rec2, get)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("LAN 取图应放行，got %d", rec2.Code)
+	}
+	if !bytes.Equal(rec2.Body.Bytes(), content) {
+		t.Fatal("内容不一致")
+	}
+}
+
+func TestAttachmentUploadStillRejectsCrossOrigin(t *testing.T) {
+	_ = attachmentTestEnv(t)
+	h := NewAgentHandler(nil)
+	upload := attachmentUploadRequest(t, "sess-x", "x.png", []byte("x"))
+	upload.Header.Set("Origin", "http://evil.example")
+	upload.Host = "192.168.1.50:56431"
+	upload.RemoteAddr = "192.168.1.50:54321"
+	rec := httptest.NewRecorder()
+	h.HandleAttachmentUpload(rec, upload)
+	if rec.Code == http.StatusOK {
+		t.Fatal("跨源上传仍应拒绝")
+	}
+}
+
+func TestAttachmentUploadNoOriginNonLoopbackStillRejected(t *testing.T) {
+	_ = attachmentTestEnv(t)
+	h := NewAgentHandler(nil)
+	upload := attachmentUploadRequest(t, "sess-nb", "n.png", []byte("n"))
+	// 无 Origin（非浏览器直写）+ LAN 地址：写语义保持 loopback 底线
+	upload.RemoteAddr = "192.168.1.50:54321"
+	rec := httptest.NewRecorder()
+	h.HandleAttachmentUpload(rec, upload)
+	if rec.Code == http.StatusOK {
+		t.Fatal("无 Origin 非 loopback 上传仍应拒绝")
 	}
 }

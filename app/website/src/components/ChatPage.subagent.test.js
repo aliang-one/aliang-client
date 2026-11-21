@@ -6,6 +6,7 @@ import { beforeEach, describe, it, expect, vi } from 'vitest';
 
 vi.mock('../composables/useAliangChat', async () => {
   const { ref } = await import('vue');
+  const activeId = ref('dev1');
   const activeConversation = ref({
     id: 'dev1',
     name: '测试会话',
@@ -23,7 +24,7 @@ vi.mock('../composables/useAliangChat', async () => {
     useAliangChat: () => ({
       activeApprovals: ref([]),
       activeConversation,
-      activeId: ref('dev1'),
+      activeId,
       activeIsDevice: ref(true),
       activeMessages: ref([]),
       activeOptionCards: ref([]),
@@ -97,7 +98,7 @@ vi.mock('../composables/useAliangChat', async () => {
       subagentWatchingTaskId,
       refetchSubagentsForSession: refetchSpy,
     }),
-    __test: { subagentWatchingTaskId, refetchSpy, activeConversation },
+    __test: { subagentWatchingTaskId, refetchSpy, activeConversation, activeId },
   };
 });
 // 重组件桩化：本测试只关心子agent链路接线，其余聊天子树不装配。
@@ -179,5 +180,21 @@ describe('ChatPage 子agent面板接线（Task 8 / M1）', () => {
     el.querySelector('button[data-testid="chat-subagent-entry"]').click();
     await nextTick();
     expect(el.querySelector('[data-testid="chat-subagent-panel"]')).toBeTruthy();
+  });
+
+  // D2（2026-11-21 审计四批拍板修）：面板开着切会话——面板显示旧会话的子
+  // 代理内容、watchingTaskId 跨会话泄漏。修法：切会话即收面板。
+  it('面板开着切换会话：面板收起、watching 清空', async () => {
+    const { el } = await mountPage();
+    el.querySelector('button[data-testid="chat-subagent-entry"]').click();
+    await nextTick();
+    expect(el.querySelector('[data-testid="chat-subagent-panel"]')).toBeTruthy();
+    expect(__test.subagentWatchingTaskId.value).toBe('ta_1');
+    // 切会话（mock 的 activeId 是 ChatPage 消费的同一 ref）
+    __test.activeId.value = 'dev2';
+    await nextTick();
+    await nextTick();
+    expect(el.querySelector('[data-testid="chat-subagent-panel"]')).toBeNull();
+    expect(__test.subagentWatchingTaskId.value).toBeNull();
   });
 });

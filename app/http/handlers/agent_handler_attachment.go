@@ -10,7 +10,6 @@ import (
 	"mime"
 	"net"
 	"net/http"
-	"net/url"
 	"path/filepath"
 	"strings"
 
@@ -18,26 +17,26 @@ import (
 	"aliang.one/nursorgate/app/http/services"
 )
 
-// guardAttachmentLoopbackOrigin 复刻 transfers D13 的本地入口加固：强制
-// loopback + 拒绝跨源 Origin（浏览器跨源 POST 恒带 Origin，text/plain 免
-// 预检的 CSRF 盲触发在此断掉；同源 GET 不带 Origin 不受影响）。
-func guardAttachmentLoopbackOrigin(w http.ResponseWriter, r *http.Request) bool {
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err != nil ||
-		(host != "127.0.0.1" && host != "::1") {
-		common.Error(w, common.CodeForbidden, "Loopback only", nil)
-		return false
-	}
-	if origin := r.Header.Get("Origin"); origin != "" {
-		u, err := url.Parse(origin)
-		if err != nil {
-			common.Error(w, common.CodeForbidden, "Invalid origin", nil)
+// guardAttachmentOrigin 附件两端点的同源口径（2026-11-21 审计拍板：对齐聊
+// 天 WS 真同源——旧 loopback+Origin 双闸把 LAN 浏览的图片收发整体 403，同页
+// 「文字能聊、图片全裂」分叉）：
+//   - 有 Origin（浏览器）：真同源判定（aiStreamHostAllowed 同款，Origin.Host
+//     == r.Host 精确比较）——LAN 同源页放行，跨源断掉；
+//   - 无 Origin：写语义（POST 等）保持 loopback 底线（非浏览器直写）；读语义
+//     （<img> 取图天然无 Origin）放行——LAN 页的图不再裂，ref 穿越守卫不变。
+func guardAttachmentOrigin(w http.ResponseWriter, r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin != "" {
+		if !aiStreamHostAllowed(r) {
+			common.Error(w, common.CodeForbidden, "Cross-origin requests are not allowed", nil)
 			return false
 		}
-		switch u.Hostname() {
-		case "127.0.0.1", "localhost", "::1":
-			// 本机仪表盘页面，放行
-		default:
-			common.Error(w, common.CodeForbidden, "Cross-origin requests are not allowed", nil)
+		return true
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		if host, _, err := net.SplitHostPort(r.RemoteAddr); err != nil ||
+			(host != "127.0.0.1" && host != "::1") {
+			common.Error(w, common.CodeForbidden, "Loopback only", nil)
 			return false
 		}
 	}
@@ -52,7 +51,7 @@ func (h *AgentHandler) HandleAttachmentUpload(w http.ResponseWriter, r *http.Req
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
 		return
 	}
-	if !guardAttachmentLoopbackOrigin(w, r) {
+	if !guardAttachmentOrigin(w, r) {
 		return
 	}
 	if err := r.ParseMultipartForm(12 << 20); err != nil {
@@ -112,7 +111,7 @@ func (h *AgentHandler) HandleAttachmentGet(w http.ResponseWriter, r *http.Reques
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
 		return
 	}
-	if !guardAttachmentLoopbackOrigin(w, r) {
+	if !guardAttachmentOrigin(w, r) {
 		return
 	}
 	ref := strings.TrimSpace(r.URL.Query().Get("ref"))

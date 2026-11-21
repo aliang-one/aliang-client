@@ -1805,6 +1805,49 @@ export function useAliangChat() {
     return { today, yesterday, older };
   });
 
+  // 跨 tab 合并（2026-11-21 审计四批 D3，存疑③拍板修）：旧实现他 tab 任意
+  // 一次落盘，本 tab 下次 loadFromStorage 用旧内存快照整体覆盖（前 tab 新会
+  // 话/新消息静默消失）。storage 事件（他 tab 写入时浏览器对本 tab 派发）按
+  // updatedAt 逐会话合并：同 id 新者胜（仅替换落盘字段，本地瞬态态/approvals
+  // 等不落盘项不动）、缺者补、本 tab 独有草稿不丢（他 tab 删除不传播——删除
+  // 场景本 tab 视角仍是权威，合并语义保守）。坏 JSON 忽略。
+  function mergeIncomingChatStorage(rawValue) {
+    let data;
+    try {
+      data = JSON.parse(rawValue);
+    } catch (_) {
+      return;
+    }
+    if (!data || !Array.isArray(data.conversations)) return;
+    const incoming = data.conversations
+      .map(normalizeConversation)
+      .filter((c) => c && !c.deviceSession && normalizeDeviceProvider(c.provider) === 'agentcore');
+    const byId = new Map(conversations.value.map((c) => [c.id, c]));
+    let changed = false;
+    for (const inc of incoming) {
+      const local = byId.get(inc.id);
+      if (!local) {
+        conversations.value.push(inc);
+        byId.set(inc.id, inc);
+        changed = true;
+      } else if ((inc.updatedAt || 0) > (local.updatedAt || 0)) {
+        local.title = inc.title;
+        local.messages = inc.messages;
+        local.model = inc.model;
+        local.effort = inc.effort;
+        local.updatedAt = inc.updatedAt;
+        changed = true;
+      }
+    }
+    if (changed) saveToStorage(); // 合并结果回写，下一 tab 收敛到同一份
+  }
+
+  function onChatStorageEvent(e) {
+    if (!e || e.key !== STORAGE_KEY || e.newValue == null) return;
+    mergeIncomingChatStorage(e.newValue);
+  }
+  window.addEventListener('storage', onChatStorageEvent);
+
   function loadFromStorage() {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
@@ -2057,8 +2100,13 @@ export function useAliangChat() {
     nextTick(() => scrollToBottom());
 
     // 详情装载：5 分钟内重复打开不重拉（之后的更新由快照覆盖**展示流**，
-    // deviceTranscript 喂入流仍以这里的分页全量为准——见 applyDeviceSnapshotTranscript）
-    if (Date.now() - (live.deviceLoadedAt || 0) > DEVICE_SESSION_DETAIL_TTL_MS) {
+    // deviceTranscript 喂入流仍以这里的分页全量为准——见 applyDeviceSnapshotTranscript）。
+    // 流式守卫（2026-11-21 审计四批 D1，存疑①拍板修）：TTL 过期但会话在跑时
+    // 跳过重拉——重拉整体替换 messages 会丢在途回合已流出的前缀（journal 落
+    // 后于流），且终态后无人回取。权威对账交由订阅快照/终态帧既有链路。
+    if (isConversationRunning(live)) {
+      // 跑动中：跳过重拉（deviceLoadedAt 不动，跑完下次打开按 TTL 正常重拉）
+    } else if (Date.now() - (live.deviceLoadedAt || 0) > DEVICE_SESSION_DETAIL_TTL_MS) {
       const { transcript, lastDetail, pageError } = await fetchFullJournalTranscript(entry.id, getAgentSessionDetail);
       if (transcript.length) {
         live.deviceLoadedAt = now();
@@ -4158,6 +4206,7 @@ export function useAliangChat() {
     aiSocketPromise = null;
     disarmIdleWatchdog();
     disposeDeviceSessions(); // B8：尾随刷新定时器随卸载收口
+    window.removeEventListener('storage', onChatStorageEvent); // D3：跨 tab 合并监听随卸载拆
   }
 
   onUnmounted(() => {

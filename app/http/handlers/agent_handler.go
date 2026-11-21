@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/http/common"
+	"aliang.one/nursorgate/app/http/middleware"
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/http/services"
 	"aliang.one/nursorgate/processor/config"
@@ -89,6 +90,15 @@ func aiStreamHostAllowed(r *http.Request) bool {
 // is written straight back over the same socket, giving the page a live,
 // token-by-token stream plus the running -> done status transitions.
 func (h *AgentHandler) HandleAIStream(w http.ResponseWriter, r *http.Request) {
+	// 握手鉴权（2026-11-21 审计拍板「握手要登录态」）：Origin 同源闸只能拦浏
+	// 览器跨站 CSRF，拦不住可自定义请求头的非浏览器客户端——LAN 内任意进程
+	// 伪造 Origin 即可驱动 AI 会话并代答工具审批（命令执行面），dashboard
+	// 登录态此前完全不参与此通道。cookie（SameSite=Strict）随同站 WS 握手
+	// 自动携带；未登录/伪造 cookie 一律 401。放在本地/透传分叉之前：两条
+	// 路径同门，透传侧无需重复校验。
+	if !middleware.RequireDashboardSession(w, r) {
+		return
+	}
 	// 2026-10-28 统一：仪表盘聊天必须在 agent 进程跑（journal/统一清单与手机
 	// 同源）。core 角色一律 TCP 透传到 56433，绝不本地兜底——本地跑的会话进不
 	// 了任何记录（2026-10-27 liang-dev 事故）。
