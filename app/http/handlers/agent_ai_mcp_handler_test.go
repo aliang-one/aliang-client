@@ -59,6 +59,22 @@ func TestHandleAIMCPMethodNotAllowed(t *testing.T) {
 	}
 }
 
+// TestHandleAIApprovalHookMethodNotAllowed 钉审批钩子的 method 闸：非 POST
+// 必须是真 405。存量 bug（TODOS agent-as-MCP 遗留账 5）：此处曾走
+// common.Error 直传 http.StatusMethodNotAllowed，被 ErrorCodeToHTTPStatus 折
+// default → 500；修法与 handleAIMCPOp / HandlePeerMcp 同款 http.Error。
+func TestHandleAIApprovalHookMethodNotAllowed(t *testing.T) {
+	t.Setenv(services.AgentRuntimeEnv, "1")
+	h := &AgentHandler{}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/agent/ai/approval-hook", nil)
+	rec := httptest.NewRecorder()
+	h.HandleAIApprovalHook(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET code = %d, want 405（common.Error 直传 405 会折成 500）; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 // TestHandleAIMCPOpSuccessEnvelope 钉成功信封形状：{code:0,data:{result:"<json字符串>"}}。
 // 形状错整次工具调用报废 —— cmd/mcp.go 的 invokeTool 只解包 data.result 字符串。
 func TestHandleAIMCPOpSuccessEnvelope(t *testing.T) {

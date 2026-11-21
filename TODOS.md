@@ -76,7 +76,7 @@
 4. `snapshot()` 是浅拷贝,安全性依赖 `fanOutWrite` 的「帧写后不再改」冻结契约;若将来有帧被原地改写,这里会静默串数据。
 
 *端点层(Task 3)*
-5. **`HandleAIApprovalHook` 存量 bug**(`app/http/handlers/agent_handler.go:~304`):用 `common.Error(w, http.StatusMethodNotAllowed, ...)`,而 8 行之上的注释明确写着「直传 405 会被映射成 500」——实测确实返回 500。本批新增的 `handleAIMCPOp` 已按正确写法(`http.Error`)实现,老函数未动(不在本批范围)。修法:改成 `http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)`。
+5. ~~**`HandleAIApprovalHook` 存量 bug**(`app/http/handlers/agent_handler.go:~304`):用 `common.Error(w, http.StatusMethodNotAllowed, ...)`,而 8 行之上的注释明确写着「直传 405 会被映射成 500」——实测确实返回 500。~~ **已修**:改为 `http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)`(与 `handleAIMCPOp` 同款),并补 `TestHandleAIApprovalHookMethodNotAllowed` 钉死 405(修前变异实测 500 变红)。
 6. `cleanExistingAgentDirectory` 的 stat 错误会把**绝对路径**回吐给工具调用方(手机/桌面同款行为,存量)。是否脱敏需产品口径。
 7. 已被逐出的工具面会话调 status 返回 `200 {state:"idle"}` 而非 400——「会话不存在」的语义在逐出场景下要不要区分,待定。
 

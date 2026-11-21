@@ -337,16 +337,28 @@ func normalizeRequiredForParity(schema map[string]interface{}) string {
 }
 
 // M2:四个 tools/call 各自经真 handlers 壳路由到「自己的」 invoke——每个 op
-// 用只有该 op 会产生的本地错误/离线文本做指纹,端点↔invoke 接错线即刻红。
-// delete/list 会触达惰性共享服务(无凭据→离线哨兵),零网络外呼。
+// 用只有该 op 会产生的响应做指纹,端点↔invoke 接错线即刻红。
+// create/update 走真链本地预检指纹(零网络外呼);delete/list 零本地闸、
+// 真链只会同落一句 listener cloud offline(接错线检测不到,2026-11-21 盲区),
+// 故这两枚在 mock agent 上 canned 成功体:list 回 {listeners:[...]},
+// delete 回 {id,deleted},形状互斥即指纹。
 func TestListenerCallOps_RoutedToOwnInvoke(t *testing.T) {
 	t.Setenv(services.AgentRuntimeEnv, "1")
 	mux := http.NewServeMux()
 	h := handlers.NewAgentHandler(&services.AgentService{})
 	mux.HandleFunc("POST /api/agent/listeners/mcp/create", h.HandleListenerMCPCreate)
-	mux.HandleFunc("POST /api/agent/listeners/mcp/list", h.HandleListenerMCPList)
 	mux.HandleFunc("POST /api/agent/listeners/mcp/update", h.HandleListenerMCPUpdate)
-	mux.HandleFunc("POST /api/agent/listeners/mcp/delete", h.HandleListenerMCPDelete)
+	// delete/list canned 成功体(common.Success 同形信封,code=0+data 原样):
+	// 真链须共享服务凭据才能到云端,seed 身份会拖进注册/WS/状态盘副作用,
+	// 与本用例「只钉 stdio 表路由」的意图不成比例。
+	mux.HandleFunc("POST /api/agent/listeners/mcp/list", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"msg":"success","data":{"listeners":[{"id":"L-1"}]}}`))
+	})
+	mux.HandleFunc("POST /api/agent/listeners/mcp/delete", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"msg":"success","data":{"id":"L-1","deleted":true}}`))
+	})
 	srv := &peerMCPServer{baseURL: newBodyPreservingServer(t, mux.ServeHTTP).URL, client: &http.Client{}}
 
 	invoke := func(t *testing.T, id int, name, args string) (string, bool) {
@@ -363,15 +375,19 @@ func TestListenerCallOps_RoutedToOwnInvoke(t *testing.T) {
 	if text, isErr := invoke(t, 6, "listener_update", `{"id":"L-1"}`); !isErr || !strings.Contains(text, "empty patch") {
 		t.Fatalf("update 路由指纹失败: isErr=%v %q", isErr, text)
 	}
-	// delete 指纹:本地闸全过 → 直达云端 → 离线哨兵(若接错到 create/update
-	// 会先撞各自的本地预检,不会出现离线文本)。
-	if text, isErr := invoke(t, 7, "listener_delete", `{"id":"L-1"}`); !isErr || !strings.Contains(text, "listener cloud offline") {
-		t.Fatalf("delete 路由指纹失败: isErr=%v %q", isErr, text)
+	// delete 指纹:canned 成功体 {id,deleted:true}——接错到 list 得
+	// listeners 体、接错到 create/update 得各自错误文本,均不含 deleted:true。
+	delText, delErr := invoke(t, 7, "listener_delete", `{"id":"L-1"}`)
+	if delErr || !strings.Contains(delText, `"deleted":true`) || strings.Contains(delText, `"listeners"`) {
+		t.Fatalf("delete 路由指纹失败: isErr=%v %q", delErr, delText)
 	}
-	// list 指纹:零本地闸 → 云端 → 离线哨兵(接错到 update/delete 会得
-	// invalid listener id,接到 create 会得 source type)。
-	if text, isErr := invoke(t, 8, "listener_list", `{}`); !isErr || !strings.Contains(text, "listener cloud offline") {
-		t.Fatalf("list 路由指纹失败: isErr=%v %q", isErr, text)
+	// list 指纹:canned 成功体 {listeners:[...]}(与 delete 形状互斥)。
+	listText, listErr := invoke(t, 8, "listener_list", `{}`)
+	if listErr || !strings.Contains(listText, `"listeners"`) || strings.Contains(listText, `"deleted"`) {
+		t.Fatalf("list 路由指纹失败: isErr=%v %q", listErr, listText)
+	}
+	if listText == delText {
+		t.Fatalf("delete/list 指纹同形,接错线检测失效: %q", listText)
 	}
 }
 

@@ -338,7 +338,10 @@ func (h *AgentHandler) HandlePeerGates(w http.ResponseWriter, r *http.Request) {
 
 func (h *AgentHandler) HandleAIApprovalHook(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		// 必须走 http.Error 而非 common.Error：后者把 code 当业务码过
+		// ErrorCodeToHTTPStatus，405 落 default → HTTP 500（handleAIMCPOp /
+		// HandlePeerMcp 同款修法，TODOS agent-as-MCP 遗留账 5）。
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	defer r.Body.Close()
@@ -394,8 +397,8 @@ func (h *AgentHandler) HandleAIMCPApprove(w http.ResponseWriter, r *http.Request
 func (h *AgentHandler) handleAIMCPOp(w http.ResponseWriter, r *http.Request, op func(context.Context, map[string]string) (map[string]interface{}, int, error)) {
 	if r.Method != http.MethodPost {
 		// 必须走 http.Error，不能走 common.Error：后者把 code 当业务码过
-		// ErrorCodeToHTTPStatus，405 落在 default → HTTP 500（存量同型 bug 见
-		// HandleAIApprovalHook：本意 405 实发 500）。手写 405 还附带正确的
+		// ErrorCodeToHTTPStatus，405 落在 default → HTTP 500（同型 bug 曾在
+		// HandleAIApprovalHook：本意 405 实发 500，已修）。手写 405 还附带正确的
 		// Allow 语义（ServeMux 兜底那条路径也带）。
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
