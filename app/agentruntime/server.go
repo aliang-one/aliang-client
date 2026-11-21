@@ -142,7 +142,7 @@ func StopLocalServer() error {
 }
 
 func registerAgentRoutes(mux *http.ServeMux) {
-	logger.Info("[AGENT-BOOT] local_server registering_routes routes=/api/agent/status,/api/agent/sync,/api/agent/enable,/api/agent/auth-recover,/api/agent/disable,/api/agent/tools,/api/agent/protocol,/api/agent/tools/launch,/api/agent/ai/approval-hook,/api/agent/ai/stream,/api/agent/peer/*")
+	logger.Info("[AGENT-BOOT] local_server registering_routes routes=/api/agent/status,/api/agent/sync,/api/agent/enable,/api/agent/auth-recover,/api/agent/disable,/api/agent/tools,/api/agent/protocol,/api/agent/tools/launch,/api/agent/ai/approval-hook,/api/agent/ai/stream,/api/agent/web-terminal*,/api/agent/peer/*")
 	agentHandler := handlers.NewAgentHandler(services.GetSharedAgentService())
 	mux.HandleFunc("/api/agent/status", agentHandler.HandleStatus)
 	mux.HandleFunc("/api/agent/sync", agentHandler.HandleSync)
@@ -191,6 +191,19 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	// runtime，由本地 AI 管理器跑（journal/清单与手机同源）。缺注册=404 透传
 	// （2026-10-21 liang-dev 双注册教训）。
 	mux.HandleFunc("/api/agent/ai/stream", agentHandler.HandleAIStream)
+	// 网页终端(spec docs/superpowers/specs/2026-11-21-web-terminal-design.md):
+	// 真身在此(保险箱/令牌/终端管理器住本 runtime),core routes.go 侧同名
+	// 注册只做 proxy 透传。缺任一侧=404(双注册教训,2026-10-21 liang-dev 实测)。
+	mux.HandleFunc("GET /api/agent/web-terminal", agentHandler.HandleWebTerminalState)
+	mux.HandleFunc("POST /api/agent/web-terminal", agentHandler.HandleWebTerminalCommand)
+	mux.HandleFunc("/api/agent/web-terminal/stream", agentHandler.HandleWebTerminalStream)
+	// OpenViking 跨设备记忆面读点/apply(spec Phase2 §7.5/§7.7):状态/拨测/对齐
+	// 真身住本 runtime(boot 处 StartOpenVikingProbe/EnsureOpenVikingMatchesConfig
+	// 在此),core routes.go 侧同名注册只做 proxyIfNeeded 透传(handler 注释自证)。
+	// 0829febd 落地时漏了本侧注册=404 透传(双注册教训,2026-10-21 同族),parity
+	// 护栏 2026-11-21 坐实补齐。
+	mux.HandleFunc("/api/agent/openviking/status", agentHandler.HandleOpenVikingStatus)
+	mux.HandleFunc("/api/agent/openviking/apply", agentHandler.HandleOpenVikingApply)
 	// 聊天图片链路（spec §3.4）：上传+取图,双注册另一处 routes.go。
 	mux.HandleFunc("/api/agent/ai/attachment/upload", agentHandler.HandleAttachmentUpload)
 	mux.HandleFunc("/api/agent/ai/attachment", agentHandler.HandleAttachmentGet)

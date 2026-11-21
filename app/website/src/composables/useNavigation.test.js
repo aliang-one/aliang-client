@@ -143,6 +143,26 @@ describe('useNavigation ESC 页面返回层', () => {
   });
 });
 
+describe('useNavigation terminal 页', () => {
+  it('showTerminal 切到 terminal 页', () => {
+    const nav = useNavigation();
+    nav.showTerminal();
+    expect(nav.currentPage.value).toBe('terminal');
+  });
+
+  it('terminal 压 page-return 层,Esc 回 dashboard 且层移除（工作台组件层 terminal-workspace 另行自管,双层同归 dashboard）', () => {
+    const nav = useNavigation();
+    const { stack } = useEscStack();
+
+    nav.showTerminal();
+    expect(stack.value.some((l) => l.label === 'page-return')).toBe(true);
+
+    pressEscape();
+    expect(nav.currentPage.value).toBe('dashboard');
+    expect(stack.value.some((l) => l.label === 'page-return')).toBe(false);
+  });
+});
+
 describe('useNavigation ESC 子 tab 收回层', () => {
   it('agent 非默认子 tab:第一次 Esc 收回 records,第二次 Esc 回 dashboard', () => {
     const nav = useNavigation();

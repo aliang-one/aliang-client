@@ -965,43 +965,13 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 		go handleAgentGoalMessage(msg, writeJSON)
 	case models.AgentEventGoalPlanAIResponse, models.AgentEventGoalPlanAIError:
 		deliverGoalPlanAIResponse(msg)
-	case models.AgentEventTerminalCreate:
+	case models.AgentEventTerminalCreate, models.AgentEventTerminalInput,
+		models.AgentEventTerminalResize, models.AgentEventTerminalClose:
+		// 四类终端帧统一走 DispatchTerminalFrame(与网页腿共用的分派口;
+		// create 异步离读循环/input·resize·close 保持 inline 的契约注释
+		// 见该函数)。本腿的 enabled 闸给 remoteTerminalEnabled。
 		s.setRemoteConnectionState(true, "online", "")
-		if !s.remoteTerminalEnabled() {
-			_ = writeJSON(agentTerminalErrorPayload(remoteString(msg, "session_id"), errors.New("remote terminal is disabled for this device")))
-			return
-		}
-		// create leaves the read loop entirely: an attach replay (up to
-		// 2MiB of scrollback as 64KiB frames, all sent under the session's
-		// outputGate) used to block every subsequent message on this
-		// connection — typing during a replay stalled, AI acks stalled, and
-		// the 10s write deadline amplified it. The creating registry is
-		// registered SYNCHRONOUSLY here (see beginCreate) so the very next
-		// inline terminal.input can wait for the create instead of erroring;
-		// terminal.input/resize/close themselves stay inline — input order
-		// is contractual.
-		release := s.terminal.beginCreate(remoteString(msg, "session_id"))
-		safeGo("terminal.create", func() {
-			defer release()
-			s.terminal.create(msg, writeJSON)
-		})
-	case models.AgentEventTerminalInput:
-		s.setRemoteConnectionState(true, "online", "")
-		if !s.remoteTerminalEnabled() {
-			_ = writeJSON(agentTerminalErrorPayload(remoteString(msg, "session_id"), errors.New("remote terminal is disabled for this device")))
-			return
-		}
-		s.terminal.write(msg, writeJSON)
-	case models.AgentEventTerminalResize:
-		s.setRemoteConnectionState(true, "online", "")
-		if !s.remoteTerminalEnabled() {
-			_ = writeJSON(agentTerminalErrorPayload(remoteString(msg, "session_id"), errors.New("remote terminal is disabled for this device")))
-			return
-		}
-		s.terminal.resize(msg, writeJSON)
-	case models.AgentEventTerminalClose:
-		s.setRemoteConnectionState(true, "online", "")
-		s.terminal.close(msg, writeJSON)
+		s.DispatchTerminalFrame(msg, writeJSON, s.remoteTerminalEnabled)
 	case models.AgentEventTerminalQuotaResolved:
 		// Deliberately NOT behind the remote-terminal toggle: a challenge
 		// verdict must always be honored — dropping it would strand a pending

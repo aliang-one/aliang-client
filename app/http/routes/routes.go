@@ -323,6 +323,14 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/peer/gates", h.Agent.HandlePeerGates, http.MethodGet, http.MethodPost)
 	register("/api/agent/ai/stream", h.Agent.HandleAIStream, http.MethodGet)
 	register("/api/agent/ai/approval-hook", h.Agent.HandleAIApprovalHook, http.MethodPost)
+	// 网页终端(spec docs/superpowers/specs/2026-11-21-web-terminal-design.md):
+	// state/command/stream。真身在 user agent runtime(保险箱/令牌/终端管理器),
+	// core 侧闸门②+proxy 透传。双注册另一处 agentruntime/server.go(缺任一侧
+	// =404 透传,老坑)。同路径双方法用方法前缀模式(同 /api/agent/ai/mcp/*
+	// 先例,防 ServeMux 同路径互相覆盖)。
+	register("GET /api/agent/web-terminal", h.Agent.HandleWebTerminalState, http.MethodGet)
+	register("POST /api/agent/web-terminal", h.Agent.HandleWebTerminalCommand, http.MethodPost)
+	register("/api/agent/web-terminal/stream", h.Agent.HandleWebTerminalStream, http.MethodGet)
 	// agent-as-MCP 工具面端点：真身在 user agent runtime，core 侧只做 proxy
 	// 透传（handler 内 proxyIfNeeded 分流）。register 是裸 pattern 透传，方法
 	// 前缀必须写进 path——同 /api/agent/memory 六端点先例（2026-10-21 教训）。

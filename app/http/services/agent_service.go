@@ -151,6 +151,7 @@ type AgentService struct {
 	policyLastCheckAtPath map[string]time.Time
 	client                *http.Client
 	terminal              *agentTerminalManager
+	webTerminal           *webTerminalVault
 	ai                    *agentAIManager
 	tunnel                *tunnel.Manager
 	// Forwarded user credentials are process-local only. The session owner sends
@@ -248,11 +249,18 @@ func NewAgentService() *AgentService {
 	s := &AgentService{
 		client:            &http.Client{Timeout: agentHTTPTimeout},
 		terminal:          newAgentTerminalManager(),
+		webTerminal:       newWebTerminalVault(),
 		ai:                newAgentAIManager(),
 		sessionRefreshSig: make(chan struct{}, 1),
 	}
 	s.tunnel = tunnel.NewManager(s.emitTunnelStatus)
 	s.ai.service = s
+	// 网页终端保险箱(Task 5 接线):onLock 在构造期一次性注入(早于任何
+	// 流量,评审指令),Lock/Reset/闲置回收联动 closeAll 活终端;回收循环
+	// 恰在此启动一次(构造期不启,测试零 goroutine)。core 侧副本不刷新
+	// (构造期陈旧镜像),状态读一律在 proxy 之后(runtime 角色)。
+	s.webTerminal.onLock = func() { s.terminal.closeAll() }
+	s.webTerminal.startSweep()
 	s.ai.loadPendingTerminals()
 	// 审批请求投递 journal 回灌(L1,2026-11-01):上次进程未确认送达的审批
 	// 请求,注册成功后重放(服务端 intake 幂等)。
