@@ -173,8 +173,11 @@ func agentServerRaceLoop() {
 		}
 		incumbent := AgentServerOverride()
 		if incumbent == "" {
-			// 首轮:现任=配置原值(首个候选,兼容旧行为)。
-			incumbent = candidates[0]
+			// 首轮:现任=配置实际基座(AgentBaseURL 在 override 为空时返回配置
+			// 解析值——它才是此刻流量真正在走的线;候选含它则滞回有据,
+			// 不含则首轮按「无现任」裁决)。此前误种 candidates[0],实测
+			// (liang-dev 首轮 kept)导致胜者永不落 override、流量原地踏步。
+			incumbent = cfg.AgentBaseURL()
 		}
 		probes := make([]agentRaceProbe, 0, len(candidates))
 		for _, base := range candidates {
@@ -193,7 +196,9 @@ func agentServerRaceLoop() {
 			// 全败:保持现任粘滞(last-known-good),仅记日志。
 			logger.Info(fmt.Sprintf("[AGENT-SERVER-RACE] all candidates failed, keeping incumbent=%s probes=%v", incumbent, ttfbLog))
 		} else {
-			if winner != incumbent {
+			if AgentServerOverride() != winner {
+				// kept 分支也必须落 override:首轮 incumbent(配置基座)≠胜者时,
+				// override 为空,不写则 AgentBaseURL 永远回配置值(liang-dev 实测教训)。
 				SetAgentServerOverride(winner)
 				logger.Info(fmt.Sprintf("[AGENT-SERVER-RACE] active=%s ttfb=%v (switched from %s)", winner, ttfbLog, incumbent))
 			} else {
