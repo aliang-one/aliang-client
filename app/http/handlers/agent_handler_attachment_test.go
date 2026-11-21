@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"aliang.one/nursorgate/app/http/middleware"
 )
 
 func attachmentTestEnv(t *testing.T) string {
@@ -179,14 +181,15 @@ func TestHandleAttachmentGetGuards(t *testing.T) {
 		t.Fatalf("missing ref = %d", rr.Code)
 	}
 
-	// 非 loopback 无 Origin GET → 200（2026-11-21 拍板：取图对齐真同源口径，
-	// <img> 天然无 Origin，LAN 页图片不再裂；ref 穿越守卫上面已单测）
+	// 非 loopback 无 Origin 无 cookie GET → 403（统一门：无 session 的 LAN 进
+	// 程零鉴权读图面收回——ref 可预测不可裸奔；LAN 同源页带 session 放行，
+	// 见 TestAttachmentGetAllowsLANSameOrigin）
 	get = httptest.NewRequest(http.MethodGet, "/api/agent/ai/attachment?ref=s/a.png", nil)
 	get.RemoteAddr = "10.0.0.5:1234"
 	rr = httptest.NewRecorder()
 	h.HandleAttachmentGet(rr, get)
-	if rr.Code == http.StatusForbidden {
-		t.Fatalf("LAN 无 Origin 取图不应 403（拍板新口径），got %d", rr.Code)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("LAN 无 Origin 无 cookie 取图应 403，got %d", rr.Code)
 	}
 
 	// 带 Origin 的跨源取图 → 仍 403（真同源闸）
@@ -227,18 +230,49 @@ func attachmentRequestWithOrigin(t *testing.T, method, rawURL, origin, remoteAdd
 	return req
 }
 
-func TestAttachmentUploadAllowsLANSameOrigin(t *testing.T) {
+func mintDashboardCookie(t *testing.T) *http.Cookie {
+	t.Helper()
+	mint := httptest.NewRecorder()
+	mintReq := httptest.NewRequest(http.MethodPost, "/x", nil)
+	mintReq.RemoteAddr = "127.0.0.1:55555"
+	if err := middleware.IssueDashboardSession(mint, mintReq); err != nil {
+		t.Fatalf("签发 session: %v", err)
+	}
+	for _, c := range mint.Result().Cookies() {
+		if c.Name == middleware.DashboardSessionCookieName {
+			return c
+		}
+	}
+	t.Fatal("未签发 session cookie")
+	return nil
+}
+
+func TestAttachmentUploadAllowsLANSameOriginWithSession(t *testing.T) {
 	_ = attachmentTestEnv(t)
 	h := NewAgentHandler(nil)
+	// 统一门（评审 should 修订）：LAN 上传须持有效 dashboard session cookie
+	// （同站浏览器自动携带）；伪造 Origin 无 cookie 一律拒。
+	cookie := mintDashboardCookie(t)
 	upload := attachmentUploadRequest(t, "sess-lan", "lan.png", []byte("lan-bytes"))
-	// attachmentUploadRequest 默认 Origin 空 + 回环地址——改造成 LAN 同源形态
 	upload.Header.Set("Origin", "http://192.168.1.50:56431")
 	upload.Host = "192.168.1.50:56431"
 	upload.RemoteAddr = "192.168.1.50:54321"
+	upload.AddCookie(cookie)
 	rec := httptest.NewRecorder()
 	h.HandleAttachmentUpload(rec, upload)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("LAN 同源上传应放行，got %d body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("LAN 同源带 session 上传应放行，got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 同形态无 cookie（LAN 伪造 Origin 的非浏览器进程）→ 拒（评审 should 坐实面）
+	upload2 := attachmentUploadRequest(t, "sess-lan2", "lan2.png", []byte("lan2"))
+	upload2.Header.Set("Origin", "http://192.168.1.50:56431")
+	upload2.Host = "192.168.1.50:56431"
+	upload2.RemoteAddr = "192.168.1.50:54321"
+	rec2 := httptest.NewRecorder()
+	h.HandleAttachmentUpload(rec2, upload2)
+	if rec2.Code == http.StatusOK {
+		t.Fatal("LAN 伪造 Origin 无 cookie 上传应拒")
 	}
 }
 
@@ -251,6 +285,7 @@ func TestAttachmentGetAllowsLANSameOrigin(t *testing.T) {
 	upload.Header.Set("Origin", "http://192.168.1.50:56431")
 	upload.Host = "192.168.1.50:56431"
 	upload.RemoteAddr = "192.168.1.50:54321"
+	upload.AddCookie(mintDashboardCookie(t))
 	rec := httptest.NewRecorder()
 	h.HandleAttachmentUpload(rec, upload)
 	if rec.Code != http.StatusOK {
@@ -268,17 +303,29 @@ func TestAttachmentGetAllowsLANSameOrigin(t *testing.T) {
 	}
 	ref := envelope.Data.Attachment.Ref
 
-	// LAN 取图：<img> 无 Origin 头、RemoteAddr 为 LAN IP——放行（ref 守卫不变）
+	// LAN 取图：同站 <img> GET 照发 SameSite cookie——带 session 放行
 	get := httptest.NewRequest(http.MethodGet, "/api/agent/ai/attachment?ref="+url.QueryEscape(ref), nil)
 	get.Host = "192.168.1.50:56431"
 	get.RemoteAddr = "192.168.1.50:54321"
+	get.AddCookie(mintDashboardCookie(t))
 	rec2 := httptest.NewRecorder()
 	h.HandleAttachmentGet(rec2, get)
 	if rec2.Code != http.StatusOK {
-		t.Fatalf("LAN 取图应放行，got %d", rec2.Code)
+		t.Fatalf("LAN 带 session 取图应放行，got %d", rec2.Code)
 	}
 	if !bytes.Equal(rec2.Body.Bytes(), content) {
 		t.Fatal("内容不一致")
+	}
+
+	// 无 cookie 的 LAN GET（跨源 <img> 嵌入天然无 session）→ 拒（评审 should：
+	// 零鉴权读图面收回——ref 可预测不可裸奔）
+	get2 := httptest.NewRequest(http.MethodGet, "/api/agent/ai/attachment?ref="+url.QueryEscape(ref), nil)
+	get2.Host = "192.168.1.50:56431"
+	get2.RemoteAddr = "192.168.1.50:54321"
+	rec3 := httptest.NewRecorder()
+	h.HandleAttachmentGet(rec3, get2)
+	if rec3.Code == http.StatusOK {
+		t.Fatal("LAN 无 cookie 取图应拒")
 	}
 }
 

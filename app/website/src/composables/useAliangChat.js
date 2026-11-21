@@ -1839,7 +1839,11 @@ export function useAliangChat() {
         changed = true;
       }
     }
-    if (changed) saveToStorage(); // 合并结果回写，下一 tab 收敛到同一份
+    if (changed) saveToStorage(); // 合并结果回写，下一 tab 收敛到同一份。
+    // 已知限制（评审 nit，刻意接受）：LWW 以 updatedAt 单键判定，改名刻意
+    // 不抬 updatedAt（commitRename 注释：改名不是内容更新不顶分组首位）——
+    // 纯改名跨 tab 后写会被同 updatedAt 的他端版本回滚标题。两侧二选一为
+    // 已知取舍，不为此引入软时间戳。
   }
 
   function onChatStorageEvent(e) {

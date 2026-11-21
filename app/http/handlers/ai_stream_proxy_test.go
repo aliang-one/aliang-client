@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -279,4 +280,55 @@ func TestProxyAIStreamAgentOfflineCloses1011(t *testing.T) {
 		t.Fatalf("read close: %v", err)
 	}
 	t.Fatal("expected close frame, got normal message")
+}
+
+// 透传腿 Cookie 转发（2026-11-21 审计四批评审 blocker 修订钉）：同用户单
+// 二进制部署下 core 与 agent 共享 session 存储——浏览器 Cookie 必须原样进
+// handshakeAgent 自造请求，agent 侧握手门才能验签；分路径部署走 loopback
+// 豁免不受影响。两种形态都钉住。
+func TestHandshakeAgentForwardsBrowserCookie(t *testing.T) {
+	var seenCookie string
+	up := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool {
+		seenCookie = r.Header.Get("Cookie")
+		return true
+	}}
+	agentSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		conn.Close()
+	}))
+	defer agentSrv.Close()
+
+	origTarget := aiStreamTargetHost
+	aiStreamTargetHost = func() string { return strings.TrimPrefix(agentSrv.URL, "http://") }
+	defer func() { aiStreamTargetHost = origTarget }()
+
+	agentConn, err := net.DialTimeout("tcp", aiStreamTargetHost(), aiStreamProxyDialTimeout)
+	if err != nil {
+		t.Fatalf("dial agent: %v", err)
+	}
+	defer agentConn.Close()
+
+	if _, err := handshakeAgent(agentConn, aiStreamTargetHost(), "/api/agent/ai/stream", "aliang_dashboard_session=abc"); err != nil {
+		t.Fatalf("handshake: %v", err)
+	}
+	if seenCookie != "aliang_dashboard_session=abc" {
+		t.Fatalf("agent 侧未收到转发 Cookie: %q", seenCookie)
+	}
+
+	// 空 cookie：不带 Cookie 头（分路径部署形态不泄漏空/错值）
+	agentConn2, err := net.DialTimeout("tcp", aiStreamTargetHost(), aiStreamProxyDialTimeout)
+	if err != nil {
+		t.Fatalf("dial agent 2: %v", err)
+	}
+	defer agentConn2.Close()
+	seenCookie = ""
+	if _, err := handshakeAgent(agentConn2, aiStreamTargetHost(), "/api/agent/ai/stream", ""); err != nil {
+		t.Fatalf("handshake 2: %v", err)
+	}
+	if seenCookie != "" {
+		t.Fatalf("空 cookie 不应带 Cookie 头: %q", seenCookie)
+	}
 }

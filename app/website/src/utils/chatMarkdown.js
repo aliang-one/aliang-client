@@ -249,6 +249,9 @@ export function chatMdRenderInterval(contentLength) {
 function isAllowedImageSrc(src) {
   const t = String(src || '').trim();
   if (!t) return false;
+  // 协议相对（//evil.com/pixel）是跨源请求（评审 blocker：两字符绕穿让信标
+  // 通道原样复活），显式拒绝后再放行同源根相对路径。
+  if (t.startsWith('//')) return false;
   if (t.startsWith('/') || t.startsWith('#')) return true;
   if (/^data:image\//i.test(t)) return true;
   try {

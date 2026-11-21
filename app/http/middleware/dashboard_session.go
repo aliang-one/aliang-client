@@ -143,6 +143,12 @@ func CanBootstrapDashboardSession(r *http.Request) bool {
 	return isLoopbackRequest(r)
 }
 
+// IsLoopbackRequest 导出只读形态（2026-11-21 审计四批评审：聊天 WS 握手门
+// 与附件同源门共用「cookie ∥ loopback」双闸的来源判定）。
+func IsLoopbackRequest(r *http.Request) bool {
+	return isLoopbackRequest(r)
+}
+
 func isLoopbackRequest(r *http.Request) bool {
 	if r == nil {
 		return false
