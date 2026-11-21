@@ -175,6 +175,13 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	// runtime，由本地 AI 管理器跑（journal/清单与手机同源）。缺注册=404 透传
 	// （2026-10-21 liang-dev 双注册教训）。
 	mux.HandleFunc("/api/agent/ai/stream", agentHandler.HandleAIStream)
+	// OpenViking 跨设备记忆面读点/apply(spec Phase2 §7.5/§7.7):状态/拨测/对齐
+	// 真身住本 runtime(boot 处 StartOpenVikingProbe/EnsureOpenVikingMatchesConfig
+	// 在此),core routes.go 侧同名注册只做 proxyIfNeeded 透传(handler 注释自证)。
+	// 0829febd 落地时漏了本侧注册=404 透传(双注册教训,2026-10-21 同族),parity
+	// 护栏 2026-11-21 坐实补齐。
+	mux.HandleFunc("/api/agent/openviking/status", agentHandler.HandleOpenVikingStatus)
+	mux.HandleFunc("/api/agent/openviking/apply", agentHandler.HandleOpenVikingApply)
 	// 聊天图片链路（spec §3.4）：上传+取图,双注册另一处 routes.go。
 	mux.HandleFunc("/api/agent/ai/attachment/upload", agentHandler.HandleAttachmentUpload)
 	mux.HandleFunc("/api/agent/ai/attachment", agentHandler.HandleAttachmentGet)
