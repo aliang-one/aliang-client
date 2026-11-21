@@ -245,6 +245,8 @@ func GetSharedAgentService() *AgentService {
 }
 
 func NewAgentService() *AgentService {
+	// 多通道竞速(2026-11-21):进程级单飞;候选<2 空转(存量设备零变化)。
+	config.StartAgentServerRacerOnce()
 	s := &AgentService{
 		client:            &http.Client{Timeout: agentHTTPTimeout},
 		terminal:          newAgentTerminalManager(),

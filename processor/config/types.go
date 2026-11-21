@@ -1444,6 +1444,9 @@ type AliangServerConfig struct {
 	Type        string `json:"type"`
 	CoreServer  string `json:"core_server,omitempty"`
 	AgentServer string `json:"agent_server,omitempty"`
+	// AgentServers 多通道候选(2026-11-21 四线竞速):竞速器每 10min 探测
+	// 取最快写入进程内 override,AgentBaseURL() 优先读;缺省=单值行为不变。
+	AgentServers []string `json:"agent_servers,omitempty"`
 }
 
 type CustomerProxyConfig struct {
@@ -1990,6 +1993,10 @@ func (c *Config) APIBaseURL() string {
 }
 
 func (c *Config) AgentBaseURL() string {
+	// 竞速胜者优先(2026-11-21 多通道竞速):未竞速/候选<2 时为空,走配置原值。
+	if override := AgentServerOverride(); override != "" {
+		return override
+	}
 	if c == nil || c.Core == nil {
 		return ""
 	}
