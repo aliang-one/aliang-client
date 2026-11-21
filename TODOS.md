@@ -2,7 +2,7 @@
 
 ## Security
 
-### 聊天 WS 零登录鉴权:Origin 同源闸可被非浏览器客户端伪造绕过(审计 2026-11-20,需拍板)
+### 聊天 WS 零登录鉴权:Origin 同源闸可被非浏览器客户端伪造绕过(✅已修 2026-11-21 四批拍板「握手要登录态」——WS 门改 cookie∥loopback 双闸,详见 Web Chat 收口记录)
 
 **What:** `HandleAIStream`(app/http/handlers/agent_handler.go:70)握手仅过 aiStreamHostAllowed 同源闸(Orgin.Host==r.Host 即放行)——该闸只能拦浏览器跨站 CSRF,拦不住任何可自定义请求头的客户端:LAN 内任意进程带 `Origin: http://<设备IP>:56431` 握手即入,可经 DispatchLocalAI 驱动任意 prompt 并代答工具审批(ai.approval.response/option/tool_ask=命令执行面),dashboard 登录态完全不参与此通道。修复方向:握手前加 dashboard session 校验(至少对写语义帧 create/message/steer/approval/option/tool_ask),或 WS 握手引入登录后签发的一次性 ticket,让「Origin 同源」回归纯 CSRF 防线。
 
@@ -117,18 +117,18 @@
 **Effort:** M(首批 7 条);**Priority:** P1
 **Depends on:** 无
 
-### 网页聊天审计遗留(仅剩拍板 2 条+存疑 3 条,三批修复全收口)
+### 网页聊天审计账本清零(四批 28 缺陷全收口,✅2026-11-21)
 
-**收口记录:**①首批 7 条(2026-11-20,fix/webchat-audit-batch1 已合 master)+双评审 4 坐实全修(迟到 close 属主校验/净化域撞名键/dot-at-0/并发批证伪);②二批 11 条(2026-11-21,fix/webchat-audit-batch2 已合 master fb016da9)+双评审 6 坐实全修(blocker=审批族豁免白名单);③三批 Markdown 族 6 条(2026-11-21,fix/webchat-audit-batch3 已合 master)+双评审 9 坐实(去重 4 根)全修(blocker=列表缩进围栏保护/should=M5 快照前缀+M4 缩进收敛+JSON 闸门/nit=黏行死分支)。终态前端 813/813 绿。
+**收口记录:**①首批 7 条(2026-11-20,fix/webchat-audit-batch1)+双评审 4 坐实全修(迟到 close 属主校验/净化域撞名键/dot-at-0);②二批 11 条(2026-11-21,fix/webchat-audit-batch2→fb016da9)+双评审 6 坐实全修(blocker=审批族豁免白名单);③三批 Markdown 族 6 条(2026-11-21,fix/webchat-audit-batch3)+双评审 9 坐实(去重 4 根)全修(blocker=列表缩进围栏保护/should=M5 快照前缀+M4 缩进收敛+JSON 闸门/nit=黏行死分支);④四批拍板批 6 条(2026-11-21,fix/webchat-audit-batch4,四项拍板全按推荐口径:WS 握手要登录态/附件对齐真同源/图片限同源/存疑 3 条修)+双评审 9 坐实(去重 5 根)全修(**blocker×2=S1 透传腿丢 cookie——core 角色聊天全灭,门改 cookie∥loopback 双闸+handshakeAgent 原样转发/S3 //evil.com 两字符绕穿**;should=S2 统一门三分支收敛(cookie 有效∥跨源 403∥无 Origin loopback)+零鉴权读图收回;nit=D3 LWW 改名回滚注释存档)。**终态前端 828/828 绿+Go handlers/middleware 全绿,四 worktree 全清,审计 27 缺陷+存疑 3 条全部闭环。**
 
-**What:** 仅剩两类不动账:①拍板 2 条——聊天 WS 零登录鉴权/Origin 伪造(见 Security 节,P1 拍板后动);LAN 附件上传/取图 loopback+Origin 双闸 403(需拍板对齐聊天 WS 真同源口径,`agent_handler_attachment.go:16`,注意取图端点服务 <img> 无 Origin GET 需 Host 对齐)。②存疑 3 条(验证员 1:1 分歧,挂账):openDeviceSession 5min TTL 重入丢流式前缀/子代理面板状态不随会话切换复位/localStorage 跨 tab 覆盖。另有 AI 图片无白名单=追踪信标(需拍板:禁远程 or 限同源,`chatMarkdown.js:161` DOMPurify 配置)。
+**What:** 账本清零,无遗留缺陷。遗留动作=①出包装机(四批全部生效待出包;S1 部署注意:LAN 页须登录后才可聊天——未登录 WS 401 属拍板预期行为);②真机回归(LAN 页图片收发/未登录聊天 401 提示/跨 tab 会话合并/撤回带图)。Security 节 WS 鉴权条目随四批关闭。
 
 **Why:** 均有坐实证据;Markdown 族为渲染正确性/性能/安全面,逐条独立;两条需拍板项等待用户定口径。
 
 **Context:** 全部细节(触发场景+修复方向+双验证员理由)在审计 workflow 输出;生命周期族收口记录在上。
 
 **Effort:** M(逐条独立);**Priority:** P2(需拍板两条 P2)/P3(其余)
-**Depends on:** 首批(worktree fix/webchat-audit-batch1)
+**Depends on:** 无(全部已合 master)
 
 ## Networking
 
