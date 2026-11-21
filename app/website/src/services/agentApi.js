@@ -227,3 +227,21 @@ export async function saveRoutingConfig(payload) {
     body: JSON.stringify(payload),
   });
 }
+
+// ——— 网页终端(spec docs/superpowers/specs/2026-11-21-web-terminal-design.md)———
+
+export async function getWebTerminalState() {
+  return request('/api/agent/web-terminal', { method: 'GET' });
+}
+
+// token 由调用方(useWebTerminal)注入 header——plain HTTP proxy 全量转发。
+// 业务失败不走 throw:{ok:false, reason,...} 结构化返回(前端要读锁定秒数)。
+export async function webTerminalCommand(payload, token = '') {
+  const headers = {};
+  if (token) headers['X-Web-Terminal-Token'] = token;
+  return request('/api/agent/web-terminal', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+    headers,
+  });
+}

@@ -21,8 +21,10 @@ function normalizeAgentSubTab(sub) {
 
 // ── ESC 页面返回层 / 子 tab 收回层(设计:docs/superpowers/specs/2026-11-18-esc-navigation-design.md)──
 // chat 页返回层不在这里压:其 handler 依赖 useAliangChat.close()(在途重命名落地),
-// 反向 import 会成环,由 ChatPage 组件挂载/卸载自管。
-const PAGE_RETURN_PAGES = ['settings', 'agent', 'user', 'log'];
+// 反向 import 会成环,由 ChatPage 组件挂载/卸载自管。terminal 页同理组件自管一层
+// ('terminal-workspace' 由 TerminalWorkspace 压/移),这里另挂通用 page-return 兜底:
+// 两层 handler 同归 dashboard,栈顶先消费组件层,无双击误触。
+const PAGE_RETURN_PAGES = ['settings', 'agent', 'user', 'log', 'terminal'];
 const AGENT_DEFAULT_SUB = 'records';
 const { push: escPush, remove: escRemove, stack: escStack } = useEscStack();
 
@@ -96,6 +98,10 @@ function showDashboard() {
   showPage('dashboard');
 }
 
+function showTerminal() {
+  showPage('terminal');
+}
+
 function showChat(options = {}) {
   // 只认字符串：provider 是封闭字符串词表，非字符串（Number/对象）一律归一为空串，
   // 否则 `String({})` 会写出 '[object object]' 这种脏预置传进 ChatPage。
@@ -115,6 +121,7 @@ export function useNavigation() {
     showUserCenter,
     showLogs,
     showDashboard,
+    showTerminal,
     showChat
   };
 }

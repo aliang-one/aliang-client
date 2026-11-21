@@ -174,6 +174,17 @@
         </button>
         <button
           type="button"
+          data-testid="terminal-entry-sidebar"
+          :disabled="!isAuthenticated"
+          @click="showTerminal()"
+          class="w-full flex items-center gap-3 px-4 py-2.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded text-sm font-medium hover:border-primary transition-colors"
+          :class="!isAuthenticated ? 'cursor-not-allowed opacity-60 hover:border-slate-200 dark:hover:border-slate-700' : ''"
+        >
+          <span class="material-symbols-outlined text-slate-400 text-lg">terminal</span>
+          {{ t('term_open') }}
+        </button>
+        <button
+          type="button"
           class="w-full flex items-center gap-3 px-4 py-2.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded text-sm font-medium hover:border-primary transition-colors"
           @click="handleShowSettings"
         >
@@ -356,6 +367,17 @@
             >
               <span class="material-symbols-outlined text-lg text-slate-400">smart_toy</span>
               {{ t('dash_aliangChat') }}
+            </button>
+            <button
+              type="button"
+              data-testid="terminal-entry-topbar"
+              :disabled="!isAuthenticated"
+              class="flex w-full items-center gap-3 rounded border bg-white px-4 py-3 text-sm font-medium dark:bg-slate-900"
+              :class="!isAuthenticated ? 'cursor-not-allowed opacity-60 border-slate-200 dark:border-slate-700' : 'border-slate-200 hover:border-primary dark:border-slate-700'"
+              @click="showTerminal()"
+            >
+              <span class="material-symbols-outlined text-lg text-slate-400">terminal</span>
+              {{ t('term_open') }}
             </button>
             <button
               type="button"
@@ -1031,7 +1053,7 @@ const isProdBuild = import.meta.env.PROD || ['prod', 'production'].includes(Stri
 const frontEndLogsFetchLimit = isProdBuild ? 200 : 800;
 
 const { certStatus, loading: certLoading, startPolling: startCertPolling, stopPolling: stopCertPolling } = useCertStatus();
-const { currentPage, showPage, showSettings, showAgent, showChat } = useNavigation();
+const { currentPage, showPage, showSettings, showAgent, showChat, showTerminal } = useNavigation();
 // Agent 入口的状态点：与 Agent 页共享同一份 /api/agent/status 单例，
 // 仪表盘加载时预热一次，进 Agent 页不再重复拉取。
 const { runtimeOnline, agentEnabled, statusLabel, ensureLoaded } = useAgentStatus();
