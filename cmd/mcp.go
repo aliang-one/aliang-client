@@ -215,10 +215,14 @@ func peerMCPToolDescriptors() []map[string]interface{} {
 	// config.json 不会生效——这是有意的，工具面上半截变化的列表比稳定的旧
 	// 列表更难排查。
 	aiGateOn := agentMCPGateOn()
+	listenerGateOn := listenerMCPGateOn()
 	for _, t := range peerMCPTools {
 		// 过滤放在列表出口而不是从表里删：表是编译期常量，list 与 call 两处
 		// 门控读同一张表，「谁在不在表里」才只有一种答案。
 		if isAIMCPToolName(t.name) && !aiGateOn {
+			continue
+		}
+		if isListenerMCPToolName(t.name) && !listenerGateOn {
 			continue
 		}
 		out = append(out, map[string]interface{}{
@@ -322,6 +326,53 @@ func isAIMCPToolName(name string) bool {
 		return true
 	}
 	return false
+}
+
+// isListenerMCPToolName 判断名字是否属于监听器工具组（监听器批 2026-11-21）。
+// 与 isAIMCPToolName 同一纪律：list 与 call 两处门控共用这一份名单，防
+// 「列表里没有、tools/call 仍能打到」的静默越门。
+func isListenerMCPToolName(name string) bool {
+	switch name {
+	case "listener_create", "listener_list", "listener_update", "listener_delete":
+		return true
+	}
+	return false
+}
+
+// listenerMCPGateOn 读 customer.event_listeners 三态（对应常驻侧
+// config.EffectiveEventListenersEnabled 的冷子进程镜像）。为什么直读文件而
+// 不 GetGlobalConfig().EffectiveEventListenersEnabled()：与 agentMCPGateOn
+// 同因——customer config 只由常驻 agent 主进程 SetGlobalConfig 装载，冷子
+// 进程从全局读等于把门写成永久 fail-open；fail-open 语义（缺文件/解析失败
+// /字段缺失一律 = 开启，显式 false 才关）与家族其它能力开关一致。JSON 是
+// 嵌套的 event_listeners.enable。
+func listenerMCPGateOn() bool {
+	path := agentMCPGateConfigPath()
+	if path == "" {
+		return true
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "aliang mcp: read %s for event_listeners gate: %v (defaulting to enabled)\n", path, err)
+		}
+		return true
+	}
+	var probe struct {
+		Customer struct {
+			EventListeners struct {
+				Enable *bool `json:"enable"`
+			} `json:"event_listeners"`
+		} `json:"customer"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		fmt.Fprintf(os.Stderr, "aliang mcp: parse %s for event_listeners gate: %v (defaulting to enabled)\n", path, err)
+		return true
+	}
+	if probe.Customer.EventListeners.Enable == nil {
+		return true
+	}
+	return *probe.Customer.EventListeners.Enable
 }
 
 // peerMCPTools 与 services 侧 LLM 工具面一一对应；后端全走 56433 本地路由，
@@ -600,6 +651,123 @@ var peerMCPTools = []peerMCPTool{
 		buildReq:  func(map[string]interface{}) interface{} { return nil },
 		rawData:   true,
 	},
+	// ---- 第 8 工具组:监听器管理(listener_*,监听器批 2026-11-21) ----
+	//
+	// 与 agentcore 面(agent_listener_tools.go)共用 Task 12 共享处理器:本表
+	// 只管 stdio 描述符 + 本地路由,后端在 user agent runtime 的
+	// /api/agent/listeners/mcp/*(云端凭据住常驻进程,冷子进程直调恒失败,
+	// ai_run_* 同款一跳)。两面描述符是手维护副本,语义等价(参数面 + 关键
+	// 行为约束)由 PeerMCPContractSpecs 契约行钉住。刻意差异只有一处:stdio
+	// 面无环境会话 → create 的 target_session_id 在本面必填(描述明示,运行
+	// 时由共享处理器 1a fail-fast 兜底);schema.required 两面保持一致,不
+	// 单方收紧。结果 data 是结构化对象,走 rawData 原样透传(mesh 读面同款
+	// 分支)。预算链:云端单跳 8s → tool 层 14s 兜底。
+	{
+		name: "listener_create",
+		description: "Register an event listener for the user (替用户注册监听;事件命中后会以新回合注入绑定的会话). " +
+			"On this MCP face target_session_id is REQUIRED — there is no ambient session, so omitting it fails fast; pass the session that should receive the injected turns. " +
+			"Sources: file_tail (tail a local file, params: path, match, optional max_bytes) and process_exit (params: command or pid, optional expect_code) run on THIS device only — leave source.device_id empty or pass this device's id; " +
+			"http_poll (params: url, optional interval_s, match) and webhook (no params; the create result carries the callback URL) run server-side — device_id is ignored. " +
+			"prompt_template MUST contain the {{event}} placeholder (rendered with the fired event payload). mode: once (fires once then expires) or recurring. " +
+			"Returns {id, status, target_session_id} plus approval_warning when the target session's approval mode would strand unattended turns on approval cards.",
+		schema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"title": map[string]interface{}{"type": "string", "description": "Human-readable listener title, e.g. 盯 build.log 等编译报错"},
+				"source": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"type":      map[string]interface{}{"type": "string", "enum": []interface{}{"file_tail", "process_exit", "http_poll", "webhook"}, "description": "Event source type"},
+						"device_id": map[string]interface{}{"type": "string", "description": "Event-source device; file_tail/process_exit: this device only (leave empty for this machine, foreign ids are rejected); http_poll/webhook: ignored (server-side)"},
+						"params":    map[string]interface{}{"type": "object", "description": "Source params per type (file_tail: path/match/max_bytes; process_exit: command|pid/expect_code; http_poll: url/interval_s/match; webhook: none)"},
+					},
+					"required": []interface{}{"type"},
+				},
+				"prompt_template":   map[string]interface{}{"type": "string", "description": "Prompt injected when the listener fires; must contain {{event}}"},
+				"mode":              map[string]interface{}{"type": "string", "enum": []interface{}{"once", "recurring"}, "description": "once = fire once then expire (default 24h window); recurring = repeat with cooldown (default 10min)"},
+				"target_session_id": map[string]interface{}{"type": "string", "description": "Session that receives the injected turn. REQUIRED on this MCP face (no ambient session — omitting fails fast); a future release will allow empty = create a new session on fire"},
+			},
+			"required": []string{"title", "source", "prompt_template", "mode"},
+		},
+		timeoutMs: 14_000,
+		method:    http.MethodPost,
+		path:      "/api/agent/listeners/mcp/create",
+		// 工具参数整包透传为请求体(server 侧 invoke 按已知键抽取,未知键
+		// 丢弃);nil 归一 {} 防 nil map 序列化成字面 null 送上 wire。
+		buildReq: func(args map[string]interface{}) interface{} {
+			if args == nil {
+				return map[string]interface{}{}
+			}
+			return args
+		},
+		rawData: true,
+	},
+	{
+		name: "listener_list",
+		description: "List every listener in this Aliang account (same source as the sidebar listener panel — no second schema): " +
+			"id, title, source_type, status, mode, target_session_id, last_fired_at, fired_count, cooldown_ms, error_note, updated_at. Read-only.",
+		schema:    map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+		timeoutMs: 14_000,
+		method:    http.MethodPost,
+		path:      "/api/agent/listeners/mcp/list",
+		buildReq: func(args map[string]interface{}) interface{} {
+			if args == nil {
+				return map[string]interface{}{}
+			}
+			return args
+		},
+		rawData: true,
+	},
+	{
+		name: "listener_update",
+		description: "Patch a listener by id: pause (status=paused), resume (status=active — also revives an error row), " +
+			"or edit title / prompt_template (must keep {{event}}) / mode / cooldown_ms. " +
+			"The updated_at LWW stamp is carried automatically from the local mirror; pass your own only to retry after a 409 conflict.",
+		schema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"id":              map[string]interface{}{"type": "string", "description": "Listener id (L-...) from listener_list"},
+				"title":           map[string]interface{}{"type": "string", "description": "New title"},
+				"prompt_template": map[string]interface{}{"type": "string", "description": "New prompt template (must contain {{event}})"},
+				"cooldown_ms":     map[string]interface{}{"type": "integer", "description": "Recurring dedupe window in ms (default 600000)"},
+				"mode":            map[string]interface{}{"type": "string", "enum": []interface{}{"once", "recurring"}, "description": "once or recurring"},
+				"status":          map[string]interface{}{"type": "string", "enum": []interface{}{"active", "paused"}, "description": "active = run/revive; paused = hold"},
+				"updated_at":      map[string]interface{}{"type": "string", "description": "LWW 乐观锁戳,ISO UTC Z;省略则自动携带本地镜像值——仅在遇 409 冲突重试时从 listener_list 取最新值填入"},
+			},
+			"required": []string{"id"},
+		},
+		timeoutMs: 14_000,
+		method:    http.MethodPost,
+		path:      "/api/agent/listeners/mcp/update",
+		buildReq: func(args map[string]interface{}) interface{} {
+			if args == nil {
+				return map[string]interface{}{}
+			}
+			return args
+		},
+		rawData: true,
+	},
+	{
+		name:        "listener_delete",
+		description: "Delete a listener by id. The listener stops firing immediately and disappears from every device's sidebar panel.",
+		schema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"id": map[string]interface{}{"type": "string", "description": "Listener id (L-...) from listener_list"},
+			},
+			"required": []string{"id"},
+		},
+		timeoutMs: 14_000,
+		method:    http.MethodPost,
+		path:      "/api/agent/listeners/mcp/delete",
+		buildReq: func(args map[string]interface{}) interface{} {
+			if args == nil {
+				return map[string]interface{}{}
+			}
+			return args
+		},
+		rawData: true,
+	},
 }
 
 // invokeTool 执行一个 tools/call：本地路由 → {code:0,data:{result}} 解包；
@@ -611,6 +779,12 @@ func (s *peerMCPServer) invokeTool(name string, rawArgs json.RawMessage) (string
 	// 文案与 peer_mcp 关闸同款（unknown tool）是刻意的：模型对「工具不存在」
 	// 的处理是明确的（换路子），对「工具被禁用」会反复重试或改写参数。
 	if isAIMCPToolName(name) && !agentMCPGateOn() {
+		return fmt.Sprintf("unknown tool: %s", name), true
+	}
+	// 监听器组门控同款（监听器批 2026-11-21）：关闸时这四个名字落「未知工具」
+	// 分支，文案与 ai_mcp 关闸同款是刻意的——模型对「工具不存在」的处理是
+	// 换路子，对「工具被禁用」会反复重试或改写参数。
+	if isListenerMCPToolName(name) && !listenerMCPGateOn() {
 		return fmt.Sprintf("unknown tool: %s", name), true
 	}
 	var tool *peerMCPTool

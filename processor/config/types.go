@@ -599,6 +599,29 @@ type CustomerConfig struct {
 	// SSHIngress 是 SSH 入口服务面(customer.ssh_ingress)。nil 时服务关闭——
 	// 默认关,升级零回退。与组网分支的 MeshConfig 为相邻行合并关系(双方尾部追加)。
 	SSHIngress *SSHIngressConfig `json:"ssh_ingress,omitempty"`
+	// EventListeners 是事件监听器 LLM 工具面总闸(customer.event_listeners,
+	// specs/005-event-listener §5)。nil 时默认开——升级零回退;监听器数据面
+	// (listeners.json + server DB)独立于 config 文件(spec §6),关闸只摘
+	// 工具注入,不删任何监听器。
+	EventListeners *EventListenersConfig `json:"event_listeners,omitempty"`
+}
+
+// EventListenersConfig 事件监听器工具面开关(customer.event_listeners)。
+type EventListenersConfig struct {
+	// Enable 总闸(nil=默认开,与 peer_mcp 同族「默认开」语义:能力默认在,
+	// 开关只用于显式关停)。消费面:agentcore 内置桥注入(agentCoreListenerTools)
+	// 与后续 stdio MCP 面。
+	Enable *bool `json:"enable,omitempty"`
+}
+
+// EffectiveEventListenersEnabled 返回监听器 LLM 工具面是否开启。默认开启
+// (对齐 EffectivePeerMCPEnabled 家族):nil(未配置)与 true 等价,只有
+// 显式 false 才关闭。
+func (c *Config) EffectiveEventListenersEnabled() bool {
+	if c == nil || c.Customer == nil || c.Customer.EventListeners == nil || c.Customer.EventListeners.Enable == nil {
+		return true
+	}
+	return *c.Customer.EventListeners.Enable
 }
 
 // CustomerGeoIPSettings 自定义 GeoIP 国家库下载源（customer.geoip）。
@@ -1737,7 +1760,7 @@ func (c *Config) customerUnknownKeyErrors() error {
 	if len(c.customerUnknownFields) > 0 {
 		sorted := append([]string(nil), c.customerUnknownFields...)
 		sort.Strings(sorted)
-		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp mesh ssh_ingress]", sorted[0])
+		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp mesh ssh_ingress event_listeners]", sorted[0])
 	}
 
 	providers := make([]string, 0, len(c.aiRuleUnknownFields))
@@ -1774,7 +1797,7 @@ func extractCustomerUnknownFields(root map[string]json.RawMessage) ([]string, ma
 
 	for key := range customerRoot {
 		switch key {
-		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip", "agentcore_llm", "agentcore", "peer_mcp", "mesh", "ssh_ingress":
+		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip", "agentcore_llm", "agentcore", "peer_mcp", "mesh", "ssh_ingress", "event_listeners":
 		default:
 			unknownCustomer = append(unknownCustomer, key)
 		}

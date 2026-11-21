@@ -784,6 +784,29 @@ func TestValidateEditableCustomerKeysAllowsSSHIngress(t *testing.T) {
 	}
 }
 
+// event_listeners 必须在可编辑白名单里,否则保存 400;拒绝文案须含更新后的
+// 字段清单(监听器工具面总闸,specs/005-event-listener;改一处必改三处的
+// 第三处,见 validateEditableCustomerKeys 注释)。
+func TestValidateEditableCustomerKeysAllowsEventListeners(t *testing.T) {
+	raw := map[string]json.RawMessage{
+		"event_listeners": json.RawMessage(`{"enable":false}`),
+	}
+	if err := validateEditableCustomerKeys(raw); err != nil {
+		t.Fatalf("event_listeners 应放行, got %v", err)
+	}
+	err := validateEditableCustomerKeys(map[string]json.RawMessage{
+		"no_such_key": json.RawMessage(`{}`),
+	})
+	if err == nil || !strings.Contains(err.Error(), "event_listeners") {
+		t.Errorf("拒绝文案应含更新后的字段清单, got %v", err)
+	}
+	// normalizeCustomerPayload 的拒绝文案是第三处逐字同步点(根级陌生键分支),
+	// 一并钉住改一处必改三处的闭环(M4)。
+	if _, err := normalizeCustomerPayload([]byte(`{"evil":1,"customer":{"proxy":{}}}`)); err == nil || !strings.Contains(err.Error(), "event_listeners") {
+		t.Errorf("normalizeCustomerPayload 拒绝文案应含更新后的字段清单, got %v", err)
+	}
+}
+
 // 保存通道 400:agentcore_llm 远端+无 key 必须在保存时被 Config.Validate 拒绝,
 // 不能出现「保存成功、回合时静默整层关闭」的形态。
 func TestSaveCustomerConfigRejectsAgentCoreLLMRemoteNoKey(t *testing.T) {
