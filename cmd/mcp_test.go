@@ -128,9 +128,9 @@ func toolCallText(t *testing.T, resp map[string]interface{}) (string, bool) {
 }
 
 func TestPeerMCPToolsList_HasNinePeerToolsAndThreeAIMCPTools(t *testing.T) {
-	// 钉夹具：本用例断言的是「peer 五工具 + mesh 四读面」的份额，而 ai_run_*
-	// 的在场与否取决于 ai_mcp 门控——不钉的话开发机上若有人关了 ai_mcp，这条
-	// 会莫名从 12 变 9 而看不出是门控还是工具表回归。
+	// 钉夹具：本用例断言的是「peer 五工具 + mesh 四读面 + 监听器四件」的
+	// 份额，而 ai_run_* 的在场与否取决于 ai_mcp 门控——不钉的话开发机上若
+	// 有人关了 ai_mcp，这条会莫名从 16 变 13 而看不出是门控还是工具表回归。
 	pinAIMCPGateConfig(t, "") // 文件不存在 = 默认开
 	rec := newMCPTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("tools/list must not touch the local agent")
@@ -143,13 +143,15 @@ func TestPeerMCPToolsList_HasNinePeerToolsAndThreeAIMCPTools(t *testing.T) {
 	}
 	result, _ := resp["result"].(map[string]interface{})
 	tools, _ := result["tools"].([]interface{})
-	// 9 peer（含 mesh 诊断读面四件）+ 3 ai_run_*（门控默认开）。
-	if len(tools) != 12 {
-		t.Fatalf("tools = %d, want 12", len(tools))
+	// 9 peer（含 mesh 诊断读面四件）+ 4 listener_*（监听器批 2026-11-21）
+	// + 3 ai_run_*（门控默认开）。
+	if len(tools) != 16 {
+		t.Fatalf("tools = %d, want 16", len(tools))
 	}
 	want := map[string]bool{
 		"peer_exec": false, "peer_fetch_file": false, "device_list": false, "device_info": false, "device_note": false,
 		"mesh_readiness": false, "mesh_identity": false, "mesh_stun_probe": false, "mesh_lan_candidates": false,
+		"listener_create": false, "listener_list": false, "listener_update": false, "listener_delete": false,
 		"ai_run_start": false, "ai_run_status": false, "ai_run_approve": false,
 	}
 	for _, item := range tools {
@@ -377,6 +379,10 @@ func TestPeerMCPCall_LargeResultWithin4MiBCap(t *testing.T) {
 // 第 7 组 mesh_* 同理不在映射里：它们是 agentcore 面+stdio 面双面读工具
 // （读面批 2026-11-20），CLI bridge（agent_ai_tool_ask_peer.go）刻意不注入
 // ——两面语义由 PeerMCPContractSpecs 契约测试钉住，与 bridge 无关。
+//
+// 第 8 组 listener_*（监听器批 2026-11-21）同理：agentcore 面
+// （agentCoreListenerTools）+stdio 面双面工具，共用 Task 12 共享处理器，
+// 不走 ask-peer bridge——两面语义同样由 PeerMCPContractSpecs 钉住。
 func TestPeerMCPToolNamesMapBridgeNames(t *testing.T) {
 	// bridge 名(services/agent_ai_tool_ask_peer.go)
 	bridgeNames := map[string]bool{
@@ -396,6 +402,8 @@ func TestPeerMCPToolNamesMapBridgeNames(t *testing.T) {
 	noBridgeFace := map[string]bool{
 		"mesh_readiness": true, "mesh_identity": true,
 		"mesh_stun_probe": true, "mesh_lan_candidates": true,
+		"listener_create": true, "listener_list": true,
+		"listener_update": true, "listener_delete": true,
 	}
 	seen := map[string]bool{}
 	for _, tool := range peerMCPTools {

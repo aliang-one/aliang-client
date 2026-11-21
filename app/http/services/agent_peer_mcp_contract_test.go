@@ -20,6 +20,12 @@ import (
 func TestPeerMCPContractAgentCoreSide(t *testing.T) {
 	m := newAgentAIManager()
 	tools := m.agentCorePeerTools(agentAIRun{sessionID: "contract"})
+	// 监听器族(监听器批 Task 12/13)走第二个注入构建器,合进同一张名字表
+	// 共用一份契约行钉住。门控 customer.event_listeners 默认开,reset 防
+	// 同包前序用例残留关闸态把工具剥空(TestMeshDiag 同款手法)。
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(config.ResetGlobalConfigForTest)
+	tools = append(tools, m.agentCoreListenerTools(agentAIRun{sessionID: "contract"})...)
 	byName := map[string]agentcore.Tool{}
 	for _, tool := range tools {
 		byName[tool.Name()] = tool

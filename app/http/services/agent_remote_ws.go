@@ -747,6 +747,9 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 		// 小时级定时器在跑；首次触发时清一遍陈旧 .partial（7 天对齐服务端）。
 		s.kickAgentTransferInbox()
 		sweepAgentTransferPartials()
+		// 监听器断联暂存重放(specs/005 FR-5,Task 9)：注册成功即按序补发
+		// outbox(缝内 safeGo 离线化，不堵读循环)。
+		listenerOutboxReplayHook()
 	case models.AgentEventHeartbeatAck:
 		s.setRemoteConnectionState(true, "online", "")
 		// Retry durable terminals while the socket remains healthy. A prior
@@ -893,6 +896,39 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 		// default 臂 unsupported 噪声（peer.lan.listen_result 同款）。
 		s.setRemoteConnectionState(true, "online", "")
 		safeGo("peer_punch_session_result", func() { sharedAgentPeerPunchA().handleResultFrame(msg) })
+	case models.AgentEventListenerUpsert:
+		// 事件监听器镜像下行(specs/005-event-listener §2/FR-4)：server 注册表
+		// 行变更推镜像。状态同步类流量(与 device.settings 同族)，不进
+		// enabled-device 门控名单——被禁用设备也须保持镜像同步；读循环内联
+		// 处理保持帧序(LWW 仲裁输入)。handler 自带 recover 护栏(旧工具臂
+		// 同款仓规)——Task 9 钩子会跑真 watcher 生命周期代码,畸形帧只记
+		// 日志、panic 就地吞掉,绝不撕断读循环。
+		s.setRemoteConnectionState(true, "online", "")
+		if err := handleListenerUpsertFrame(msg); err != nil {
+			logger.Warn(fmt.Sprintf("[AGENT-LISTENER] upsert frame error=%v", err))
+		}
+	case models.AgentEventListenerRemove:
+		// 事件监听器镜像下行同族(specs/005-event-listener §2/FR-4)：删镜像行
+		// + watcher 停止钩子(钩子幂等，server 补偿重放 remove 是常态；护栏
+		// 同 upsert)。
+		s.setRemoteConnectionState(true, "online", "")
+		if err := handleListenerRemoveFrame(msg); err != nil {
+			logger.Warn(fmt.Sprintf("[AGENT-LISTENER] remove frame error=%v", err))
+		}
+	case models.AgentEventListenerEventReject:
+		// 事件上行拒绝回执(specs/005 §2/FR-6,Task 9)：file_tail watcher 批
+		// 消费——fired/expired/deleted/paused 停 watcher，device_unregistered
+		// 计数(≥5 置 error)。状态同步类流量，不进 enabled-device 门控。
+		s.setRemoteConnectionState(true, "online", "")
+		handleListenerEventRejectFrame(msg)
+	case models.AgentEventListenerTriggered:
+		// 云端触发引擎命中帧(specs/005 §2,Task 14)：server 已判定监听器命中
+		// (once+recurring 同帧)，原样账号级广播给全部本机 AI-chat socket
+		// (仪表盘 toast 面)。状态同步类展示流量，不进 enabled-device 门控
+		// (upsert/remove 同族)；广播 enqueue 有界非阻塞，不堵 read loop；
+		// server 侧 best-effort——agent 侧同样 fire-and-forget，不回执。
+		s.setRemoteConnectionState(true, "online", "")
+		s.ai.BroadcastListenerEvent(msg)
 	// 注意：这五个旧工具事件（file.list/file.read/file.write/git.status/env.info；
 	// file.write 为 D3 新增，与 file.list/file.read 同走 agent_detail 臂）由下面的
 	// 显式臂直派、有意绕过 default 臂的 tools.RunWithGuards 护栏（无超时看门狗/

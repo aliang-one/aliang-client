@@ -613,6 +613,33 @@ func (m *agentAIManager) fanOutFrom(originID, sessionID string, payload map[stri
 	}
 }
 
+// BroadcastListenerEvent 账号级广播,无会话订阅门槛(specs/005-event-listener
+// §2 / 计划 Task 14):云端触发引擎的 listener.triggered 命中帧原样 enqueue 给
+// 全部注册的 AI-chat socket——零订阅的 socket 也收(监听器事件不属于任何
+// 会话,与审批族广播同语义但不限帧型判定)。绝不阻塞调用方(read loop):
+// enqueue 非阻塞(有界队列,溢出即断开该 socket 并经 onDead 摘除);目标
+// 收集持 m.mu、enqueue 在锁外——enqueue 溢出路径会在 closeOnce 闭包内回取
+// m.mu(onDead),持锁 enqueue 会 AB-BA 死锁(fanOutFrom 同款纪律)。
+// payload 冻结契约同 fanOutWrite:同一 map 实例投给 N 个 pump,返回后调用
+// 方不得原地改写。
+func (m *agentAIManager) BroadcastListenerEvent(payload map[string]interface{}) {
+	if payload == nil {
+		return
+	}
+	m.mu.Lock()
+	targets := make([]*agentAISocket, 0, len(m.aiSockets))
+	for _, s := range m.aiSockets {
+		if s == nil || !s.alive() {
+			continue
+		}
+		targets = append(targets, s)
+	}
+	m.mu.Unlock()
+	for _, s := range targets {
+		s.enqueue(payload)
+	}
+}
+
 // RegisterLocalAIChatSocket 注册一条本地聊天 WS 出站 socket，返回其 id
 // （空串=manager 未就绪，调用方跳过注册与标记）。
 func (s *AgentService) RegisterLocalAIChatSocket(write agentTerminalWriter) string {

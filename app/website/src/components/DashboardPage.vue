@@ -174,6 +174,21 @@
         </button>
         <button
           type="button"
+          data-testid="listener-entry-sidebar"
+          :disabled="!isAuthenticated"
+          class="w-full flex items-center gap-3 px-4 py-2.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded text-sm font-medium hover:border-primary transition-colors"
+          :class="!isAuthenticated ? 'cursor-not-allowed opacity-60 hover:border-slate-200 dark:hover:border-slate-700' : ''"
+          @click="openListenerPanel"
+        >
+          <span class="material-symbols-outlined text-slate-400 text-lg">notifications</span>
+          {{ t('listener_entryTitle') }}
+          <span
+            v-if="listenerActiveCount !== null"
+            class="ml-auto shrink-0 rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-bold text-primary"
+          >{{ listenerActiveCount }}</span>
+        </button>
+        <button
+          type="button"
           class="w-full flex items-center gap-3 px-4 py-2.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded text-sm font-medium hover:border-primary transition-colors"
           @click="handleShowSettings"
         >
@@ -356,6 +371,21 @@
             >
               <span class="material-symbols-outlined text-lg text-slate-400">smart_toy</span>
               {{ t('dash_aliangChat') }}
+            </button>
+            <button
+              type="button"
+              data-testid="listener-entry-panel"
+              :disabled="!isAuthenticated"
+              class="flex w-full items-center gap-3 rounded border bg-white px-4 py-3 text-sm font-medium dark:bg-slate-900"
+              :class="!isAuthenticated ? 'cursor-not-allowed opacity-60 border-slate-200 dark:border-slate-700' : 'border-slate-200 hover:border-primary dark:border-slate-700'"
+              @click="openListenerPanel"
+            >
+              <span class="material-symbols-outlined text-lg text-slate-400">notifications</span>
+              {{ t('listener_entryTitle') }}
+              <span
+                v-if="listenerActiveCount !== null"
+                class="ml-auto shrink-0 rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-bold text-primary"
+              >{{ listenerActiveCount }}</span>
             </button>
             <button
               type="button"
@@ -990,6 +1020,8 @@
       </div>
     </div>
 
+    <ListenerSettings v-if="listenerPanelOpen" @close="listenerPanelOpen = false" />
+
     <OnboardingGuide
       @open-cert="openCertModal"
       @open-login="openLoginModal"
@@ -1005,6 +1037,7 @@ import { computed, ref, onMounted, onUnmounted, watch, nextTick } from 'vue';
 import OnboardingGuide from './OnboardingGuide.vue';
 import { useEscLayer } from '../composables/useEscStack';
 import ScanLoginPanel from './settings/ScanLoginPanel.vue';
+import ListenerSettings from './settings/ListenerSettings.vue';
 import { isOnboardingCompleted, openOnboardingGuide } from '../composables/useOnboardingGuide';
 import { openTutorialDocs } from '../composables/useTutorialDocs';
 import { useI18n } from '../i18n';
@@ -1025,6 +1058,8 @@ import {
   getDashboardUsageRecords
 } from '../services/dashboardApi';
 import { getAliangLinkStatus } from '../services/runApi';
+import { getListeners } from '../services/agentApi';
+import { normalizeListenerList } from '../utils/listenerFormat';
 
 const { t } = useI18n();
 const isProdBuild = import.meta.env.PROD || ['prod', 'production'].includes(String(import.meta.env.MODE || '').toLowerCase());
@@ -1063,6 +1098,12 @@ const requestFilter = ref('all');
 const pathSearch = ref('');
 const isLoginModalOpen = ref(false);
 const mobilePanelOpen = ref(false);
+// 监听器面板(桌面+移动同入口):v-if 挂载即拉列表+轮询,卸载即停——
+// 面板自身的轮询生命周期完全由组件 mounted/beforeUnmount 自管。
+const listenerPanelOpen = ref(false);
+// 入口徽标 = active 监听器数(null=未加载不显徽标);独立 15s 慢轮询,
+// 与面板内 5s 轮询互不替代(面板关着时徽标也要活)。
+const listenerActiveCount = ref(null);
 const loginMode = ref('password'); // 'password' | 'scan'
 const loginEmail = ref('');
 const loginPassword = ref('');
@@ -1116,6 +1157,7 @@ let tunStartStatusTimer = null;
 let tunStartBackendTimer = null;
 let tunStartAutoCloseTimer = null;
 let serverLinkTimer = null;
+let listenerBadgeTimer = null;
 
 const serverLinkOnline = computed(() => ['connected', 'degraded'].includes(serverLinkState.value));
 
@@ -1766,6 +1808,9 @@ useEscLayer('login-modal', () => {
   if (!loginPending.value) closeLoginModal();
 }, () => isLoginModalOpen.value);
 useEscLayer('tun-start-modal', closeTunStartModal, () => tunStartModal.value.visible);
+useEscLayer('listener-panel', () => {
+  listenerPanelOpen.value = false;
+}, () => listenerPanelOpen.value);
 
 function openCertModal() {
   emit('openCertModal');
@@ -1785,6 +1830,25 @@ function handleShowSettings() {
 
 function handleShowAgent() {
   showAgent();
+}
+
+function openListenerPanel() {
+  listenerPanelOpen.value = true;
+}
+
+// 监听器入口徽标轮询:静默容错——云端离线是预期态(面板内自会亮专用横幅),
+// 这里绝不弹全局错误框;失败保留上一份徽标值。
+async function refreshListenerBadge() {
+  if (!isAuthenticated.value) {
+    listenerActiveCount.value = null;
+    return;
+  }
+  try {
+    const rows = normalizeListenerList(await getListeners()); // agentApi 已解包为数组
+    listenerActiveCount.value = rows.filter((row) => row?.status === 'active').length;
+  } catch {
+    // 徽标是非关键装饰态:吞错保安静(列表真实错误面在面板里表达)
+  }
 }
 
 const runModeLabel = computed(() => {
@@ -2215,6 +2279,10 @@ onMounted(() => {
   refreshSoftwareUpdateStatus().catch(() => {});
   sampleServerLink();
   serverLinkTimer = window.setInterval(sampleServerLink, 15000);
+  refreshListenerBadge();
+  listenerBadgeTimer = window.setInterval(() => {
+    if (document.visibilityState === 'visible') refreshListenerBadge();
+  }, 15000);
   syncAccountBalance();
   loadDashboardUsageData();
   window.addEventListener('aliang:tun-progress-open', handleExternalTunProgressOpen);
@@ -2237,6 +2305,10 @@ onUnmounted(() => {
     window.clearInterval(serverLinkTimer);
     serverLinkTimer = null;
   }
+  if (listenerBadgeTimer !== null) {
+    window.clearInterval(listenerBadgeTimer);
+    listenerBadgeTimer = null;
+  }
   window.removeEventListener('aliang:tun-progress-open', handleExternalTunProgressOpen);
   window.removeEventListener('aliang:tun-progress-update', handleExternalTunProgressUpdate);
   window.removeEventListener('aliang:tun-progress-success', handleExternalTunProgressSuccess);
@@ -2251,7 +2323,8 @@ watch(isAuthenticated, async (authenticated) => {
       sampleServerLink(),
       syncAccountBalance(),
       loadDashboardUsageData(),
-      refreshRunState()
+      refreshRunState(),
+      refreshListenerBadge()
     ]);
     return;
   }
@@ -2259,7 +2332,8 @@ watch(isAuthenticated, async (authenticated) => {
   await Promise.allSettled([
     sampleServerLink(),
     loadDashboardUsageData(),
-    refreshRunState()
+    refreshRunState(),
+    refreshListenerBadge()
   ]);
 });
 

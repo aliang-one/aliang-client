@@ -125,6 +125,15 @@ const (
 	AgentEventGoalVerify              = "goal.verify"
 	AgentEventGoalVerifyResult        = "goal.verify.result"
 	AgentEventGoalVerifyError         = "goal.verify.error"
+	// 事件监听器(specs/005-event-listener §2/FR-4/FR-5):server 注册表下行
+	// 推镜像 + agent 事件上行面。upsert/remove 走 handleRemoteAgentMessage
+	// 显式 case(稳定处理,不走工具注册表 default 臂);event(.reject) 由
+	// file_tail watcher 批消费,常量先行登记 wire 契约。
+	AgentEventListenerUpsert      = "listener.upsert"       // server→agent: 注册表行变更推镜像(updated_at LWW 仲裁在 agent 侧镜像存储)
+	AgentEventListenerRemove      = "listener.remove"       // server→agent: 注册表行删除(载荷可只带 id+updated_at,容忍完整行)
+	AgentEventListenerEvent       = "listener.event"        // agent→server: 事件命中上行(§1.5 ListenerEvent 契约原样,无信封包装)
+	AgentEventListenerEventReject = "listener.event.reject" // server→agent: 拒绝回执{reason, permanent}——agent 侧按 FR-6 计数/终态
+	AgentEventListenerTriggered   = "listener.triggered"    // server→agent: 云端触发引擎命中帧{listener_id, title, summary}——agent 原样账号级广播给仪表盘 AI-chat socket(Task 14,best-effort 展示数据,无回执)
 	// 设备互访阶段 1（spec 2026-10-29-device-peer-link-and-profile-design §5.2）：
 	// 一次性命令执行帧族。与 LLM 工具事件（peer.exec/peer.fetch_file/
 	// peer.device_info/peer.device_note，走注册表 default 臂）是两套名空间——

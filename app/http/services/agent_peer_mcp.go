@@ -632,5 +632,34 @@ func PeerMCPContractSpecs() []PeerMCPContractSpec {
 			CoreName: "mesh.lan_candidates", StdioName: "mesh_lan_candidates",
 			Keywords: []string{"idempotent", "read-only", "not auto-paired"},
 		},
+		// 监听器管理四件(监听器批 2026-11-21,specs/005-event-listener §5):
+		// 两面共用 Task 12 共享处理器,描述是手维护近似副本——参数面与关键
+		// 行为约束由本行钉住。agentcore 面名与 stdio 面名相同(无前缀族)。
+		// 刻意的两面差异只有一处:create 的 target_session_id 在 stdio 面
+		// 必填(无环境会话,运行时 1a fail-fast),该语义写在 stdio 描述里、
+		// 不进 schema.required——两面共用本行的 Required 集,单方收紧会假红。
+		// Keywords 只取两面描述都保得住的稳定词({{event}} 占位契约 /
+		// approval_warning 产物 / 源类型枚举 / 挡位词 / LWW 409)。
+		{
+			CoreName: "listener_create", StdioName: "listener_create",
+			Required: []string{"title", "source", "prompt_template", "mode"},
+			Optional: []string{"target_session_id"},
+			Keywords: []string{"{{event}}", "approval_warning", "file_tail", "http_poll"},
+		},
+		{
+			CoreName: "listener_list", StdioName: "listener_list",
+			Keywords: []string{"no second schema", "Read-only"},
+		},
+		{
+			CoreName: "listener_update", StdioName: "listener_update",
+			Required: []string{"id"},
+			Optional: []string{"title", "prompt_template", "cooldown_ms", "mode", "status", "updated_at"},
+			Keywords: []string{"status=paused", "status=active", "409"},
+		},
+		{
+			CoreName: "listener_delete", StdioName: "listener_delete",
+			Required: []string{"id"},
+			Keywords: []string{"stops firing immediately"},
+		},
 	}
 }

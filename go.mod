@@ -11,6 +11,7 @@ require (
 	github.com/andydunstall/piko v0.10.0
 	github.com/creack/pty v1.1.24
 	github.com/docker/go-units v0.5.0
+	github.com/fsnotify/fsnotify v1.7.0
 	github.com/gen2brain/beeep v0.11.2
 	github.com/getkin/kin-openapi v0.134.0
 	github.com/getlantern/systray v1.2.2
@@ -67,7 +68,6 @@ require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/ebitengine/purego v0.10.0 // indirect
 	github.com/esiqveland/notify v0.13.3 // indirect
-	github.com/fsnotify/fsnotify v1.7.0 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.12 // indirect
 	github.com/getlantern/context v0.0.0-20190109183933-c447772a6520 // indirect
 	github.com/getlantern/errors v0.0.0-20190325191628-abdb3e3e36f7 // indirect

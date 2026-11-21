@@ -1529,6 +1529,16 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		}
 	}
 
+	// 监听器工具注入(specs/005-event-listener §5/FR-9,Task 12):四件桥与
+	// peer 工具同款宿主注入(agentCorePeerToolBridge,journal 自带)。刻意在
+	// readOnly 块外:readOnly run 仍保 listener_list 读面供模型感知既有监听器
+	// (create/update/delete 在 agentCoreListenerTools 内按 run.readOnly 剥离,
+	// 任务拍板的细粒度门控,宽于 peer 族全剥惯例);config 总闸
+	// EffectiveEventListenersEnabled 默认开,显式 false = 零注入。
+	for _, tool := range m.agentCoreListenerTools(run) {
+		registry.Register(tool)
+	}
+
 	cfg := &agentcore.Config{
 		Client: kernelClient,
 		Model:  model,

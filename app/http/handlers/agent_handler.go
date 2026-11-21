@@ -434,6 +434,80 @@ func (h *AgentHandler) handleAIMCPOp(w http.ResponseWriter, r *http.Request, op 
 	common.Success(w, map[string]interface{}{"result": string(raw)})
 }
 
+// HandleListenerMCPCreate POST /api/agent/listeners/mcp/create —— 监听器
+// stdio MCP 面(监听器批 plan Task 13)。`aliang mcp` 的 listener_create 工具
+// 经 stdio 面转成对本端点的 POST;真正干活的是 services 侧复用的 Task 12
+// 共享处理器(零上下文:无环境会话,target_session_id 必填 fail-fast)。
+func (h *AgentHandler) HandleListenerMCPCreate(w http.ResponseWriter, r *http.Request) {
+	h.handleListenerMCPOp(w, r, services.ListenerMCPCreate)
+}
+
+// HandleListenerMCPList POST /api/agent/listeners/mcp/list —— 监听器全量列表。
+func (h *AgentHandler) HandleListenerMCPList(w http.ResponseWriter, r *http.Request) {
+	h.handleListenerMCPOp(w, r, services.ListenerMCPList)
+}
+
+// HandleListenerMCPUpdate POST /api/agent/listeners/mcp/update —— 监听器部分更新。
+func (h *AgentHandler) HandleListenerMCPUpdate(w http.ResponseWriter, r *http.Request) {
+	h.handleListenerMCPOp(w, r, services.ListenerMCPUpdate)
+}
+
+// HandleListenerMCPDelete POST /api/agent/listeners/mcp/delete —— 监听器删除。
+func (h *AgentHandler) HandleListenerMCPDelete(w http.ResponseWriter, r *http.Request) {
+	h.handleListenerMCPOp(w, r, services.ListenerMCPDelete)
+}
+
+// handleListenerMCPOp 是监听器 stdio 面四端点共用的壳:方法闸 → 双进程分流
+// → 限长解码 → invoke → 信封。顺序约束与 handleAIMCPOp 同源:method 闸必须
+// 在 proxyIfNeeded 之前;proxy 必须在解码之前(core 侧只做透明转发,body 要
+// 原样到达 runtime)。
+//
+// 两处与 handleAIMCPOp 的刻意差异:
+//  1. 解码目标是 map[string]interface{} 而非 map[string]string——create 的
+//     source 是嵌套对象(params 对象整体透传),字符串表会把它吃掉;
+//  2. 错误分支一律走 JSON 信封(common.Error)而非 http.Error——stdio 面
+//     invokeTool 对纯文本 body 会整段丢弃并报「response is not JSON」,
+//     msg 必须活在信封里才能如实到达模型(handleAIMCPOp 的 503 走
+//     http.Error 是存量缺陷,不在此复制)。成功 data 是结构化对象,stdio
+//     侧走 rawData 原样透传(mesh 读面同形)。
+func (h *AgentHandler) handleListenerMCPOp(w http.ResponseWriter, r *http.Request, op func(context.Context, map[string]interface{}) (interface{}, int, error)) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
+	if err != nil {
+		common.ErrorBadRequest(w, "读取请求体失败", nil)
+		return
+	}
+	args := map[string]interface{}{}
+	if len(strings.TrimSpace(string(raw))) > 0 {
+		if err := json.Unmarshal(raw, &args); err != nil {
+			common.ErrorBadRequest(w, "请求体非法", nil)
+			return
+		}
+	}
+	payload, status, err := op(r.Context(), args)
+	if err != nil {
+		switch status {
+		case http.StatusServiceUnavailable:
+			// 刻意映射:业务码 CodeServiceUnavailable=201 经 ErrorCodeToHTTPStatus
+			// 落 HTTP 500(handleAIMCPOp 同款,非 bug)——stdio 面只消费
+			// code!=0+msg,信封业务码 201 才承载「服务不可用」语义。
+			common.Error(w, common.CodeServiceUnavailable, err.Error(), nil)
+		case http.StatusConflict:
+			common.Error(w, common.CodeConflict, err.Error(), nil)
+		default:
+			common.Error(w, common.CodeBadRequest, err.Error(), nil)
+		}
+		return
+	}
+	common.Success(w, payload)
+}
+
 func (h *AgentHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)

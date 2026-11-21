@@ -639,7 +639,7 @@ func normalizeCustomerPayload(payload []byte) (map[string]interface{}, error) {
 				forbidden = append(forbidden, key)
 			}
 			sort.Strings(forbidden)
-			return nil, fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp mesh ssh_ingress openviking]", forbidden[0])
+			return nil, fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp mesh ssh_ingress openviking event_listeners]", forbidden[0])
 		}
 		rawRoot = map[string]json.RawMessage{}
 		if err := json.Unmarshal(rawCustomer, &rawRoot); err != nil {
@@ -667,9 +667,9 @@ func validateEditableCustomerKeys(rawRoot map[string]json.RawMessage) error {
 	for key := range rawRoot {
 		// 字段清单与 processor/config/types.go customerUnknownKeyErrors 的文案逐字同步,改一处必改三处(两 switch + 三文案)。
 		switch key {
-		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip", "agentcore_llm", "agentcore", "peer_mcp", "mesh", "ssh_ingress", "openviking":
+		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip", "agentcore_llm", "agentcore", "peer_mcp", "mesh", "ssh_ingress", "openviking", "event_listeners":
 		default:
-			return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp mesh ssh_ingress openviking]", key)
+			return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp mesh ssh_ingress openviking event_listeners]", key)
 		}
 	}
 	return nil

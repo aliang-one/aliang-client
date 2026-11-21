@@ -329,6 +329,14 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("POST /api/agent/ai/mcp/start", h.Agent.HandleAIMCPStart, http.MethodPost)
 	register("POST /api/agent/ai/mcp/status", h.Agent.HandleAIMCPStatus, http.MethodPost)
 	register("POST /api/agent/ai/mcp/approve", h.Agent.HandleAIMCPApprove, http.MethodPost)
+	// 监听器 stdio MCP 面四端点(监听器批 plan Task 13,spec §5):真身在
+	// user agent runtime(云端凭据住彼处,Task 12 共享处理器在彼处复用),
+	// core 侧只做 proxy 透传(handler 内 proxyIfNeeded 分流)。双注册纪律:
+	// 缺任一侧=404(ai_run_* 同族,2026-10-21 教训)。
+	register("POST /api/agent/listeners/mcp/create", h.Agent.HandleListenerMCPCreate, http.MethodPost)
+	register("POST /api/agent/listeners/mcp/list", h.Agent.HandleListenerMCPList, http.MethodPost)
+	register("POST /api/agent/listeners/mcp/update", h.Agent.HandleListenerMCPUpdate, http.MethodPost)
+	register("POST /api/agent/listeners/mcp/delete", h.Agent.HandleListenerMCPDelete, http.MethodPost)
 	// 聊天图片链路（spec 2026-11-05-chat-image-pipeline §3.4）：网页发图上传
 	// 与网页显示取图（loopback+Origin 守卫在 handler 内,transfers D13 同源）。
 	register("/api/agent/ai/attachment/upload", h.Agent.HandleAttachmentUpload, http.MethodPost)
@@ -362,6 +370,20 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("PUT /api/agent/memory/{id}", h.Memory.HandleMemoryPut, http.MethodPut)
 	register("DELETE /api/agent/memory/{id}", h.Memory.HandleMemoryDelete, http.MethodDelete)
 	register("GET /api/agent/memory/projects", h.Memory.HandleMemoryProjects, http.MethodGet)
+
+	// 事件监听器本地 REST 代理(specs/005-event-listener §2/FR-4/FR-11,plan
+	// Task 11):仪表盘侧栏 CRUD 直达 PhoneServer 用户面 /api/listeners*,auth
+	// 由 services 层 remoteConnectionSnapshot 同源注入;POST 的 source.device_id
+	// 代理层强制覆盖本机;云端不可达 → 502 listener_cloud_offline 绝不静默。
+	// 鉴权同 quick-setup CRUD 家族 = handler 内 RequireDashboardSession。{id}
+	// 路由用方法前缀模式注册(同 quick-setup combos 约定,避免 ServeMux 双
+	// 注册 panic);注册存在性护栏见 services/agent_listener_api_test.go 的
+	// TestListenerProxyRoutesWired。
+	register("GET /api/listeners", services.HandleListenerList, http.MethodGet)
+	register("POST /api/listeners", services.HandleListenerCreate, http.MethodPost)
+	register("PATCH /api/listeners/{id}", services.HandleListenerPatch, http.MethodPatch)
+	register("DELETE /api/listeners/{id}", services.HandleListenerDelete, http.MethodDelete)
+	register("GET /api/listeners/{id}/events", services.HandleListenerEvents, http.MethodGet)
 	register("/api/docs/tutorials", h.Tutorial.HandleGetTutorial, http.MethodGet)
 
 	// Mesh LAN 发现(/api/mesh/*):beacon 候选只读,供仪表盘离线模式点选
