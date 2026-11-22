@@ -166,6 +166,76 @@ describe('TerminalPane', () => {
     expect(m.events.dead).toBe(1);
   });
 
+  it('本会话 error → 退避 1.5s 后以全新随机 ID 自动重建(旧 sock 已释放)', async () => {
+    vi.useFakeTimers();
+    try {
+      const m = await mount();
+      const firstId = createTerminalSocket.mock.calls[0][0].sessionId;
+      sockHandlers.status({ kind: 'error', message: 'terminal session limit reached: 4', sessionId: firstId });
+      await nextTick();
+      expect(m.el.querySelector('[data-testid="terminal-status"]').textContent).toContain(t('term_reconnecting'));
+      expect(createTerminalSocket).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(1500);
+      await nextTick();
+      expect(createTerminalSocket).toHaveBeenCalledTimes(2);
+      const secondOpts = createTerminalSocket.mock.calls[1][0];
+      expect(secondOpts.sessionId).toMatch(/^web-[a-z0-9]{8}$/);
+      expect(secondOpts.sessionId).not.toBe(firstId); // 重建=全新会话,不再打死 ID
+      expect(secondOpts.token).toBe('tok_abc');
+      expect(sock.dispose).toHaveBeenCalledTimes(1); // 旧 socket 先释放
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('重建链:第二次 error → 退避 4s 第三次建连;第三次 error 触顶停重建', async () => {
+    vi.useFakeTimers();
+    try {
+      const m = await mount();
+      sockHandlers.status({ kind: 'error', message: 'limit', sessionId: createTerminalSocket.mock.calls[0][0].sessionId });
+      vi.advanceTimersByTime(1500);
+      sockHandlers.status({ kind: 'error', message: 'limit', sessionId: createTerminalSocket.mock.calls[1][0].sessionId });
+      vi.advanceTimersByTime(4000);
+      expect(createTerminalSocket).toHaveBeenCalledTimes(3);
+      sockHandlers.status({ kind: 'error', message: 'limit', sessionId: createTerminalSocket.mock.calls[2][0].sessionId });
+      vi.advanceTimersByTime(10000);
+      await nextTick();
+      expect(createTerminalSocket).toHaveBeenCalledTimes(3); // 上限 2 次重建
+      // 触顶后错误文案保留(用户手动关窗重开,不再静默重建)
+      expect(m.el.querySelector('[data-testid="terminal-status"]').textContent).toContain('limit');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('全局 error(session_id 空,如 re-locked)不触发重建——重建只会再撞闸', async () => {
+    vi.useFakeTimers();
+    try {
+      const m = await mount();
+      sockHandlers.status({ kind: 'error', message: 'web terminal re-locked', sessionId: '' });
+      vi.advanceTimersByTime(10000);
+      await nextTick();
+      expect(createTerminalSocket).toHaveBeenCalledTimes(1);
+      expect(m.el.querySelector('[data-testid="terminal-status"]').textContent).toContain('web terminal re-locked');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('重建期间卸载:定时器已清,不再重建,新 sock 不泄漏', async () => {
+    vi.useFakeTimers();
+    try {
+      const m = await mount();
+      sockHandlers.status({ kind: 'error', message: 'limit', sessionId: createTerminalSocket.mock.calls[0][0].sessionId });
+      m.app.unmount(); // 卸载时重建定时器挂起中
+      vi.advanceTimersByTime(5000);
+      expect(createTerminalSocket).toHaveBeenCalledTimes(1); // 卸载斩断重建
+      expect(sock.dispose).toHaveBeenCalledTimes(1); // 仅卸载链自己的 dispose
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('ResizeObserver 100ms 去抖后 fit + resize', async () => {
     vi.useFakeTimers();
     try {

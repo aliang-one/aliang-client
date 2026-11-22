@@ -211,6 +211,21 @@ func (h *AgentHandler) HandleWebTerminalStream(w http.ResponseWriter, r *http.Re
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 
+	// 网页腿会话生命周期:记录本连接创建(terminal.create)且未显式关闭
+	// (terminal.close 出册)的会话,连接退出(任何 return 路径)后统一安排
+	// 延迟孤儿回收。治 2026-11-22 真机 not found 风暴:PTY 空闲无输出→写失败
+	// 探测永不触发→旧死 WS 会话占着 agentMaxTerminalSessions 坑直到 30m,
+	// 刷新恢复壳的并发 create 全撞 limit reached→用户输入打死 ID 报
+	// "terminal session not found"。延迟窗口(10s)给浏览器闪断重连留活路;
+	// 网页恢复壳=全新随机 ID 永不 attach 旧 ID,窗口期只是宽容。手机腿不经
+	// 此处(它走 markAllDetached,断线重连续屏是特性)。
+	created := make(map[string]bool)
+	defer func() {
+		for id := range created {
+			h.service.ScheduleWebOrphanTerminalClose(id)
+		}
+	}()
+
 	for {
 		var msg map[string]interface{}
 		if err := conn.ReadJSON(&msg); err != nil {
@@ -233,8 +248,16 @@ func (h *AgentHandler) HandleWebTerminalStream(w http.ResponseWriter, r *http.Re
 		switch frameType {
 		case "terminal.create":
 			h.service.WebTerminalAuditTerminal("terminal_create", webTerminalFrameString(msg, "session_id"))
+			// 本连接创建的会话入册——连接退出后统一安排孤儿回收(见下方 defer)
+			if id := webTerminalFrameString(msg, "session_id"); id != "" {
+				created[id] = true
+			}
 		case "terminal.close":
 			h.service.WebTerminalAuditTerminal("terminal_close", webTerminalFrameString(msg, "session_id"))
+			// 显式关闭出册:会话走正常 close 路径,孤儿回收不再接管
+			if id := webTerminalFrameString(msg, "session_id"); id != "" {
+				delete(created, id)
+			}
 		}
 		h.service.DispatchTerminalFrame(msg, writeJSON, h.service.WebTerminalEnabled)
 	}

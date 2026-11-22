@@ -486,6 +486,16 @@ func AgentTerminalErrorPayloadPublic(sessionID string, err error) map[string]int
 	return agentTerminalErrorPayload(sessionID, err)
 }
 
+// ScheduleWebOrphanTerminalClose 是 manager.ScheduleWebOrphanClose 的 service
+// 导出壳:网页 WS 腿连接退出时,对「本连接创建且未显式 close」的终端会话安排
+// 延迟回收(2026-11-22 真机 not found 风暴的治本腿,详见 manager 字段注释)。
+func (s *AgentService) ScheduleWebOrphanTerminalClose(sessionID string) {
+	if s == nil || s.terminal == nil {
+		return
+	}
+	s.terminal.ScheduleWebOrphanClose(sessionID)
+}
+
 // WebTerminalAuditTerminal 落 terminal_create/terminal_close 审计行(网页腿
 // 专属;手机腿审计在 remote 侧已有落点,不经过这里)。
 func (s *AgentService) WebTerminalAuditTerminal(action, sessionID string) {

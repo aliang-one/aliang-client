@@ -37,7 +37,9 @@ export function createTerminalSocket({ token, sessionId, rows, cols, onFrame, on
         onExit && onExit(parsed);
         break;
       case 'terminal.error':
-        onStatus && onStatus({ kind: 'error', message: parsed.error || 'terminal error' });
+        // session_id 上抛供窗格判定错误归属:仅本会话(如 create 失败)可触发
+        // 自动重建;re-locked 等全局错误帧 session_id 为空,重建只会再撞闸
+        onStatus && onStatus({ kind: 'error', message: parsed.error || 'terminal error', sessionId: parsed.session_id || '' });
         break;
       default:
         break;

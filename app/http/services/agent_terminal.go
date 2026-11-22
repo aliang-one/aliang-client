@@ -127,6 +127,16 @@ type agentTerminalManager struct {
 	// when the attempt finishes (see beginCreate / waitForCreate).
 	creating map[string]chan struct{}
 
+	// orphanTimers 跟踪网页腿的延迟孤儿回收定时器(sessionID→timer)。网页终端
+	// 每窗一条 WS 且恢复壳(刷新后)=全新随机 session id,不会 attach 旧 ID——
+	// 所以网页连接断开后,该连接创建的会话是纯孤儿:PTY 空闲时无输出、写失败
+	// 探测永不触发,只剩 30m idle 回收一条路,期间持续占用
+	// agentMaxTerminalSessions(全局 4 坑,手机共享)。2026-11-22 真机复盘:
+	// 刷新恢复壳并发 create 与旧死 WS 会话撞坑→limit reached 静默失败→用户
+	// 输入打死 ID→"terminal session not found" 风暴。手机腿不走此处——它的
+	// 断线走 markAllDetached,掉线重连 attach 续屏是特性。
+	orphanTimers map[string]*time.Timer
+
 	startProcess agentTerminalProcessStarter
 }
 
@@ -184,6 +194,7 @@ func newAgentTerminalManager() *agentTerminalManager {
 		sessions:     make(map[string]*agentTerminalSession),
 		history:      make(map[string]*agentTerminalHistory),
 		creating:     make(map[string]chan struct{}),
+		orphanTimers: make(map[string]*time.Timer),
 		startProcess: startAgentTerminalProcess,
 	}
 	// Tombstone TTL sweeper: runs for the life of the process (there is no
@@ -317,6 +328,13 @@ func (m *agentTerminalManager) create(msg map[string]interface{}, writeJSON agen
 		return
 	}
 	m.sessions[sessionID] = session
+	// 同 ID 新建落地即清残留孤儿定时器(前一会话被回收后 timer 条目理论上已
+	// 随回调自删;但回调「删条目→get」与新建「注册会话」可交错——timer 回调
+	// 若在注册后 get 到新会话会误杀。这里同锁内清条目斩断该竞态)。
+	if t := m.orphanTimers[sessionID]; t != nil {
+		t.Stop()
+		delete(m.orphanTimers, sessionID)
+	}
 	m.mu.Unlock()
 
 	_ = writeJSON(map[string]interface{}{
@@ -354,6 +372,12 @@ func (m *agentTerminalManager) attachLive(sessionID string, rows, cols int, atta
 		session.detachedAt = time.Time{}
 		session.lastActiveAt = now
 		session.lastInputAt = now
+		// 网页腿孤儿回收定时器随重连取消(同锁内直操作,不可调 cancel 包装——嵌套死锁)。
+		// attach 成功即证明活人回来了,延迟回收窗口让位给续屏。
+		if t := m.orphanTimers[sessionID]; t != nil {
+			t.Stop()
+			delete(m.orphanTimers, sessionID)
+		}
 	}
 	m.mu.Unlock()
 	if session == nil {
@@ -791,6 +815,52 @@ func (m *agentTerminalManager) closeAll() {
 
 	for _, session := range sessions {
 		session.kill()
+	}
+}
+
+// agentWebOrphanCloseDelay bounds how long a web-leg orphaned session may keep
+// squatting on a manager slot after its WS dropped. Generous enough for the
+// browser's transient-reconnect window (2 reconnects × 800ms backoff + connect
+// time); a page refresh never re-attaches the old random id (fresh shell =
+// fresh id), so the window is leniency, not function. A var so tests shorten it.
+var agentWebOrphanCloseDelay = 10 * time.Second
+
+// ScheduleWebOrphanClose arms the delayed reap for one web-leg session whose
+// WS is about to go away (or already did). Fired after the delay: session gone
+// (explicit close / PTY exit / already reaped) → timer entry cleanup only;
+// session alive → kill, which routes through waitTerminal → tombstone exactly
+// like an explicit close. Re-scheduling the same id re-arms (Stop + new timer).
+func (m *agentTerminalManager) ScheduleWebOrphanClose(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	m.mu.Lock()
+	if old := m.orphanTimers[sessionID]; old != nil {
+		old.Stop()
+	}
+	m.orphanTimers[sessionID] = time.AfterFunc(agentWebOrphanCloseDelay, func() {
+		// Drop our entry first: a fresh create reusing this id between now and
+		// the kill must not be mistaken for the orphan (create also clears the
+		// entry under the lock, so whoever wins the race, the entry is gone).
+		m.mu.Lock()
+		delete(m.orphanTimers, sessionID)
+		m.mu.Unlock()
+		if session := m.get(sessionID); session != nil {
+			session.kill()
+		}
+	})
+	m.mu.Unlock()
+}
+
+// cancelWebOrphanClose disarms the delayed reap (explicit terminal.close while
+// the connection is still up). attachLive and create clear the entry inline
+// under the manager lock instead — they already hold m.mu.
+func (m *agentTerminalManager) cancelWebOrphanClose(sessionID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if t := m.orphanTimers[sessionID]; t != nil {
+		t.Stop()
+		delete(m.orphanTimers, sessionID)
 	}
 }
 
