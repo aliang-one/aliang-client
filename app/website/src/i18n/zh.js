@@ -1861,4 +1861,21 @@ export default {
   fs_empty_hint: '选择左侧文件查看内容',
   fs_dir_hint: '目录没有预览内容',
   fs_load_error: '加载失败',
+  // -- 文件浏览导航补全(2026-11-22 文件管理计划 Task A:面包屑+上级+当前目录列表) --
+  fs_parent: '上一级',
+  fs_home: '主目录',
+  fs_back_to_list: '返回列表',
+  fs_empty_dir: '空目录',
+  // -- 文件管理批(2026-11-22 计划 Task C:新建文件夹/重命名/删除双段确认) --
+  fs_mkdir: '新建文件夹',
+  fs_rename: '重命名',
+  fs_delete: '删除',
+  fs_cancel: '取消',
+  fs_continue: '继续',
+  fs_delete_submit: '确认删除',
+  fs_delete_confirm_title: '确认删除',
+  fs_delete_recursive_warn: '该目录非空,将递归删除其全部内容',
+  fs_delete_type_name: '输入名称以确认删除',
+  fs_mismatch: '名称不匹配',
+  fs_op_failed: '操作失败',
 };

@@ -1864,4 +1864,22 @@ export default {
   fs_empty_hint: 'Select a file on the left to preview',
   fs_dir_hint: 'Directories have no preview',
   fs_load_error: 'Load failed',
+  // -- File browser navigation completion (2026-11-22 file-manager plan Task A:
+  //    breadcrumb + up + current-directory list) --
+  fs_parent: 'Up',
+  fs_home: 'Home',
+  fs_back_to_list: 'Back to list',
+  fs_empty_dir: 'Empty directory',
+  // -- File management (2026-11-22 plan Task C: new folder / rename / two-stage delete confirm) --
+  fs_mkdir: 'New folder',
+  fs_rename: 'Rename',
+  fs_delete: 'Delete',
+  fs_cancel: 'Cancel',
+  fs_continue: 'Continue',
+  fs_delete_submit: 'Confirm delete',
+  fs_delete_confirm_title: 'Confirm delete',
+  fs_delete_recursive_warn: 'This directory is not empty and will be deleted recursively with all contents',
+  fs_delete_type_name: 'Type the name to confirm deletion',
+  fs_mismatch: 'Name does not match',
+  fs_op_failed: 'Operation failed',
 };
