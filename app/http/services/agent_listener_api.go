@@ -197,7 +197,7 @@ func HandleListenerList(w http.ResponseWriter, r *http.Request) {
 	if !middleware.RequireDashboardSession(w, r) {
 		return
 	}
-	listenerList(w, r)
+	listenerList(w, r, true)
 }
 
 // HandleListenerListAgent GET /api/listeners(runtime 面,无会话闸,见块注)。
@@ -206,19 +206,19 @@ func HandleListenerListAgent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	listenerList(w, r)
+	listenerList(w, r, false)
 }
 
 // listenerList → 云端 GET /api/listeners 透传;listeners 键 null 归一为 []
 // (前端可迭代契约,FR-11)。查询串刻意丢弃(固定形态契约;未来分页须扩
 // 此处与云端面)。
-func listenerList(w http.ResponseWriter, r *http.Request) {
+func listenerList(w http.ResponseWriter, r *http.Request, browserFace bool) {
 	body, status, err := listenerCloudRequest(r.Context(), http.MethodGet, "/api/listeners", nil)
 	if err != nil {
 		writeListenerCloudError(w, err)
 		return
 	}
-	writeListenerPassthrough(w, status, normalizeListenerListBody(body, "listeners"))
+	writeListenerOutcome(w, status, normalizeListenerListBody(body, "listeners"), browserFace)
 }
 
 // HandleListenerCreate POST /api/listeners(仪表盘面,带会话闸)。
@@ -230,7 +230,7 @@ func HandleListenerCreate(w http.ResponseWriter, r *http.Request) {
 	if !middleware.RequireDashboardSession(w, r) {
 		return
 	}
-	listenerCreate(w, r)
+	listenerCreate(w, r, true)
 }
 
 // HandleListenerCreateAgent POST /api/listeners(runtime 面,无会话闸,见块注)。
@@ -239,12 +239,12 @@ func HandleListenerCreateAgent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	listenerCreate(w, r)
+	listenerCreate(w, r, false)
 }
 
 // listenerCreate → source.device_id 强制覆盖为本机(永不信任 body)→ 云端
 // POST;应答信封化(2xx 拍平 200,data={listener:…})。
-func listenerCreate(w http.ResponseWriter, r *http.Request) {
+func listenerCreate(w http.ResponseWriter, r *http.Request, browserFace bool) {
 	defer r.Body.Close()
 	raw, err := readListenerProxyBody(w, r)
 	if err != nil {
@@ -260,7 +260,7 @@ func listenerCreate(w http.ResponseWriter, r *http.Request) {
 		writeListenerCloudError(w, err)
 		return
 	}
-	writeListenerPassthrough(w, status, body)
+	writeListenerOutcome(w, status, body, browserFace)
 }
 
 // HandleListenerPatch PATCH /api/listeners/{id}(仪表盘面,带会话闸)。
@@ -272,7 +272,7 @@ func HandleListenerPatch(w http.ResponseWriter, r *http.Request) {
 	if !middleware.RequireDashboardSession(w, r) {
 		return
 	}
-	listenerPatch(w, r)
+	listenerPatch(w, r, true)
 }
 
 // HandleListenerPatchAgent PATCH /api/listeners/{id}(runtime 面,无会话闸)。
@@ -281,12 +281,12 @@ func HandleListenerPatchAgent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	listenerPatch(w, r)
+	listenerPatch(w, r, false)
 }
 
 // listenerPatch → 云端 PATCH 透传(body 含 LWW 期望 updated_at,由前端携带;
 // 代理不改写)。
-func listenerPatch(w http.ResponseWriter, r *http.Request) {
+func listenerPatch(w http.ResponseWriter, r *http.Request, browserFace bool) {
 	id, ok := listenerPathID(w, r)
 	if !ok {
 		return
@@ -301,7 +301,7 @@ func listenerPatch(w http.ResponseWriter, r *http.Request) {
 		writeListenerCloudError(w, err)
 		return
 	}
-	writeListenerPassthrough(w, status, body)
+	writeListenerOutcome(w, status, body, browserFace)
 }
 
 // HandleListenerDelete DELETE /api/listeners/{id}(仪表盘面,带会话闸)。
@@ -313,7 +313,7 @@ func HandleListenerDelete(w http.ResponseWriter, r *http.Request) {
 	if !middleware.RequireDashboardSession(w, r) {
 		return
 	}
-	listenerDelete(w, r)
+	listenerDelete(w, r, true)
 }
 
 // HandleListenerDeleteAgent DELETE /api/listeners/{id}(runtime 面,无会话闸)。
@@ -322,11 +322,11 @@ func HandleListenerDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	listenerDelete(w, r)
+	listenerDelete(w, r, false)
 }
 
 // listenerDelete → 云端 DELETE 透传。
-func listenerDelete(w http.ResponseWriter, r *http.Request) {
+func listenerDelete(w http.ResponseWriter, r *http.Request, browserFace bool) {
 	id, ok := listenerPathID(w, r)
 	if !ok {
 		return
@@ -336,7 +336,7 @@ func listenerDelete(w http.ResponseWriter, r *http.Request) {
 		writeListenerCloudError(w, err)
 		return
 	}
-	writeListenerPassthrough(w, status, body)
+	writeListenerOutcome(w, status, body, browserFace)
 }
 
 // HandleListenerEvents GET /api/listeners/{id}/events(仪表盘面,带会话闸)。
@@ -348,7 +348,7 @@ func HandleListenerEvents(w http.ResponseWriter, r *http.Request) {
 	if !middleware.RequireDashboardSession(w, r) {
 		return
 	}
-	listenerEvents(w, r)
+	listenerEvents(w, r, true)
 }
 
 // HandleListenerEventsAgent GET /api/listeners/{id}/events(runtime 面)。
@@ -357,12 +357,12 @@ func HandleListenerEventsAgent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	listenerEvents(w, r)
+	listenerEvents(w, r, false)
 }
 
 // listenerEvents → 云端 GET 透传;events 键 null 归一为 []。查询串刻意丢弃
 // (固定形态契约;未来分页须扩此处与云端面)。
-func listenerEvents(w http.ResponseWriter, r *http.Request) {
+func listenerEvents(w http.ResponseWriter, r *http.Request, browserFace bool) {
 	id, ok := listenerPathID(w, r)
 	if !ok {
 		return
@@ -372,7 +372,7 @@ func listenerEvents(w http.ResponseWriter, r *http.Request) {
 		writeListenerCloudError(w, err)
 		return
 	}
-	writeListenerPassthrough(w, status, normalizeListenerListBody(body, "events"))
+	writeListenerOutcome(w, status, normalizeListenerListBody(body, "events"), browserFace)
 }
 
 // listenerValidID listener id 合法性闸(模型可控 id 拼进云端 URL 前的注入
@@ -407,6 +407,38 @@ func readListenerProxyBody(w http.ResponseWriter, r *http.Request) ([]byte, erro
 		return nil, fmt.Errorf("request body exceeds %d bytes", listenerProxyBodyLimit)
 	}
 	return raw, nil
+}
+
+// writeListenerOutcome 双面收尾(2026-11-22 双重信封修复):browserFace=true
+// 走 writeListenerPassthrough 浏览器信封(C1);false=runtime 面回环转发载荷
+// ——原样 status+云端形态 body(归一后),信封由 core 侧转发消费者统一打
+// 一次。runtime 面若也信封化,core 会把整个信封塞进 data 形成双层包裹
+// (实测:data={"code":0,"data":{"listeners":[]}},前端取 listeners 恒空)。
+func writeListenerOutcome(w http.ResponseWriter, status int, body []byte, browserFace bool) {
+	if browserFace {
+		writeListenerPassthrough(w, status, body)
+		return
+	}
+	if status < 200 || status >= 300 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write(body)
+		return
+	}
+	parsed, ok := parseListenerCloudBody(body)
+	if !ok {
+		// 云端 2xx 腐败 JSON:runtime 面同样归离线哨兵族,绝不让残缺体过桥。
+		writeListenerCloudError(w, fmt.Errorf("%w: cloud 2xx body is not valid JSON", errListenerCloudOffline))
+		return
+	}
+	out, err := json.Marshal(parsed)
+	if err != nil {
+		writeListenerCloudError(w, fmt.Errorf("%w: %v", errListenerCloudOffline, err))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(out)
 }
 
 // writeListenerPassthrough 云端应答信封化转发(C1 评审定案:浏览器 request()
