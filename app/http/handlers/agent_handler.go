@@ -33,6 +33,11 @@ type AgentHandler struct {
 	client  *http.Client
 	// dataClient 不设 Timeout：期限由 agentProxyDataTimeout 的 context 控制。
 	dataClient *http.Client
+	// fsClient 零硬超时:FS download/upload 是大文件流(100MiB 慢链路轻松
+	// 超 12s),client.Timeout 会罩住流式 body 中途掐断并误报 503「user
+	// agent 未运行」(proxyDataIfNeeded 同族事故,2026-10-21);取消由浏览器
+	// 请求 ctx 管(客户端断开即取消),期限不设上限。
+	fsClient *http.Client
 }
 
 func NewAgentHandler(service *services.AgentService) *AgentHandler {
@@ -43,6 +48,7 @@ func NewAgentHandler(service *services.AgentService) *AgentHandler {
 		service:    service,
 		client:     &http.Client{Timeout: 12 * time.Second},
 		dataClient: &http.Client{},
+		fsClient:   &http.Client{},
 	}
 }
 
@@ -929,6 +935,26 @@ func (h *AgentHandler) proxyIfNeeded(w http.ResponseWriter, r *http.Request) boo
 			common.Success(w, services.UserAgentOfflineStatus(err))
 			return true
 		}
+		common.Error(w, common.CodeServiceUnavailable, "User agent process is not running", map[string]interface{}{
+			"error": err.Error(),
+			"url":   services.UserAgentBaseURL(),
+		})
+		return true
+	}
+	return true
+}
+
+// proxyFSIfNeeded 是 FS 数据面端点(网页终端文件浏览 download/upload 大文件
+// 流)专用的代理入口:与 proxyDataIfNeeded 同族(2026-10-21 数据面 12s 掐断
+// 事故的教训),但走零硬超时的 fsClient 且不加 context 期限——100MiB 上传/
+// 下载在慢链路下轻松超 12s/45s,任何硬期限都会把流式中途掐断并误报 503
+// 「user agent 未运行」;取消交由浏览器请求 ctx(客户端断开即取消)。
+func (h *AgentHandler) proxyFSIfNeeded(w http.ResponseWriter, r *http.Request) bool {
+	if services.IsUserAgentRuntime() {
+		return false
+	}
+
+	if err := h.proxyToUserAgentClient(r.Context(), w, r, h.fsClient); err != nil {
 		common.Error(w, common.CodeServiceUnavailable, "User agent process is not running", map[string]interface{}{
 			"error": err.Error(),
 			"url":   services.UserAgentBaseURL(),

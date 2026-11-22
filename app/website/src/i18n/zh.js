@@ -1837,4 +1837,28 @@ export default {
   vault_killall_confirm: '确定终止当前设备上全部网页终端会话？',
   vault_disabled_desc: '网页终端当前未开启。开启后，持有仪表盘登录态并知道保险箱密码的人可在本页使用本机终端。',
   vault_enable: '开启网页终端',
+  // -- Web Terminal 多窗(P2.4 起;win_* 提示词条由 P2.5 落齐) --
+  win_new: '新建终端',
+  win_title: '终端 {n}',
+  win_empty_hint: '还没有终端窗口',
+  win_minimize: '最小化',
+  win_maximize: '最大化',
+  win_close: '关闭',
+  win_restore: '恢复',
+  // ⚠ 死徽标文案面(P2.5 随批预留:头栏 ⚠ 前缀暂复用标题文本,后续tooltip化时启用)
+  win_dead: '会话已断开',
+  // -- 文件浏览窗(P3.4+P3.5+P3.6,spec §7.4;上传 UI 与工作台「文件」钮 P3.6 落地,
+  //    fs_upload 由预留转真用) --
+  fs_title: '文件浏览',
+  fs_open: '文件',
+  fs_retry: '重试',
+  fs_binary: '二进制文件',
+  fs_truncated: '内容已截断',
+  fs_download: '下载',
+  fs_upload: '上传',
+  fs_uploading: '上传中…',
+  fs_upload_error: '上传失败',
+  fs_empty_hint: '选择左侧文件查看内容',
+  fs_dir_hint: '目录没有预览内容',
+  fs_load_error: '加载失败',
 };

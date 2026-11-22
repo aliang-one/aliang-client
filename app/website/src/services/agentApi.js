@@ -291,3 +291,62 @@ export async function webTerminalCommand(payload, token = '') {
     headers,
   });
 }
+
+// ——— 网页终端文件浏览(spec §6.3;阶段3 四端点)———
+// 四端点同门同治:runtime 腿主开关+令牌头(X-Web-Terminal-Token);业务拒绝
+// 走 HTTP 错误码(403 越界/关停/令牌无效、404 不存在、400 坏文件名)。list/
+// read 经 request() 即抛 envelope.msg;download/upload 是 binary/multipart,
+// 绕开 request() 的 JSON Content-Type 假设,信封/鉴权失败处理与
+// uploadChatAttachment 同构(extractEnvelope + handleAuthenticationFailure)。
+
+export async function fsList(path, token) {
+  return request(`/api/agent/fs/list?path=${encodeURIComponent(path)}`, {
+    method: 'GET',
+    headers: { 'X-Web-Terminal-Token': token },
+  });
+}
+
+export async function fsRead(path, token) {
+  return request(`/api/agent/fs/read?path=${encodeURIComponent(path)}`, {
+    method: 'GET',
+    headers: { 'X-Web-Terminal-Token': token },
+  });
+}
+
+// 下载:binary 流(ServeContent),不走 request()(它假定 JSON envelope)。
+// 失败体仍是 JSON 信封(403/404/400),读出 msg 让 UI 文案可读。
+export async function fsDownload(path, token) {
+  const response = await fetch(`/api/agent/fs/download?path=${encodeURIComponent(path)}`, {
+    method: 'GET',
+    credentials: 'same-origin',
+    headers: { 'X-Web-Terminal-Token': token },
+  });
+  if (!response.ok) {
+    const json = await response.json().catch(() => ({}));
+    const envelope = extractEnvelope(json);
+    handleAuthenticationFailure(response.status, envelope, syncUnauthenticatedAuthState);
+    throw new Error(envelope.msg || `Download failed: HTTP ${response.status}`);
+  }
+  return await response.blob();
+}
+
+// 上传:multipart FormData(Content-Type 由浏览器带 boundary,不能手设)。
+// data 形状 {path(冲突加时间戳后缀的终名), bytes}。
+export async function fsUpload(dir, file, token) {
+  const form = new FormData();
+  form.append('dir', dir);
+  form.append('file', file);
+  const response = await fetch('/api/agent/fs/upload', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'X-Web-Terminal-Token': token },
+    body: form,
+  });
+  const json = await response.json().catch(() => ({}));
+  const envelope = extractEnvelope(json);
+  handleAuthenticationFailure(response.status, envelope, syncUnauthenticatedAuthState);
+  if (!response.ok || envelope.code !== 0) {
+    throw new Error(envelope.msg || `Upload failed: HTTP ${response.status}`);
+  }
+  return envelope.data;
+}
