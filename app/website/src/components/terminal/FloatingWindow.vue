@@ -14,7 +14,7 @@
   -->
   <div
     data-testid="floating-window"
-    class="absolute flex flex-col overflow-hidden rounded-lg border bg-white shadow-xl dark:bg-slate-900"
+    class="pointer-events-auto absolute flex flex-col overflow-hidden rounded-lg border bg-white shadow-xl dark:bg-slate-900"
     :class="active ? 'border-primary ring-1 ring-primary/40' : 'border-slate-200 dark:border-slate-700'"
     :style="winStyle"
   >

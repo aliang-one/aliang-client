@@ -71,7 +71,7 @@
           <!-- 多窗桌面:relative 锚定窗层带/任务栏带;改 PIN 面板展开时占据顶部 -->
           <div class="relative min-h-0 flex-1" data-testid="terminal-desktop">
             <!-- 窗层带 z-20:注册表 z 只在本容器内叠放;任务栏可见时 bottom-10 让位 -->
-            <div ref="desktopEl" class="absolute inset-x-0 top-0 z-20" :class="hasWindows ? 'bottom-10' : 'bottom-0'" data-testid="terminal-windows-layer">
+            <div ref="desktopEl" class="pointer-events-none absolute inset-x-0 top-0 z-20" :class="hasWindows ? 'bottom-10' : 'bottom-0'" data-testid="terminal-windows-layer">
               <template v-for="w in windows" :key="w.id">
                 <!-- activated 门控:本会话从未 open 过的窗(刷新恢复壳)不挂壳——
                      点任务栏重开时经 openWindows watch 激活,壳+面板此时才出现 -->
@@ -102,6 +102,7 @@
               <FileBrowserWindow
                 v-if="browserOpen"
                 v-bind="browserEffectiveGeom"
+                :token="token"
                 :z-index="browserZ"
                 :active="browserActive"
                 :minimized="browserMinimized"
