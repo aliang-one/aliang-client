@@ -295,18 +295,27 @@ func (m *agentTerminalManager) create(msg map[string]interface{}, writeJSON agen
 		return
 	}
 
-	m.mu.Lock()
-	if existing := m.sessions[sessionID]; existing != nil {
+	// 上限闸:满时先同步回收网页孤儿腾坑再复查一轮(最多两轮,天然终止——
+	// 回收后 orphanTimers 已清空,第二轮 reap 必返 0)。2026-11-23 缝隙收口:
+	// 10s 孤儿宽容窗 > 前端重建窗(1.5s+4s),快速重输 PIN 后立即开窗的
+	// create 会撞坑且重建触顶;孤儿永不被 attach,让位无损。
+	for {
+		m.mu.Lock()
+		if existing := m.sessions[sessionID]; existing != nil {
+			m.mu.Unlock()
+			_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf("terminal session already exists: %s", sessionID)))
+			return
+		}
+		if len(m.sessions) < agentMaxTerminalSessions {
+			m.mu.Unlock()
+			break // 有坑,落到 startProcess
+		}
 		m.mu.Unlock()
-		_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf("terminal session already exists: %s", sessionID)))
-		return
+		if m.reapWebOrphansNow() == 0 {
+			_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf("terminal session limit reached: %d", agentMaxTerminalSessions)))
+			return
+		}
 	}
-	if len(m.sessions) >= agentMaxTerminalSessions {
-		m.mu.Unlock()
-		_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf("terminal session limit reached: %d", agentMaxTerminalSessions)))
-		return
-	}
-	m.mu.Unlock()
 
 	session, readers, err := m.startProcess(sessionID, shell, cwd, rows, cols)
 	if err != nil {
@@ -850,6 +859,36 @@ func (m *agentTerminalManager) ScheduleWebOrphanClose(sessionID string) {
 		}
 	})
 	m.mu.Unlock()
+}
+
+// reapWebOrphansNow synchronously reaps every armed web-orphan timer (kill +
+// unregister + tombstone, closeAll discipline). Called from create when the
+// session limit is hit: the 10s leniency window yields to a waiting create.
+// Semantically safe — orphans are dead-WS web-leg sessions whose ids a page
+// refresh never re-attaches (fresh shell = fresh random id), and phone-leg
+// sessions never enter this table (their path is markAllDetached). Returns the
+// number of sessions reaped.
+func (m *agentTerminalManager) reapWebOrphansNow() int {
+	m.mu.Lock()
+	if len(m.orphanTimers) == 0 {
+		m.mu.Unlock()
+		return 0
+	}
+	victims := make([]*agentTerminalSession, 0, len(m.orphanTimers))
+	for id, t := range m.orphanTimers {
+		t.Stop()
+		if s := m.sessions[id]; s != nil {
+			victims = append(victims, s)
+			delete(m.sessions, id)
+			m.tombstoneSessionLocked(id, s, -1)
+		}
+	}
+	m.orphanTimers = make(map[string]*time.Timer)
+	m.mu.Unlock()
+	for _, s := range victims {
+		s.kill()
+	}
+	return len(victims)
 }
 
 // cancelWebOrphanClose disarms the delayed reap (explicit terminal.close while
