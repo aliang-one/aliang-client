@@ -23,6 +23,12 @@ package services
 // ({code:<status>,msg:可读错误,data:null}),前端 request() 抛携带
 // server 错误文案的 Error(I1:复活撞 LWW 的 listener_conflict 等可读)。
 //
+// 三层拓扑转发(2026-11-22 补丁,见 listenerCloudRequest 转发分支块注):
+// Mac root core + user agent / Linux 双单元形态下,仪表盘 mux 住 core 而
+// 云端凭据住 user agent(数据目录分离,身份快照在 core 恒空)→ 非本机
+// runtime 回环转发同名端点到 user agent,身份留在持有凭据的进程;单进程
+// 形态行为不变。
+//
 // 缝纪律(文件头注同 agent_listener_boot.go):复用 listenerCloudBaseURL /
 // listenerCloudFetchTimeout / listenerCloudFetchBodyLimit 三缝,勿另起炉灶。
 // 响应 wire 形态按 PhoneServer 真实契约(裸 JSON 键名对象,如
@@ -92,14 +98,33 @@ func listenerCloudRequest(ctx context.Context, method, path string, body []byte)
 	}
 	identity, shouldRun := svc.remoteConnectionSnapshot()
 	if !shouldRun || identity.authorization == "" || identity.deviceID == "" {
+		// Mac/双单元拓扑补丁(2026-11-22 实证):仪表盘 mux 住 core,云端凭据
+		// 住 user agent(数据目录分离,core 侧持久库恒空)→ 本进程身份快照
+		// 恒空。回环转发同名端点到 user agent,身份留在持有凭据的进程;
+		// runtime 进程(含单进程形态)不转发——其身份缺失即真离线,哨兵原路。
+		// 转发分支仅三层拓扑可达,无循环风险。
+		if !IsUserAgentRuntime() {
+			return forwardListenerCloudRequest(ctx, method, path, body)
+		}
 		return nil, 0, fmt.Errorf("%w: agent remote identity unavailable (not registered/enabled or no authorization)", errListenerCloudOffline)
 	}
 	base, err := listenerCloudBaseURL()
 	if err != nil {
 		return nil, 0, fmt.Errorf("%w: %v", errListenerCloudOffline, err)
 	}
-	endpoint := base + path
+	return execListenerRequest(ctx, svc.client, method, base+path, body, map[string]string{
+		"Authorization":      identity.authorization,
+		"X-Aliang-Device-ID": identity.deviceID,
+	})
+}
 
+// execListenerRequest 直拨与回环转发共用尾段:超时(listenerCloudFetchTimeout
+// 与调用方 ctx 取 min——M4:HTTP 面传入 r.Context(),客户端断连即取消云端
+// 拨号,不再熬满 8s)、读侧 4MiB 上限(limit+1 读法探测截断,agent_goal.go
+// 同款仓内 idiom:超限 body 必是被截断的腐败 JSON,透传=转发残缺载荷——归
+// 离线哨兵族而非假成功)、非 2xx 回 *listenerCloudStatusError(携带原 body,
+// 业务错误直达前端不在代理层吞成 5xx),传输失败/截断一律回离线哨兵包装。
+func execListenerRequest(ctx context.Context, client *http.Client, method, endpoint string, body []byte, headers map[string]string) ([]byte, int, error) {
 	ctx, cancel := context.WithTimeout(ctx, listenerCloudFetchTimeout)
 	defer cancel()
 	var reader io.Reader
@@ -114,15 +139,14 @@ func listenerCloudRequest(ctx context.Context, method, path string, body []byte)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	req.Header.Set("Authorization", identity.authorization)
-	req.Header.Set("X-Aliang-Device-ID", identity.deviceID)
-	resp, err := svc.client.Do(req)
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("%w: %v", errListenerCloudOffline, err)
 	}
 	defer resp.Body.Close()
-	// limit+1 读法探测截断(agent_goal.go 同款仓内 idiom):超限 body 必是被
-	// 截断的腐败 JSON,透传=转发残缺载荷——归离线哨兵族而非假成功。
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, listenerCloudFetchBodyLimit+1))
 	if err != nil {
 		return nil, 0, fmt.Errorf("%w: read response: %v", errListenerCloudOffline, err)
@@ -136,11 +160,35 @@ func listenerCloudRequest(ctx context.Context, method, path string, body []byte)
 	return raw, resp.StatusCode, nil
 }
 
-// --- 本地代理路由 handler(routes.go 挂载;方法前缀注册下的纵深防御检查) ---
+// listenerUserAgentBase core→user agent 回环转发基址缝(测试替换;同
+// listenerCloudBaseURL 缝纪律,勿另起炉灶)。
+var listenerUserAgentBase = func() string { return UserAgentBaseURL() }
 
-// HandleListenerList GET /api/listeners → 云端 GET /api/listeners 透传;
-// listeners 键 null 归一为 [](前端可迭代契约,FR-11)。查询串刻意丢弃
-// (固定形态契约;未来分页须扩此处与云端面)。
+// forwardListenerCloudRequest 三层拓扑(Mac root core + user agent /Linux
+// 双单元)回环转发:同一 (method,path,body) 打到 user agent runtime mux 的
+// 同名端点(/api/listeners*,agentruntime/server.go 注册),由持有云端凭据的
+// 进程执行直拨。应答契约与直拨一致——agent 侧透传的云端业务错误照常
+// listenerCloudStatusError;runtime 未运行/无同名路由(404=老二进制部署
+// 偏斜)归传输族 → 离线哨兵,横幅语义不回退成假成功。转发链不携带身份头
+// (身份注入是 runtime 侧直拨的事,见 agent 侧注册面块注)。
+func forwardListenerCloudRequest(ctx context.Context, method, path string, body []byte) ([]byte, int, error) {
+	endpoint := strings.TrimRight(listenerUserAgentBase(), "/") + path
+	return execListenerRequest(ctx, http.DefaultClient, method, endpoint, body, nil)
+}
+
+// --- 本地代理路由 handler(routes.go 挂载;方法前缀注册下的纵深防御检查) ---
+//
+// 双注册面(监听器批 Mac/双单元拓扑补丁,2026-11-22):
+//   仪表盘 mux(routes.go)= HandleListenerX:方法校验 + RequireDashboardSession
+//   (浏览器信任边界住 core)+ listenerX 逻辑;
+//   runtime mux(agentruntime/server.go)= HandleListenerXAgent:仅方法校验 +
+//   同一 listenerX 逻辑。无会话闸——dashboard 会话库住 core,转发链不可携带,
+//   信任边界=runtime mux 仅 loopback 绑定(同 /api/agent/* 家族信任级)。
+//   core 侧身份快照恒空(数据目录分离),listenerCloudRequest 识别后回环转发
+//   至此处,由持有云端凭据的进程直拨;缺任一侧注册=404(双注册教训,
+//   2026-10-21 同族)。
+
+// HandleListenerList GET /api/listeners(仪表盘面,带会话闸)。
 func HandleListenerList(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -149,6 +197,22 @@ func HandleListenerList(w http.ResponseWriter, r *http.Request) {
 	if !middleware.RequireDashboardSession(w, r) {
 		return
 	}
+	listenerList(w, r)
+}
+
+// HandleListenerListAgent GET /api/listeners(runtime 面,无会话闸,见块注)。
+func HandleListenerListAgent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	listenerList(w, r)
+}
+
+// listenerList → 云端 GET /api/listeners 透传;listeners 键 null 归一为 []
+// (前端可迭代契约,FR-11)。查询串刻意丢弃(固定形态契约;未来分页须扩
+// 此处与云端面)。
+func listenerList(w http.ResponseWriter, r *http.Request) {
 	body, status, err := listenerCloudRequest(r.Context(), http.MethodGet, "/api/listeners", nil)
 	if err != nil {
 		writeListenerCloudError(w, err)
@@ -157,8 +221,7 @@ func HandleListenerList(w http.ResponseWriter, r *http.Request) {
 	writeListenerPassthrough(w, status, normalizeListenerListBody(body, "listeners"))
 }
 
-// HandleListenerCreate POST /api/listeners → source.device_id 强制覆盖为本机
-// (永不信任 body)→ 云端 POST;应答信封化(2xx 拍平 200,data={listener:…})。
+// HandleListenerCreate POST /api/listeners(仪表盘面,带会话闸)。
 func HandleListenerCreate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -167,6 +230,21 @@ func HandleListenerCreate(w http.ResponseWriter, r *http.Request) {
 	if !middleware.RequireDashboardSession(w, r) {
 		return
 	}
+	listenerCreate(w, r)
+}
+
+// HandleListenerCreateAgent POST /api/listeners(runtime 面,无会话闸,见块注)。
+func HandleListenerCreateAgent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	listenerCreate(w, r)
+}
+
+// listenerCreate → source.device_id 强制覆盖为本机(永不信任 body)→ 云端
+// POST;应答信封化(2xx 拍平 200,data={listener:…})。
+func listenerCreate(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	raw, err := readListenerProxyBody(w, r)
 	if err != nil {
@@ -185,8 +263,7 @@ func HandleListenerCreate(w http.ResponseWriter, r *http.Request) {
 	writeListenerPassthrough(w, status, body)
 }
 
-// HandleListenerPatch PATCH /api/listeners/{id} → 云端 PATCH 透传(body 含
-// LWW 期望 updated_at,由前端携带;代理不改写)。
+// HandleListenerPatch PATCH /api/listeners/{id}(仪表盘面,带会话闸)。
 func HandleListenerPatch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPatch {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -195,6 +272,21 @@ func HandleListenerPatch(w http.ResponseWriter, r *http.Request) {
 	if !middleware.RequireDashboardSession(w, r) {
 		return
 	}
+	listenerPatch(w, r)
+}
+
+// HandleListenerPatchAgent PATCH /api/listeners/{id}(runtime 面,无会话闸)。
+func HandleListenerPatchAgent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPatch {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	listenerPatch(w, r)
+}
+
+// listenerPatch → 云端 PATCH 透传(body 含 LWW 期望 updated_at,由前端携带;
+// 代理不改写)。
+func listenerPatch(w http.ResponseWriter, r *http.Request) {
 	id, ok := listenerPathID(w, r)
 	if !ok {
 		return
@@ -212,7 +304,7 @@ func HandleListenerPatch(w http.ResponseWriter, r *http.Request) {
 	writeListenerPassthrough(w, status, body)
 }
 
-// HandleListenerDelete DELETE /api/listeners/{id} → 云端 DELETE 透传。
+// HandleListenerDelete DELETE /api/listeners/{id}(仪表盘面,带会话闸)。
 func HandleListenerDelete(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -221,6 +313,20 @@ func HandleListenerDelete(w http.ResponseWriter, r *http.Request) {
 	if !middleware.RequireDashboardSession(w, r) {
 		return
 	}
+	listenerDelete(w, r)
+}
+
+// HandleListenerDeleteAgent DELETE /api/listeners/{id}(runtime 面,无会话闸)。
+func HandleListenerDeleteAgent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	listenerDelete(w, r)
+}
+
+// listenerDelete → 云端 DELETE 透传。
+func listenerDelete(w http.ResponseWriter, r *http.Request) {
 	id, ok := listenerPathID(w, r)
 	if !ok {
 		return
@@ -233,9 +339,7 @@ func HandleListenerDelete(w http.ResponseWriter, r *http.Request) {
 	writeListenerPassthrough(w, status, body)
 }
 
-// HandleListenerEvents GET /api/listeners/{id}/events → 云端 GET 透传;
-// events 键 null 归一为 []。查询串刻意丢弃(固定形态契约;未来分页须扩
-// 此处与云端面)。
+// HandleListenerEvents GET /api/listeners/{id}/events(仪表盘面,带会话闸)。
 func HandleListenerEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -244,6 +348,21 @@ func HandleListenerEvents(w http.ResponseWriter, r *http.Request) {
 	if !middleware.RequireDashboardSession(w, r) {
 		return
 	}
+	listenerEvents(w, r)
+}
+
+// HandleListenerEventsAgent GET /api/listeners/{id}/events(runtime 面)。
+func HandleListenerEventsAgent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	listenerEvents(w, r)
+}
+
+// listenerEvents → 云端 GET 透传;events 键 null 归一为 []。查询串刻意丢弃
+// (固定形态契约;未来分页须扩此处与云端面)。
+func listenerEvents(w http.ResponseWriter, r *http.Request) {
 	id, ok := listenerPathID(w, r)
 	if !ok {
 		return
@@ -424,8 +543,19 @@ func overrideListenerSourceDeviceID(body []byte) ([]byte, error) {
 		return nil, errListenerCloudOffline
 	}
 	identity, shouldRun := svc.remoteConnectionSnapshot()
-	if !shouldRun || identity.deviceID == "" {
-		return nil, fmt.Errorf("%w: agent remote identity unavailable", errListenerCloudOffline)
+	deviceID := identity.deviceID
+	if !shouldRun || deviceID == "" {
+		// 三层拓扑补丁(2026-11-22):core 侧授权恒空使快照 shouldRun=false,
+		// 但设备 id 属本机注册(state.DeviceID),覆盖仍可本地完成;两处皆空
+		// (从未注册)→ 原样放行,交由 agent 侧直拨前用本进程身份再覆盖
+		// (幂等,同值同义)——归属锚最终钉在身份持有方,永不信任 body 的
+		// 语义不变。agent 侧直拨前若身份也缺,哨兵照常返回。
+		svc.mu.Lock()
+		deviceID = strings.TrimSpace(svc.state.DeviceID)
+		svc.mu.Unlock()
+		if deviceID == "" {
+			return body, nil
+		}
 	}
 	var payload map[string]interface{}
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -435,7 +565,7 @@ func overrideListenerSourceDeviceID(body []byte) ([]byte, error) {
 	if !ok {
 		return body, nil
 	}
-	source["device_id"] = identity.deviceID
+	source["device_id"] = deviceID
 	out, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err

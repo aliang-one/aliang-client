@@ -203,6 +203,18 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/agent/listeners/mcp/list", agentHandler.HandleListenerMCPList)
 	mux.HandleFunc("POST /api/agent/listeners/mcp/update", agentHandler.HandleListenerMCPUpdate)
 	mux.HandleFunc("POST /api/agent/listeners/mcp/delete", agentHandler.HandleListenerMCPDelete)
+	// 监听器本地 REST 代理真身(监听器批 Mac/双单元拓扑补丁,2026-11-22):
+	// 仪表盘 mux 住 core,core 侧云端凭据恒空(数据目录分离,身份快照在
+	// core 进程恒不满足)→ listenerCloudRequest 识别后回环转发同名端点到
+	// 此处,由持有云端凭据的本进程直拨云端。无会话闸——dashboard 会话库
+	// 住 core 转发链不可携带,信任边界=本 mux 仅 loopback 绑定(同
+	// /api/agent/* 家族)。缺注册=core 侧转发 404(双注册教训,2026-10-21
+	// 同族);路径形态与 core 侧 routes.go 逐字对齐。
+	mux.HandleFunc("GET /api/listeners", services.HandleListenerListAgent)
+	mux.HandleFunc("POST /api/listeners", services.HandleListenerCreateAgent)
+	mux.HandleFunc("PATCH /api/listeners/{id}", services.HandleListenerPatchAgent)
+	mux.HandleFunc("DELETE /api/listeners/{id}", services.HandleListenerDeleteAgent)
+	mux.HandleFunc("GET /api/listeners/{id}/events", services.HandleListenerEventsAgent)
 	// 仪表盘聊天 WS（2026-10-28 统一）：core 把 /api/agent/ai/stream 透传到本
 	// runtime，由本地 AI 管理器跑（journal/清单与手机同源）。缺注册=404 透传
 	// （2026-10-21 liang-dev 双注册教训）。
