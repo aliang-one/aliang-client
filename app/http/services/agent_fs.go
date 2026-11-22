@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -38,6 +39,10 @@ var (
 	ErrAgentFSEscapeRoot = errors.New("path escapes web terminal fs root")
 	// ErrAgentFSBadFilename 上传文件名清洗拒绝(handler 映射 CodeBadRequest)。
 	ErrAgentFSBadFilename = errors.New("invalid upload filename")
+	// ErrAgentFSAlreadyExists mkdir/rename 目标已存在(handler 映射 CodeConflict)。
+	ErrAgentFSAlreadyExists = errors.New("path already exists")
+	// ErrAgentFSRootDelete delete 打到守卫根本身(handler 映射 CodeForbidden)。
+	ErrAgentFSRootDelete = errors.New("cannot delete the web terminal fs root")
 )
 
 var (
@@ -111,8 +116,10 @@ func agentFSResolve(raw string) (string, error) {
 }
 
 // AgentFSList 一级目录列表(spec §6.3):目录优先、同层按名排序;目录 size=0。
-// 返回守卫解析后的真身路径(handler 回 {path,entries} 信封)。单条目不可读
-// (并发删除等)跳过并告警,不拖垮整表。
+// 返回守卫解析后的真身路径(handler 回 {path,entries} 信封)。信封边界统一
+// ToSlash:前端导航(cd 闸/面包屑/上级)全按 '/' 拼接拆分,Windows 原生 '\'
+// 路径会让整条导航面哑火;内部 os.ReadDir 仍用原生 resolved(先例
+// agent_file_write.go 信封 ToSlash)。
 func (s *AgentService) AgentFSList(rawDir string) (string, []map[string]interface{}, error) {
 	dir, err := agentFSResolve(rawDir)
 	if err != nil {
@@ -154,12 +161,13 @@ func (s *AgentService) AgentFSList(rawDir string) (string, []map[string]interfac
 			"mode":  info.Mode().String(),
 		})
 	}
-	return dir, entries, nil
+	return filepath.ToSlash(dir), entries, nil
 }
 
 // AgentFSRead 有界文本读(spec §6.3):读 maxBytes+1 判截断;binary=前 8KiB
 // 含 NUL。内容按原字节转 string(Go string 保字节,UTF-8 呈现由前端兜底)。
-// 返回守卫解析后的真身路径供 handler 信封。
+// 返回守卫解析后的真身路径供 handler 信封(信封边界 ToSlash,同
+// AgentFSList 注记;内部 os.Open 用原生 resolved)。
 func (s *AgentService) AgentFSRead(rawPath string, maxBytes int64) (string, string, bool, bool, error) {
 	if maxBytes <= 0 {
 		maxBytes = AgentFSReadMaxBytes
@@ -192,7 +200,7 @@ func (s *AgentService) AgentFSRead(rawPath string, maxBytes int64) (string, stri
 			break
 		}
 	}
-	return resolved, string(data), truncated, binary, nil
+	return filepath.ToSlash(resolved), string(data), truncated, binary, nil
 }
 
 // AgentFSOpen 供 download 流式回放(ServeContent):resolve→open→stat,拒目录
@@ -241,8 +249,9 @@ func agentFSSanitizeFilename(name string) (string, error) {
 
 // AgentFSUpload 上传:dir 守卫解析→文件名清洗→同名追加 _HHMMSS(扩展名前)
 // →后置守卫(join 结果再过 agentFSResolve,防未来改动引入回归)→0600 落盘。
-// fs_upload 审计自 P3.6 起在 handler 层落(真源 origin 只有 HTTP 层可见,
-// 与 fs_download 同走 WebTerminalAuditFS)。
+// 返回终名完整路径供 handler 信封(信封边界 ToSlash,同 AgentFSList 注记;
+// 内部 os.Stat/WriteFile 用原生 full)。fs_upload 审计自 P3.6 起在 handler 层
+// 落(真源 origin 只有 HTTP 层可见,与 fs_download 同走 WebTerminalAuditFS)。
 func (s *AgentService) AgentFSUpload(rawDir, filename string, src []byte) (string, error) {
 	dir, err := agentFSResolve(rawDir)
 	if err != nil {
@@ -278,7 +287,7 @@ func (s *AgentService) AgentFSUpload(rawDir, filename string, src []byte) (strin
 	if err := os.WriteFile(full, src, 0o600); err != nil {
 		return "", err
 	}
-	return full, nil
+	return filepath.ToSlash(full), nil
 }
 
 // WebTerminalAuditFS 落 fs_upload/fs_download 审计行(均由 handler 调:download
@@ -287,4 +296,125 @@ func (s *AgentService) AgentFSUpload(rawDir, filename string, src []byte) (strin
 // 标记头判定(P3.6 Finding B 修正,语义见 markWebTerminalLoopbackSource)。
 func (s *AgentService) WebTerminalAuditFS(action, path string, bytes int64, origin string) {
 	s.webTerminalJournalAudit(action, fmt.Sprintf("path=%s bytes=%d origin=%s", path, bytes, origin), false)
+}
+
+// ——— 阶段 3 续:写操作三端点(文件管理批,spec §6.3 mkdir/rename/delete)———
+// 与上面四个只读/上传端点同守卫同纪律:dir/path 一律 agentFSResolve(含
+// EvalSymlinks 双检),name 一律 agentFSSanitizeFilename(上传批已抽出的可复用
+// 清洗器:Base 剥路径成分→拒空/. /..→控制字符与 Windows 保留字符→_)。审计
+// fs_mkdir/fs_rename/fs_delete 与 fs_upload/fs_download 同款在 handler 层落
+// (真源 origin 只有 HTTP 层可见),本层三函数保持审计无关。
+
+// AgentFSMkdir 在 rawDir 下新建单层 name 目录。**单层 os.Mkdir 非 MkdirAll**:
+// 父目录缺失=错误原样上抛(前端在正确目录上下文里操作,静默建链只会掩盖导航
+// 漂移)。重名→ErrAgentFSAlreadyExists(前置 os.Stat;Stat 后 Mkdir 前被占的
+// 竞态窗口由 fs.ErrExist 兜底归一)。join 后再过 agentFSResolve 防御性复检
+// (消毒后的 base 理论不可越根,复检防未来改动回归,同 AgentFSUpload 注记)。
+// 返回 ToSlash(full)(信封边界统一,同 AgentFSList 注记;内部 os.Mkdir 用
+// 原生 full)。
+func (s *AgentService) AgentFSMkdir(rawDir, name string) (string, error) {
+	dir, err := agentFSResolve(rawDir)
+	if err != nil {
+		return "", err
+	}
+	clean, err := agentFSSanitizeFilename(name)
+	if err != nil {
+		return "", err
+	}
+	full := filepath.Join(dir, clean)
+	full, err = agentFSResolve(full)
+	if err != nil {
+		return "", err
+	}
+	if _, statErr := os.Stat(full); statErr == nil {
+		return "", fmt.Errorf("%w: %s", ErrAgentFSAlreadyExists, clean)
+	} else if !errors.Is(statErr, fs.ErrNotExist) {
+		return "", statErr
+	}
+	if err := os.Mkdir(full, 0o755); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return "", fmt.Errorf("%w: %s", ErrAgentFSAlreadyExists, clean)
+		}
+		return "", err // 权限/ENOSPC 等系统错误原样(文案带系统消息,前端直显)
+	}
+	return filepath.ToSlash(full), nil
+}
+
+// AgentFSRename 同目录内重命名(oldName→newName)。新旧名都过消毒,dir 过
+// 守卫;旧名必须存在(fs.ErrNotExist 上抛,handler 映射 103),新名必须不存
+// 在(ErrAgentFSAlreadyExists)——os.Rename 在多数平台会静默覆盖既有目标,
+// 前置双 Stat 把「覆盖」语义显式变成错误(改名意图从不包含覆盖)。返回
+// ToSlash(新 full);新 join 结果同样防御性复检(同 AgentFSMkdir 注记)。
+func (s *AgentService) AgentFSRename(rawDir, oldName, newName string) (string, error) {
+	dir, err := agentFSResolve(rawDir)
+	if err != nil {
+		return "", err
+	}
+	oldClean, err := agentFSSanitizeFilename(oldName)
+	if err != nil {
+		return "", err
+	}
+	newClean, err := agentFSSanitizeFilename(newName)
+	if err != nil {
+		return "", err
+	}
+	oldFull := filepath.Join(dir, oldClean)
+	newFull := filepath.Join(dir, newClean)
+	if oldFull, err = agentFSResolve(oldFull); err != nil {
+		return "", err
+	}
+	if newFull, err = agentFSResolve(newFull); err != nil {
+		return "", err
+	}
+	if _, statErr := os.Stat(oldFull); statErr != nil {
+		return "", statErr
+	}
+	if _, statErr := os.Stat(newFull); statErr == nil {
+		return "", fmt.Errorf("%w: %s", ErrAgentFSAlreadyExists, newClean)
+	} else if !errors.Is(statErr, fs.ErrNotExist) {
+		return "", statErr
+	}
+	if err := os.Rename(oldFull, newFull); err != nil {
+		return "", err
+	}
+	return filepath.ToSlash(newFull), nil
+}
+
+// AgentFSDelete 删除文件或目录,统一 os.RemoveAll(目录=递归;前端双段强确认
+// 前置,服务层不设防递归开关——闸门链+审计已是纵深)。守卫根自身保护:
+// resolved==守卫根 → ErrAgentFSRootDelete(根是整个浏览面的锚点,误删=首页
+// 没了)。不存在→fs.ErrNotExist(handler 映射 103)。返回 ToSlash(resolved)
+// 供 handler 信封与 fs_delete 审计(其余两函数同款回真身路径)。
+func (s *AgentService) AgentFSDelete(rawPath string) (string, error) {
+	resolved, err := agentFSResolve(rawPath)
+	if err != nil {
+		return "", err
+	}
+	root, err := webTerminalFSRoot()
+	if err != nil {
+		return "", fmt.Errorf("web terminal fs root unavailable: %w", err)
+	}
+	if resolved == root {
+		return "", ErrAgentFSRootDelete
+	}
+	if _, statErr := os.Stat(resolved); statErr != nil {
+		return "", statErr
+	}
+	if err := os.RemoveAll(resolved); err != nil {
+		return "", err
+	}
+	return filepath.ToSlash(resolved), nil
+}
+
+// WebTerminalAuditFSMutation 落 fs_mkdir/fs_rename/fs_delete 审计行(均由
+// handler 调,与 WebTerminalAuditFS 同款落点与理由:真源 origin 只有 HTTP 层
+// 可见)。path 用守卫解析后的真身(斜杠形态)。delete 带 recursive 标志——
+// 服务层 os.RemoveAll 语义上目录即递归,标志值由前端双段确认 UX 透传(文件
+// 删 false/目录删 true),审计行据此可辨「用户被告知并确认了递归」。
+func (s *AgentService) WebTerminalAuditFSMutation(action, path, origin string, recursive bool) {
+	if recursive {
+		s.webTerminalJournalAudit(action, fmt.Sprintf("path=%s recursive=true origin=%s", path, origin), false)
+		return
+	}
+	s.webTerminalJournalAudit(action, fmt.Sprintf("path=%s origin=%s", path, origin), false)
 }

@@ -234,6 +234,13 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/agent/fs/read", agentHandler.HandleWebTerminalFSRead)
 	mux.HandleFunc("GET /api/agent/fs/download", agentHandler.HandleWebTerminalFSDownload)
 	mux.HandleFunc("POST /api/agent/fs/upload", agentHandler.HandleWebTerminalFSUpload)
+	// FS 写操作三端点(文件管理批,spec §6.3):mkdir/rename/delete 真 body 在
+	// 本 runtime(handler+服务层守卫/清洗/审计),core routes.go 侧同名注册只
+	// 做 proxy 透传(零 body 解析)。缺任一侧=404(双注册教训,2026-10-21
+	// liang-dev 实测)。方法前缀模式与 core 侧对齐。
+	mux.HandleFunc("POST /api/agent/fs/mkdir", agentHandler.HandleWebTerminalFSMkdir)
+	mux.HandleFunc("POST /api/agent/fs/rename", agentHandler.HandleWebTerminalFSRename)
+	mux.HandleFunc("POST /api/agent/fs/delete", agentHandler.HandleWebTerminalFSDelete)
 	// OpenViking 跨设备记忆面读点/apply(spec Phase2 §7.5/§7.7):状态/拨测/对齐
 	// 真身住本 runtime(boot 处 StartOpenVikingProbe/EnsureOpenVikingMatchesConfig
 	// 在此),core routes.go 侧同名注册只做 proxyIfNeeded 透传(handler 注释自证)。

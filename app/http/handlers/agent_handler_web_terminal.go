@@ -474,3 +474,181 @@ func (h *AgentHandler) HandleWebTerminalFSUpload(w http.ResponseWriter, r *http.
 	h.service.WebTerminalAuditFS("fs_upload", finalPath, int64(len(src)), webTerminalLoopbackOrigin(r))
 	common.Success(w, map[string]interface{}{"path": finalPath, "bytes": len(src)})
 }
+
+// ——— 阶段 3 续:FS 写操作三端点(文件管理批,spec §6.3 mkdir/rename/delete)———
+// 门链与上面四端点同门同治:①双闸→②marking(proxy 前)→③core 腿
+// proxyFSIfNeeded 透传(**零 body 解析**——小 JSON 原样流穿,阶段1 勘误#10
+// 的 PROXY-FIRST;delete 递归删大目录树可超 12s 控制面期限,故与 download/
+// upload 同走零硬超时 fsClient)→④runtime 腿主开关+令牌门→⑤服务层
+// agentFSResolve 守卫+清洗。审计 fs_mkdir/fs_rename/fs_delete 均在 runtime
+// 腿成功后落(真源 origin 读 X-Aliang-WT-Loopback 标记头,同 fs_upload)。
+
+// writeAgentFSMutationError 写操作三端点的错误映射:在查询面映射之上补三
+// 哨兵——清洗拒绝=100、目标已存在=104 Conflict(重名/改名撞已有名,前端要
+// 可见的结构化语义)、删守卫根=102;不存在/穿越/权限兜底复用
+// writeAgentFSQueryError(穿越与权限均收敛 102,不向 LAN 泄路径细节)。
+func writeAgentFSMutationError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, services.ErrAgentFSBadFilename):
+		common.ErrorBadRequest(w, "Invalid name", nil)
+	case errors.Is(err, services.ErrAgentFSAlreadyExists):
+		common.ErrorConflict(w, "Target already exists")
+	case errors.Is(err, services.ErrAgentFSRootDelete):
+		common.Error(w, common.CodeForbidden, "Cannot delete the file browser root", nil)
+	default:
+		writeAgentFSQueryError(w, err)
+	}
+}
+
+// parseWebTerminalFSBody 解析 FS 写操作端点的小 JSON 体(≤4KiB,失败 nil)。
+// 只在 runtime 腿执行(proxyFSIfNeeded 已返回 false 之后),core 腿零 body
+// 解析(PROXY-FIRST),故不像 parseWebTerminalCommandBody 需要回填 r.Body
+// ——runtime 腿此后不再转发。取 map 形态是为字段名双拼宽容:契约主拼法随
+// 计划 camelCase(oldName/newName),snake(old_name/new_name)与命令体
+// old_pin/new_pin 同族,两拼都收防一字之差断全链。
+func parseWebTerminalFSBody(r *http.Request) map[string]interface{} {
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 4<<10))
+	if err != nil || len(raw) == 0 {
+		return nil
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(raw, &body); err != nil || body == nil {
+		return nil
+	}
+	return body
+}
+
+// webTerminalFSBodyString 按候选键序取首个非空串字段(双拼宽容,见上)。
+func webTerminalFSBodyString(body map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if v, ok := body[key].(string); ok {
+			if trimmed := strings.TrimSpace(v); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return ""
+}
+
+// HandleWebTerminalFSMkdir POST /api/agent/fs/mkdir {dir,name}——单层建目录,
+// 重名 409;回 {path}(守卫真身,斜杠形态)。
+func (h *AgentHandler) HandleWebTerminalFSMkdir(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !guardWebTerminalGate(w, r) {
+		return
+	}
+	markWebTerminalLoopbackSource(r) // fs_mkdir 审计真源:标记先于 proxy 透传
+	if h.proxyFSIfNeeded(w, r) {
+		return
+	}
+	if !h.webTerminalFSRuntimeGate(w, r) {
+		return
+	}
+	body := parseWebTerminalFSBody(r)
+	if body == nil {
+		common.ErrorBadRequest(w, "Invalid request body", nil)
+		return
+	}
+	dir := webTerminalFSBodyString(body, "dir")
+	if dir == "" {
+		dir = "."
+	}
+	name := webTerminalFSBodyString(body, "name")
+	if name == "" {
+		common.ErrorBadRequest(w, "Missing required field: name", nil)
+		return
+	}
+	full, err := h.service.AgentFSMkdir(dir, name)
+	if err != nil {
+		writeAgentFSMutationError(w, err)
+		return
+	}
+	h.service.WebTerminalAuditFSMutation("fs_mkdir", full, webTerminalLoopbackOrigin(r), false)
+	common.Success(w, map[string]interface{}{"path": full})
+}
+
+// HandleWebTerminalFSRename POST /api/agent/fs/rename {dir,oldName,newName}——
+// 同目录内重命名,旧名缺失 404/新名已存在 409;回 {path}(新名真身,斜杠)。
+func (h *AgentHandler) HandleWebTerminalFSRename(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !guardWebTerminalGate(w, r) {
+		return
+	}
+	markWebTerminalLoopbackSource(r) // fs_rename 审计真源:标记先于 proxy 透传
+	if h.proxyFSIfNeeded(w, r) {
+		return
+	}
+	if !h.webTerminalFSRuntimeGate(w, r) {
+		return
+	}
+	body := parseWebTerminalFSBody(r)
+	if body == nil {
+		common.ErrorBadRequest(w, "Invalid request body", nil)
+		return
+	}
+	dir := webTerminalFSBodyString(body, "dir")
+	if dir == "" {
+		dir = "."
+	}
+	oldName := webTerminalFSBodyString(body, "oldName", "old_name")
+	if oldName == "" {
+		common.ErrorBadRequest(w, "Missing required field: oldName", nil)
+		return
+	}
+	newName := webTerminalFSBodyString(body, "newName", "new_name")
+	if newName == "" {
+		common.ErrorBadRequest(w, "Missing required field: newName", nil)
+		return
+	}
+	full, err := h.service.AgentFSRename(dir, oldName, newName)
+	if err != nil {
+		writeAgentFSMutationError(w, err)
+		return
+	}
+	h.service.WebTerminalAuditFSMutation("fs_rename", full, webTerminalLoopbackOrigin(r), false)
+	common.Success(w, map[string]interface{}{"path": full})
+}
+
+// HandleWebTerminalFSDelete POST /api/agent/fs/delete {path,recursive?}——文件
+// 与目录统一 os.RemoveAll(递归;前端双段强确认前置,recursive 标志由确认 UX
+// 透传仅供审计);守卫根本身 403;不存在 404。回 {path}(守卫真身,斜杠)。
+func (h *AgentHandler) HandleWebTerminalFSDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !guardWebTerminalGate(w, r) {
+		return
+	}
+	markWebTerminalLoopbackSource(r) // fs_delete 审计真源:标记先于 proxy 透传
+	if h.proxyFSIfNeeded(w, r) {
+		return
+	}
+	if !h.webTerminalFSRuntimeGate(w, r) {
+		return
+	}
+	body := parseWebTerminalFSBody(r)
+	if body == nil {
+		common.ErrorBadRequest(w, "Invalid request body", nil)
+		return
+	}
+	path := webTerminalFSBodyString(body, "path")
+	if path == "" {
+		common.ErrorBadRequest(w, "Missing required field: path", nil)
+		return
+	}
+	recursive, _ := body["recursive"].(bool)
+	resolved, err := h.service.AgentFSDelete(path)
+	if err != nil {
+		writeAgentFSMutationError(w, err)
+		return
+	}
+	h.service.WebTerminalAuditFSMutation("fs_delete", resolved, webTerminalLoopbackOrigin(r), recursive)
+	common.Success(w, map[string]interface{}{"path": resolved})
+}

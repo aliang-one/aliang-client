@@ -350,3 +350,33 @@ export async function fsUpload(dir, file, token) {
   }
   return envelope.data;
 }
+
+// ——— 文件管理批(Task C:mkdir/rename/delete 写操作三端点)———
+// 与 list/read 同门同治(X-Web-Terminal-Token 令牌头);小 JSON POST 走
+// request() 即抛 envelope.msg——服务端错误文案用户可读直显(104 重名/100 非
+// 法名/103 不存在/102 权限或越根)。dir 缺省 "." 由服务端兜,前端始终传规范
+// currentDir(空串时传 '.');rename 载荷按计划契约 snake_case(old_name/new_name,
+// handler 双拼宽容);delete 的 recursive 仅供审计溯源(服务端目录恒 RemoveAll)。
+export async function fsMkdir(dir, name, token) {
+  return request('/api/agent/fs/mkdir', {
+    method: 'POST',
+    body: JSON.stringify({ dir, name }),
+    headers: { 'X-Web-Terminal-Token': token },
+  });
+}
+
+export async function fsRename(dir, oldName, newName, token) {
+  return request('/api/agent/fs/rename', {
+    method: 'POST',
+    body: JSON.stringify({ dir, old_name: oldName, new_name: newName }),
+    headers: { 'X-Web-Terminal-Token': token },
+  });
+}
+
+export async function fsDelete(path, recursive, token) {
+  return request('/api/agent/fs/delete', {
+    method: 'POST',
+    body: JSON.stringify({ path, recursive }),
+    headers: { 'X-Web-Terminal-Token': token },
+  });
+}
