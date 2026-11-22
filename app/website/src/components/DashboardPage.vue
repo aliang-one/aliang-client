@@ -147,20 +147,6 @@
         </div>
       </div>
       <div class="mt-8 px-6 space-y-3">
-        <p class="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-1">{{ t('dash_quickTools') }}</p>
-        <div class="group relative">
-          <button
-            type="button"
-            data-guide="quick-setup"
-            :disabled="!isAuthenticated"
-            @click="openQuickSetup"
-            class="w-full flex items-center gap-3 px-4 py-2.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded text-sm font-medium hover:border-primary transition-colors"
-            :class="!isAuthenticated ? 'cursor-not-allowed opacity-60 hover:border-slate-200 dark:hover:border-slate-700' : ''"
-          >
-            <span class="material-symbols-outlined text-slate-400 text-lg">bolt</span>
-            {{ t('dash_quickSetup') }}
-          </button>
-        </div>
         <button
           type="button"
           data-testid="aliang-chat-entry-sidebar"
@@ -174,32 +160,6 @@
         </button>
         <button
           type="button"
-          data-testid="listener-entry-sidebar"
-          :disabled="!isAuthenticated"
-          class="w-full flex items-center gap-3 px-4 py-2.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded text-sm font-medium hover:border-primary transition-colors"
-          :class="!isAuthenticated ? 'cursor-not-allowed opacity-60 hover:border-slate-200 dark:hover:border-slate-700' : ''"
-          @click="openListenerPanel"
-        >
-          <span class="material-symbols-outlined text-slate-400 text-lg">notifications</span>
-          {{ t('listener_entryTitle') }}
-          <span
-            v-if="listenerActiveCount !== null"
-            class="ml-auto shrink-0 rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-bold text-primary"
-          >{{ listenerActiveCount }}</span>
-        </button>
-        <button
-          type="button"
-          data-testid="terminal-entry-sidebar"
-          :disabled="!isAuthenticated"
-          @click="showTerminal()"
-          class="w-full flex items-center gap-3 px-4 py-2.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded text-sm font-medium hover:border-primary transition-colors"
-          :class="!isAuthenticated ? 'cursor-not-allowed opacity-60 hover:border-slate-200 dark:hover:border-slate-700' : ''"
-        >
-          <span class="material-symbols-outlined text-slate-400 text-lg">terminal</span>
-          {{ t('term_open') }}
-        </button>
-        <button
-          type="button"
           class="w-full flex items-center gap-3 px-4 py-2.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded text-sm font-medium hover:border-primary transition-colors"
           @click="handleShowSettings"
         >
@@ -207,7 +167,44 @@
           {{ t('dash_moreSettings') }}
         </button>
       </div>
-      <div class="mt-auto p-6 border-t border-slate-100 dark:border-slate-800 bg-slate-50/30 dark:bg-slate-800/10">
+      <div class="mt-auto p-4 border-t border-slate-100 dark:border-slate-800 bg-slate-50/30 dark:bg-slate-800/10">
+      <!-- 快捷工具图标排:快速配置/监听器/终端(大按钮收纳为底部小图标,悬停显名) -->
+      <div class="mb-3 flex items-center justify-center gap-2" data-testid="sidebar-quick-tools">
+        <button
+          type="button"
+          data-guide="quick-setup"
+          :disabled="!isAuthenticated"
+          :title="t('dash_quickSetup')"
+          class="relative flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-400 transition-colors hover:border-primary hover:text-slate-600 dark:border-slate-700 dark:hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-60"
+          @click="openQuickSetup"
+        >
+          <span class="material-symbols-outlined text-lg">bolt</span>
+        </button>
+        <button
+          type="button"
+          data-testid="listener-entry-sidebar"
+          :disabled="!isAuthenticated"
+          :title="t('listener_entryTitle')"
+          class="relative flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-400 transition-colors hover:border-primary hover:text-slate-600 dark:border-slate-700 dark:hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-60"
+          @click="openListenerPanel"
+        >
+          <span class="material-symbols-outlined text-lg">notifications</span>
+          <span
+            v-if="listenerActiveCount !== null"
+            class="absolute -right-1.5 -top-1.5 rounded-full bg-primary/10 px-1.5 text-[10px] font-bold text-primary"
+          >{{ listenerActiveCount }}</span>
+        </button>
+        <button
+          type="button"
+          data-testid="terminal-entry-sidebar"
+          :disabled="!isAuthenticated"
+          :title="t('term_open')"
+          class="relative flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-400 transition-colors hover:border-primary hover:text-slate-600 dark:border-slate-700 dark:hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-60"
+          @click="showTerminal()"
+        >
+          <span class="material-symbols-outlined text-lg">terminal</span>
+        </button>
+      </div>
         <div class="flex justify-between items-center mb-3">
           <span class="text-xs font-bold text-slate-500 uppercase tracking-wider">{{ t('dash_accountBalance') }}</span>
           <span class="text-lg font-bold text-slate-900 dark:text-white">{{ accountBalanceText }}</span>
@@ -361,17 +358,6 @@
           </div>
           <!-- 快捷工具块 -->
           <div class="space-y-3">
-            <p class="px-1 text-[10px] font-bold uppercase tracking-widest text-slate-400">{{ t('dash_quickTools') }}</p>
-            <button
-              type="button"
-              :disabled="!isAuthenticated"
-              class="flex w-full items-center gap-3 rounded border bg-white px-4 py-3 text-sm font-medium dark:bg-slate-900"
-              :class="!isAuthenticated ? 'cursor-not-allowed opacity-60 border-slate-200 dark:border-slate-700' : 'border-slate-200 hover:border-primary dark:border-slate-700'"
-              @click="openQuickSetup"
-            >
-              <span class="material-symbols-outlined text-lg text-slate-400">bolt</span>
-              {{ t('dash_quickSetup') }}
-            </button>
             <button
               type="button"
               data-testid="aliang-chat-entry-panel"
@@ -385,32 +371,6 @@
             </button>
             <button
               type="button"
-              data-testid="listener-entry-panel"
-              :disabled="!isAuthenticated"
-              class="flex w-full items-center gap-3 rounded border bg-white px-4 py-3 text-sm font-medium dark:bg-slate-900"
-              :class="!isAuthenticated ? 'cursor-not-allowed opacity-60 border-slate-200 dark:border-slate-700' : 'border-slate-200 hover:border-primary dark:border-slate-700'"
-              @click="openListenerPanel"
-            >
-              <span class="material-symbols-outlined text-lg text-slate-400">notifications</span>
-              {{ t('listener_entryTitle') }}
-              <span
-                v-if="listenerActiveCount !== null"
-                class="ml-auto shrink-0 rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-bold text-primary"
-              >{{ listenerActiveCount }}</span>
-            </button>
-            <button
-              type="button"
-              data-testid="terminal-entry-topbar"
-              :disabled="!isAuthenticated"
-              class="flex w-full items-center gap-3 rounded border bg-white px-4 py-3 text-sm font-medium dark:bg-slate-900"
-              :class="!isAuthenticated ? 'cursor-not-allowed opacity-60 border-slate-200 dark:border-slate-700' : 'border-slate-200 hover:border-primary dark:border-slate-700'"
-              @click="showTerminal()"
-            >
-              <span class="material-symbols-outlined text-lg text-slate-400">terminal</span>
-              {{ t('term_open') }}
-            </button>
-            <button
-              type="button"
               class="flex w-full items-center gap-3 rounded border border-slate-200 bg-white px-4 py-3 text-sm font-medium hover:border-primary dark:border-slate-700 dark:bg-slate-900"
               @click="handleShowSettings"
             >
@@ -420,6 +380,42 @@
           </div>
           <!-- 余额块 -->
           <div class="border-t border-slate-100 pt-4 dark:border-slate-800">
+            <!-- 快捷工具图标排:快速配置/监听器/终端(大按钮收纳为底部小图标,悬停显名) -->
+            <div class="mb-4 flex items-center justify-center gap-3" data-testid="mobile-quick-tools">
+              <button
+                type="button"
+                :disabled="!isAuthenticated"
+                :title="t('dash_quickSetup')"
+                class="relative flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-400 transition-colors hover:border-primary hover:text-slate-600 dark:border-slate-700 dark:hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-60"
+                @click="openQuickSetup"
+              >
+                <span class="material-symbols-outlined text-lg">bolt</span>
+              </button>
+              <button
+                type="button"
+                data-testid="listener-entry-panel"
+                :disabled="!isAuthenticated"
+                :title="t('listener_entryTitle')"
+                class="relative flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-400 transition-colors hover:border-primary hover:text-slate-600 dark:border-slate-700 dark:hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-60"
+                @click="openListenerPanel"
+              >
+                <span class="material-symbols-outlined text-lg">notifications</span>
+                <span
+                  v-if="listenerActiveCount !== null"
+                  class="absolute -right-1.5 -top-1.5 rounded-full bg-primary/10 px-1.5 text-[10px] font-bold text-primary"
+                >{{ listenerActiveCount }}</span>
+              </button>
+              <button
+                type="button"
+                data-testid="terminal-entry-topbar"
+                :disabled="!isAuthenticated"
+                :title="t('term_open')"
+                class="relative flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-400 transition-colors hover:border-primary hover:text-slate-600 dark:border-slate-700 dark:hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-60"
+                @click="showTerminal()"
+              >
+                <span class="material-symbols-outlined text-lg">terminal</span>
+              </button>
+            </div>
             <div class="mb-3 flex items-center justify-between">
               <span class="text-xs font-bold uppercase tracking-wider text-slate-500">{{ t('dash_accountBalance') }}</span>
               <span class="text-lg font-bold text-slate-900 dark:text-white">{{ accountBalanceText }}</span>
