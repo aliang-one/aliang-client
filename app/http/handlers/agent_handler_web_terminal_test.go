@@ -316,6 +316,90 @@ func TestWebTerminalFSRuntimeLegGateBeforeBodyParse(t *testing.T) {
 	if body := rec.Body.String(); !strings.Contains(body, "Web terminal is disabled") && !strings.Contains(body, "Invalid web terminal token") {
 		t.Fatalf("upload 403 应来自主开关/令牌分支且先于 body 解析, got %s", body)
 	}
+	// 写操作三端点(文件管理批 Task B):403 同样先于 body 解析(body 故意
+	// 喂坏 JSON,若门错位到解析之后会是 400 而非 403——PROXY-FIRST 契约的
+	// runtime 半场)。
+	for name, fn := range map[string]func(http.ResponseWriter, *http.Request){
+		"mkdir":  h.HandleWebTerminalFSMkdir,
+		"rename": h.HandleWebTerminalFSRename,
+		"delete": h.HandleWebTerminalFSDelete,
+	} {
+		rec := httptest.NewRecorder()
+		fn(rec, webTerminalGateRequest(http.MethodPost, "/api/agent/fs/"+name, "garbage-not-json", mintDashboardCookie(t)))
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("runtime 腿 %s 无令牌应 403(且先于 body 解析), got %d body=%s", name, rec.Code, rec.Body.String())
+		}
+		if body := rec.Body.String(); !strings.Contains(body, "Web terminal is disabled") && !strings.Contains(body, "Invalid web terminal token") {
+			t.Fatalf("%s 403 应来自主开关/令牌分支且先于 body 解析, got %s", name, body)
+		}
+	}
+}
+
+// ——— FS 写操作三端点(文件管理批 Task B):门前语义 + marking ———
+
+func TestWebTerminalFSMutationGateMatrix(t *testing.T) {
+	h := NewAgentHandler(nil)
+	forged := &http.Cookie{Name: middleware.DashboardSessionCookieName, Value: url.QueryEscape("forged-token")}
+	mutationHandlers := map[string]func(http.ResponseWriter, *http.Request){
+		"mkdir":  h.HandleWebTerminalFSMkdir,
+		"rename": h.HandleWebTerminalFSRename,
+		"delete": h.HandleWebTerminalFSDelete,
+	}
+	bodyBy := map[string]string{
+		"mkdir":  `{"dir":".","name":"x"}`,
+		"rename": `{"dir":".","oldName":"a","newName":"b"}`,
+		"delete": `{"path":"a"}`,
+	}
+	for name, fn := range mutationHandlers {
+		// 无 cookie 非 loopback → 401;伪造 cookie → 401(与四端点同门同治)。
+		rec := httptest.NewRecorder()
+		fn(rec, webTerminalGateRequest(http.MethodPost, "/api/agent/fs/"+name, bodyBy[name], nil))
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s 无登录态应 401, got %d body=%s", name, rec.Code, rec.Body.String())
+		}
+		rec = httptest.NewRecorder()
+		fn(rec, webTerminalGateRequest(http.MethodPost, "/api/agent/fs/"+name, bodyBy[name], forged))
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s 伪造 cookie 应 401, got %d body=%s", name, rec.Code, rec.Body.String())
+		}
+		// 方法闸最前(先于鉴权,同 upload/list 约定):GET 打 POST 端点 → 405。
+		rec = httptest.NewRecorder()
+		fn(rec, webTerminalGateRequest(http.MethodGet, "/api/agent/fs/"+name, "", nil))
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("GET 打 %s 应 405, got %d", name, rec.Code)
+		}
+	}
+}
+
+func TestWebTerminalFSMutationLoopbackMarking(t *testing.T) {
+	// core 角色(未设 runtime env):三 POST 端点必须在 proxy 之前完成真源
+	// 标记——LAN 来源的伪造 X-Aliang-WT-Loopback 必须被剥净(否则经 proxy
+	// 透传可在 runtime 侧冒充 loopback),loopback 来源置 1。断言只看 handler
+	// 返回后 r.Header 的同步突变,不钉响应码:56433 拨号被拒=503;本机若有
+	// 活 runtime,请求不带令牌其 runtime 门也在触盘前 403(无副作用),两
+	// 种结局对头部真值均无影响。
+	h := NewAgentHandler(nil)
+	mutationHandlers := map[string]func(http.ResponseWriter, *http.Request){
+		"mkdir":  h.HandleWebTerminalFSMkdir,
+		"rename": h.HandleWebTerminalFSRename,
+		"delete": h.HandleWebTerminalFSDelete,
+	}
+	for name, fn := range mutationHandlers {
+		req := webTerminalGateRequest(http.MethodPost, "/api/agent/fs/"+name, `{"dir":".","name":"x"}`, mintDashboardCookie(t))
+		req.Header.Set(WebTerminalLoopbackHeader, "1") // LAN 伪造 loopback
+		fn(httptest.NewRecorder(), req)
+		if got := req.Header.Get(WebTerminalLoopbackHeader); got != "" {
+			t.Fatalf("%s marking 必须剥净伪造真源头, got %q", name, got)
+		}
+	}
+	// loopback 来源(loopback 豁免腿过闸):core 见证并置 1,runtime 侧审计
+	// origin 据此为真。
+	req := webTerminalGateRequest(http.MethodPost, "/api/agent/fs/mkdir", `{"dir":".","name":"x"}`, nil)
+	req.RemoteAddr = "127.0.0.1:55555"
+	h.HandleWebTerminalFSMkdir(httptest.NewRecorder(), req)
+	if got := req.Header.Get(WebTerminalLoopbackHeader); got != "1" {
+		t.Fatalf("loopback 来源应被标记为 1, got %q", got)
+	}
 }
 
 // ——— P3.6 审计真源标记(阶段 1 终审 Finding B 残余)———

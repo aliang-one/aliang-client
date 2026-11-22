@@ -340,6 +340,14 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("GET /api/agent/fs/read", h.Agent.HandleWebTerminalFSRead, http.MethodGet)
 	register("GET /api/agent/fs/download", h.Agent.HandleWebTerminalFSDownload, http.MethodGet)
 	register("POST /api/agent/fs/upload", h.Agent.HandleWebTerminalFSUpload, http.MethodPost)
+	// FS 写操作三端点(文件管理批,spec §6.3):mkdir/rename/delete 全 POST
+	// 小 JSON。core 腿闸门②+marking+proxy 透传且**零 body 解析**(PROXY-FIRST,
+	// 同 upload 的阶段1 勘误#10);真身在 user agent runtime(守卫/清洗/审计
+	// 全在彼处)。delete 走零硬超时数据面 client(递归删大目录树可超控制面
+	// 12s)。双注册另一处 agentruntime/server.go(缺任一侧=404 透传,老坑)。
+	register("POST /api/agent/fs/mkdir", h.Agent.HandleWebTerminalFSMkdir, http.MethodPost)
+	register("POST /api/agent/fs/rename", h.Agent.HandleWebTerminalFSRename, http.MethodPost)
+	register("POST /api/agent/fs/delete", h.Agent.HandleWebTerminalFSDelete, http.MethodPost)
 	// agent-as-MCP 工具面端点：真身在 user agent runtime，core 侧只做 proxy
 	// 透传（handler 内 proxyIfNeeded 分流）。register 是裸 pattern 透传，方法
 	// 前缀必须写进 path——同 /api/agent/memory 六端点先例（2026-10-21 教训）。
