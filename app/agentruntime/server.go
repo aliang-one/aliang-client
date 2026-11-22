@@ -142,7 +142,7 @@ func StopLocalServer() error {
 }
 
 func registerAgentRoutes(mux *http.ServeMux) {
-	logger.Info("[AGENT-BOOT] local_server registering_routes routes=/api/agent/status,/api/agent/sync,/api/agent/enable,/api/agent/auth-recover,/api/agent/disable,/api/agent/tools,/api/agent/protocol,/api/agent/tools/launch,/api/agent/ai/approval-hook,/api/agent/ai/stream,/api/agent/web-terminal*,/api/agent/peer/*")
+	logger.Info("[AGENT-BOOT] local_server registering_routes routes=/api/agent/status,/api/agent/sync,/api/agent/enable,/api/agent/auth-recover,/api/agent/disable,/api/agent/tools,/api/agent/protocol,/api/agent/tools/launch,/api/agent/ai/approval-hook,/api/agent/ai/stream,/api/agent/web-terminal*,/api/agent/fs/*,/api/agent/peer/*")
 	agentHandler := handlers.NewAgentHandler(services.GetSharedAgentService())
 	mux.HandleFunc("/api/agent/status", agentHandler.HandleStatus)
 	mux.HandleFunc("/api/agent/sync", agentHandler.HandleSync)
@@ -197,6 +197,15 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/agent/web-terminal", agentHandler.HandleWebTerminalState)
 	mux.HandleFunc("POST /api/agent/web-terminal", agentHandler.HandleWebTerminalCommand)
 	mux.HandleFunc("/api/agent/web-terminal/stream", agentHandler.HandleWebTerminalStream)
+	// 网页终端文件浏览 FS 面(spec §6.3,阶段 3):list/read/download/upload
+	// 四端点。真身在此(路径守卫/令牌/主开关全在本 runtime 的 handler+服务
+	// 层),core routes.go 侧同名注册只做 proxy 透传——upload 的 core 腿零
+	// body 解析(multipart 原样流穿,阶段1 勘误#10)。缺任一侧=404(双注册
+	// 教训,2026-10-21 liang-dev 实测)。方法前缀模式与 core 侧对齐。
+	mux.HandleFunc("GET /api/agent/fs/list", agentHandler.HandleWebTerminalFSList)
+	mux.HandleFunc("GET /api/agent/fs/read", agentHandler.HandleWebTerminalFSRead)
+	mux.HandleFunc("GET /api/agent/fs/download", agentHandler.HandleWebTerminalFSDownload)
+	mux.HandleFunc("POST /api/agent/fs/upload", agentHandler.HandleWebTerminalFSUpload)
 	// OpenViking 跨设备记忆面读点/apply(spec Phase2 §7.5/§7.7):状态/拨测/对齐
 	// 真身住本 runtime(boot 处 StartOpenVikingProbe/EnsureOpenVikingMatchesConfig
 	// 在此),core routes.go 侧同名注册只做 proxyIfNeeded 透传(handler 注释自证)。

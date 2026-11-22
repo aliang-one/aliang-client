@@ -331,6 +331,15 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("GET /api/agent/web-terminal", h.Agent.HandleWebTerminalState, http.MethodGet)
 	register("POST /api/agent/web-terminal", h.Agent.HandleWebTerminalCommand, http.MethodPost)
 	register("/api/agent/web-terminal/stream", h.Agent.HandleWebTerminalStream, http.MethodGet)
+	// 网页终端文件浏览 FS 面(spec §6.3,阶段 3):list/read/download/upload
+	// 四端点。真身在 user agent runtime(路径守卫/令牌/主开关都在彼处),
+	// core 侧只闸门②+proxy 透传——upload 的 core 腿零 body 解析(multipart
+	// 原样流穿,阶段1 勘误#10)。双注册另一处 agentruntime/server.go(缺任一
+	// 侧=404 透传,老坑)。方法前缀模式防同路径互相覆盖(先例同上)。
+	register("GET /api/agent/fs/list", h.Agent.HandleWebTerminalFSList, http.MethodGet)
+	register("GET /api/agent/fs/read", h.Agent.HandleWebTerminalFSRead, http.MethodGet)
+	register("GET /api/agent/fs/download", h.Agent.HandleWebTerminalFSDownload, http.MethodGet)
+	register("POST /api/agent/fs/upload", h.Agent.HandleWebTerminalFSUpload, http.MethodPost)
 	// agent-as-MCP 工具面端点：真身在 user agent runtime，core 侧只做 proxy
 	// 透传（handler 内 proxyIfNeeded 分流）。register 是裸 pattern 透传，方法
 	// 前缀必须写进 path——同 /api/agent/memory 六端点先例（2026-10-21 教训）。

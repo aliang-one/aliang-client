@@ -622,7 +622,10 @@ func (s *AgentService) WebTerminalRunCommand(action, pin, oldPin, newPin string,
 		}
 		return webTerminalOkPayload(nil)
 	case "reset":
-		// loopback-only 的调用门在 handler 层(core 腿拦截)。
+		// loopback-only 的调用门在 handler 层(core 腿拦截)。P3.6 真源标记
+		// (X-Aliang-WT-Loopback)只修正本函数收到的 loopback 判定真伪,不改
+		// 拦截位置:reset 的 core 腿 403 仍在,[NON-LOOPBACK] 高亮经 HTTP 仍
+		// 不可达,维持防御性留痕。
 		s.webTerminal.Reset()
 		summary := "origin=" + origin
 		if !loopback {
