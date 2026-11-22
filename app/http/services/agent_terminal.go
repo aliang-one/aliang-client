@@ -828,11 +828,13 @@ func (m *agentTerminalManager) closeAll() {
 }
 
 // agentWebOrphanCloseDelay bounds how long a web-leg orphaned session may keep
-// squatting on a manager slot after its WS dropped. Generous enough for the
-// browser's transient-reconnect window (2 reconnects × 800ms backoff + connect
-// time); a page refresh never re-attaches the old random id (fresh shell =
-// fresh id), so the window is leniency, not function. A var so tests shorten it.
-var agentWebOrphanCloseDelay = 10 * time.Second
+// squatting on a manager slot after its WS dropped. 30m aligns with the
+// detached-idle threshold: the web window id is now the stable session id, so
+// a page refresh + re-unlock re-attaches the SAME id and replays the live
+// session — the orphan window IS the survive-a-refresh window. Slot pressure
+// is resolved by create's reap-on-limit (reapWebOrphansNow), not by this timer,
+// so a long TTL here never blocks a waiting create. A var so tests shorten it.
+var agentWebOrphanCloseDelay = 30 * time.Minute
 
 // ScheduleWebOrphanClose arms the delayed reap for one web-leg session whose
 // WS is about to go away (or already did). Fired after the delay: session gone

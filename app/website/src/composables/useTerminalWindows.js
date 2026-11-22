@@ -35,8 +35,11 @@ function persist() {
   }
 }
 
-// 持久化行 → 恢复条目:一律 status='minimized'、zIndex=0(刷新恢复语义);
-// id/title/createdAt 原样保留;缺 id 的脏行丢弃,createdAt 缺失/非法补当前时间。
+// 持久化行 → 恢复条目:status/zIndex 原样保留(2026-11-23 会话保活改造)——
+// sessionId=窗 id 后,刷新恢复的 open 窗经 openWindows immediate watch 自动
+// 挂面板并 attach 同 id 会话,滚动缓冲/活 shell 跨刷新存活,窗直接回桌面。
+// 此前一律降级 minimized(恢复壳=新会话时代的保守语义,已废)。缺 id 的脏行
+// 丢弃;status 非法值回落 minimized;createdAt 缺失/非法补当前时间。
 function parsePersistedRows() {
   const s = safeStorage();
   if (!s) return [];
@@ -52,8 +55,8 @@ function parsePersistedRows() {
     .map((r) => ({
       id: r.id,
       title: typeof r.title === 'string' ? r.title : '',
-      status: 'minimized',
-      zIndex: 0,
+      status: r.status === 'open' ? 'open' : 'minimized',
+      zIndex: Number.isFinite(r.zIndex) && r.zIndex > 0 ? r.zIndex : 0,
       createdAt: Number.isFinite(r.createdAt) ? r.createdAt : Date.now(),
     }));
 }

@@ -93,7 +93,7 @@ describe('useTerminalWindows', () => {
     expect(m.zIndex).toBe(3); // minimized 不参与 renumber,保持原值
   });
 
-  it('持久化往返:两条落盘 → 清内存态从同键恢复 → 全 minimized、id/title/createdAt 保留', () => {
+  it('持久化往返:两条落盘 → 清内存态从同键恢复 → status/zIndex 原样保留(会话保活刷新语义)、id/title/createdAt 保留', () => {
     const tw = useTerminalWindows();
     const a = tw.createWindow('a');
     const b = tw.createWindow('b');
@@ -108,16 +108,18 @@ describe('useTerminalWindows', () => {
 
     tw.loadPersisted();
     expect(tw.windows.value).toHaveLength(2);
+    // 会话保活(2026-11-23):sessionId=窗 id 后刷新恢复的 open 窗直接回桌面,
+    // openWindows immediate watch 自动挂面板 attach 同 id 会话续屏
     for (const w of tw.windows.value) {
-      expect(w.status).toBe('minimized'); // 刷新恢复语义:活 WS 不跨刷新,恢复即挂起壳
-      expect(w.zIndex).toBe(0);
+      expect(w.status).toBe('open');
+      expect(w.zIndex).toBeGreaterThan(0);
     }
     const byId = Object.fromEntries(tw.windows.value.map((w) => [w.id, w]));
     expect(byId[a.id].title).toBe('a');
     expect(byId[a.id].createdAt).toBe(a.createdAt);
     expect(byId[b.id].title).toBe('b');
-    expect(tw.minimizedWindows.value).toHaveLength(2);
-    expect(tw.openWindows.value).toHaveLength(0);
+    expect(tw.minimizedWindows.value).toHaveLength(0);
+    expect(tw.openWindows.value).toHaveLength(2);
   });
 
   it('initPersistence:启动恢复(同 loadPersisted),脏条目/脏载荷安全忽略', () => {
@@ -135,8 +137,8 @@ describe('useTerminalWindows', () => {
     expect(tw.windows.value[0]).toMatchObject({
       id: 'win-x',
       title: 'x',
-      status: 'minimized', // 落盘时 open,恢复一律 minimized
-      zIndex: 0,
+      status: 'open', // 会话保活:落盘 open 恢复 open
+      zIndex: 9,
       createdAt: 111,
     });
 

@@ -94,6 +94,7 @@ async function mount() {
   const app = createApp({
     render: () => h(TerminalPane, {
       token: 'tok_abc',
+      sessionId: 'win-test1', // 会话保活:sessionId=窗 id,由调用方传入
       onExit: () => { events.exit += 1; },
       onDead: () => { events.dead += 1; },
     }),
@@ -105,11 +106,11 @@ async function mount() {
 }
 
 describe('TerminalPane', () => {
-  it('挂载即建 socket（web- 会话号 + 当前行列）并 open 进宿主 + 首次 fit', async () => {
+  it('挂载即建 socket（sessionId=窗 id + 当前行列）并 open 进宿主 + 首次 fit', async () => {
     const m = await mount();
     expect(createTerminalSocket).toHaveBeenCalledTimes(1);
     expect(m.opts.token).toBe('tok_abc');
-    expect(m.opts.sessionId).toMatch(/^web-[a-z0-9]{8}$/);
+    expect(m.opts.sessionId).toBe('win-test1'); // 同 id attach 续屏(会话保活)
     expect(m.opts.rows).toBe(24);
     expect(m.opts.cols).toBe(80);
     // xterm open 进 pane 内宿主 div,fit addon 已挂载且首调
@@ -166,7 +167,7 @@ describe('TerminalPane', () => {
     expect(m.events.dead).toBe(1);
   });
 
-  it('本会话 error → 退避 1.5s 后以全新随机 ID 自动重建(旧 sock 已释放)', async () => {
+  it('本会话 error → 退避 1.5s 后以同 id 自动重建(旧 sock 已释放,窗 id=会话 id 恒定)', async () => {
     vi.useFakeTimers();
     try {
       const m = await mount();
@@ -179,8 +180,7 @@ describe('TerminalPane', () => {
       await nextTick();
       expect(createTerminalSocket).toHaveBeenCalledTimes(2);
       const secondOpts = createTerminalSocket.mock.calls[1][0];
-      expect(secondOpts.sessionId).toMatch(/^web-[a-z0-9]{8}$/);
-      expect(secondOpts.sessionId).not.toBe(firstId); // 重建=全新会话,不再打死 ID
+      expect(secondOpts.sessionId).toBe('win-test1'); // 同 id 重连:窗 id=会话 id 恒定,不换新 ID
       expect(secondOpts.token).toBe('tok_abc');
       expect(sock.dispose).toHaveBeenCalledTimes(1); // 旧 socket 先释放
     } finally {
@@ -201,11 +201,35 @@ describe('TerminalPane', () => {
       vi.advanceTimersByTime(10000);
       await nextTick();
       expect(createTerminalSocket).toHaveBeenCalledTimes(3); // 上限 2 次重建
+      for (const call of createTerminalSocket.mock.calls) {
+        expect(call[0].sessionId).toBe('win-test1'); // 三次全同 id
+      }
       // 触顶后错误文案保留(用户手动关窗重开,不再静默重建)
       expect(m.el.querySelector('[data-testid="terminal-status"]').textContent).toContain('limit');
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('created{exited:true} 墓碑回放:显示会话结束 + 上抛 exit(历史内容已写入 xterm)', async () => {
+    const m = await mount();
+    // 先回放历史帧(attachHistory 的 replay),再收墓碑确认
+    sockHandlers.frame({ type: 'terminal.replay', data: 'old-session-output\n' });
+    sockHandlers.status({ kind: 'created', resumed: false, pty: true, exited: true });
+    await nextTick();
+    expect(m.term.written).toBe('old-session-output\n'); // 历史内容保留在窗里
+    expect(m.el.querySelector('[data-testid="terminal-status"]').textContent).toContain(t('term_exit'));
+    expect(m.events.exit).toBe(1);
+  });
+
+  it('created{resumed:true} 续屏确认:清徽标(活会话 attach 成功)', async () => {
+    const m = await mount();
+    sockHandlers.status({ kind: 'error', message: 'boom', sessionId: 'win-test1' });
+    await nextTick();
+    sockHandlers.status({ kind: 'created', resumed: true, pty: true, exited: false });
+    await nextTick();
+    expect(m.el.querySelector('[data-testid="terminal-status"]')).toBe(null);
+    expect(m.events.exit).toBe(0);
   });
 
   it('全局 error(session_id 空,如 re-locked)不触发重建——重建只会再撞闸', async () => {

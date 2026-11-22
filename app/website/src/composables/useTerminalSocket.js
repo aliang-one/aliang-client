@@ -30,7 +30,9 @@ export function createTerminalSocket({ token, sessionId, rows, cols, onFrame, on
         onFrame && onFrame(parsed);
         break;
       case 'terminal.created':
-        onStatus && onStatus({ kind: 'created', resumed: !!parsed.resumed, pty: !!parsed.pty });
+        // exited:true=attach 命中墓碑(会话已死,只回放历史)——窗格据此显示
+        // 会话结束并上抛 exit,不再等待活 shell 输出
+        onStatus && onStatus({ kind: 'created', resumed: !!parsed.resumed, pty: !!parsed.pty, exited: !!parsed.exited });
         break;
       case 'terminal.exit':
         onStatus && onStatus({ kind: 'exit' });

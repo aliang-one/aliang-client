@@ -91,7 +91,7 @@
                   <!-- 窗体点击聚焦直通:pointerdown 不 .stop——xterm 仍收指针;
                        背景窗点体即抬升(P2.2 评审随身条款) -->
                   <div class="h-full w-full" @pointerdown="reg.focusWindow(w.id)">
-                    <TerminalPane :token="token" @exit="statusRefresh" @dead="onPaneDead(w.id)" />
+                    <TerminalPane :token="token" :session-id="w.id" @exit="statusRefresh" @dead="onPaneDead(w.id)" />
                   </div>
                 </FloatingWindow>
               </template>
