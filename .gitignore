@@ -98,3 +98,16 @@ aliang-rename-test
 
 # 脑暴可视化伴侣的临时画布与交互事件
 .superpowers/
+
+# vendored third-party widgets with no build references (dead weight)
+app/website/public/main-chat.js
+app/website/public/jquery.min.js
+
+# geoip database is downloaded at runtime (cache.GetCacheSubdir("geoip"))
+data/*.mmdb
+
+# vendored upstream repo (gemini-cli source drop) — kept on disk for reference, not tracked
+gemini-cli-main/
+
+# stale worktree snapshot (built Oct 2026, references missing main-chat-ws.js)
+alianggate-transfer/
