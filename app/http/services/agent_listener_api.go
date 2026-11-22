@@ -455,9 +455,14 @@ type ListenerCloudSource struct {
 // ListenerCreateViaCloud 注册监听器(设备面 POST /api/agent/listeners,server
 // 侧另有 deviceIdOverride 双保险):body 为 server listenerCreateSchema 字段
 // 名(snake_case:title/source{type,device_id,params}/prompt_template/mode/
-// target_session_id),201 应答 {listener:{...}} 中取 id+status 回传。云端
-// 业务 4xx → 非 sentinel 错误;不可达 → errListenerCloudOffline 包装。
-func ListenerCreateViaCloud(ctx context.Context, title string, source ListenerCloudSource, promptTemplate, mode, targetSessionID string) (string, string, error) {
+// target_session_id,session_id 可选键),201 应答 {listener:{...}} 中取
+// id+status 回传。云端业务 4xx → 非 sentinel 错误;不可达 →
+// errListenerCloudOffline 包装。
+//
+// sessionID 是 SV-3 溯源参数(残余项补线):发起 run 的会话 id,非空才上
+// wire——server REST 层据此写 created_by=ai:<session_id>;空/空白(如 stdio
+// MCP 面无会话上下文)省键,server 兜底 created_by=user:<deviceId>。
+func ListenerCreateViaCloud(ctx context.Context, title string, source ListenerCloudSource, promptTemplate, mode, targetSessionID, sessionID string) (string, string, error) {
 	svc := GetSharedAgentService()
 	if svc == nil {
 		return "", "", errListenerCloudOffline
@@ -469,13 +474,21 @@ func ListenerCreateViaCloud(ctx context.Context, title string, source ListenerCl
 	if source.Params == nil {
 		source.Params = json.RawMessage("{}")
 	}
-	body, err := json.Marshal(map[string]interface{}{
+	payload := map[string]interface{}{
 		"title":             title,
 		"source":            map[string]interface{}{"type": source.Type, "device_id": identity.deviceID, "params": source.Params},
 		"prompt_template":   promptTemplate,
 		"mode":              mode,
 		"target_session_id": targetSessionID,
-	})
+	}
+	// SV-3 溯源:session_id 非空(TrimSpace 归一)才上 wire——server 据此写
+	// created_by=ai:<session_id>;空=无会话上下文,省键让 server 兜底
+	// user:<deviceId>(空串上 wire 虽被 server 视同未带,省键让 body 形状与
+	// 会话态一一对应,测试据此钉「不带」形态)。
+	if sessionID = strings.TrimSpace(sessionID); sessionID != "" {
+		payload["session_id"] = sessionID
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", "", err
 	}

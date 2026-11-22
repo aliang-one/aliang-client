@@ -133,6 +133,11 @@ func listenerToolCreate(ctx context.Context, rc listenerToolContext, title, sour
 		promptTemplate,
 		mode,
 		targetSessionID,
+		// SV-3 溯源:发起 run 的会话 id 上 wire(server created_by=ai:<sid>);
+		// rc.sessionID 为空(stdio MCP 无会话面)则省略,server 兜底
+		// user:<deviceId>。注意这是「发起会话」,与 target_session_id(事件
+		// 注入目标,可异会话)语义不同。
+		rc.sessionID,
 	)
 	if err != nil {
 		return nil, err

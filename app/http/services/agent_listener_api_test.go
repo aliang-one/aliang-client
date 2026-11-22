@@ -644,6 +644,7 @@ func TestListenerCreateViaCloud(t *testing.T) {
 			"监听器命中:{{event}}",
 			"recurring",
 			"sess-current",
+			"",
 		)
 		if err != nil {
 			t.Fatalf("ListenerCreateViaCloud: %v", err)
@@ -691,6 +692,56 @@ func TestListenerCreateViaCloud(t *testing.T) {
 		}
 	})
 
+	t.Run("session_id provenance: non-empty goes on the wire, blank stays off", func(t *testing.T) {
+		t.Setenv(AgentRuntimeEnv, "1")
+		swapListenerSharedService(t, newListenerProxyTestService(true))
+		var gotBody []byte
+		cap := newListenerFakeCloud(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+			if r.Method == http.MethodPost && r.URL.Path == "/api/agent/listeners" {
+				gotBody = body
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(`{"listener":{"id":"L-agent-43","status":"active"}}`))
+				return
+			}
+			http.NotFound(w, r)
+		})
+		swapListenerCloudBase(t, cap.server.URL)
+
+		// 非空:第六键 session_id 随 body 上 wire(SV-3 溯源,server 写
+		// created_by=ai:<session_id>)。
+		if _, _, err := ListenerCreateViaCloud(context.Background(), "盯",
+			ListenerCloudSource{Type: "file_tail", Params: json.RawMessage(`{}`)},
+			"p {{event}}", "once", "sess-target", "sess-run"); err != nil {
+			t.Fatalf("create with session_id: %v", err)
+		}
+		var withSession map[string]json.RawMessage
+		if err := json.Unmarshal(gotBody, &withSession); err != nil {
+			t.Fatalf("create body 须是 JSON: %v", err)
+		}
+		if string(withSession["session_id"]) != `"sess-run"` {
+			t.Fatalf("非空 session_id 须上 wire: %s", gotBody)
+		}
+
+		// 空白串(TrimSpace 归一后为空,stdio 无会话面形态):键省略,
+		// server 兜底 user:<deviceId>——不产 "session_id":"" 形态。
+		if _, _, err := ListenerCreateViaCloud(context.Background(), "盯",
+			ListenerCloudSource{Type: "file_tail", Params: json.RawMessage(`{}`)},
+			"p {{event}}", "once", "sess-target", "  "); err != nil {
+			t.Fatalf("create without session_id: %v", err)
+		}
+		var withoutSession map[string]json.RawMessage
+		if err := json.Unmarshal(gotBody, &withoutSession); err != nil {
+			t.Fatalf("create body 须是 JSON: %v", err)
+		}
+		if _, has := withoutSession["session_id"]; has {
+			t.Fatalf("空白 session_id 须省略键: %s", gotBody)
+		}
+		if n := len(cap.snapshot()); n != 2 {
+			t.Fatalf("应恰两笔云端调用: %d", n)
+		}
+	})
+
 	t.Run("cloud 4xx maps to error not offline", func(t *testing.T) {
 		t.Setenv(AgentRuntimeEnv, "1")
 		swapListenerSharedService(t, newListenerProxyTestService(true))
@@ -700,7 +751,7 @@ func TestListenerCreateViaCloud(t *testing.T) {
 			_, _ = w.Write([]byte(`{"error":"listener_source_not_in_1a"}`))
 		})
 		swapListenerCloudBase(t, cap.server.URL)
-		_, _, err := ListenerCreateViaCloud(context.Background(), "x", ListenerCloudSource{Type: "http_poll", Params: json.RawMessage(`{"url":"https://a"}`)}, "p", "recurring", "sess")
+		_, _, err := ListenerCreateViaCloud(context.Background(), "x", ListenerCloudSource{Type: "http_poll", Params: json.RawMessage(`{"url":"https://a"}`)}, "p", "recurring", "sess", "")
 		if err == nil {
 			t.Fatal("云端 400 必须映射为错误,不得假成功")
 		}
@@ -714,7 +765,7 @@ func TestListenerCreateViaCloud(t *testing.T) {
 		swapListenerSharedService(t, newListenerProxyTestService(false))
 		cap := newListenerFakeCloud(t, nil)
 		swapListenerCloudBase(t, cap.server.URL)
-		_, _, err := ListenerCreateViaCloud(context.Background(), "x", ListenerCloudSource{Type: "file_tail", Params: json.RawMessage(`{}`)}, "p", "once", "sess")
+		_, _, err := ListenerCreateViaCloud(context.Background(), "x", ListenerCloudSource{Type: "file_tail", Params: json.RawMessage(`{}`)}, "p", "once", "sess", "")
 		if err == nil || !strings.Contains(err.Error(), "listener cloud offline") {
 			t.Fatalf("无身份须回离线哨兵错误: %v", err)
 		}
