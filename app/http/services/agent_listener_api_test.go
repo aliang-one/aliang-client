@@ -60,6 +60,21 @@ func newListenerProxyTestService(registered bool) *AgentService {
 	return svc
 }
 
+// newListenerCoreTestService core 形态测试服务(真实 core 注册状态镜像):
+// 有本机设备 id(state.DeviceID),无云端授权(forwarded 凭据空——数据目录
+// 分离恒空)→ 身份快照不满足但 device_id 覆盖仍可本地完成。
+func newListenerCoreTestService() *AgentService {
+	svc := &AgentService{client: &http.Client{Timeout: agentHTTPTimeout}}
+	svc.mu.Lock()
+	// Enabled/Registered 刻意保持 false:身份快照(含 auth 库回读)确定性
+	// 失败、与运行环境无关——全量包跑时更早用例可能写入真实 auth 库
+	// (2026-11-22 实证),快照成败不得依赖环境。DeviceID 保留=真实 core
+	// 的「设备注册在 core、授权在 agent」拆分镜像。
+	svc.state.DeviceID = "dev-proxy-1"
+	svc.mu.Unlock()
+	return svc
+}
+
 // swapListenerCloudBase 把 base 缝指到指定 URL 并登记还原。
 func swapListenerCloudBase(t *testing.T, baseURL string) {
 	t.Helper()
@@ -848,6 +863,33 @@ func TestListenerProxyRoutesWired(t *testing.T) {
 			t.Fatalf("routes.go 缺注册 %s(漏注册=404,2026-10-21 同族)", registration)
 		}
 	}
+
+	// 三层拓扑回环转发的另一侧:runtime mux 同名端点(2026-11-22 补丁)。
+	// core 侧身份恒空必走转发,缺 runtime 侧注册=core 转发恒 404(双注册
+	// 教训,2026-10-21 同族)。
+	agentRaw, err := os.ReadFile("../../agentruntime/server.go")
+	if err != nil {
+		t.Fatalf("read ../../agentruntime/server.go: %v", err)
+	}
+	var agentCode strings.Builder
+	for _, line := range strings.Split(string(agentRaw), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "//") {
+			continue
+		}
+		agentCode.WriteString(line)
+		agentCode.WriteByte('\n')
+	}
+	for _, registration := range []string{
+		`mux.HandleFunc("GET /api/listeners", services.HandleListenerListAgent)`,
+		`mux.HandleFunc("POST /api/listeners", services.HandleListenerCreateAgent)`,
+		`mux.HandleFunc("PATCH /api/listeners/{id}", services.HandleListenerPatchAgent)`,
+		`mux.HandleFunc("DELETE /api/listeners/{id}", services.HandleListenerDeleteAgent)`,
+		`mux.HandleFunc("GET /api/listeners/{id}/events", services.HandleListenerEventsAgent)`,
+	} {
+		if !strings.Contains(agentCode.String(), registration) {
+			t.Fatalf("agentruntime/server.go 缺注册 %s(缺=core 转发恒 404)", registration)
+		}
+	}
 }
 
 // --- 8. I1/M2:id 闸(handler 面 + 客户端面 + HTTP 面;畸形 id 零云端调用) ---
@@ -941,5 +983,189 @@ func TestListenerProxyCreateNonJSONPassthrough422(t *testing.T) {
 	status, body := doListenerProxy(t, srv, cookie, http.MethodPost, "/api/listeners", []byte("not-json"))
 	if status != http.StatusUnprocessableEntity || !strings.Contains(string(body), "listener_validation_error") {
 		t.Fatalf("非 JSON create body 须由云端 422 兜底透传,得到 %d %s", status, body)
+	}
+}
+
+// --- 10. 三层拓扑回环转发(Mac/双单元补丁):core 身份恒空 → 转发 user agent --
+
+// listenerAgentCapture 假 user agent runtime mux 的请求捕获 + 可配置应答:
+// 形状镜像 listenerCloudCapture,Auth/Device 断言转发链不携带身份头
+// (身份注入是 runtime 侧直拨的事,转发面只搬运载荷)。
+type listenerAgentCapture struct {
+	mu      sync.Mutex
+	calls   []listenerCloudCall
+	handler func(w http.ResponseWriter, r *http.Request, body []byte)
+}
+
+func (c *listenerAgentCapture) record(r *http.Request, body []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls = append(c.calls, listenerCloudCall{
+		Method: r.Method,
+		Path:   r.URL.Path,
+		Auth:   r.Header.Get("Authorization"),
+		Device: r.Header.Get("X-Aliang-Device-ID"),
+		Body:   body,
+	})
+}
+
+func (c *listenerAgentCapture) snapshot() []listenerCloudCall {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]listenerCloudCall(nil), c.calls...)
+}
+
+// setupListenerCoreForwardHarness core 形态一把装好:不设 runtime env
+// (t.Setenv 未触即 unset)、共享服务未注册(身份快照空 → 转发分支)、
+// listenerUserAgentBase 缝指假 agent、返回带 mux 的测试服务器/假 agent
+// 捕获器/会话 cookie。
+func setupListenerCoreForwardHarness(t *testing.T, handler func(w http.ResponseWriter, r *http.Request, body []byte)) (*httptest.Server, *listenerAgentCapture, *http.Cookie) {
+	t.Helper()
+	if os.Getenv(AgentRuntimeEnv) != "" {
+		t.Fatalf("core 形态 harness 要求 %s 未设置", AgentRuntimeEnv)
+	}
+	swapListenerSharedService(t, newListenerProxyTestService(false))
+	cap := &listenerAgentCapture{handler: handler}
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		cap.record(r, body)
+		if handler != nil {
+			handler(w, r, body)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/listeners":
+			_, _ = w.Write([]byte(`{"listeners":[]}`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	t.Cleanup(agent.Close)
+	swapListenerUserAgentBase(t, agent.URL)
+	srv := httptest.NewServer(newListenerProxyMux())
+	t.Cleanup(srv.Close)
+	return srv, cap, withListenerDashboardSessionCookie(t)
+}
+
+// swapListenerUserAgentBase 换回环转发基址缝并登记还原。
+func swapListenerUserAgentBase(t *testing.T, base string) {
+	t.Helper()
+	old := listenerUserAgentBase
+	listenerUserAgentBase = func() string { return base }
+	t.Cleanup(func() { listenerUserAgentBase = old })
+}
+
+// 10a. GET 转发:core 身份空 → 同 (method,path) 打到假 agent,载荷逐项
+// 一致、转发链无身份头;本地面侧契约不变(200 信封,data=agent 对象)。
+func TestListenerProxyCoreTopologyForwardsToUserAgent(t *testing.T) {
+	agentBody := []byte(`{"listeners":[{"id":"L-9","title":"盯发布","status":"active"}]}`)
+	srv, cap, cookie := setupListenerCoreForwardHarness(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(agentBody)
+	})
+
+	status, localBody := doListenerProxy(t, srv, cookie, http.MethodGet, "/api/listeners", nil)
+	if status != http.StatusOK {
+		t.Fatalf("转发 GET status = %d,body=%s", status, localBody)
+	}
+	env := decodeListenerEnvelope(t, localBody)
+	if env.Code != float64(0) {
+		t.Fatalf("转发 2xx 信封 code 须为 number 0: %s", localBody)
+	}
+	if !reflect.DeepEqual(decodeListenerJSON(t, env.Data), decodeListenerJSON(t, agentBody)) {
+		t.Fatalf("信封 data 须逐项等于 agent 对象:\n got %s\nwant %s", env.Data, agentBody)
+	}
+	calls := cap.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("假 agent 应恰收到 1 次转发,得到 %+v", calls)
+	}
+	if calls[0].Method != http.MethodGet || calls[0].Path != "/api/listeners" {
+		t.Fatalf("转发 (method,path) 不符: %+v", calls[0])
+	}
+	if calls[0].Auth != "" || calls[0].Device != "" {
+		t.Fatalf("转发链不得携带身份头: Auth=%q Device=%q", calls[0].Auth, calls[0].Device)
+	}
+}
+
+// 10b. POST 转发载荷逐字节一致(device_id 覆盖后仍是原始 body 过转发链——
+// 覆盖发生在本进程 listenerCreate,agent 侧直拨前还会再覆盖,幂等无害)。
+func TestListenerProxyCoreTopologyForwardsCreateBody(t *testing.T) {
+	srv, cap, cookie := setupListenerCoreForwardHarness(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"listener":{"id":"L-new","status":"active"}}`))
+	})
+	// 真实 core 镜像:有设备 id 无授权 → 覆盖在本进程完成,转发 body 已携带。
+	swapListenerSharedService(t, newListenerCoreTestService())
+	payload := []byte(`{"title":"盯构建","source":{"type":"file_tail","params":{},"device_id":"forged"}}`)
+
+	status, localBody := doListenerProxy(t, srv, cookie, http.MethodPost, "/api/listeners", payload)
+	if status != http.StatusOK {
+		t.Fatalf("转发 POST status = %d,body=%s", status, localBody)
+	}
+	calls := cap.snapshot()
+	if len(calls) != 1 || calls[0].Method != http.MethodPost || calls[0].Path != "/api/listeners" {
+		t.Fatalf("假 agent 收到调用不符: %+v", calls)
+	}
+	// device_id 已在本进程覆盖为本机测试值(dev-proxy-1),转发 body 须携带。
+	if !strings.Contains(string(calls[0].Body), `"dev-proxy-1"`) {
+		t.Fatalf("转发 body 须为覆盖后的载荷: %s", calls[0].Body)
+	}
+}
+
+// 10c. agent 侧业务错误(非 2xx)照透传:状态与可读文案不走离线哨兵。
+func TestListenerProxyCoreTopologyRelaysBusinessError(t *testing.T) {
+	srv, cap, cookie := setupListenerCoreForwardHarness(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"error":"listener_validation_error"}`))
+	})
+	_ = cap
+
+	status, localBody := doListenerProxy(t, srv, cookie, http.MethodGet, "/api/listeners", nil)
+	if status != http.StatusUnprocessableEntity || !strings.Contains(string(localBody), "listener_validation_error") {
+		t.Fatalf("agent 侧 422 须原样透传,得到 %d %s", status, localBody)
+	}
+}
+
+// 10d. runtime 未运行(转发基址不可达)→ 离线哨兵族 502,横幅语义不回退。
+func TestListenerProxyCoreTopologyAgentUnreachableOffline(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close() // 先关再挂缝=确定性 connection refused
+	swapListenerSharedService(t, newListenerProxyTestService(false))
+	swapListenerUserAgentBase(t, deadURL)
+	srv := httptest.NewServer(newListenerProxyMux())
+	t.Cleanup(srv.Close)
+	cookie := withListenerDashboardSessionCookie(t)
+
+	status, localBody := doListenerProxy(t, srv, cookie, http.MethodGet, "/api/listeners", nil)
+	if status != http.StatusBadGateway || !strings.Contains(string(localBody), "listener_cloud_offline") {
+		t.Fatalf("agent 不可达须 502 离线哨兵,得到 %d %s", status, localBody)
+	}
+}
+
+// 10e. runtime 进程自身(单进程形态)身份缺失 → 哨兵原路,不得转发(防循环
+// +真离线语义不漂移):假 agent 恒零调用。
+func TestListenerProxyRuntimeIdentityMissingStaysSentinel(t *testing.T) {
+	t.Setenv(AgentRuntimeEnv, "1")
+	swapListenerSharedService(t, newListenerProxyTestService(false))
+	cap := &listenerAgentCapture{}
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		cap.record(r, body)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(agent.Close)
+	swapListenerUserAgentBase(t, agent.URL)
+	srv := httptest.NewServer(newListenerProxyMux())
+	t.Cleanup(srv.Close)
+	cookie := withListenerDashboardSessionCookie(t)
+
+	status, localBody := doListenerProxy(t, srv, cookie, http.MethodGet, "/api/listeners", nil)
+	if status != http.StatusBadGateway || !strings.Contains(string(localBody), "listener_cloud_offline") {
+		t.Fatalf("runtime 形态身份缺失须 502 哨兵原路,得到 %d %s", status, localBody)
+	}
+	if calls := cap.snapshot(); len(calls) != 0 {
+		t.Fatalf("runtime 形态不得回环转发,已触达: %+v", calls)
 	}
 }
