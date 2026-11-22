@@ -161,6 +161,11 @@ func NeedsAuthenticatedSync(timeout time.Duration) bool {
 	if err := getLocalAgentJSON(timeout, capabilityPath, &envelope); err != nil || envelope.Code != 0 {
 		return false
 	}
+	// 锁忙降级快照(2026-11-22 评审 must_fix):code=0 但 Degraded=true = 陈旧
+	// 快照,观测未知——粘性禁用白名单判断不得基于非实时状态驱动 reconcile。
+	if envelope.Data.Degraded {
+		return false
+	}
 	if envelope.Data.Enabled || envelope.Data.Registered {
 		return false
 	}
@@ -195,6 +200,12 @@ func NeedsRegistrationRecovery(timeout time.Duration) (bool, bool) {
 		Data models.AgentStatusResponse `json:"data"`
 	}
 	if err := getLocalAgentJSON(timeout, capabilityPath, &envelope); err != nil || envelope.Code != 0 {
+		return false, false
+	}
+	// 锁忙降级快照(2026-11-22 评审 must_fix):code=0 但 Degraded=true = Status()
+	// TryLock 失败退回的陈旧快照,观测未知——按 probeOK=false 冻结坏态时钟,
+	// 一并覆盖启动后尚无成功采集的零值降级分支(不得伪报「显式禁用」)。
+	if envelope.Data.Degraded {
 		return false, false
 	}
 	if !envelope.Data.DeviceEnabled {

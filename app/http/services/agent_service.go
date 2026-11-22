@@ -144,6 +144,15 @@ type agentState struct {
 }
 
 type AgentService struct {
+	// mu 锁纪律(2026-11-22 生产死锁定案,2026-11-20 同族二次):非重入锁,
+	// 持锁区内禁止调用任何会取 s.mu 的函数——包括表面无害的取值助手。
+	// 安全取锁助手( TryLock+快照,锁忙退化读):currentAgentDeviceIDForChannel
+	// Notify / currentAgentDeviceIDForNotify / Status(锁忙降级返回 statusSnapshot)。
+	// 401 通知链 NotifyOwnerAuthRejectedForChannel 禁止在持锁区触发(见
+	// callAgentServerWithAuthorization 与「MUST run without s.mu held」注释);
+	// 新增强制回填 statusSnapshot 的写点:Status() 成功路径 + enable/disable
+	// 锁内出迫。新增持锁区调用前先核对本清单——当天事故即「register 持锁→
+	// 401 分支→通知链→二次加锁」一条隐藏调用链焊死整把锁。
 	mu                    sync.Mutex
 	state                 agentState
 	identity              *agentDeviceIdentity
@@ -159,6 +168,13 @@ type AgentService struct {
 	// reads or rotates the persisted refresh token.
 	forwardedUserAuthorization atomic.Value // 存 string;owner 推送写、通道 401 重试读——两侧分别持不同锁,字符串快照用原子值避免跨锁读(2026-11-20 死锁定案:register 路径持 s.mu 走 callAgentServer,401 分支若再取 s.mu 即自锁死)
 	forwardedUserKey           string
+	// deviceIDSnapshot 是 state.DeviceID 的原子快照:currentAgentDeviceIDFor
+	// ChannelNotify 在锁被占用时退化读它(2026-11-22 死锁定案:401 通知链会在
+	// 持锁区调用设备号读取,TryLock 失败必须以快照保真,绝不二次加锁)。
+	deviceIDSnapshot atomic.Value // 存 string
+	// statusSnapshot 是最近一次完整 Status() 结果:锁忙降级路径退回它,仪表盘
+	// 轮询在 sync/register 长持锁窗口内不再无限排队(2026-11-22 死锁善后)。
+	statusSnapshot atomic.Value // 存 models.AgentStatusResponse
 
 	// releaseMu guards lastReleasedAuthHash — the fire-once guard for the
 	// logout device-release POST (logout reaches disableWithReasonMessage
@@ -325,8 +341,32 @@ func UserAgentOfflineStatus(err error) models.AgentStatusResponse {
 }
 
 func (s *AgentService) Status() models.AgentStatusResponse {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.mu.TryLock() {
+		resp := s.computeStatusLocked()
+		// 快照回填(2026-11-22 死锁善后):锁忙降级路径的「最近一次已知状态」
+		// 来源。resp 内指针字段(Runtime/Device/Tools/History)以只读共享——
+		// 按值副本只做 JSON 序列化,无人改写。
+		s.statusSnapshot.Store(resp)
+		s.mu.Unlock()
+		return resp
+	}
+	// 锁忙降级:sync/register 路径持锁最坏可达 ~50s,期间仪表盘 ~5s 节奏的
+	// 轮询不再无限排队(2026-11-22 生产事故:「agent 状态拉不起来」形态),
+	// 立即退回最近一次已知状态。
+	if v, ok := s.statusSnapshot.Load().(models.AgentStatusResponse); ok {
+		resp := v
+		resp.Degraded = true
+		resp.Message = "Agent 服务忙,返回最近一次已知状态(内部同步进行中)"
+		return resp
+	}
+	return models.AgentStatusResponse{
+		Degraded: true,
+		Message:  "Agent 服务忙,暂无已知状态(启动后尚无成功状态采集)",
+	}
+}
+
+// computeStatusLocked 组装完整状态响应(身份钉扎+状态+文案);调用方必须已持 s.mu。
+func (s *AgentService) computeStatusLocked() models.AgentStatusResponse {
 	s.ensureDeviceIdentityLocked()
 	resp := s.statusLocked()
 
@@ -476,6 +516,9 @@ func (s *AgentService) enableWithUserContext(authHeader string, userKey string) 
 				s.state.LastSyncStatus, s.state.DeviceID))
 		}
 		status := s.statusLocked()
+		// 锁内顺手回填快照(2026-11-22 评审 nit):锁忙降级读拿到的是本次
+		// 真实结果而非上一个状态迁移前的旧值。
+		s.statusSnapshot.Store(status)
 		s.mu.Unlock()
 		// Register-path 401 during an explicit enable: still try a recovery
 		// refresh before letting the session die (the JWT may be stale). Run
@@ -487,6 +530,7 @@ func (s *AgentService) enableWithUserContext(authHeader string, userKey string) 
 	}
 	registered := s.state.Registered
 	status := s.statusLocked()
+	s.statusSnapshot.Store(status)
 	s.mu.Unlock()
 	if registered {
 		go func() {
@@ -541,6 +585,9 @@ func (s *AgentService) disableWithReasonMessage(reason string, message string) m
 	}
 	_ = s.saveStateLocked()
 	status := s.statusLocked()
+	// 锁内顺手回填快照(2026-11-22 评审 nit):logout/粘性禁用立即可被锁忙
+	// 降级读看到,不必等下一轮 ~5s 轮询自愈。
+	s.statusSnapshot.Store(status)
 	s.mu.Unlock()
 
 	if releaseAuthHeader != "" && releaseDeviceID != "" {
@@ -1183,6 +1230,20 @@ func agentMessageIndicatesAuthError(msg string) bool {
 	return strings.Contains(m, "authentication_required") || strings.Contains(m, "returned 401") || strings.Contains(m, "unauthorized")
 }
 
+// copyAgentDeviceForStatus 对状态响应携带的 *AgentDevice 做值拷贝(2026-11-22
+// 对抗评审 must_fix)。锁下多处原地改写同一指针(syncRuntimeDeviceStatusLocked/
+// applyRemoteDeviceSettings/pinPermanentDeviceIDLocked/ensureDeviceIdentityLocked),
+// 而 Status() 的锁忙降级路径与 handler 序列化都在锁外读响应——共享指针即
+// 数据竞争(并发 string 撕裂读,-race 必报)。Capabilities 仅被整体重赋值
+// (:applyRemoteDeviceSettings)、User 指针本文件从不写入,浅拷贝即全隔离。
+func copyAgentDeviceForStatus(src *models.AgentDevice) *models.AgentDevice {
+	if src == nil {
+		return nil
+	}
+	d := *src
+	return &d
+}
+
 func (s *AgentService) statusLocked() models.AgentStatusResponse {
 	s.syncRuntimeDeviceStatusLocked()
 	status := agentStatusDisabled
@@ -1209,7 +1270,7 @@ func (s *AgentService) statusLocked() models.AgentStatusResponse {
 		ProtocolVersion: models.AgentProtocolVersion,
 		AgentServer:     currentAgentServerURL(),
 		Runtime:         currentAgentRuntimeStatus(),
-		Device:          s.state.Device,
+		Device:          copyAgentDeviceForStatus(s.state.Device),
 		Capabilities:    agentCapabilities(),
 		Tools:           detectAgentTools(),
 		History:         collectAgentHistoryRoots(),
@@ -1290,6 +1351,12 @@ func (s *AgentService) ensureDeviceIdentityLocked() {
 	// dedicated identity file (creating it once if needed) and pin it into
 	// state, never generating or adopting a server-provided id here.
 	s.pinPermanentDeviceIDLocked()
+	// 快照预热(2026-11-22 死锁定案):本函数是 DeviceID 的权威写入点,在此
+	// 同步刷 deviceIDSnapshot,保证「首次设备号读取发生在持锁区」时
+	// currentAgentDeviceIDForChannelNotify 的 TryLock 退化路径也有值可回。
+	if s.state.DeviceID != "" {
+		s.deviceIDSnapshot.Store(s.state.DeviceID)
+	}
 	changed := s.state.DeviceID != beforeID
 	if s.state.Device != nil {
 		if strings.TrimSpace(s.state.Device.ID) == "" {
@@ -2260,10 +2327,24 @@ func (s *AgentService) NotifyOwnerAuthRejectedForChannel(fingerprint string) {
 // currentAgentDeviceIDForChannelNotify 通道通知专用的设备号读取:与
 // currentAgentDeviceIDForNotify 语义一致,但只读本进程 state,不走
 // GetSharedAgentService(保持通知路径在包级 var 初始化依赖图之外)。
+//
+// 锁纪律(2026-11-22 生产死锁定案):本函数会被 401 闸门 callAgentServerWith
+// Authorization 在「SyncNowWithUserContext 持 s.mu 的 register 路径」内调用
+// ——非重入锁二次加锁即同 goroutine 永久 park、整把锁焊死(当日 /api/agent/
+// status|sync|disable 全部无限挂死、goroutine 以 +12/min 线性泄漏)。改
+// TryLock:空闲场景真读并顺手刷新快照;持锁场景退化读快照(保真不丢
+// device_id),绝不阻塞。2026-11-20 同族先例见 forwardedUserAuthorization。
 func (s *AgentService) currentAgentDeviceIDForChannelNotify() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.state.DeviceID
+	if s.mu.TryLock() {
+		id := s.state.DeviceID
+		s.deviceIDSnapshot.Store(id)
+		s.mu.Unlock()
+		return id
+	}
+	if v, ok := s.deviceIDSnapshot.Load().(string); ok {
+		return v
+	}
+	return ""
 }
 
 // forwardedCredentialIfDifferent 返回 owner 推送的转发凭据;与被拒头相同或
@@ -2319,9 +2400,19 @@ func resetOwnerAuthRejectedNotify() {
 // 无副作用：此时 agent 已决定自禁，不再做 identity 补建等持久化动作。
 func currentAgentDeviceIDForNotify() string {
 	s := GetSharedAgentService()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.state.DeviceID
+	// 同款锁纪律(2026-11-22 死锁定案):本函数现有调用方均在锁外,但它是与
+	// currentAgentDeviceIDForChannelNotify 同一形状的地雷——任何未来的持锁
+	// 调用方都会复现自死锁。TryLock+快照,持锁场景绝不阻塞。
+	if s.mu.TryLock() {
+		id := s.state.DeviceID
+		s.deviceIDSnapshot.Store(id)
+		s.mu.Unlock()
+		return id
+	}
+	if v, ok := s.deviceIDSnapshot.Load().(string); ok {
+		return v
+	}
+	return ""
 }
 
 // currentSessionGenerationForNotify 带保护地读取本地会话代：agent 子进程

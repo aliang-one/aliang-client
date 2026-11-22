@@ -111,6 +111,22 @@ func (s *AgentService) EnsureRemoteConnection() error {
 	return nil
 }
 
+// newAgentRemoteWSDialer 构造远端 WS 拨号器。显式书写 DefaultDialer 的两条
+// 默认不变量(ProxyFromEnvironment + 正握手超时)防静默回退:Proxy 丢了会在
+// 仅代理可达出口的环境造成「REST 注册成功 / WS 永久重连失败」不对称;超时
+// 归零则握手挂死时 dial goroutine 无界。事实核对(2026-11-22 评审纠正):
+// gorilla v1.5.3 DefaultDialer 本就是 {Proxy, 45s},当日 2h+ dialing 静默
+// 并非拨号缺陷,而是 WS goroutine 停在被焊死的 s.mu 上(锁纪律修复根治,
+// 见 agent_channel_lock_reentry_test.go);本拨号器是钉死不变量的文档化锚点。
+func newAgentRemoteWSDialer(handshakeTimeout time.Duration) *websocket.Dialer {
+	return &websocket.Dialer{
+		Proxy:            http.ProxyFromEnvironment,
+		HandshakeTimeout: handshakeTimeout,
+	}
+}
+
+var agentRemoteWSDialer = newAgentRemoteWSDialer(45 * time.Second)
+
 func (s *AgentService) remoteConnectionLoop() {
 	// loopExitRecoverable 在循环体内首次判定 recoverable 时置位，defer 直接
 	// 采用、cleanup 内不得二次求值：保活并发重注册会在窗口内把 Registered
@@ -150,7 +166,10 @@ func (s *AgentService) remoteConnectionLoop() {
 		headers := http.Header{}
 		headers.Set("Authorization", identity.authorization)
 		headers.Set("X-Aliang-Device-ID", identity.deviceID)
-		conn, resp, err := websocket.DefaultDialer.Dial(wsURL, headers)
+		// 显式拨号器(不变量钉死见 newAgentRemoteWSDialer):当日 09:02:49
+		// 第 5 次 dialing 后 2h+ 无 connected/dial_failed 的真因是 WS goroutine
+		// 停在被焊死的 s.mu 上(锁纪律修复根治),非拨号器缺陷。
+		conn, resp, err := agentRemoteWSDialer.Dial(wsURL, headers)
 		if err != nil {
 			if resp != nil && resp.StatusCode == http.StatusUnauthorized {
 				if s.handleHandshakeUnauthorized() {

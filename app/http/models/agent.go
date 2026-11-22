@@ -24,6 +24,10 @@ type AgentStatusResponse struct {
 	SyncStatus      string             `json:"sync_status,omitempty"`
 	SyncMessage     string             `json:"sync_message,omitempty"`
 	Message         string             `json:"message,omitempty"`
+	// Degraded 标记本次响应来自「锁忙降级」路径(2026-11-22 死锁善后):内部
+	// sync/register 长持锁期间以最近一次已知快照返回,非实时采集。正常路径
+	// 恒为 false(zero,JSON omitempty 不落字段)。
+	Degraded bool `json:"degraded,omitempty"`
 
 	// Registration/connection health (derived, authoritative). These answer the
 	// two questions users actually care about: "is this device correctly

@@ -141,19 +141,35 @@ func StopLocalServer() error {
 	return nil
 }
 
+// userAgentHandlerBusyTimeout 是 56433 上三把「锁串行」端点的服务端收割上限:
+// AgentService.s.mu 忙(最坏 ~50s)或被焊死(2026-11-22 生产死锁)时,客户端
+// 在上限内拿到 503,而非无限挂。var 而非 const 供测试收缩窗口。
+var userAgentHandlerBusyTimeout = 30 * time.Second
+
+// wrapAgentBusyRoute 给锁串行端点套 http.TimeoutHandler。与 services.Status()
+// 的锁忙降级构成双保险——降级覆盖 status 常规轮询,503 兜底 sync/disable/
+// enable/auth-recover 与极端锁死。超时体用 common.Error 同形 JSON envelope:
+// 经 core proxy 透传后,仪表盘/手机按 {code,data} 解析,纯文本体会变成解析
+// 错误。注意:TimeoutHandler 不回收已 park 的 handler goroutine(根治靠
+// services 侧锁纪律),只保证客户端可见性;core 侧 proxy 12s 超时先于本 30s
+// 触发,直连 56433 的调用方(测试/curl/MCP stdio)由本层兜底。
+func wrapAgentBusyRoute(h http.HandlerFunc) http.Handler {
+	return http.TimeoutHandler(h, userAgentHandlerBusyTimeout, `{"code":503,"msg":"agent busy","data":null}`)
+}
+
 func registerAgentRoutes(mux *http.ServeMux) {
 	logger.Info("[AGENT-BOOT] local_server registering_routes routes=/api/agent/status,/api/agent/sync,/api/agent/enable,/api/agent/auth-recover,/api/agent/disable,/api/agent/tools,/api/agent/protocol,/api/agent/tools/launch,/api/agent/ai/approval-hook,/api/agent/ai/stream,/api/agent/web-terminal*,/api/agent/peer/*")
 	agentHandler := handlers.NewAgentHandler(services.GetSharedAgentService())
-	mux.HandleFunc("/api/agent/status", agentHandler.HandleStatus)
-	mux.HandleFunc("/api/agent/sync", agentHandler.HandleSync)
-	mux.HandleFunc("/api/agent/enable", agentHandler.HandleEnable)
+	mux.Handle("/api/agent/status", wrapAgentBusyRoute(agentHandler.HandleStatus))
+	mux.Handle("/api/agent/sync", wrapAgentBusyRoute(agentHandler.HandleSync))
+	mux.Handle("/api/agent/enable", wrapAgentBusyRoute(agentHandler.HandleEnable))
 	// auth_expired 自愈链（2026-10-29 修复）：core 在 token 刷新成功后经
 	// requestLocalUserAgentRecoverAfterAuthExpired 直连 POST 本端点，仪表盘侧
 	// HandleAuthRecover 的 proxyIfNeeded 也转发到本 runtime。缺注册=404 透传，
 	// auth_expired 终态在 core+user agent 双进程拓扑下永不自愈（双注册教训，
 	// 2026-10-21 liang-dev 同族）。
-	mux.HandleFunc("/api/agent/auth-recover", agentHandler.HandleAuthRecover)
-	mux.HandleFunc("/api/agent/disable", agentHandler.HandleDisable)
+	mux.Handle("/api/agent/auth-recover", wrapAgentBusyRoute(agentHandler.HandleAuthRecover))
+	mux.Handle("/api/agent/disable", wrapAgentBusyRoute(agentHandler.HandleDisable))
 	mux.HandleFunc("/api/agent/reconnect", agentHandler.HandleReconnect)
 	mux.HandleFunc("/api/agent/session-event", agentHandler.HandleSessionEvent)
 	mux.HandleFunc("/api/agent/tools", agentHandler.HandleTools)
