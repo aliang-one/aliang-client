@@ -186,6 +186,9 @@
             v-if="listenerActiveCount !== null"
             class="ml-auto shrink-0 rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-bold text-primary"
           >{{ listenerActiveCount }}</span>
+        </button>
+        <button
+          type="button"
           data-testid="terminal-entry-sidebar"
           :disabled="!isAuthenticated"
           @click="showTerminal()"
@@ -394,6 +397,9 @@
                 v-if="listenerActiveCount !== null"
                 class="ml-auto shrink-0 rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-bold text-primary"
               >{{ listenerActiveCount }}</span>
+            </button>
+            <button
+              type="button"
               data-testid="terminal-entry-topbar"
               :disabled="!isAuthenticated"
               class="flex w-full items-center gap-3 rounded border bg-white px-4 py-3 text-sm font-medium dark:bg-slate-900"
