@@ -56,21 +56,35 @@ mkdir -p "$APP_DIR/Contents/Resources"
 mkdir -p "$CORE_DIR"
 mkdir -p "$SCRIPTS_DIR"
 
-# Step 1: Build the binary (skip if pre-built binary already exists, e.g. from CI)
-if [ -x "$SCRIPT_DIR/aliang" ]; then
-	echo "=== Pre-built binary found, skipping compile ==="
-else
-	echo "=== Building aliang binary ==="
-	cd "$PROJECT_DIR"
+# Step 0: Build the frontend + guard (2026-11-23 根治 embed 时序陷阱:Go 二进制
+# 经 app/embed.go 内嵌 app/website/dist——此前前端构建靠人工先跑,顺序颠倒就
+# 打出「新 Go 代码 + 旧前端」的包且任何护栏都查不出来(check-dist 只看磁盘
+# dist,不看二进制内嵌)。现在脚本强制重建前端并过护栏,再进 Go 编译;预编译
+# 二进制跳过路径(scripts/aliang 已存在)同样先走本步,保证 dist 新鲜度由脚本
+# 统一裁决而非人工记忆。)
+echo "=== Building dashboard frontend (embed asset) ==="
+(cd "$PROJECT_DIR/app/website" && npm run build) || exit 1
+node "$PROJECT_DIR/scripts/check-dist.mjs" || exit 1
 
-	# On macOS, CGO is required for systray (Cocoa/Objective-C)
-	COMMIT="$(git rev-parse --short HEAD)"
-	LDFLAGS="-s -w -X aliang.one/nursorgate/common/version.Version=$VERSION -X aliang.one/nursorgate/common/version.GitCommit=$COMMIT -X aliang.one/nursorgate/common/version.BuildMode=prod"
-	if [ "$(uname)" = "Darwin" ]; then
-		go build -ldflags="$LDFLAGS" -o "$SCRIPT_DIR/aliang" ./cmd/aliang/main.go
-	else
-		CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o "$SCRIPT_DIR/aliang" ./cmd/aliang/main.go
-	fi
+# Step 1: Build the binary — unconditional (2026-11-23 根治第二坑:预编译跳过
+# 路径下 scripts/aliang 内嵌的是构建时刻的旧 dist,Step 0 重建磁盘 dist 救不了
+# 二进制内嵌——内嵌资产只由 go build 落定,跳过=必打「新磁盘旧内嵌」的包。
+# go build 有构建缓存,无条件编译代价几十秒;CI 侧若需跳过应自行保证
+# 二进制与 dist 同源)。）
+if [ -x "$SCRIPT_DIR/aliang" ]; then
+	echo "=== Removing stale pre-built binary (embed must match fresh dist) ==="
+	rm -f "$SCRIPT_DIR/aliang"
+fi
+echo "=== Building aliang binary ==="
+cd "$PROJECT_DIR"
+
+# On macOS, CGO is required for systray (Cocoa/Objective-C)
+COMMIT="$(git rev-parse --short HEAD)"
+LDFLAGS="-s -w -X aliang.one/nursorgate/common/version.Version=$VERSION -X aliang.one/nursorgate/common/version.GitCommit=$COMMIT -X aliang.one/nursorgate/common/version.BuildMode=prod"
+if [ "$(uname)" = "Darwin" ]; then
+	go build -ldflags="$LDFLAGS" -o "$SCRIPT_DIR/aliang" ./cmd/aliang/main.go
+else
+	CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o "$SCRIPT_DIR/aliang" ./cmd/aliang/main.go
 fi
 
 BINARY_VERSION="$("$SCRIPT_DIR/aliang" version 2>/dev/null | awk 'NR == 1 { print $NF }')"
