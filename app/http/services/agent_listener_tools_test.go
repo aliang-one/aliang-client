@@ -228,6 +228,11 @@ func TestListenerToolCreateValidationMatrix(t *testing.T) {
 		if string(sent["target_session_id"]) != `"sess-current"` {
 			t.Fatalf("target_session_id 缺省须回填当前会话: %s", gotBody)
 		}
+		// SV-3 溯源(残余项补线):rc.sessionID(发起 run 的会话)须随
+		// listenerToolCreate 一并上 wire,server 据此写 created_by=ai:<sid>。
+		if string(sent["session_id"]) != `"sess-current"` {
+			t.Fatalf("session_id 须随 run 上下文上 wire: %s", gotBody)
+		}
 		if res["target_session_id"] != "sess-current" {
 			t.Fatalf("result 须回显 target_session_id: %+v", res)
 		}

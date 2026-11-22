@@ -62,7 +62,9 @@ func listenerMCPErrorStatus(err error) int {
 // ListenerMCPCreate 注册监听器(stdio 面)。source{type,device_id?,params}
 // 嵌套对象在本层抽取:type/device_id 取字符串、params 对象整体透传(与
 // agentcore 桥同款);file_tail/process_exit 的设备归属闸与 1a target 必填
-// fail-fast 都在共享处理器内,零云端调用即拒绝。
+// fail-fast 都在共享处理器内,零云端调用即拒绝。会话上下文置空(SV-3:
+// stdio 面无发起 run 会话,create wire 不带 session_id,server 溯源兜底
+// created_by=user:<deviceId>)。
 func ListenerMCPCreate(ctx context.Context, args map[string]interface{}) (interface{}, int, error) {
 	var sourceType, sourceDeviceID string
 	var sourceParams map[string]interface{}
