@@ -1839,4 +1839,29 @@ export default {
   vault_killall_confirm: 'Terminate all web terminal sessions on this device?',
   vault_disabled_desc: 'The web terminal is currently disabled. Once enabled, anyone with a signed-in dashboard session and the vault PIN can use this machine\'s terminal here.',
   vault_enable: 'Enable web terminal',
+  // -- Web terminal multi-window (from P2.4; win_* tooltip keys completed in P2.5) --
+  win_new: 'New Terminal',
+  win_title: 'Terminal {n}',
+  win_empty_hint: 'No terminal windows yet',
+  win_minimize: 'Minimize',
+  win_maximize: 'Maximize',
+  win_close: 'Close',
+  win_restore: 'Restore',
+  // Reserved for the dead-session badge (P2.5): header prefix reuses the title
+  // text for now; enable as a tooltip when the badge is tooltip-ized.
+  win_dead: 'Session lost',
+  // -- File browser window (P3.4+P3.5+P3.6, spec §7.4; upload UI and the
+  //    workspace Files button land in P3.6, fs_upload now in real use) --
+  fs_title: 'File Browser',
+  fs_open: 'Files',
+  fs_retry: 'Retry',
+  fs_binary: 'Binary file',
+  fs_truncated: 'Content truncated',
+  fs_download: 'Download',
+  fs_upload: 'Upload',
+  fs_uploading: 'Uploading...',
+  fs_upload_error: 'Upload failed',
+  fs_empty_hint: 'Select a file on the left to preview',
+  fs_dir_hint: 'Directories have no preview',
+  fs_load_error: 'Load failed',
 };
