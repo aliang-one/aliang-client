@@ -1169,3 +1169,38 @@ func TestListenerProxyRuntimeIdentityMissingStaysSentinel(t *testing.T) {
 		t.Fatalf("runtime 形态不得回环转发,已触达: %+v", calls)
 	}
 }
+
+// 10f. runtime 面收尾契约(双重信封修复,2026-11-22):agent 面应答必须是
+// 云端原始形态(裸 {listeners:[…]},无 {code,msg,data} 信封)——信封只由
+// core 侧转发消费者打一次;若 runtime 面也信封化,浏览器取 listeners 恒空。
+func TestListenerAgentFaceRawPassthroughNoEnvelope(t *testing.T) {
+	t.Setenv(AgentRuntimeEnv, "1")
+	swapListenerSharedService(t, newListenerProxyTestService(true))
+	cloudBody := []byte(`{"listeners":[{"id":"L-1","title":"盯构建","status":"active"}]}`)
+	cap := newListenerFakeCloud(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(cloudBody)
+	})
+	swapListenerCloudBase(t, cap.server.URL)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/listeners", nil)
+	HandleListenerListAgent(rec, req) // runtime 面:无会话闸
+	if rec.Code != http.StatusOK {
+		t.Fatalf("agent 面 status = %d", rec.Code)
+	}
+	raw := rec.Body.Bytes()
+	if strings.Contains(string(raw), `"code":`) {
+		t.Fatalf("agent 面不得信封化(双层包裹实测病),得到 %s", raw)
+	}
+	var got map[string]interface{}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("agent 面 body 须为合法 JSON: %v", err)
+	}
+	if _, ok := got["listeners"]; !ok {
+		t.Fatalf("agent 面 body 须为云端原始形态(含 listeners 键): %s", raw)
+	}
+	if !reflect.DeepEqual(decodeListenerJSON(t, raw), decodeListenerJSON(t, cloudBody)) {
+		t.Fatalf("agent 面 body 须逐项等于云端对象:\n got %s\nwant %s", raw, cloudBody)
+	}
+}
