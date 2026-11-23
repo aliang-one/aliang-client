@@ -1467,6 +1467,9 @@ type AliangServerConfig struct {
 	Type        string `json:"type"`
 	CoreServer  string `json:"core_server,omitempty"`
 	AgentServer string `json:"agent_server,omitempty"`
+	// AgentServers 多通道候选(2026-11-21 四线竞速):竞速器每 10min 探测
+	// 取最快写入进程内 override,AgentBaseURL() 优先读;缺省=单值行为不变。
+	AgentServers []string `json:"agent_servers,omitempty"`
 }
 
 type CustomerProxyConfig struct {
@@ -2013,6 +2016,10 @@ func (c *Config) APIBaseURL() string {
 }
 
 func (c *Config) AgentBaseURL() string {
+	// 竞速胜者优先(2026-11-21 多通道竞速):未竞速/候选<2 时为空,走配置原值。
+	if override := AgentServerOverride(); override != "" {
+		return override
+	}
 	if c == nil || c.Core == nil {
 		return ""
 	}
@@ -2022,6 +2029,14 @@ func (c *Config) AgentBaseURL() string {
 	if c.Core.AliangServer != nil {
 		if server := strings.TrimSpace(c.Core.AliangServer.AgentServer); server != "" {
 			return strings.TrimRight(server, "/")
+		}
+		// 数组-only 配置回落首候选(审计 #1):否则 AgentBaseURL 落到
+		// DefaultAgentServerURL(localhost:4000),全败轮的「粘滞」粘的是
+		// 一个不在候选表里的死地址。
+		for _, s := range c.Core.AliangServer.AgentServers {
+			if s = strings.TrimSpace(s); s != "" {
+				return strings.TrimRight(s, "/")
+			}
 		}
 	}
 	return DefaultAgentServerURL

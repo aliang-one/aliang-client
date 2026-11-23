@@ -195,7 +195,28 @@ func mergeCorePayload(baseCfg *config.Config, payload []byte) (string, *config.C
 	if err := json.Unmarshal(baseRaw, &root); err != nil {
 		return "", nil, fmt.Errorf("decode current config: %w", err)
 	}
-	root["core"] = coreRaw
+	// aliangServer 子对象深合并(2026-11-21 审计 #13):推送体由旧 schema 表单
+	// 生成,不知道本地新增键(如 aliangServer.agent_servers)——整对象替换会
+	// 静默抹掉它们 → 竞速停摆 + stale override 粘死。按 JSON map 级合并:
+	// 推送体出现的键以推送体为准,本地独有键保留。
+	var coreBase map[string]json.RawMessage
+	if len(root["core"]) > 0 {
+		if err := json.Unmarshal(root["core"], &coreBase); err != nil {
+			return "", nil, fmt.Errorf("decode current core: %w", err)
+		}
+	}
+	var coreNext map[string]json.RawMessage
+	if err := json.Unmarshal(coreRaw, &coreNext); err != nil {
+		return "", nil, fmt.Errorf("decode core payload: %w", err)
+	}
+	for k, v := range coreNext {
+		coreBase[k] = v
+	}
+	mergedCore, err := json.Marshal(coreBase)
+	if err != nil {
+		return "", nil, fmt.Errorf("marshal merged core: %w", err)
+	}
+	root["core"] = mergedCore
 
 	mergedRaw, err := json.Marshal(root)
 	if err != nil {
