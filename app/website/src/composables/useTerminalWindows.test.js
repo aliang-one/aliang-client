@@ -176,3 +176,50 @@ describe('useTerminalWindows', () => {
     }
   });
 });
+
+describe('窗口几何持久化(2026-11-23 排布保活)', () => {
+  it('saveWindowGeom 落条目→模拟刷新→loadPersisted 几何原样恢复', () => {
+    const tw = useTerminalWindows();
+    const a = tw.createWindow('a');
+    tw.saveWindowGeom(a.id, { x: 120, y: 80, width: 900, height: 600, maximized: true });
+    const raw = readRaw();
+
+    resetForTests();
+    window.localStorage.setItem(WINDOWS_STORAGE_KEY, raw);
+    tw.loadPersisted();
+
+    const w = tw.windows.value.find((x) => x.id === a.id);
+    expect(w.geom).toEqual({ x: 120, y: 80, width: 900, height: 600, maximized: true });
+  });
+
+  it('脏 geom(缺数值/负宽高/非对象)整组弃用回落 null,不恢复畸形窗', () => {
+    window.localStorage.setItem(
+      WINDOWS_STORAGE_KEY,
+      JSON.stringify([
+        { id: 'win-g1', title: '', status: 'open', zIndex: 1, createdAt: 1, geom: { x: 10, y: 20, width: -5, height: 100, maximized: false } },
+        { id: 'win-g2', title: '', status: 'open', zIndex: 2, createdAt: 2, geom: { x: 'abc', y: 0, width: 100, height: 100, maximized: false } },
+        { id: 'win-g3', title: '', status: 'open', zIndex: 3, createdAt: 3, geom: 'garbage' },
+        { id: 'win-g4', title: '', status: 'open', zIndex: 4, createdAt: 4, geom: null },
+      ])
+    );
+    const tw = useTerminalWindows();
+    tw.loadPersisted();
+    const byId = Object.fromEntries(tw.windows.value.map((w) => [w.id, w]));
+    expect(byId['win-g1'].geom).toBe(null);
+    expect(byId['win-g2'].geom).toBe(null);
+    expect(byId['win-g3'].geom).toBe(null);
+    expect(byId['win-g4'].geom).toBe(null);
+  });
+
+  it('saveWindowGeom 非有限坐标不落盘(拖拽中间态 NaN 不污染持久化)', () => {
+    resetForTests(); // 显式清场:断言按 title 定位本用例窗,不受前用例表残留影响
+    const tw = useTerminalWindows();
+    const a = tw.createWindow('a');
+    tw.saveWindowGeom(a.id, { x: 10, y: 10, width: 500, height: 400, maximized: false });
+    tw.saveWindowGeom(a.id, { x: NaN, y: undefined, width: 0, height: -1, maximized: false });
+    const parsed = JSON.parse(readRaw());
+    const mine = parsed.find((row) => row.title === 'a');
+    expect(mine).toBeTruthy();
+    expect(mine.geom).toEqual({ x: 10, y: 10, width: 500, height: 400, maximized: false });
+  });
+});

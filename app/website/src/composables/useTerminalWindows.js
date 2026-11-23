@@ -35,11 +35,27 @@ function persist() {
   }
 }
 
-// 持久化行 → 恢复条目:status/zIndex 原样保留(2026-11-23 会话保活改造)——
-// sessionId=窗 id 后,刷新恢复的 open 窗经 openWindows immediate watch 自动
-// 挂面板并 attach 同 id 会话,滚动缓冲/活 shell 跨刷新存活,窗直接回桌面。
-// 此前一律降级 minimized(恢复壳=新会话时代的保守语义,已废)。缺 id 的脏行
-// 丢弃;status 非法值回落 minimized;createdAt 缺失/非法补当前时间。
+// 持久化行 → 恢复条目:status/zIndex/geom 原样保留(2026-11-23 会话保活改造
+// +窗口排布持久化)——sessionId=窗 id 后,刷新恢复的 open 窗经 openWindows
+// immediate watch 自动挂面板并 attach 同 id 会话,滚动缓冲/活 shell 跨刷新
+// 存活,窗直接回桌面;几何随条目恢复,排布原样(此前几何只在 desktop 内存,
+// 刷新即弃=每次恢复都落缺省级联位)。缺 id 的脏行丢弃;status 非法值回落
+// minimized;geom 脏值回落 null(ensureActivated 落缺省级联位);createdAt
+// 缺失/非法补当前时间。
+function parseWindowGeom(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const g = {
+    x: Number.isFinite(raw.x) ? raw.x : null,
+    y: Number.isFinite(raw.y) ? raw.y : null,
+    width: Number.isFinite(raw.width) && raw.width > 0 ? raw.width : null,
+    height: Number.isFinite(raw.height) && raw.height > 0 ? raw.height : null,
+    maximized: raw.maximized === true,
+  };
+  // 四数值齐才算有效排布,否则整组弃用(半截数据恢复出畸形窗不如缺省位)
+  if (g.x === null || g.y === null || g.width === null || g.height === null) return null;
+  return g;
+}
+
 function parsePersistedRows() {
   const s = safeStorage();
   if (!s) return [];
@@ -58,6 +74,7 @@ function parsePersistedRows() {
       status: r.status === 'open' ? 'open' : 'minimized',
       zIndex: Number.isFinite(r.zIndex) && r.zIndex > 0 ? r.zIndex : 0,
       createdAt: Number.isFinite(r.createdAt) ? r.createdAt : Date.now(),
+      geom: parseWindowGeom(r.geom),
     }));
 }
 
@@ -145,6 +162,30 @@ function setWindowTitle(id, title) {
   persist();
 }
 
+// 窗口几何落条目并持久化(desktop 的 setPos/toggleMaximize/ensureActivated
+// 缺省落位三处调用)——geom 随注册表同键同频落盘,刷新后排布原样恢复。
+// 全数值有效才落盘;任一非法(NaN/undefined/非正宽高)整次丢弃并保持条目
+// 原值——拖拽中间态可能带 NaN,不许污染持久化。
+function saveWindowGeom(id, geom) {
+  const w = findById(id);
+  if (!w || !geom || typeof geom !== 'object') return;
+  if (![geom.x, geom.y, geom.width, geom.height].every(Number.isFinite)) return;
+  if (geom.width <= 0 || geom.height <= 0) return;
+  w.geom = {
+    x: geom.x,
+    y: geom.y,
+    width: geom.width,
+    height: geom.height,
+    maximized: geom.maximized === true,
+  };
+  persist();
+}
+
+function getWindowGeom(id) {
+  const w = findById(id);
+  return (w && w.geom) || null;
+}
+
 const openWindows = computed(() =>
   windows.value.filter((w) => w.status === 'open').slice().sort((a, b) => a.zIndex - b.zIndex)
 );
@@ -184,6 +225,8 @@ export function useTerminalWindows() {
     closeWindow,
     focusWindow,
     setWindowTitle,
+    saveWindowGeom,
+    getWindowGeom,
     nextZ,
     loadPersisted,
   };

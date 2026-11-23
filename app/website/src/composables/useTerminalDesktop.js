@@ -48,22 +48,31 @@ const geometry = reactive({}); // id → {x,y,width,height,maximized,dead}
 const activated = reactive({}); // id → true:本会话曾 open 过(挂过面板)
 const viewport = ref({ w: 0, h: 0 }); // 窗层容器量纲(最大化窗的满幅面积源)
 
-// 激活=确保挂壳资格:置 activated 标记并补缺省几何(已有几何则原样保留,幂等)。
+// 激活=确保挂壳资格:置 activated 标记并补几何(已有几何则原样保留,幂等)。
 // 工作台对 openWindows 的 watch 调此处——新建窗与「点任务栏重开恢复壳」同走
-// 一条激活路;恢复壳首开=全新会话(旧 WS 不跨刷新,语义见工作台头注)。
+// 一条激活路。补几何的来源优先级:注册表持久化 geom(2026-11-23 窗口排布
+// 持久化——刷新后排布原样)>级联缺省位;前者落定后回写注册表(首开即持久化,
+// 后续 setPos/toggleMaximize 各自同步)。
 function ensureActivated(id, cascadeCount) {
   if (!id || typeof id !== 'string') return null;
   activated[id] = true;
   if (!geometry[id]) {
-    const p = cascadePos(cascadeCount);
-    geometry[id] = {
-      x: p.x,
-      y: p.y,
-      width: DEFAULT_WINDOW_WIDTH,
-      height: DEFAULT_WINDOW_HEIGHT,
-      maximized: false,
-      dead: false,
-    };
+    const reg = useTerminalWindows();
+    const saved = reg.getWindowGeom(id);
+    if (saved) {
+      geometry[id] = { ...saved, dead: false };
+    } else {
+      const p = cascadePos(cascadeCount);
+      geometry[id] = {
+        x: p.x,
+        y: p.y,
+        width: DEFAULT_WINDOW_WIDTH,
+        height: DEFAULT_WINDOW_HEIGHT,
+        maximized: false,
+        dead: false,
+      };
+    }
+    reg.saveWindowGeom(id, geometry[id]); // 首开落定即持久化(含缺省位,一次写齐)
   }
   return geometry[id];
 }
@@ -77,18 +86,23 @@ function createTerminalWindow(title) {
   return entry;
 }
 
-// 拖拽回写(FloatingWindow @move 已是 clamp 后绝对坐标);非数值防御忽略
+// 拖拽回写(FloatingWindow @move 已是 clamp 后绝对坐标);非数值防御忽略。
+// 内存面更新后同步注册表持久化(窗口排布保活)
 function setPos(id, x, y) {
   const g = geometry[id];
   if (!g) return;
   if (Number.isFinite(x)) g.x = x;
   if (Number.isFinite(y)) g.y = y;
+  useTerminalWindows().saveWindowGeom(id, g);
 }
 
-// 最大化切换:只翻标记,x/y/w/h 原值保留(还原时回原位),满幅尺寸由展示层取
+// 最大化切换:只翻标记,x/y/w/h 原值保留(还原时回原位),满幅尺寸由展示层取。
+// 内存面更新后同步注册表持久化(窗口排布保活)
 function toggleMaximize(id) {
   const g = geometry[id];
-  if (g) g.maximized = !g.maximized;
+  if (!g) return;
+  g.maximized = !g.maximized;
+  useTerminalWindows().saveWindowGeom(id, g);
 }
 
 // 窗级死亡标记(浮窗头栏 ⚠ 徽标的数据源;全局回退判定归 classifyDead)
