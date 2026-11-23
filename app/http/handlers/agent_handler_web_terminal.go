@@ -156,6 +156,20 @@ func (h *AgentHandler) HandleWebTerminalCommand(w http.ResponseWriter, r *http.R
 	common.Success(w, resp)
 }
 
+// webTerminalConnSink 单连接输出汇:实现终端 writer 接口;指针身份可比较——
+// manager 的 liveWriter 换道后,旧 sink != liveWriter 即「此连接已让位」。
+type webTerminalConnSink struct {
+	conn *websocket.Conn
+	mu   sync.Mutex
+}
+
+func (s *webTerminalConnSink) write(payload interface{}) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_ = s.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	return s.conn.WriteJSON(payload)
+}
+
 // HandleWebTerminalStream GET /api/agent/web-terminal/stream。
 // core 角色:闸门②+同源闸+proxyAIStream TCP 透传(与聊天 WS 同管线,路径无关)。
 // runtime 角色:双闸→upgrade→首帧强制 terminal.auth(15s 内未过=close 1008)
@@ -185,13 +199,11 @@ func (h *AgentHandler) HandleWebTerminalStream(w http.ResponseWriter, r *http.Re
 	// (那是为 replay 批量出站留的,与本入站限制无关)
 	conn.SetReadLimit(1 << 20)
 
-	var writeMu sync.Mutex
-	writeJSON := func(payload interface{}) error {
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		return conn.WriteJSON(payload)
-	}
+	// 连接输出汇(可比较身份):writeJSON 不再是无名闭包——孤儿回收回调用
+	// 接口相等判定「这条 arm 请求来自的连接是否仍是当前附着连接」,旧连接迟到
+	// 的清理(刷新后新连接已 attach 同 id)据此免杀正被使用的会话。
+	sink := &webTerminalConnSink{conn: conn}
+	writeJSON := sink.write
 
 	// 首帧强制鉴权
 	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
@@ -222,7 +234,9 @@ func (h *AgentHandler) HandleWebTerminalStream(w http.ResponseWriter, r *http.Re
 	created := make(map[string]bool)
 	defer func() {
 		for id := range created {
-			h.service.ScheduleWebOrphanTerminalClose(id)
+			// from=sink:回调凭身份判定——本连接仍是 liveWriter 才杀,已让位
+			// 给新连接(刷新重 attach)则免杀
+			h.service.ScheduleWebOrphanTerminalClose(id, sink)
 		}
 	}()
 
@@ -259,7 +273,7 @@ func (h *AgentHandler) HandleWebTerminalStream(w http.ResponseWriter, r *http.Re
 				delete(created, id)
 			}
 		}
-		h.service.DispatchTerminalFrame(msg, writeJSON, h.service.WebTerminalEnabled)
+		h.service.DispatchTerminalFrame(msg, writeJSON, sink, h.service.WebTerminalEnabled)
 	}
 }
 

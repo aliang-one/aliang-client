@@ -388,23 +388,31 @@ func (v *webTerminalVault) ValidateToken(token string) bool {
 	return true
 }
 
-// sweepOnce 回收超时令牌;有回收即触发 Lock(关箱:终止活终端+作废余令牌,
-// spec §5 的「闲置自动重锁」)。返回是否有回收。startSweep 以固定节拍循环调它。
+// sweepOnce 回收超时令牌;仅当回收后已无任何有效令牌才触发 Lock(关箱:终止
+// 活终端+作废余令牌,spec §5 的「闲置自动重锁」)。返回是否触发关箱。
+// 2026-11-23 误杀修复:旧语义「任一令牌过期即锁箱」在浏览器刷新场景必然误杀
+// ——刷新清空前端内存令牌并重新 verify 出新令牌,旧令牌 15m 后过期,旧语义
+// 等于把活跃新令牌名下的终端全部连带杀掉。安全语义保持「无人持有有效令牌达
+// 闲置阈值才锁箱」,未放宽。startSweep 以固定节拍循环调它。
 func (v *webTerminalVault) sweepOnce() bool {
 	v.mu.Lock()
 	now := v.now()
 	expired := false
+	remaining := 0
 	for token, t := range v.tokens {
 		if v.tokenExpiredLocked(t, now) {
 			delete(v.tokens, token)
 			expired = true
+		} else {
+			remaining++
 		}
 	}
 	v.mu.Unlock()
-	if expired {
+	if expired && remaining == 0 {
 		v.Lock()
+		return true
 	}
-	return expired
+	return false
 }
 
 // startSweep 常驻回收循环(Task 5 接线时启动;构造期不启,测试零 goroutine)。
@@ -446,7 +454,7 @@ func (s *AgentService) WebTerminalStatus() map[string]interface{} {
 // (remoteTerminalEnabled / WebTerminalEnabled)。create 离开调用方读循环
 // (beginCreate 同步登记+safeGo 异步,紧随的 input 可等待);input/resize/
 // close 保持 inline——输入顺序是契约。close 恒放行:关闭自身永远合法。
-func (s *AgentService) DispatchTerminalFrame(msg map[string]interface{}, writeJSON agentTerminalWriter, enabled func() bool) {
+func (s *AgentService) DispatchTerminalFrame(msg map[string]interface{}, writeJSON agentTerminalWriter, connSink any, enabled func() bool) {
 	switch remoteString(msg, "type") {
 	case models.AgentEventTerminalCreate:
 		if !enabled() {
@@ -456,7 +464,7 @@ func (s *AgentService) DispatchTerminalFrame(msg map[string]interface{}, writeJS
 		release := s.terminal.beginCreate(remoteString(msg, "session_id"))
 		safeGo("terminal.create", func() {
 			defer release()
-			s.terminal.create(msg, writeJSON)
+			s.terminal.createWithSink(msg, writeJSON, connSink)
 		})
 	case models.AgentEventTerminalInput:
 		if !enabled() {
@@ -489,11 +497,13 @@ func AgentTerminalErrorPayloadPublic(sessionID string, err error) map[string]int
 // ScheduleWebOrphanTerminalClose 是 manager.ScheduleWebOrphanClose 的 service
 // 导出壳:网页 WS 腿连接退出时,对「本连接创建且未显式 close」的终端会话安排
 // 延迟回收(2026-11-22 真机 not found 风暴的治本腿,详见 manager 字段注释)。
-func (s *AgentService) ScheduleWebOrphanTerminalClose(sessionID string) {
+// from=本连接的输出汇:回调凭 liveWriter==from 身份判定归属,旧连接迟到的清理
+// 不得杀掉已被新连接重附着的会话。
+func (s *AgentService) ScheduleWebOrphanTerminalClose(sessionID string, from any) {
 	if s == nil || s.terminal == nil {
 		return
 	}
-	s.terminal.ScheduleWebOrphanClose(sessionID)
+	s.terminal.ScheduleWebOrphanClose(sessionID, from)
 }
 
 // WebTerminalAuditTerminal 落 terminal_create/terminal_close 审计行(网页腿

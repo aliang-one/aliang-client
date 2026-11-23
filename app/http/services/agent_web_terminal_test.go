@@ -306,7 +306,7 @@ func TestDispatchTerminalFrameGateMatrix(t *testing.T) {
 
 	// create/input/resize 在 deny 门下:各回一帧 disabled 错误,不碰引擎。
 	for _, typ := range []string{models.AgentEventTerminalCreate, models.AgentEventTerminalInput, models.AgentEventTerminalResize} {
-		svc.DispatchTerminalFrame(map[string]interface{}{"type": typ, "session_id": "s1"}, write, deny)
+		svc.DispatchTerminalFrame(map[string]interface{}{"type": typ, "session_id": "s1"}, write, nil, deny)
 	}
 	errs := coll.ofTypes(models.AgentEventTerminalError)
 	if len(errs) != 3 {
@@ -322,13 +322,13 @@ func TestDispatchTerminalFrameGateMatrix(t *testing.T) {
 	}
 
 	// close 恒放行:关闭自身永远合法(会话不存在也回 exit 回执)。
-	svc.DispatchTerminalFrame(map[string]interface{}{"type": models.AgentEventTerminalClose, "session_id": "s1"}, write, deny)
+	svc.DispatchTerminalFrame(map[string]interface{}{"type": models.AgentEventTerminalClose, "session_id": "s1"}, write, nil, deny)
 	if frames := coll.ofTypes(models.AgentEventTerminalExit); len(frames) != 1 {
 		t.Fatalf("deny 下 close 仍应执行(exit 回执), got %d", len(frames))
 	}
 
 	// 未知类型:unsupported 错误帧(allow 也不该到达引擎)。
-	svc.DispatchTerminalFrame(map[string]interface{}{"type": "bogus.type", "session_id": "s1"}, write, allow)
+	svc.DispatchTerminalFrame(map[string]interface{}{"type": "bogus.type", "session_id": "s1"}, write, nil, allow)
 	errs = coll.ofTypes(models.AgentEventTerminalError)
 	if len(errs) != 4 {
 		t.Fatalf("bogus 类型应回 unsupported error, got %d", len(errs))
@@ -357,12 +357,12 @@ func TestDispatchTerminalFrameCreateAsyncOrdering(t *testing.T) {
 
 	svc.DispatchTerminalFrame(map[string]interface{}{
 		"type": models.AgentEventTerminalCreate, "session_id": "s1", "shell": "", "cwd": dir, "rows": 24, "cols": 80,
-	}, write, allow)
+	}, write, nil, allow)
 	// 紧随其后的 input:inline 走 write,由 beginCreate 的同步登记等待在途
 	// create,而不是报 not found——这就是 DispatchTerminalFrame 要保住的契约。
 	svc.DispatchTerminalFrame(map[string]interface{}{
 		"type": models.AgentEventTerminalInput, "session_id": "s1", "data": "ls\n",
-	}, write, allow)
+	}, write, nil, allow)
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -451,5 +451,41 @@ func TestWebTerminalRunCommandAuthMatrix(t *testing.T) {
 	}
 	if tok, _ := resp["token"].(string); tok == "" {
 		t.Fatal("verify 成功应携带非空 token")
+	}
+}
+
+// TestWebTerminalSweepSparesBoxWhileValidTokenRemains 浏览器刷新常态:旧令牌
+// 过期时新令牌仍活跃(持续帧复验滑动续期)——只删过期项,不得关箱连带杀活终端
+// (2026-11-23 sweepOnce 误杀修复的回归钉)。
+func TestWebTerminalSweepSparesBoxWhileValidTokenRemains(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "web-terminal.json")
+	v := newTestVaultAt(t, path)
+	v.tokenIdleTTL = time.Minute
+	killed := false
+	v.onLock = func() { killed = true }
+	_ = v.Setup("1234")
+	oldToken, _, _, _ := v.Verify("1234") // 刷新前的旧令牌
+	v.frozen = v.frozen.Add(50 * time.Second)
+	newToken, _, _, _ := v.Verify("1234") // 刷新后换发的新令牌
+	// 新令牌持续活跃(每帧复验=滑动续期),把闲置锚点推到 110s
+	for v.frozen.Before(v.frozen.Add(0)) || v.frozen.Unix() < time.Unix(0, 0).Unix() {
+		break
+	}
+	v.frozen = v.frozen.Add(60 * time.Second)
+	if !v.ValidateToken(newToken) {
+		t.Fatal("活跃新令牌应验真并续期")
+	}
+	v.frozen = v.frozen.Add(40 * time.Second) // 旧令牌 age≈150s>60s;新令牌闲置 40s<60s
+	if v.sweepOnce() {
+		t.Fatal("仍有有效令牌时 sweepOnce 不得触发关箱")
+	}
+	if killed {
+		t.Fatal("未关箱不得联动 onLock(closeAll)")
+	}
+	if !v.ValidateToken(newToken) {
+		t.Fatal("活跃新令牌必须幸存")
+	}
+	if v.ValidateToken(oldToken) {
+		t.Fatal("过期旧令牌必须已被回收")
 	}
 }

@@ -990,7 +990,8 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 		// create 异步离读循环/input·resize·close 保持 inline 的契约注释
 		// 见该函数)。本腿的 enabled 闸给 remoteTerminalEnabled。
 		s.setRemoteConnectionState(true, "online", "")
-		s.DispatchTerminalFrame(msg, writeJSON, s.remoteTerminalEnabled)
+		// 手机腿无连接 sink 身份(nil):网页孤儿回收链不涉手机腿
+		s.DispatchTerminalFrame(msg, writeJSON, nil, s.remoteTerminalEnabled)
 	case models.AgentEventTerminalQuotaResolved:
 		// Deliberately NOT behind the remote-terminal toggle: a challenge
 		// verdict must always be honored — dropping it would strand a pending

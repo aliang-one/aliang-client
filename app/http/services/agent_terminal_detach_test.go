@@ -141,7 +141,7 @@ func TestReattachedStaleSessionSurvivesIdleWatcher(t *testing.T) {
 	m.sessions["t-survive"] = live
 	m.mu.Unlock()
 
-	if !m.attachLive("t-survive", 24, 80, "", func(interface{}) error { return nil }) {
+	if !m.attachLive("t-survive", 24, 80, "", func(interface{}) error { return nil }, nil) {
 		t.Fatalf("attachLive must re-attach a live session")
 	}
 	go m.watchTerminalIdle("t-survive", live.token, func(interface{}) error { return nil })
@@ -184,7 +184,7 @@ func TestAttachLiveRetractsCommittedReap(t *testing.T) {
 			// The reap has been decided but not yet executed: the user
 			// re-attaches exactly here.
 			if atomic.CompareAndSwapInt32(&committed, 0, 1) {
-				if !m.attachLive("t-retract", 24, 80, "", func(interface{}) error { return nil }) {
+				if !m.attachLive("t-retract", 24, 80, "", func(interface{}) error { return nil }, nil) {
 					t.Error("attachLive must still find the live session")
 				}
 			}

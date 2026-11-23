@@ -175,6 +175,47 @@ type agentTerminalSession struct {
 	ring       *terminalRingBuffer
 	outputGate sync.Mutex
 	detachedAt time.Time
+
+	// liveWriter 是当前附着连接的输出道,writerMu 护航(2026-11-23 会话保活
+	// 主断链修复)。create 孵化的 copy/wait 循环持有 writeViaLive 间接闭包而
+	// 不是创建时那条连接的 writeJSON——attachLive 换道后,回放之后的活输出
+	// 自然汇到新连接。没有这一层,刷新续屏只能看到历史,新输出仍流向已死的
+	// 旧 WS(手机腿的等价物是 agent_remote_ws 的 currentRemoteWriter 间接层,
+	// 注释原话「so a reconnect reattaches」)。nil=无附着,写即静默失败(与
+	// 死连接写失败同路径)。
+	writerMu   sync.Mutex
+	liveWriter agentTerminalWriter
+	// liveSink 是可比较的连接身份(*webTerminalConnSink 指针,func 不可比较
+	// 故分立存储):孤儿回收回调凭 liveSink==from 判定「arm 这条请求的连接
+	// 是否仍是当前附着连接」,旧连接迟到的清理据此免杀重附着会话。nil=无身份
+	// (手机腿 create 不传),nil!=任何非 nil from→回调恒 skip(手机腿不进
+	// 网页孤儿链,语义自洽)。
+	liveSink any
+}
+
+// swapConn 换道:attachLive 把输出道与新连接身份一并写入。
+func (s *agentTerminalSession) swapConn(w agentTerminalWriter, sink any) {
+	if s == nil {
+		return
+	}
+	s.writerMu.Lock()
+	s.liveWriter = w
+	s.liveSink = sink
+	s.writerMu.Unlock()
+}
+
+// writeViaLive 是 copy/wait 循环持有的间接写入口:每帧取当前附着连接。
+func (s *agentTerminalSession) writeViaLive(payload interface{}) error {
+	if s == nil {
+		return errors.New("terminal session nil")
+	}
+	s.writerMu.Lock()
+	w := s.liveWriter
+	s.writerMu.Unlock()
+	if w == nil {
+		return errors.New("terminal session has no attached writer")
+	}
+	return w(payload)
 }
 
 // agentTerminalHandle is the platform-supplied wiring for a started shell. The
@@ -254,7 +295,13 @@ func (m *agentTerminalManager) waitForCreate(sessionID string, timeout time.Dura
 	}
 }
 
+// create 是 createWithSink 的两参壳(nil sink):既有 57 处测试调用点的兼容
+// 面。生产路径(DispatchTerminalFrame)恒走 createWithSink 带连接身份。
 func (m *agentTerminalManager) create(msg map[string]interface{}, writeJSON agentTerminalWriter) {
+	m.createWithSink(msg, writeJSON, nil)
+}
+
+func (m *agentTerminalManager) createWithSink(msg map[string]interface{}, writeJSON agentTerminalWriter, connSink any) {
 	if writeJSON == nil {
 		return
 	}
@@ -276,7 +323,7 @@ func (m *agentTerminalManager) create(msg map[string]interface{}, writeJSON agen
 	// falls through to the regular fresh-create path below, and a create
 	// without attach keeps the exact pre-attach behavior (already-exists error).
 	if remoteBool(msg, "attach", false) {
-		if m.attachLive(sessionID, rows, cols, attachToken, writeJSON) {
+		if m.attachLive(sessionID, rows, cols, attachToken, writeJSON, connSink) {
 			return
 		}
 		if m.attachHistory(sessionID, attachToken, writeJSON) {
@@ -357,17 +404,21 @@ func (m *agentTerminalManager) create(msg map[string]interface{}, writeJSON agen
 		"resumed":    false,
 	})
 
+	// 输出道换层(会话保活主断链修复):copy/wait 循环持有 writeViaLive 间接
+	// 闭包而非本连接 writeJSON——此后任何 attachLive 都能把活输出换道到新连接;
+	// watchTerminalIdle 的杀会话帧同样走间接层(exit 事件必须到达当前附着连接)
+	session.swapConn(writeJSON, connSink)
 	for _, reader := range readers {
-		go m.copyTerminalOutput(sessionID, reader, writeJSON)
+		go m.copyTerminalOutput(sessionID, reader, session.writeViaLive)
 	}
-	go m.waitTerminal(sessionID, session.token, writeJSON)
-	go m.watchTerminalIdle(sessionID, session.token, writeJSON)
+	go m.waitTerminal(sessionID, session.token, session.writeViaLive)
+	go m.watchTerminalIdle(sessionID, session.token, session.writeViaLive)
 }
 
 // attachLive re-attaches to a live session: resize first (so a TUI redraws via
 // SIGWINCH), then replay the scrollback, then confirm with
 // terminal.created{resumed:true}. It reports whether the attach happened.
-func (m *agentTerminalManager) attachLive(sessionID string, rows, cols int, attachToken string, writeJSON agentTerminalWriter) bool {
+func (m *agentTerminalManager) attachLive(sessionID string, rows, cols int, attachToken string, writeJSON agentTerminalWriter, connSink any) bool {
 	m.mu.Lock()
 	session := m.sessions[sessionID]
 	if session != nil {
@@ -389,6 +440,14 @@ func (m *agentTerminalManager) attachLive(sessionID string, rows, cols int, atta
 		}
 	}
 	m.mu.Unlock()
+	if session == nil {
+		return false
+	}
+	// 输出道换道(会话保活主断链修复):replay 之后活输出必须汇到本连接——
+	// copy/wait 循环持有 writeViaLive 间接层,这里换道即生效。必须在 sendReplay
+	// 之前换,replay 与首批活输出才不会分叉到两条连接。connSink=本连接身份,
+	// 孤儿回收归属判定依据。
+	session.swapConn(writeJSON, connSink)
 	if session == nil {
 		return false
 	}
@@ -839,13 +898,23 @@ var agentWebOrphanCloseDelay = 30 * time.Minute
 // ScheduleWebOrphanClose arms the delayed reap for one web-leg session whose
 // WS is about to go away (or already did). Fired after the delay: session gone
 // (explicit close / PTY exit / already reaped) → timer entry cleanup only;
-// session alive → kill, which routes through waitTerminal → tombstone exactly
-// like an explicit close. Re-scheduling the same id re-arms (Stop + new timer).
-func (m *agentTerminalManager) ScheduleWebOrphanClose(sessionID string) {
-	if sessionID == "" {
+// session alive AND still owned by this connection (liveWriter == from) →
+// kill; session re-attached meanwhile (liveWriter swapped to the newer
+// connection by attachLive) → skip — identity, not the detached stamp, is the
+// ownership verdict: a stale older leg's cleanup racing behind a page refresh
+// would otherwise re-mark and reap a session the user is actively using.
+// Re-scheduling the same id re-arms (Stop + new timer).
+func (m *agentTerminalManager) ScheduleWebOrphanClose(sessionID string, from any) {
+	if sessionID == "" || from == nil {
 		return
 	}
 	m.mu.Lock()
+	session := m.sessions[sessionID]
+	if session != nil && session.detachedAt.IsZero() {
+		// WS dropped = lost its attached client (normal first drop — stamp it;
+		// re-attached sessions carry a cleared stamp which this must NOT undo).
+		session.detachedAt = time.Now()
+	}
 	if old := m.orphanTimers[sessionID]; old != nil {
 		old.Stop()
 	}
@@ -855,9 +924,11 @@ func (m *agentTerminalManager) ScheduleWebOrphanClose(sessionID string) {
 		// entry under the lock, so whoever wins the race, the entry is gone).
 		m.mu.Lock()
 		delete(m.orphanTimers, sessionID)
+		s := m.sessions[sessionID]
+		mine := s != nil && s.liveSink == from
 		m.mu.Unlock()
-		if session := m.get(sessionID); session != nil {
-			session.kill()
+		if mine {
+			s.kill()
 		}
 	})
 	m.mu.Unlock()
@@ -865,9 +936,10 @@ func (m *agentTerminalManager) ScheduleWebOrphanClose(sessionID string) {
 
 // reapWebOrphansNow synchronously reaps every armed web-orphan timer (kill +
 // unregister + tombstone, closeAll discipline). Called from create when the
-// session limit is hit: the 10s leniency window yields to a waiting create.
-// Semantically safe — orphans are dead-WS web-leg sessions whose ids a page
-// refresh never re-attaches (fresh shell = fresh random id), and phone-leg
+// session limit is hit: the 30m leniency window yields to a waiting create.
+// Only sessions still orphaned (detached stamp set — no live connection owns
+// them) are taken; a re-attached session (stamp cleared by attachLive) whose
+// stale timer is still armed is left alone. Semantically safe — phone-leg
 // sessions never enter this table (their path is markAllDetached). Returns the
 // number of sessions reaped.
 func (m *agentTerminalManager) reapWebOrphansNow() int {
@@ -879,7 +951,7 @@ func (m *agentTerminalManager) reapWebOrphansNow() int {
 	victims := make([]*agentTerminalSession, 0, len(m.orphanTimers))
 	for id, t := range m.orphanTimers {
 		t.Stop()
-		if s := m.sessions[id]; s != nil {
+		if s := m.sessions[id]; s != nil && !s.detachedAt.IsZero() {
 			victims = append(victims, s)
 			delete(m.sessions, id)
 			m.tombstoneSessionLocked(id, s, -1)
