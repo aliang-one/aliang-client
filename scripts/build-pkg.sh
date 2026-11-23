@@ -63,6 +63,13 @@ mkdir -p "$SCRIPTS_DIR"
 # 二进制跳过路径(scripts/aliang 已存在)同样先走本步,保证 dist 新鲜度由脚本
 # 统一裁决而非人工记忆。)
 echo "=== Building dashboard frontend (embed asset) ==="
+# 依赖自举:CI runner(以及任何干净环境)没有 node_modules,vite 不存在,
+# 强制重建会在这一步死(2026-11-23 v1.1.123 darwin 双 job 实锤)。缺失即
+# npm ci——本地有依赖的环境行为不变,时序根治的「dist 必新鲜」语义不变。
+if [ ! -d "$PROJECT_DIR/app/website/node_modules" ]; then
+	echo "=== Installing frontend deps (node_modules absent) ==="
+	(cd "$PROJECT_DIR/app/website" && npm ci --no-audit --no-fund --silent) || exit 1
+fi
 (cd "$PROJECT_DIR/app/website" && npm run build) || exit 1
 node "$PROJECT_DIR/scripts/check-dist.mjs" || exit 1
 
