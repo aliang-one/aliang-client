@@ -49,6 +49,11 @@ func (s *aliangWindowsService) Execute(args []string, req <-chan svc.ChangeReque
 
 	status <- svc.Status{State: svc.StartPending}
 
+	// 服务态 stderr 是黑洞(SCM 不给句柄),panic/runtime fatal 的崩溃栈全
+	// 蒸发——2026-11-23 win196 158 次静默崩溃只能靠控制台复现取证。一切
+	// 之前先落 crash 文件,以后每次死亡都自带栈。
+	redirectCrashOutput()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
