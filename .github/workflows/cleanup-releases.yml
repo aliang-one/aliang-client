@@ -84,8 +84,13 @@ jobs:
 
           while IFS= read -r tag; do
             [ -n "$tag" ] || continue
-            echo "Deleting release and tag: $tag"
-            gh release delete "$tag" --cleanup-tag --yes
+            echo "Deleting release: $tag"
+            # 只删 release,不删 tag(--cleanup-tag):tag 的权威在 GitLab,push
+            # mirror 每轮同步都会把 GitHub 缺失的 tag 推回来——GitHub 侧删 tag
+            # 后,镜像下轮同步即原样推回 → push 事件重触发旧版本全量构建,旧
+            # release 重生按发布时间抢走 Latest(v1.1.117 复活事故 2026-11-24
+            # 实证,11-21 同款)。tag 常驻后镜像重推变 no-op,不再触发任何事件。
+            gh release delete "$tag" --yes
           done <<< "$DELETE_TAGS"
 
       - name: Summary
