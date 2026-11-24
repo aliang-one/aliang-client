@@ -10,10 +10,13 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"aliang.one/nursorgate/app/mesh/lanbeacon"
+	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
 )
 
@@ -116,5 +119,102 @@ func TestMeshRosterSyncStatusThreeStates(t *testing.T) {
 	}
 	if pubLine, fp, ok := MeshRosterEntryFor("dev-x"); !ok || pubLine != "kx" || fp != "fx" {
 		t.Fatalf("成功轮应落清洗后缓存: %q %q %v", pubLine, fp, ok)
+	}
+}
+
+// resetMeshRosterForTest 归零 roster 同步态(缓存/时间戳/错误),用例起步与收尾各一次。
+func resetMeshRosterForTest() {
+	meshRosterMu.Lock()
+	meshRosterCache = nil
+	meshRosterFetchedAt = time.Time{}
+	meshRosterLastError = ""
+	meshRosterMu.Unlock()
+}
+
+// newMeshRosterTestServer 起充当 roster 端点的 httptest:计数命中并回单条名单。
+func newMeshRosterTestServer(t *testing.T, hits *atomic.Int32) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.URL.Path != "/api/agent/mesh-roster" {
+			t.Errorf("roster 拉取路径 = %s, want /api/agent/mesh-roster", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"roster":[{"device_id":"dev-y","mesh_pub_key":"ky","host_key_fingerprint":"fy"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// pointUnconfiguredMeshConfigAt 把全局配置指到 roster 测试端点,customer 段无
+// mesh 键(用户从未触及 mesh 的合法态)。
+func pointUnconfiguredMeshConfigAt(t *testing.T, srvURL string) {
+	t.Helper()
+	prev := config.GetGlobalConfig()
+	config.SetGlobalConfig(&config.Config{
+		Core:     &config.CoreConfig{AgentServer: srvURL},
+		Customer: &config.CustomerConfig{},
+	})
+	t.Cleanup(func() { config.SetGlobalConfig(prev) })
+}
+
+// TestMeshRosterSyncUnconfiguredMeshFetches mesh 块缺失(Mesh==nil,用户从未
+// 触及 mesh 的合法态)时 roster 同步照常拉取:总开关 nil=默认开,状态面对此
+// 报 enable=true(/api/mesh/status 结构体初值);若同步循环却因 Mesh==nil 整轮
+// 早退,roster 就永远停在 synced=false 且 last_error 为空——「开关开而功能
+// 从未运行、连失败都不记」的假绿现场(全量未配置设备的信任锚永不落地)。
+// 经 syncMeshRosterOnce 本体(守卫所在层)驱动,httptest 充当 roster 端点。
+func TestMeshRosterSyncUnconfiguredMeshFetches(t *testing.T) {
+	auth.ResetAuthPersistenceForTest()
+	t.Cleanup(auth.ResetAuthPersistenceForTest)
+	resetMeshRosterForTest()
+	t.Cleanup(resetMeshRosterForTest)
+	// 已登录:roster 是「同账号名单」,拉取须有账号身份。
+	if err := auth.SaveUserInfo(&auth.UserInfo{AccessToken: "test-user-jwt", TokenType: "Bearer"}); err != nil {
+		t.Fatalf("SaveUserInfo() error = %v", err)
+	}
+
+	var hits atomic.Int32
+	pointUnconfiguredMeshConfigAt(t, newMeshRosterTestServer(t, &hits).URL)
+
+	syncMeshRosterOnce()
+
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("mesh 块缺失时 roster 端点应被拉取 1 次, got %d", got)
+	}
+	st := MeshRosterSyncStatus()
+	if !st.Synced || st.LastError != "" {
+		t.Fatalf("mesh 块缺失时拉取成功应落 synced=true 且无错: %+v", st)
+	}
+	if pubLine, fp, ok := MeshRosterEntryFor("dev-y"); !ok || pubLine != "ky" || fp != "fy" {
+		t.Fatalf("roster 条目应落缓存: %q %q %v", pubLine, fp, ok)
+	}
+}
+
+// TestMeshRosterSyncSkipsWithoutCredential 无用户凭据(未登录/已登出)时整轮
+// 静默:roster 是账号内资源,无凭据拉取必 401,且空鉴权的 401 不进通道退避。
+// 总开关默认开之后未配置设备也进本循环——这道闸让登出态设备不至每 30s 白拉
+// 一次并刷两行日志(改动前只有显式配置 mesh 的登出设备会如此)。
+func TestMeshRosterSyncSkipsWithoutCredential(t *testing.T) {
+	// 凭据库换一份空库:ResetAuthPersistenceForTest 只清内存句柄,磁盘上的
+	// token 会被下一轮 Load 读回——须让「无凭据」成为真实前置(清理按 LIFO:
+	// 先 Reset 关句柄,再由 Setenv 还原路径)。
+	t.Setenv("ALIANG_AUTH_SESSION_DB", filepath.Join(t.TempDir(), "auth.data"))
+	auth.ResetAuthPersistenceForTest()
+	t.Cleanup(auth.ResetAuthPersistenceForTest)
+	resetMeshRosterForTest()
+	t.Cleanup(resetMeshRosterForTest)
+
+	var hits atomic.Int32
+	pointUnconfiguredMeshConfigAt(t, newMeshRosterTestServer(t, &hits).URL)
+
+	syncMeshRosterOnce()
+
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("无用户凭据时不应拉取 roster, got %d 次", got)
+	}
+	st := MeshRosterSyncStatus()
+	if st.Synced || st.LastError != "" {
+		t.Fatalf("无凭据跳过应保持未同步且不记错: %+v", st)
 	}
 }

@@ -74,14 +74,21 @@ func MeshRosterSyncTick() {
 }
 
 // syncMeshRosterOnce 一轮同步:①身份上送(变化检测)②roster 拉取。
-// mesh 层未配置(Customer.Mesh==nil)=roster 语义不存在,整轮跳过不耗 HTTP。
+// customer.mesh 整块缺失=总开关默认开,照常同步(身份对缺失只跳过上送,
+// 见 meshIdentityForRoster);整份配置缺失才跳过不耗 HTTP。
 func syncMeshRosterOnce() {
 	cfg := config.GetGlobalConfig()
-	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
+	if cfg == nil || cfg.Customer == nil {
 		return
 	}
 	s := GetSharedAgentService()
 	if s == nil {
+		return
+	}
+	// 无用户凭据(未登录/已登出)= 无账号语义:roster 是「同账号名单」,空鉴权
+	// 拉取必 401 且不进通道退避。默认开之后未配置设备也进本循环——这道闸让
+	// 登出态设备保持静默(不白拉、不刷日志)。
+	if strings.TrimSpace(s.currentAccessToken()) == "" {
 		return
 	}
 	pubLine, hostFp := meshIdentityForRoster()
