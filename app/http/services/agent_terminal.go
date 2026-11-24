@@ -472,6 +472,24 @@ func (m *agentTerminalManager) attachLive(sessionID string, rows, cols int, atta
 		"cols":       cols,
 		"resumed":    true,
 	})
+	// attach 几何对账回执(2026-11-24 几何失偶修复):本次 attach 把 PTY 拽到
+	// 的真实几何,server 必须知道——否则「attach 拽回落地晚于网页首次 fit
+	// resize」的竞态会让 server 记录(A)与 PTY 实际(B)两端失偶,而合并闸
+	// 的同值去重又恰好把网页此后重发同值 A 的修复 resize 永久吞掉(网页上
+	// 点「使用本浏览器分辨率」无效的根因)。回执值读 session 记录(与 PTY
+	// ioctl 同锁写回),与 resize 路径的 ack() 同源;pipe fallback(无
+	// resizer)时几何本来就未变,但同样回执——server 只信任 resized 帧,
+	// 无回执才会被迫用 attach 载荷盲信几何。
+	m.mu.Lock()
+	ackRows, ackCols := session.rows, session.cols
+	m.mu.Unlock()
+	_ = writeJSON(map[string]interface{}{
+		"type":       models.AgentEventTerminalResized,
+		"session_id": sessionID,
+		"rows":       ackRows,
+		"cols":       ackCols,
+		"pty":        session.isPTY,
+	})
 	return true
 }
 
