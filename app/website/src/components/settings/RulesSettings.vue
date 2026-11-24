@@ -149,144 +149,64 @@
           </div>
         </section>
 
-        <section
-          class="rounded-xl border p-4 transition-all"
-          :class="form.proxy.enable
-            ? 'border-slate-200 bg-slate-50/80 dark:border-slate-800 dark:bg-slate-900/40'
-            : 'border-slate-200 bg-slate-100/90 opacity-70 saturate-[0.8] dark:border-slate-800 dark:bg-slate-900/70'"
-        >
-          <div class="mb-4 flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-            <div class="flex items-center gap-2">
-              <span class="material-symbols-outlined text-primary">vpn_key</span>
-              <div>
-                <h3 class="font-semibold text-slate-900 dark:text-white">{{ t('rules_customerProxy') }}</h3>
-                <p class="text-xs text-slate-500">{{ t('rules_proxyDesc') }}</p>
+        <!-- 上游代理 + 代理规则合并为同一张卡片：上半区=上游代理（禁用时仅上半子块变灰，
+             代理开关不再连累下半区），分隔线之下=代理规则（不受代理开关影响）。 -->
+        <section class="rounded-xl border border-slate-200 bg-slate-50/80 p-4 dark:border-slate-800 dark:bg-slate-900/40">
+          <div class="transition" :class="form.proxy.enable ? '' : 'opacity-70 saturate-[0.8]'">
+            <div class="mb-4 flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+              <div class="flex items-center gap-2">
+                <span class="material-symbols-outlined text-primary">vpn_key</span>
+                <div>
+                  <h3 class="font-semibold text-slate-900 dark:text-white">{{ t('rules_customerProxy') }}</h3>
+                  <p class="text-xs text-slate-500">{{ t('rules_proxyDesc') }}</p>
+                </div>
               </div>
+
+              <label
+                class="inline-flex cursor-pointer items-center justify-between gap-3 rounded-full border px-3 py-2 text-sm font-medium shadow-sm transition md:min-w-[210px]"
+                :class="form.proxy.enable
+                  ? 'border-primary/20 bg-white text-slate-700 dark:border-primary/30 dark:bg-slate-900 dark:text-slate-200'
+                  : 'border-slate-200 bg-white/70 text-slate-500 dark:border-slate-700 dark:bg-slate-900/80 dark:text-slate-300'"
+              >
+                <span>{{ t('rules_enableProxy') }}</span>
+                <span class="relative">
+                  <input v-model="form.proxy.enable" class="peer sr-only" type="checkbox" />
+                  <span class="relative block h-6 w-11 rounded-full bg-slate-300 transition-colors after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:transition-transform after:content-[''] peer-checked:bg-primary peer-checked:after:translate-x-5 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-primary dark:bg-slate-700"></span>
+                </span>
+              </label>
             </div>
 
-            <label
-              class="inline-flex cursor-pointer items-center justify-between gap-3 rounded-full border px-3 py-2 text-sm font-medium shadow-sm transition md:min-w-[210px]"
-              :class="form.proxy.enable
-                ? 'border-primary/20 bg-white text-slate-700 dark:border-primary/30 dark:bg-slate-900 dark:text-slate-200'
-                : 'border-slate-200 bg-white/70 text-slate-500 dark:border-slate-700 dark:bg-slate-900/80 dark:text-slate-300'"
-            >
-              <span>{{ t('rules_enableProxy') }}</span>
-              <span class="relative">
-                <input v-model="form.proxy.enable" class="peer sr-only" type="checkbox" />
-                <span class="relative block h-6 w-11 rounded-full bg-slate-300 transition-colors after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:transition-transform after:content-[''] peer-checked:bg-primary peer-checked:after:translate-x-5 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-primary dark:bg-slate-700"></span>
-              </span>
-            </label>
-          </div>
-
-          <div class="grid gap-4 md:grid-cols-[180px_minmax(0,1fr)]">
-            <label class="space-y-2">
-              <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyType') }}</span>
-              <select
-                v-model="form.proxy.type"
-                data-field="proxyType"
-                :disabled="!form.proxy.enable"
-                class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-              >
-                <option value="socks5">SOCKS5</option>
-                <option value="http">HTTP</option>
-                <option value="ssh">SSH</option>
-              </select>
-            </label>
-
-            <label class="space-y-2">
-              <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_server') }}</span>
-              <input
-                v-model.trim="form.proxy.server"
-                :disabled="!form.proxy.enable"
-                class="w-full rounded-lg border px-3 py-2 text-sm shadow-sm transition focus:outline-none focus:ring-2 dark:text-slate-100"
-                :class="serverFieldClass"
-                placeholder="127.0.0.1:1080"
-                type="text"
-                @keydown.enter.prevent
-              />
-              <p v-if="serverError" class="text-xs text-red-500">{{ serverError }}</p>
-            </label>
-
-            <!-- SSH 时共享网格不再放用户名:密码面自带用户名,私钥面整字段收走 -->
-            <label v-if="!isSshProxy" class="space-y-2 md:col-start-1">
-              <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyUsername') }}</span>
-              <input
-                v-model.trim="form.proxy.username"
-                data-field="proxyUsername"
-                :disabled="!form.proxy.enable"
-                autocomplete="username"
-                class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                :placeholder="t('rules_proxyUsernamePlaceholder')"
-                type="text"
-                @keydown.enter.prevent
-              />
-            </label>
-
-            <!-- 用户名与密码同族:仅 socks5/http 走共享网格;SSH 的用户名收进「密码登录」
-                 面(私钥面不显示,拨号侧 NodeFromAddrPort 用本机名兜底) -->
-            <label v-if="!isSshProxy" class="space-y-2">
-              <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyPassword') }}</span>
-              <input
-                v-model="form.proxy.password"
-                data-field="proxyPassword"
-                :disabled="!form.proxy.enable"
-                autocomplete="current-password"
-                class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                :placeholder="t('rules_proxyPasswordPlaceholder')"
-                type="password"
-                @keydown.enter.prevent
-              />
-            </label>
-          </div>
-
-          <!-- SSH 专属字段（type==='ssh' 时可见；字段值随类型切换保留，仅提交载荷按类型置零） -->
-          <div v-if="isSshProxy" data-ssh-fields class="mt-2 space-y-4 border-t border-slate-200 pt-4 dark:border-slate-800">
-            <p v-if="sshValidationError" class="text-xs text-red-500" role="alert">{{ sshValidationError }}</p>
-
-            <!-- 认证方式 tab：密码/私钥二选一。切换仅改显示面，两侧已填的值都保留在表单
-                 状态里不丢；提交载荷只带当前 tab 侧凭据、另一侧显式置零（父层对空串凭据
-                 字段显式发空串让后端 deep-merge 清旧值）。用户名输入只出现在密码面：
-                 私钥面把输入收走但不置零该字段——它与 socks5/http 共享，存量值继续生效，
-                 空值由拨号侧兜底本机名。 -->
-            <div data-ssh-auth-tabs role="tablist" class="inline-flex rounded-lg border border-slate-200 bg-slate-100 p-1 dark:border-slate-700 dark:bg-slate-900">
-              <button
-                type="button"
-                data-ssh-auth-tab-password
-                role="tab"
-                :aria-selected="sshAuthMode === 'password'"
-                :disabled="!form.proxy.enable"
-                class="inline-flex items-center gap-1 rounded-md px-3 py-1.5 text-xs font-medium transition"
-                :class="sshAuthMode === 'password'
-                  ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-800 dark:text-white'
-                  : 'text-slate-500 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-60 dark:text-slate-400 dark:hover:text-slate-200'"
-                @click="setSshAuthMode('password')"
-              >
-                <span class="material-symbols-outlined text-sm">password</span>
-                {{ t('rules_sshAuthModePassword') }}
-              </button>
-              <button
-                type="button"
-                data-ssh-auth-tab-key
-                role="tab"
-                :aria-selected="sshAuthMode === 'key'"
-                :disabled="!form.proxy.enable"
-                class="inline-flex items-center gap-1 rounded-md px-3 py-1.5 text-xs font-medium transition"
-                :class="sshAuthMode === 'key'
-                  ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-800 dark:text-white'
-                  : 'text-slate-500 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-60 dark:text-slate-400 dark:hover:text-slate-200'"
-                @click="setSshAuthMode('key')"
-              >
-                <span class="material-symbols-outlined text-sm">key</span>
-                {{ t('rules_sshAuthModeKey') }}
-              </button>
-            </div>
-
-            <!-- 密码登录面板 -->
-            <!-- 密码登录面板:用户名 + 密码。用户名归属此面——私钥面把整个用户名输入
-                 收走,连接身份由拨号侧统一兜底本机名(SSHProxyConfig.Validate 已放行
-                 私钥+空用户名)。div 包两个独立 label,避免单 label 套双输入。 -->
-            <div v-if="sshAuthMode === 'password'" data-ssh-auth-password class="grid gap-4 md:grid-cols-2">
+            <div class="grid gap-4 md:grid-cols-[180px_minmax(0,1fr)]">
               <label class="space-y-2">
+                <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyType') }}</span>
+                <select
+                  v-model="form.proxy.type"
+                  data-field="proxyType"
+                  :disabled="!form.proxy.enable"
+                  class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                >
+                  <option value="socks5">SOCKS5</option>
+                  <option value="http">HTTP</option>
+                  <option value="ssh">SSH</option>
+                </select>
+              </label>
+
+              <label class="space-y-2">
+                <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_server') }}</span>
+                <input
+                  v-model.trim="form.proxy.server"
+                  :disabled="!form.proxy.enable"
+                  class="w-full rounded-lg border px-3 py-2 text-sm shadow-sm transition focus:outline-none focus:ring-2 dark:text-slate-100"
+                  :class="serverFieldClass"
+                  placeholder="127.0.0.1:1080"
+                  type="text"
+                  @keydown.enter.prevent
+                />
+                <p v-if="serverError" class="text-xs text-red-500">{{ serverError }}</p>
+              </label>
+
+              <!-- SSH 时共享网格不再放用户名:密码面自带用户名,私钥面整字段收走 -->
+              <label v-if="!isSshProxy" class="space-y-2 md:col-start-1">
                 <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyUsername') }}</span>
                 <input
                   v-model.trim="form.proxy.username"
@@ -294,13 +214,15 @@
                   :disabled="!form.proxy.enable"
                   autocomplete="username"
                   class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                  :placeholder="t('rules_proxyUsernamePlaceholderSsh')"
+                  :placeholder="t('rules_proxyUsernamePlaceholder')"
                   type="text"
                   @keydown.enter.prevent
                 />
               </label>
 
-              <label class="space-y-2">
+              <!-- 用户名与密码同族:仅 socks5/http 走共享网格;SSH 的用户名收进「密码登录」
+                   面(私钥面不显示,拨号侧 NodeFromAddrPort 用本机名兜底) -->
+              <label v-if="!isSshProxy" class="space-y-2">
                 <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyPassword') }}</span>
                 <input
                   v-model="form.proxy.password"
@@ -308,273 +230,349 @@
                   :disabled="!form.proxy.enable"
                   autocomplete="current-password"
                   class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                  :placeholder="t('rules_proxyPasswordPlaceholderSsh')"
+                  :placeholder="t('rules_proxyPasswordPlaceholder')"
                   type="password"
                   @keydown.enter.prevent
                 />
               </label>
             </div>
 
-            <!-- 私钥登录面板:仅私钥 + 口令(用户名输入收走;空值连接时拨号侧兜底本机名) -->
-            <div v-else data-ssh-auth-key class="space-y-4">
-              <p data-ssh-auth-key-username-hint class="text-xs text-slate-500 dark:text-slate-400">{{ t('rules_sshAuthKeyUsernameHint') }}</p>
-              <label class="block space-y-2">
-                <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyPrivateKey') }}</span>
-                <textarea
-                  v-model="form.proxy.private_key"
-                  data-field="proxyPrivateKey"
-                  :disabled="!form.proxy.enable"
-                  autocomplete="off"
-                  spellcheck="false"
-                  class="min-h-28 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                  :placeholder="t('rules_proxyPrivateKeyPlaceholder')"
-                ></textarea>
-              </label>
+            <!-- SSH 专属字段（type==='ssh' 时可见；字段值随类型切换保留，仅提交载荷按类型置零） -->
+            <div v-if="isSshProxy" data-ssh-fields class="mt-2 space-y-4 border-t border-slate-200 pt-4 dark:border-slate-800">
+              <p v-if="sshValidationError" class="text-xs text-red-500" role="alert">{{ sshValidationError }}</p>
 
-              <label class="block space-y-2">
-                <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyKeyPassphrase') }}</span>
-                <input
-                  v-model="form.proxy.key_passphrase"
-                  data-field="proxyKeyPassphrase"
-                  :disabled="!form.proxy.enable"
-                  autocomplete="new-password"
-                  class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                  :placeholder="t('rules_proxyKeyPassphrasePlaceholder')"
-                  type="password"
-                  @keydown.enter.prevent
-                />
-              </label>
-            </div>
-
-            <div class="grid gap-4">
-              <label class="space-y-2">
-                <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyPoolSize') }}</span>
-                <input
-                  v-model.number="form.proxy.pool_size"
-                  data-field="proxyPoolSize"
-                  :disabled="!form.proxy.enable"
-                  class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                  :placeholder="t('rules_proxyPoolSizePlaceholder')"
-                  type="number"
-                  min="1"
-                  max="16"
-                  @keydown.enter.prevent
-                />
-              </label>
-            </div>
-
-            <!-- 跳板链：server 是单串（host:port 或 ssh://user:pass@host:port，线格式契约
-                 无独立 port 字段，UI 不拆 host/port 两个输入）；私钥经「展开」细节面板折叠，
-                 面板含私钥全文与口令两个输入，控制行高。 -->
-            <div class="space-y-2">
-              <div class="flex flex-wrap items-center justify-between gap-2">
-                <div>
-                  <h4 class="text-sm font-semibold text-slate-900 dark:text-white">{{ t('rules_proxyJumpTitle') }}</h4>
-                  <p class="text-xs text-slate-500">{{ t('rules_proxyJumpDesc') }}</p>
-                </div>
+              <!-- 认证方式 tab：密码/私钥二选一。切换仅改显示面，两侧已填的值都保留在表单
+                   状态里不丢；提交载荷只带当前 tab 侧凭据、另一侧显式置零（父层对空串凭据
+                   字段显式发空串让后端 deep-merge 清旧值）。用户名输入只出现在密码面：
+                   私钥面把输入收走但不置零该字段——它与 socks5/http 共享，存量值继续生效，
+                   空值由拨号侧兜底本机名。 -->
+              <div data-ssh-auth-tabs role="tablist" class="inline-flex rounded-lg border border-slate-200 bg-slate-100 p-1 dark:border-slate-700 dark:bg-slate-900">
                 <button
                   type="button"
-                  data-jump-add
+                  data-ssh-auth-tab-password
+                  role="tab"
+                  :aria-selected="sshAuthMode === 'password'"
                   :disabled="!form.proxy.enable"
-                  class="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 shadow-sm transition hover:border-primary/30 hover:text-primary disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
-                  @click="addJumpServer"
+                  class="inline-flex items-center gap-1 rounded-md px-3 py-1.5 text-xs font-medium transition"
+                  :class="sshAuthMode === 'password'
+                    ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-800 dark:text-white'
+                    : 'text-slate-500 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-60 dark:text-slate-400 dark:hover:text-slate-200'"
+                  @click="setSshAuthMode('password')"
                 >
-                  <span class="material-symbols-outlined text-sm">add</span>
-                  {{ t('rules_proxyJumpAdd') }}
+                  <span class="material-symbols-outlined text-sm">password</span>
+                  {{ t('rules_sshAuthModePassword') }}
+                </button>
+                <button
+                  type="button"
+                  data-ssh-auth-tab-key
+                  role="tab"
+                  :aria-selected="sshAuthMode === 'key'"
+                  :disabled="!form.proxy.enable"
+                  class="inline-flex items-center gap-1 rounded-md px-3 py-1.5 text-xs font-medium transition"
+                  :class="sshAuthMode === 'key'
+                    ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-800 dark:text-white'
+                    : 'text-slate-500 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-60 dark:text-slate-400 dark:hover:text-slate-200'"
+                  @click="setSshAuthMode('key')"
+                >
+                  <span class="material-symbols-outlined text-sm">key</span>
+                  {{ t('rules_sshAuthModeKey') }}
                 </button>
               </div>
 
-              <div
-                v-for="(jump, index) in form.proxy.jump_servers"
-                :key="`jump-${index}`"
-                data-jump-row
-                class="space-y-2 rounded-lg border border-slate-200 bg-white p-3 dark:border-slate-700 dark:bg-slate-900/60"
-              >
-                <div class="grid gap-2 md:grid-cols-[minmax(0,2fr)_minmax(0,1fr)_minmax(0,1fr)_auto] md:items-center">
+              <!-- 密码登录面板 -->
+              <!-- 密码登录面板:用户名 + 密码。用户名归属此面——私钥面把整个用户名输入
+                   收走,连接身份由拨号侧统一兜底本机名(SSHProxyConfig.Validate 已放行
+                   私钥+空用户名)。div 包两个独立 label,避免单 label 套双输入。 -->
+              <div v-if="sshAuthMode === 'password'" data-ssh-auth-password class="grid gap-4 md:grid-cols-2">
+                <label class="space-y-2">
+                  <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyUsername') }}</span>
                   <input
-                    v-model.trim="jump.server"
-                    data-field="jumpServer"
+                    v-model.trim="form.proxy.username"
+                    data-field="proxyUsername"
                     :disabled="!form.proxy.enable"
-                    autocomplete="off"
-                    spellcheck="false"
-                    class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                    :placeholder="t('rules_proxyJumpServerPlaceholder')"
-                    type="text"
-                    @keydown.enter.prevent
-                  />
-                  <input
-                    v-model.trim="jump.username"
-                    data-field="jumpUsername"
-                    :disabled="!form.proxy.enable"
-                    autocomplete="off"
+                    autocomplete="username"
                     class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                    :placeholder="t('rules_proxyUsername')"
+                    :placeholder="t('rules_proxyUsernamePlaceholderSsh')"
                     type="text"
                     @keydown.enter.prevent
                   />
-                  <div v-if="jumpAuthMode(jump) === 'password'" class="flex items-center gap-1">
-                    <input
-                      v-model="jump.password"
-                      data-field="jumpPassword"
-                      :disabled="!form.proxy.enable"
-                      autocomplete="new-password"
-                      class="w-full min-w-0 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                      :placeholder="t('rules_proxyPassword')"
-                      type="password"
-                      @keydown.enter.prevent
-                    />
-                    <button
-                      type="button"
-                      data-jump-switch-to-key
-                      :aria-label="t('rules_sshUseKeyAuth')"
-                      :title="t('rules_sshUseKeyAuth')"
-                      :disabled="!form.proxy.enable"
-                      class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-primary/5 hover:text-primary disabled:cursor-not-allowed disabled:opacity-60 dark:hover:bg-primary/10 dark:hover:text-primary"
-                      @click="setJumpAuthMode(jump, 'key')"
-                    >
-                      <span class="material-symbols-outlined text-base">key</span>
-                    </button>
-                  </div>
-                  <button
-                    v-else
-                    type="button"
-                    data-jump-switch-to-password
-                    :disabled="!form.proxy.enable"
-                    class="inline-flex items-center justify-center gap-1 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-500 shadow-sm transition hover:border-primary/30 hover:text-primary disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
-                    @click="setJumpAuthMode(jump, 'password')"
-                  >
-                    <span class="material-symbols-outlined text-sm">password</span>
-                    {{ t('rules_sshUsePasswordAuth') }}
-                  </button>
-                  <button
-                    type="button"
-                    data-jump-remove
-                    :aria-label="t('rules_proxyJumpRemove')"
-                    :disabled="!form.proxy.enable"
-                    class="inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-400 transition hover:bg-red-50 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-60 dark:hover:bg-red-500/10 dark:hover:text-red-300"
-                    @click="removeJumpServer(index)"
-                  >
-                    <span class="material-symbols-outlined text-base">delete</span>
-                  </button>
-                </div>
+                </label>
 
-                <!-- 私钥面板：登录方式为私钥时替换密码输入（私钥全文 + 可选口令）。
-                     跳板行密码/私钥互斥，payload 按当前侧收敛；切回密码登录用上方格子按钮。 -->
-                <div v-if="jumpAuthMode(jump) === 'key'" data-jump-key-panel class="space-y-2 rounded-lg bg-slate-50 p-3 dark:bg-slate-900/70">
-                  <textarea
-                    v-model="jump.private_key"
-                    data-field="jumpPrivateKey"
-                    :disabled="!form.proxy.enable"
-                    autocomplete="off"
-                    spellcheck="false"
-                    class="min-h-24 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                    :placeholder="t('rules_proxyPrivateKeyPlaceholder')"
-                  ></textarea>
+                <label class="space-y-2">
+                  <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyPassword') }}</span>
                   <input
-                    v-model="jump.key_passphrase"
-                    data-field="jumpKeyPassphrase"
+                    v-model="form.proxy.password"
+                    data-field="proxyPassword"
                     :disabled="!form.proxy.enable"
-                    autocomplete="new-password"
+                    autocomplete="current-password"
                     class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                    :placeholder="t('rules_proxyKeyPassphrase')"
+                    :placeholder="t('rules_proxyPasswordPlaceholderSsh')"
                     type="password"
                     @keydown.enter.prevent
                   />
-                </div>
-              </div>
-            </div>
-
-            <!-- 连接测试 + 链路拓扑画布（客户端连接状态反馈）：测试按钮做一次性
-                 主动验证（当前表单凭据,未保存也可测）；拓扑画布做持续监控（已保存
-                 并注册的出站链池,来自 /api/status/summary 的 ssh 字段）。两者
-                 互补：表单值 ≠ 运行态,按钮测「我现在填的能不能连」,画布看
-                 「当前生效的链路健康如何」。 -->
-            <div data-ssh-connectivity class="space-y-3 rounded-xl border border-dashed border-slate-300 bg-slate-50/60 p-4 dark:border-slate-700 dark:bg-slate-900/40">
-              <div class="flex flex-wrap items-center justify-between gap-2">
-                <div>
-                  <h4 class="text-sm font-semibold text-slate-900 dark:text-white">{{ t('rules_sshTestTitle') }}</h4>
-                  <p class="text-xs text-slate-500">{{ t('rules_sshTestDesc') }}</p>
-                </div>
-                <button
-                  type="button"
-                  data-ssh-test-button
-                  :disabled="!form.proxy.enable || sshTest.loading || !!sshValidationError"
-                  class="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 shadow-sm transition hover:border-primary/30 hover:text-primary disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
-                  @click="runSshTest"
-                >
-                  <span class="material-symbols-outlined text-sm">{{ sshTest.loading ? 'hourglass_top' : 'network_check' }}</span>
-                  {{ sshTest.loading ? t('rules_sshTestRunning') : t('rules_sshTestButton') }}
-                </button>
+                </label>
               </div>
 
-              <!-- 测试结果条：成功（延迟+指纹）/失败（阶段文案+原始错误） -->
-              <p
-                v-if="sshTest.result"
-                data-ssh-test-result
-                role="status"
-                class="rounded-lg px-3 py-2 text-xs"
-                :class="sshTest.result.ok
-                  ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300'
-                  : 'bg-red-50 text-red-700 dark:bg-red-500/10 dark:text-red-300'"
-              >
-                {{ sshTestResultText }}
-              </p>
+              <!-- 私钥登录面板:仅私钥 + 口令(用户名输入收走;空值连接时拨号侧兜底本机名) -->
+              <div v-else data-ssh-auth-key class="space-y-4">
+                <p data-ssh-auth-key-username-hint class="text-xs text-slate-500 dark:text-slate-400">{{ t('rules_sshAuthKeyUsernameHint') }}</p>
+                <label class="block space-y-2">
+                  <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyPrivateKey') }}</span>
+                  <textarea
+                    v-model="form.proxy.private_key"
+                    data-field="proxyPrivateKey"
+                    :disabled="!form.proxy.enable"
+                    autocomplete="off"
+                    spellcheck="false"
+                    class="min-h-28 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                    :placeholder="t('rules_proxyPrivateKeyPlaceholder')"
+                  ></textarea>
+                </label>
 
-              <!-- 链路拓扑画布：吃 summary.ssh 整体快照；未配置/未运行/瞬空
-                   的空态由组件内自渲染（SshChainCanvas 单份泳道推导）。 -->
-              <SshChainCanvas :ssh="sshStatusRaw" />
-            </div>
-
-            <!-- 服务器指纹（TOFU 库管理）：加载失败静默降级，不阻塞主表单 -->
-            <div data-known-hosts class="space-y-3 rounded-xl border border-dashed border-slate-300 bg-slate-50/60 p-4 dark:border-slate-700 dark:bg-slate-900/40">
-              <div>
-                <h4 class="text-sm font-semibold text-slate-900 dark:text-white">{{ t('rules_knownHostsTitle') }}</h4>
-                <p class="text-xs text-slate-500">{{ t('rules_knownHostsDesc') }}</p>
+                <label class="block space-y-2">
+                  <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyKeyPassphrase') }}</span>
+                  <input
+                    v-model="form.proxy.key_passphrase"
+                    data-field="proxyKeyPassphrase"
+                    :disabled="!form.proxy.enable"
+                    autocomplete="new-password"
+                    class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                    :placeholder="t('rules_proxyKeyPassphrasePlaceholder')"
+                    type="password"
+                    @keydown.enter.prevent
+                  />
+                </label>
               </div>
 
-              <p v-if="knownHosts.loading" class="text-xs text-slate-500">{{ t('rules_loading') }}</p>
-              <p v-else-if="knownHosts.failed" class="text-xs text-amber-600 dark:text-amber-400">{{ t('rules_knownHostsLoadFailed') }}</p>
-              <p v-else-if="!knownHosts.items.length" class="text-xs text-slate-500">{{ t('rules_knownHostsEmpty') }}</p>
-              <ul v-else class="space-y-2">
-                <li
-                  v-for="entry in knownHosts.items"
-                  :key="`${entry.host}:${entry.port}:${entry.fingerprint}`"
-                  :data-known-host="`${entry.host}:${entry.port}`"
-                  class="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900"
-                >
-                  <span class="font-mono font-semibold text-slate-700 dark:text-slate-200">{{ entry.host }}:{{ entry.port }}</span>
-                  <span class="text-slate-500 dark:text-slate-400">{{ entry.algorithm }}</span>
-                  <code
-                    class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-300"
-                    :title="entry.fingerprint"
-                  >{{ truncateFingerprint(entry.fingerprint) }}</code>
-                  <span class="text-slate-400">{{ entry.added_at }}</span>
+              <div class="grid gap-4">
+                <label class="space-y-2">
+                  <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyPoolSize') }}</span>
+                  <input
+                    v-model.number="form.proxy.pool_size"
+                    data-field="proxyPoolSize"
+                    :disabled="!form.proxy.enable"
+                    class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                    :placeholder="t('rules_proxyPoolSizePlaceholder')"
+                    type="number"
+                    min="1"
+                    max="16"
+                    @keydown.enter.prevent
+                  />
+                </label>
+              </div>
+
+              <!-- 跳板链：server 是单串（host:port 或 ssh://user:pass@host:port，线格式契约
+                   无独立 port 字段，UI 不拆 host/port 两个输入）；私钥经「展开」细节面板折叠，
+                   面板含私钥全文与口令两个输入，控制行高。 -->
+              <div class="space-y-2">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h4 class="text-sm font-semibold text-slate-900 dark:text-white">{{ t('rules_proxyJumpTitle') }}</h4>
+                    <p class="text-xs text-slate-500">{{ t('rules_proxyJumpDesc') }}</p>
+                  </div>
                   <button
                     type="button"
-                    data-known-host-remove
-                    :aria-label="t('rules_knownHostsRemove') + '：' + entry.host + ':' + entry.port"
-                    class="ml-auto text-slate-400 transition hover:text-red-600 dark:hover:text-red-300"
-                    @click="removeKnownHost(entry)"
+                    data-jump-add
+                    :disabled="!form.proxy.enable"
+                    class="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 shadow-sm transition hover:border-primary/30 hover:text-primary disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
+                    @click="addJumpServer"
                   >
-                    <span class="material-symbols-outlined text-base">delete</span>
+                    <span class="material-symbols-outlined text-sm">add</span>
+                    {{ t('rules_proxyJumpAdd') }}
                   </button>
-                </li>
-              </ul>
+                </div>
 
-              <button
-                v-if="knownHosts.items.length"
-                type="button"
-                class="text-xs font-medium text-red-500 transition hover:text-red-600 dark:text-red-400"
-                @click="clearKnownHosts"
-              >
-                {{ t('rules_knownHostsClear') }}
-              </button>
+                <div
+                  v-for="(jump, index) in form.proxy.jump_servers"
+                  :key="`jump-${index}`"
+                  data-jump-row
+                  class="space-y-2 rounded-lg border border-slate-200 bg-white p-3 dark:border-slate-700 dark:bg-slate-900/60"
+                >
+                  <div class="grid gap-2 md:grid-cols-[minmax(0,2fr)_minmax(0,1fr)_minmax(0,1fr)_auto] md:items-center">
+                    <input
+                      v-model.trim="jump.server"
+                      data-field="jumpServer"
+                      :disabled="!form.proxy.enable"
+                      autocomplete="off"
+                      spellcheck="false"
+                      class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                      :placeholder="t('rules_proxyJumpServerPlaceholder')"
+                      type="text"
+                      @keydown.enter.prevent
+                    />
+                    <input
+                      v-model.trim="jump.username"
+                      data-field="jumpUsername"
+                      :disabled="!form.proxy.enable"
+                      autocomplete="off"
+                      class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                      :placeholder="t('rules_proxyUsername')"
+                      type="text"
+                      @keydown.enter.prevent
+                    />
+                    <div v-if="jumpAuthMode(jump) === 'password'" class="flex items-center gap-1">
+                      <input
+                        v-model="jump.password"
+                        data-field="jumpPassword"
+                        :disabled="!form.proxy.enable"
+                        autocomplete="new-password"
+                        class="w-full min-w-0 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                        :placeholder="t('rules_proxyPassword')"
+                        type="password"
+                        @keydown.enter.prevent
+                      />
+                      <button
+                        type="button"
+                        data-jump-switch-to-key
+                        :aria-label="t('rules_sshUseKeyAuth')"
+                        :title="t('rules_sshUseKeyAuth')"
+                        :disabled="!form.proxy.enable"
+                        class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-primary/5 hover:text-primary disabled:cursor-not-allowed disabled:opacity-60 dark:hover:bg-primary/10 dark:hover:text-primary"
+                        @click="setJumpAuthMode(jump, 'key')"
+                      >
+                        <span class="material-symbols-outlined text-base">key</span>
+                      </button>
+                    </div>
+                    <button
+                      v-else
+                      type="button"
+                      data-jump-switch-to-password
+                      :disabled="!form.proxy.enable"
+                      class="inline-flex items-center justify-center gap-1 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-500 shadow-sm transition hover:border-primary/30 hover:text-primary disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
+                      @click="setJumpAuthMode(jump, 'password')"
+                    >
+                      <span class="material-symbols-outlined text-sm">password</span>
+                      {{ t('rules_sshUsePasswordAuth') }}
+                    </button>
+                    <button
+                      type="button"
+                      data-jump-remove
+                      :aria-label="t('rules_proxyJumpRemove')"
+                      :disabled="!form.proxy.enable"
+                      class="inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-400 transition hover:bg-red-50 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-60 dark:hover:bg-red-500/10 dark:hover:text-red-300"
+                      @click="removeJumpServer(index)"
+                    >
+                      <span class="material-symbols-outlined text-base">delete</span>
+                    </button>
+                  </div>
+
+                  <!-- 私钥面板：登录方式为私钥时替换密码输入（私钥全文 + 可选口令）。
+                       跳板行密码/私钥互斥，payload 按当前侧收敛；切回密码登录用上方格子按钮。 -->
+                  <div v-if="jumpAuthMode(jump) === 'key'" data-jump-key-panel class="space-y-2 rounded-lg bg-slate-50 p-3 dark:bg-slate-900/70">
+                    <textarea
+                      v-model="jump.private_key"
+                      data-field="jumpPrivateKey"
+                      :disabled="!form.proxy.enable"
+                      autocomplete="off"
+                      spellcheck="false"
+                      class="min-h-24 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                      :placeholder="t('rules_proxyPrivateKeyPlaceholder')"
+                    ></textarea>
+                    <input
+                      v-model="jump.key_passphrase"
+                      data-field="jumpKeyPassphrase"
+                      :disabled="!form.proxy.enable"
+                      autocomplete="new-password"
+                      class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                      :placeholder="t('rules_proxyKeyPassphrase')"
+                      type="password"
+                      @keydown.enter.prevent
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <!-- 连接测试 + 链路拓扑画布（客户端连接状态反馈）：测试按钮做一次性
+                   主动验证（当前表单凭据,未保存也可测）；拓扑画布做持续监控（已保存
+                   并注册的出站链池,来自 /api/status/summary 的 ssh 字段）。两者
+                   互补：表单值 ≠ 运行态,按钮测「我现在填的能不能连」,画布看
+                   「当前生效的链路健康如何」。 -->
+              <div data-ssh-connectivity class="space-y-3 rounded-xl border border-dashed border-slate-300 bg-slate-50/60 p-4 dark:border-slate-700 dark:bg-slate-900/40">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h4 class="text-sm font-semibold text-slate-900 dark:text-white">{{ t('rules_sshTestTitle') }}</h4>
+                    <p class="text-xs text-slate-500">{{ t('rules_sshTestDesc') }}</p>
+                  </div>
+                  <button
+                    type="button"
+                    data-ssh-test-button
+                    :disabled="!form.proxy.enable || sshTest.loading || !!sshValidationError"
+                    class="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 shadow-sm transition hover:border-primary/30 hover:text-primary disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
+                    @click="runSshTest"
+                  >
+                    <span class="material-symbols-outlined text-sm">{{ sshTest.loading ? 'hourglass_top' : 'network_check' }}</span>
+                    {{ sshTest.loading ? t('rules_sshTestRunning') : t('rules_sshTestButton') }}
+                  </button>
+                </div>
+
+                <!-- 测试结果条：成功（延迟+指纹）/失败（阶段文案+原始错误） -->
+                <p
+                  v-if="sshTest.result"
+                  data-ssh-test-result
+                  role="status"
+                  class="rounded-lg px-3 py-2 text-xs"
+                  :class="sshTest.result.ok
+                    ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300'
+                    : 'bg-red-50 text-red-700 dark:bg-red-500/10 dark:text-red-300'"
+                >
+                  {{ sshTestResultText }}
+                </p>
+
+                <!-- 链路拓扑画布：吃 summary.ssh 整体快照；未配置/未运行/瞬空
+                     的空态由组件内自渲染（SshChainCanvas 单份泳道推导）。 -->
+                <SshChainCanvas :ssh="sshStatusRaw" />
+              </div>
+
+              <!-- 服务器指纹（TOFU 库管理）：加载失败静默降级，不阻塞主表单 -->
+              <div data-known-hosts class="space-y-3 rounded-xl border border-dashed border-slate-300 bg-slate-50/60 p-4 dark:border-slate-700 dark:bg-slate-900/40">
+                <div>
+                  <h4 class="text-sm font-semibold text-slate-900 dark:text-white">{{ t('rules_knownHostsTitle') }}</h4>
+                  <p class="text-xs text-slate-500">{{ t('rules_knownHostsDesc') }}</p>
+                </div>
+
+                <p v-if="knownHosts.loading" class="text-xs text-slate-500">{{ t('rules_loading') }}</p>
+                <p v-else-if="knownHosts.failed" class="text-xs text-amber-600 dark:text-amber-400">{{ t('rules_knownHostsLoadFailed') }}</p>
+                <p v-else-if="!knownHosts.items.length" class="text-xs text-slate-500">{{ t('rules_knownHostsEmpty') }}</p>
+                <ul v-else class="space-y-2">
+                  <li
+                    v-for="entry in knownHosts.items"
+                    :key="`${entry.host}:${entry.port}:${entry.fingerprint}`"
+                    :data-known-host="`${entry.host}:${entry.port}`"
+                    class="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900"
+                  >
+                    <span class="font-mono font-semibold text-slate-700 dark:text-slate-200">{{ entry.host }}:{{ entry.port }}</span>
+                    <span class="text-slate-500 dark:text-slate-400">{{ entry.algorithm }}</span>
+                    <code
+                      class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-300"
+                      :title="entry.fingerprint"
+                    >{{ truncateFingerprint(entry.fingerprint) }}</code>
+                    <span class="text-slate-400">{{ entry.added_at }}</span>
+                    <button
+                      type="button"
+                      data-known-host-remove
+                      :aria-label="t('rules_knownHostsRemove') + '：' + entry.host + ':' + entry.port"
+                      class="ml-auto text-slate-400 transition hover:text-red-600 dark:hover:text-red-300"
+                      @click="removeKnownHost(entry)"
+                    >
+                      <span class="material-symbols-outlined text-base">delete</span>
+                    </button>
+                  </li>
+                </ul>
+
+                <button
+                  v-if="knownHosts.items.length"
+                  type="button"
+                  class="text-xs font-medium text-red-500 transition hover:text-red-600 dark:text-red-400"
+                  @click="clearKnownHosts"
+                >
+                  {{ t('rules_knownHostsClear') }}
+                </button>
+              </div>
             </div>
           </div>
-        </section>
 
-        <section class="rounded-xl border border-slate-200 bg-slate-50/80 p-4 dark:border-slate-800 dark:bg-slate-900/40">
-          <div class="mb-4 flex items-center gap-2">
+          <!-- 代理规则子区:仓库惯例是 border-t 直接落在下方内容块上(mt-*控上距/pt-*控下距),不用独立空 div -->
+          <div class="mt-5 mb-4 flex items-center gap-2 border-t border-slate-200 pt-5 dark:border-slate-800">
             <span class="material-symbols-outlined text-primary">rule_settings</span>
             <div>
               <h3 class="font-semibold text-slate-900 dark:text-white">{{ t('rules_proxyRules') }}</h3>

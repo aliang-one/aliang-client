@@ -910,7 +910,7 @@ export default {
   rules_proxyPassword: 'Password',
   rules_proxyPasswordPlaceholder: 'Optional',
   rules_aiRules: 'Aliang AI Accelerator',
-  rules_aiRulesDesc: 'Enable accelerated routing per AI provider and list included domains, separated by new lines, commas, or semicolons.',
+  rules_aiRulesDesc: 'This traffic will be forwarded to Aliang\'s servers for acceleration and enhancement.',
   // LOW#17: accessible name for the per-provider enable switch (checkbox aria-label + sr-only text)
   rules_enableAiRule: 'Enable this provider\'s rules',
   rules_noProviders: 'No AI providers were returned by the backend yet.',
