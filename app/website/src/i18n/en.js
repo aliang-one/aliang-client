@@ -1106,7 +1106,7 @@ export default {
   mesh_keyPassphrase: 'Key passphrase',
   // UDP hole punching (transfer-punch-stun): punch toggle + STUN list; pair with zh.js
   mesh_punchEnable: 'UDP hole punching',
-  mesh_punchEnableHint: 'Try direct UDP hole-punched links with peers (opens a public UDP port on this device; off by default).',
+  mesh_punchEnableHint: 'Try direct UDP hole-punched links with peers (opens a public UDP port on this device; on by default, can be disabled).',
   // Public direct-dial declaration (punch-public-peer): public_listen toggle; pair with zh.js
   mesh_publicListen: 'Public direct-dial',
   mesh_publicListenHint: 'The mesh listen port on this device is reachable from the public internet (check on servers with a public IP or a cloud EIP 1:1 NAT); off by default.',

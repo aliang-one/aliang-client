@@ -6,12 +6,15 @@ import (
 	"testing"
 )
 
-// punch 配置面(Task 11):PunchEnable 三态指针语义与 ForwardEnable 同族
-// (nil=false 让渡型默认关);依赖门挂 ValidateMeshDependency(保存期硬拒,
-// 启动期不阻断——mesh↔SSH 依赖门同款分工)。
+// punch 配置面(Task 11;2026-11-24 用户拍板默认翻转):PunchEnable 三态
+// 指针语义为「默认开」——mesh 已配置(nil)即生效,显式 false 才关;
+// nil receiver(mesh 层整体缺失)恒 false fail-closed。依赖门挂
+// ValidateMeshDependency(保存期硬拒,启动期不阻断——mesh↔SSH 依赖门
+// 同款分工),且按显式指针判矛盾(未写不再代表意图)。
 
-// (a) 默认关:零值配置 JSON round-trip 后 PunchEnable 生效值 = false。
-func TestMeshPunchEnableDefaultOff(t *testing.T) {
+// (a) 默认开:零值配置 JSON round-trip 后 PunchEnable 保持 nil 且生效值 =
+// true;nil receiver 恒 false(mesh 未配置 ≠ 开打洞,fail-closed 不变)。
+func TestMeshPunchEnableDefaultOn(t *testing.T) {
 	raw, err := json.Marshal(&MeshConfig{})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -21,14 +24,14 @@ func TestMeshPunchEnableDefaultOff(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if back.PunchEnable != nil {
-		t.Fatalf("零值 round-trip 后 PunchEnable 应为 nil(默认关), got %v", *back.PunchEnable)
+		t.Fatalf("零值 round-trip 后 PunchEnable 应保持 nil(不落盘显式值), got %v", *back.PunchEnable)
 	}
-	if back.EffectivePunchEnabled() {
-		t.Fatal("零值 EffectivePunchEnabled 应为 false(让渡型能力默认关)")
+	if !back.EffectivePunchEnabled() {
+		t.Fatal("零值(未写) EffectivePunchEnabled 应为 true(mesh 已配置即默认开)")
 	}
 	var nilMesh *MeshConfig
 	if nilMesh.EffectivePunchEnabled() {
-		t.Fatal("nil receiver 的 EffectivePunchEnabled 应为 false(fail-closed)")
+		t.Fatal("nil receiver 的 EffectivePunchEnabled 应为 false(mesh 层缺失 fail-closed)")
 	}
 }
 
@@ -79,7 +82,8 @@ func TestValidateMeshDependencyPunchRequiresMesh(t *testing.T) {
 	if err := mk(nil, &on, &on).ValidateMeshDependency(); err != nil {
 		t.Fatalf("mesh default-on + punch on + ssh on: %v", err)
 	}
-	// punch 关(缺键)不添乱:mesh 关 + ssh 开 → 过(punch 无从违规)。
+	// punch 未写(默认开语义)不添乱:mesh 显式关 → 过(punch 默认值随
+	// 总开关沉寂,矛盾判据只认显式指针——2026-11-24 默认翻转的连带)。
 	if err := mk(&off, nil, &on).ValidateMeshDependency(); err != nil {
 		t.Fatalf("mesh off + punch unset: %v", err)
 	}

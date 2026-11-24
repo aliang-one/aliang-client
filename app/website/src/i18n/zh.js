@@ -1105,7 +1105,7 @@ export default {
   mesh_keyPassphrase: '私钥口令',
   // 打洞直连(transfer-punch-stun):punch 开关 + STUN 列表;en.js 同段须成对
   mesh_punchEnable: '打洞直连（UDP 打洞）',
-  mesh_punchEnableHint: '与节点尝试 UDP 打洞直连（本机需对公网开放 UDP 端口，默认关闭）。',
+  mesh_punchEnableHint: '与节点尝试 UDP 打洞直连（本机需对公网开放 UDP 端口；默认开启，可显式关闭）。',
   // 公网直连声明(punch-public-peer):public_listen 开关;en.js 同段须成对
   mesh_publicListen: '公网直连声明',
   mesh_publicListenHint: '本机监听口可被对端公网直连（公网直挂或云 EIP 1:1 NAT 服务器勾选），默认关。',

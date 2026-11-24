@@ -346,8 +346,8 @@
     </section>
 
     <!-- —— 打洞直连(transfer-punch-stun):punch 开关 + public_listen 公网直连
-         声明开关 + STUN 列表。punch_enable 三态 nil=false(后端
-         EffectivePunchEnabled 同源,让渡型默认关);public_listen(punch-public-peer)
+         声明开关 + STUN 列表。punch_enable 三态 nil=true(2026-11-24 默认开,
+         后端 EffectivePunchEnabled 翻转同源,显式 false 才关);public_listen(punch-public-peer)
          同为三态 nil=false 让渡型,勾选后 B 侧打洞 result 帧声明 public、A 侧跳过
          STUN classify 直拨——仅公网直挂/EIP 1:1 NAT 服务器场景,与 punch 开关
          逐字同形态(checkbox class 栈/disabled 联动同口径);STUN 列表

@@ -27,11 +27,11 @@ import zh from '../../i18n/zh';
 // ——读侧恒产出显式布尔
 // （ssh_ingress「恒产出显式」先例），保存才不会漏键。
 describe('MeshSettings normalizeMeshConfig', () => {
-  it('缺失段产出全默认：三态布尔恒显式（enable=true/forward=false/punch=false/public_listen=false/fallback.enable=false）', () => {
+  it('缺失段产出全默认：三态布尔恒显式（enable=true/forward=false/punch=true(2026-11-24默认开)/public_listen=false/fallback.enable=false）', () => {
     expect(normalizeMeshConfig(undefined)).toEqual({
       enable: true,
       forward_enable: false,
-      punch_enable: false,
+      punch_enable: true,
       public_listen: false,
       max_hops: 0,
       peers: [],
@@ -66,8 +66,8 @@ describe('MeshSettings normalizeMeshConfig', () => {
     expect(out.punch_enable).toBe(true);
     expect(out.fallback.enable).toBe(true);
     expect(out.fallback.next_hop).toBe('dev-b');
-    // punch 非布尔（手改配置文件垃圾）→ 归默认关,不透传坏值
-    expect(normalizeMeshConfig({ punch_enable: 'yes' }).punch_enable).toBe(false);
+    // punch 非布尔（手改配置文件垃圾）→ 归默认开(2026-11-24 翻转),不透传坏值
+    expect(normalizeMeshConfig({ punch_enable: 'yes' }).punch_enable).toBe(true);
   });
 
   it('normalizeMeshConfig 归一 public_listen(非布尔归 false)', () => {
@@ -299,6 +299,7 @@ describe('SettingsPage buildCustomerSavePatch（mesh 透传链）', () => {
         mesh: {
           enable: true,
           forward_enable: false,
+          punch_enable: false,
           max_hops: 5,
           peers: [{ device_id: ' dev-b ', lan_addrs: ['192.168.1.20:56441'], relay: true }],
           fallback: { enable: true, next_hop: 'dev-b' }
@@ -656,7 +657,7 @@ describe('MeshSettings 卡片', () => {
     expect(saved[0].mesh).toEqual({
       enable: true,
       forward_enable: false,
-      punch_enable: false,
+      punch_enable: true,
       public_listen: false,
       max_hops: 0,
       peers: [],
