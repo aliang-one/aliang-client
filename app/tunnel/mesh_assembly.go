@@ -261,14 +261,16 @@ func reconcileMeshLAN(deviceID func() string) {
 	}
 }
 
-// meshLANDesired 期望态:mesh 层已配置且总开关开,且 deviceID 可得。
-// Mesh==nil(未配置)= 整层不生效(types.go 契约),不监听不广播。
+// meshLANDesired 期望态:总开关开且 deviceID 可得。总开关走 EffectiveEnabled
+// 的 nil 语义(nil=默认开):customer.mesh 整块缺失即「默认开」,与 /api/mesh/status
+// 对同一配置报 enable=true 同口径。此前这里对 Mesh==nil 单独早退——状态面说
+// 开、装配面不跑,未配置设备永久停在「开关开而 beacon_running=false」的假绿。
 func meshLANDesired(deviceID func() string) bool {
 	if deviceID == nil || strings.TrimSpace(deviceID()) == "" {
 		return false
 	}
 	cfg := config.GetGlobalConfig()
-	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
+	if cfg == nil || cfg.Customer == nil {
 		return false
 	}
 	return cfg.Customer.Mesh.EffectiveEnabled()

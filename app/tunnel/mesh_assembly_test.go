@@ -219,6 +219,10 @@ func TestMeshLANAssemblyLifecycle(t *testing.T) {
 	deviceID := func() string { return "dev-lan-a" }
 	interval := 15 * time.Millisecond
 	beaconPort := pickFreeUDPForAssembly(t)
+	// 期望态「关」用显式 false 表达:mesh 块缺失=默认开、装配即起(见
+	// TestMeshLANAssemblyUnconfiguredMeshDefaultsOn),不能再拿「未配置」当关。
+	restoreOffInit := swapGlobalMeshConfig(t, &config.MeshConfig{Enable: boolPtr(false)})
+	defer restoreOffInit()
 	startMeshLANAssembly(deviceID, interval, beaconPort)
 
 	// MeshLANPort 收敛为常量统一口:与装配态无关的静态拓扑事实。
@@ -226,9 +230,9 @@ func TestMeshLANAssemblyLifecycle(t *testing.T) {
 		t.Fatalf("MeshLANPort = %d, want 统一口 %d", got, config.DefaultHTTPProxyPort)
 	}
 
-	// 初始未配置 → beacon 不启动。
+	// 总开关显式关 → beacon 不启动。
 	if lanbeacon.Default() != nil {
-		t.Fatal("未配置 mesh 时 lanbeacon.Default 应为 nil")
+		t.Fatal("总开关显式关时 lanbeacon.Default 应为 nil")
 	}
 
 	restore := swapGlobalMeshConfig(t, &config.MeshConfig{})
@@ -579,11 +583,15 @@ func TestMeshLANRunningReflectsAssembly(t *testing.T) {
 	deviceID := func() string { return "dev-lan-running" }
 	interval := 15 * time.Millisecond
 	beaconPort := pickFreeUDPForAssembly(t)
+	// 期望态「关」用显式 false 表达(mesh 块缺失=默认开,装配即起,见
+	// TestMeshLANAssemblyUnconfiguredMeshDefaultsOn)。
+	restoreOff := swapGlobalMeshConfig(t, &config.MeshConfig{Enable: boolPtr(false)})
+	defer restoreOff()
 	startMeshLANAssembly(deviceID, interval, beaconPort)
 
-	// 装配器在跑但 Mesh 未配置 → 期望态 false,生效态仍 false。
+	// 装配器在跑但期望态 false → 生效态仍 false。
 	if MeshLANRunning() {
-		t.Fatal("Mesh 未配置时 MeshLANRunning() 应为 false")
+		t.Fatal("总开关显式关时 MeshLANRunning() 应为 false")
 	}
 
 	// Mesh 开(镜像该测试的启用形态:空 MeshConfig 即生效开关开)→ 下个
@@ -599,5 +607,38 @@ func TestMeshLANRunningReflectsAssembly(t *testing.T) {
 	StopMeshLANAssembly()
 	if MeshLANRunning() {
 		t.Fatal("StopMeshLANAssembly 后 MeshLANRunning() 应为 false")
+	}
+}
+
+// TestMeshLANAssemblyUnconfiguredMeshDefaultsOn 总开关「nil=默认开」的运行面
+// 对齐(假绿治理收尾):customer.mesh 整块缺失(Mesh==nil,用户从未触及 mesh 的
+// 合法态)时,状态面按默认开报 enable=true(/api/mesh/status 结构体初值 +
+// MeshConfig.EffectiveEnabled 的 nil 语义);装配器必须同一口径——起后 beacon
+// 真起。此前 meshLANDesired 的 Mesh==nil 早退让全量未配置设备永久停在
+// 「enable=true 而 beacon_running=false」(设计稿定义的装配假绿现场本身),
+// LAN 发现候选面对它们从未存在。
+func TestMeshLANAssemblyUnconfiguredMeshDefaultsOn(t *testing.T) {
+	t.Cleanup(StopMeshLANAssembly)
+	StopMeshLANAssembly()
+
+	restore := swapGlobalMeshConfig(t, nil) // customer.mesh 整块缺失
+	defer restore()
+
+	deviceID := func() string { return "dev-lan-unconfigured" }
+	interval := 15 * time.Millisecond
+	beaconPort := pickFreeUDPForAssembly(t)
+	startMeshLANAssembly(deviceID, interval, beaconPort)
+
+	waitForMeshLAN(t, true)
+	if !MeshLANRunning() {
+		t.Fatal("mesh 块缺失(默认开)装配起后 MeshLANRunning() 应为 true")
+	}
+
+	// 只有显式 false 才关(与 EffectiveEnabled 同口径):下个对账周期收摊。
+	restoreOff := swapGlobalMeshConfig(t, &config.MeshConfig{Enable: boolPtr(false)})
+	defer restoreOff()
+	waitForMeshLAN(t, false)
+	if MeshLANRunning() {
+		t.Fatal("显式 enable=false 后 MeshLANRunning() 应为 false")
 	}
 }
