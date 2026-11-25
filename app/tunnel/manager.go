@@ -16,8 +16,8 @@ import (
 
 	"github.com/andydunstall/piko/client"
 
-	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/app/mesh/ingressfwd"
+	"aliang.one/nursorgate/common/logger"
 	sshin "aliang.one/nursorgate/inbound/ssh"
 	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
 	pconfig "aliang.one/nursorgate/processor/config"
@@ -424,10 +424,14 @@ func runTunnel(ctx context.Context, config runConfig, ready func()) error {
 				go func(c net.Conn) {
 					c = sshin.WithRemoteLabel(c, "piko-"+endpoint) // 无冒号(SPEC §8.2)
 					if !ingressfwd.ServeOrForward(c, pconfig.GetGlobalConfig()) {
-						// false = 本进程无 ingress 单例且无处可转(入口未启用),
-						// SPEC §8.1 WARN 记账。双进程拓扑(数据面住 core)下
-						// ServeOrForward 已 splice 到 core 统一入口,不走此支。
-						logger.Info(fmt.Sprintf("[MESH-RELAY] ingress not running, dropped conn %s", c.RemoteAddr()))
+						// false = 本进程无 ingress 单例,且未能交给 core(非 SSH
+						// 流 / core 侧入口全不可达)。原因行在同进程的
+						// [MESH-RELAY-FWD] 日志(丢非 SSH 流 / 拨 core 失败各
+						// 有专属行);成功的 splice 同样返回 false 但不打本行之外
+						// 的告警——排查先看 [MESH-RELAY-FWD],别直接判「core 的
+						// SSH 入口没开」(2026-11-24 审计:旧注释把端口哨兵拼死口
+						// 误导成了入口未启用)。
+						logger.Info(fmt.Sprintf("[MESH-RELAY] stream dropped (see [MESH-RELAY-FWD] above for reason) conn %s", c.RemoteAddr()))
 					}
 				}(conn)
 			}

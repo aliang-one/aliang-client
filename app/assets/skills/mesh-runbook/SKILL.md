@@ -12,7 +12,7 @@ description: 组网(mesh/设备互访)故障的诊断与取证流程:先进程�
 1. **活性自检(process liveness)**:对 `127.0.0.1:56431` 与 `127.0.0.1:56433` 各发一次 2s 超时探活(如 `curl -m 2 -s http://127.0.0.1:56431/api/logs?limit=1` 与 `curl -m 2 -s http://127.0.0.1:56433/api/agent/status`)。56433 侧用 `/api/agent/status`:它挂本机 mux 且不 proxy,探活顺带产出 `device_id`(族 2 身份对比要用)。注意 `/api/logs` 只在 56431(core 内存 buffer),56433 无日志 HTTP 面。归因分支:**两个端口全部超时 = agent 进程死**,先报告进程存活问题(重启/服务状态),**勿对死进程做配置修复**;**56433 活而 56431 死 = core 数据面死(SYSTEM 服务),停在存活面,勿继续 mesh 归因**——第 2-5 步与兜底链全住 core。56430 是守卫口,探活别打它,也绝不把它当仪表盘。
 2. **`GET /api/mesh/status` 三真值**:读 `beacon_running`、`lan_running`、`roster_sync.synced`。这三个是「活着」事实,开关(`enable`/`effective`)只是配置推导——开关开而 running=false 即装配假绿现场。`roster_sync.synced=false` = **「从未同步」**(boot 未接线即此态),**不是「服务端坏」**;`synced=true` 且 `last_error` 非空 = 上一轮拉取失败但旧缓存仍在;两者皆空 = 健康。`synced=false` 且 `last_error` 非空 = 接线已通但服务端自 boot 起不可达,有诊断信息量,勿当非法态。
 3. **`GET /api/mesh/diag` 聚合**:一次拿全四重闸判定(`enable`/`effective`/`forward_enable`/`punch_enable`/`auto_peers`)、beacon 计数(`beacon.stats.*`)、载体分桶(`carriers`:lan_ok/udp_ok/piko_ok/udp_err/dial_fail)、出口委托(`delegate`:active/last_failure_at/last_failure_err)、打洞判型账本与会话快照(`punch.classify`/`punch.sessions`)、STUN 清单(静态,非活探测)、LAN 候选(`beacon.lan_peers`)。
-4. **`GET /api/mesh/identity` 双身份比对**:`device_id`(进程 state)/`identity_file_device_id`(常驻文件)/`beacon_self_device_id`(广播)/`roster_self_present`(roster 本机条目)。`mismatches[]` 非空即人话判定面,每条说明哪两源不一致。
+4. **`GET /api/mesh/identity` 双身份比对**:`device_id`(进程 state)/`identity_file_device_id`(常驻文件)/`beacon_self_device_id`(广播)/`roster_self_present`(roster 本机条目)。`mismatches[]` 非空即人话判定面,每条说明哪两源不一致。**`roster_self_present` 按服务端契约恒为 false**(PhoneServer 的 mesh-roster 接口回包前滤掉请求方自身),不是故障信号、不代表身份未上送;本机身份上送是否成功看 core 日志里 endpoint 以 `mesh-identity` 结尾的 `[AGENT-BOOT] agent_server_call` 行。
 5. **`GET /api/logs?limit=…` 按 token 查**:取大 limit(如 500)后在结果里过滤 `[MESH-` 前缀(`[MESH-OUT]`/`[MESH-LAN]`/`[MESH-BEACON]`/`[MESH-FORWARD]`/`[MESH-RELAY]`)。**勿按 level 过滤**——mesh 关键取证多在 info 级。
 
 ## ② 症状族:按现象对号,按序调用归因
@@ -22,7 +22,7 @@ description: 组网(mesh/设备互访)故障的诊断与取证流程:先进程�
 调用:status → diag。归因分支:三真值任一 false 而对应闸 true = 装配层问题(本体在、接线断/装配早于依赖就绪且无自动重试)。**治本 = 代码侧接线修复,AI 勿手填配置绕过**——手填只能盖住症状,boot 竞态现场重跑照旧断。定性结论交给人工改接线。
 
 ### 族 2 身份脑裂:双进程持不同身份
-症状:`/api/mesh/identity` 的 `mismatches` 非空。
+症状:`/api/mesh/identity` 的 `mismatches` 非空——**先剔除恒真假警报**:含「roster 已同步但缺本机条目 … 自动组网将 fail-closed」字样的那一条是旧版端点的误报(服务端回包本就滤掉请求方自身,每台同步成功的设备都会命中),直接忽略,不进本族。剩余条目才是身份不一致。
 调用:identity → 看 `identity_file_path` 暴露的凭据路径分叉 → agent 侧身份对比走 `GET /api/agent/status`(其 `device_id` 即 user agent 进程的进程内 state)。归因分支:`state ≠ identity_file_device_id` = 进程内存态与常驻文件脱节;`identity_file_device_id ≠ beacon_self_device_id` = beacon 广播身份与文件脱节(邻居看到的 self 与本机记录不符);文件源缺失(路径或文件内 device_id 为空)时端点自动退化成 state↔beacon 直比,脑裂不漏报。典型现场:同一台机 core(SYSTEM 身份)与 user agent(登录用户身份)各解析出不同 identity 文件路径,即「双身份」。修复=收敛两进程的凭据路径(人工),AI 只取证上报。
 
 ### 族 3 发现 beacon 哑火:utun7 特征
