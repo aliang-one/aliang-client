@@ -14,6 +14,15 @@ describe('authentication failure classification', () => {
     expect(reconcile).toHaveBeenCalledWith('Token has expired');
   });
 
+  it('does not treat a bare 401 without rejection evidence as session invalidation', () => {
+    expect(isAuthenticationFailure(401, {})).toBe(false);
+    expect(handleAuthenticationFailure(401, {}, vi.fn())).toBe(false);
+  });
+
+  it('does not treat 403 responses as session invalidation', () => {
+    expect(isAuthenticationFailure(403, { msg: 'forbidden' })).toBe(false);
+  });
+
   it('recognizes nested terminal envelopes', () => {
     const envelope = { data: { status: 'unauthenticated', error: 'session_expired', msg: 'Login again' } };
     expect(isAuthenticationFailure(200, envelope)).toBe(true);

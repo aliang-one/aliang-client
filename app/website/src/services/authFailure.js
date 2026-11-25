@@ -16,11 +16,29 @@ function normalized(value) {
   return typeof value === 'string' ? value.trim().toLowerCase() : '';
 }
 
-export function isAuthenticationFailure(responseStatus, envelope) {
-  if (Number(responseStatus) === 401) {
-    return true;
-  }
+// 明确拒绝语义：仅当 envelope 任一层携带这些证据时才判定会话失效。
+// 注意后端两类真实 401 文案互不为子串，需分别列出：
+// - dashboard/remote 中间件 "Authenticated dashboard session is required"
+// - quick-setup 上游快照 "authenticated session is required"（ErrQuickSetupUnauthenticated）
+const ACCESS_REJECTION_PHRASES = [
+  'local session is no longer valid',
+  'invalid authentication',
+  'authenticated dashboard session is required',
+  'authenticated session is required',
+  'token has been revoked',
+  'invalid access token',
+  'token has expired',
+  'token expired',
+  'expired token',
+  'token revoked',
+  'session_expired',
+  'token_expired',
+];
 
+export function isAuthenticationFailure(responseStatus, envelope) {
+  // 裸 401/403 等状态码本身不再是失效证据（网关瞬时 401 不再触发登出
+  // reconcile）：401 与其它状态码一律要求 envelope 层命中明确拒绝语义；
+  // nested terminal envelope（如 200 + data.status=unauthenticated）保持原语义。
   return envelopeLayers(envelope).some((layer) => {
     const status = normalized(layer.status);
     const error = normalized(layer.error);
@@ -30,7 +48,8 @@ export function isAuthenticationFailure(responseStatus, envelope) {
       || error === 'session_expired'
       || error === 'token_expired'
       || code === 'token_expired'
-      || message.includes('local session is no longer valid');
+      || code === 'token_revoked'
+      || ACCESS_REJECTION_PHRASES.some((phrase) => message.includes(phrase));
   });
 }
 
