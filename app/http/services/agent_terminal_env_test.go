@@ -157,3 +157,85 @@ func TestMergeUserPathIntoEnvAppendsWhenMissing(t *testing.T) {
 		t.Errorf("无 PATH 时应追加 Path=，got %v", got)
 	}
 }
+
+// ---- 通用注册表环境合并（Windows 全量变量，非仅 PATH）----
+// 钉「后装 Java/Rust 等任意变量」场景：机器级新增 JAVA_HOME+Path 目录、
+// 用户级新增 CARGO_HOME+Path 目录、%VAR% 交叉引用、用户覆盖机器、PATH
+// 拼接语义。纯逻辑复刻 mergeWindowsRegistryEnv（注册表读取仅真 Windows）。
+
+// 后装 Java(all-users,写机器级 JAVA_HOME+Path)、Rust(cargo 写用户级
+// CARGO_HOME+Path)后,新建终端环境必须见全部新变量与新 PATH 目录。
+func TestRegistryEnvMerge_NewToolchainVisible(t *testing.T) {
+	machine := map[string]string{
+		"path":      `C:\Program Files\Java\jdk-21\bin;%SystemRoot%\system32`,
+		"java_home": `C:\Program Files\Java\jdk-21`,
+	}
+	user := map[string]string{
+		"path":       `%USERPROFILE%\.cargo\bin`,
+		"cargo_home": `C:\Users\dev\.cargo`,
+	}
+	t.Setenv("USERPROFILE", `C:\Users\dev`)
+	t.Setenv("SystemRoot", `C:\Windows`)
+	env := []string{
+		"Path=C:\\Windows\\system32",
+		"ComSpec=C:\\Windows\\system32\\cmd.exe",
+		"USERPROFILE=C:\\Users\\dev",
+	}
+	got := mergeWindowsRegistryEnv(machine, user, env)
+	kv := map[string]string{}
+	for _, e := range got {
+		name, v, _ := strings.Cut(e, "=")
+		kv[strings.ToLower(name)] = v
+	}
+	if !strings.Contains(kv["path"], `C:\Program Files\Java\jdk-21\bin`) {
+		t.Errorf("机器级新 PATH 目录缺失: %q", kv["path"])
+	}
+	if !strings.Contains(kv["path"], `C:\Users\dev\.cargo\bin`) {
+		t.Errorf("用户级新 PATH 目录缺失: %q", kv["path"])
+	}
+	if kv["java_home"] != `C:\Program Files\Java\jdk-21` {
+		t.Errorf("JAVA_HOME 缺失: %q", kv["java_home"])
+	}
+	if kv["cargo_home"] != `C:\Users\dev\.cargo` {
+		t.Errorf("CARGO_HOME 缺失: %q", kv["cargo_home"])
+	}
+	if kv["comspec"] != `C:\Windows\system32\cmd.exe` {
+		t.Errorf("快照原键应保留: %q", kv["comspec"])
+	}
+}
+
+// 用户级引用机器级变量（%JAVA_HOME%\bin 写在用户 Path 里）必须能展开。
+func TestRegistryEnvMerge_UserRefsMachineVar(t *testing.T) {
+	machine := map[string]string{"java_home": `C:\Program Files\Java\jdk-21`}
+	user := map[string]string{"path": `%JAVA_HOME%\bin`}
+	got := mergeWindowsRegistryEnv(machine, user, []string{"Path=C:\\Windows"})
+	for _, e := range got {
+		if name, v, _ := strings.Cut(e, "="); strings.EqualFold(name, "Path") {
+			// 快照 PATH(C:\Windows) 在前保持原序，展开后的用户目录追加在后。
+			if v != `C:\Windows;C:\Program Files\Java\jdk-21\bin` {
+				t.Errorf("%%JAVA_HOME%% 未展开: %q", v)
+			}
+			return
+		}
+	}
+	t.Fatal("Path 条目丢失")
+}
+
+// 同名键用户级覆盖机器级（Windows 语义）；PATH 例外——拼接去重。
+func TestRegistryEnvMerge_UserOverridesMachine(t *testing.T) {
+	machine := map[string]string{"path": `C:\Machine\Dir`, "java_home": `C:\Machine\JDK`}
+	user := map[string]string{"path": `C:\User\Dir`, "java_home": `C:\User\JDK`}
+	got := mergeWindowsRegistryEnv(machine, user, []string{"Path=C:\\Old"})
+	kv := map[string]string{}
+	for _, e := range got {
+		name, v, _ := strings.Cut(e, "=")
+		kv[strings.ToLower(name)] = v
+	}
+	if kv["java_home"] != `C:\User\JDK` {
+		t.Errorf("用户级应覆盖机器级，got %q", kv["java_home"])
+	}
+	// PATH 是拼接：机器目录+用户目录都在。
+	if !strings.Contains(kv["path"], `C:\Machine\Dir`) || !strings.Contains(kv["path"], `C:\User\Dir`) {
+		t.Errorf("PATH 应拼接机器+用户目录，got %q", kv["path"])
+	}
+}

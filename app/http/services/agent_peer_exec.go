@@ -379,12 +379,16 @@ func agentPeerPowerShellArgs(command string) []string {
 //     异常（SystemRoot）。$env:TEMP 为空、hostname 解析失败的实机证据见
 //     spec 2026-11-05-peer-exec-windows-defects §1。
 func agentPeerExecEnv() []string {
-	return agentPeerExecEnvFor(runtime.GOOS)
+	return agentPeerExecEnvFor(runtime.GOOS, augmentEnvWithWindowsUserPath)
 }
 
 // agentPeerExecEnvFor 平台参数化纯函数：goos 可注入，darwin 测试直接断言
 // windows 键集（规避 GOOS 尾段测试文件静默跳过陷阱）。
-func agentPeerExecEnvFor(goos string) []string {
+//
+// 注入式依赖：注册表合并（augmentEnvWithWindowsUserPath）只在真 Windows
+// 运行时生效（读 HKCU/HKLM），darwin 上跨平台测试无法注入——参数化留缝，
+// 合并通道测试走 agent_terminal_env_test.go 的纯逻辑层。
+func agentPeerExecEnvFor(goos string, augmentWindowsPath func([]string) []string) []string {
 	capacity := 5
 	if goos == "windows" {
 		capacity = 12
@@ -416,6 +420,12 @@ func agentPeerExecEnvFor(goos string) []string {
 	env = append(env, "TMPDIR="+os.TempDir())
 	if goos != "windows" {
 		return env
+	}
+	// 实时合并注册表最新用户/机器 PATH：agent 快照 PATH 滞后于后装工具
+	// （Python/Git 等写 HKLM，claude npm 写 HKCU），peer exec 子进程必须看见
+	// 与网页终端/AI 子进程一致的 PATH，否则 python 等命令报「不是内部或外部命令」。
+	if augmentWindowsPath != nil {
+		env = augmentWindowsPath(env)
 	}
 	env = append(env, windowsEnvEntry("SystemRoot", `C:\Windows`))
 	env = append(env, windowsEnvEntry("windir", `C:\Windows`))

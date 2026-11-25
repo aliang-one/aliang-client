@@ -516,7 +516,7 @@ func TestPeerExecEnvFor_WindowsAddsSystemKeys(t *testing.T) {
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "sk-leak-me-not")
 	t.Setenv("ANTHROPIC_BASE_URL", "https://leak.example.com")
 	t.Setenv("PATH", "") // 触发 Windows PATH 兜底
-	env := agentPeerExecEnvFor("windows")
+	env := agentPeerExecEnvFor("windows", nil)
 	seen := map[string]string{}
 	for _, entry := range env {
 		idx := strings.IndexByte(entry, '=')
@@ -551,11 +551,36 @@ func TestPeerExecEnvFor_WindowsAddsSystemKeys(t *testing.T) {
 	}
 }
 
+// TestPeerExecEnvFor_WindowsAugmentsRegistryPath：windows 参数化路径在注入
+// 合并通道后，PATH 必须包含注册表新增目录（4070 实锤回归：装完 Python 后
+// peer exec 起 PowerShell 执行 python 报「不是内部或外部命令」）。
+func TestPeerExecEnvFor_WindowsAugmentsRegistryPath(t *testing.T) {
+	t.Setenv("PATH", `C:\Windows\System32`)
+	augment := func(env []string) []string {
+		return mergeUserPathIntoEnv(env, `C:\Program Files\Python311\Scripts\;C:\Program Files\Python311\`)
+	}
+	env := agentPeerExecEnvFor("windows", augment)
+	seen := map[string]string{}
+	for _, entry := range env {
+		idx := strings.IndexByte(entry, '=')
+		if idx <= 0 {
+			t.Fatalf("malformed env entry %q", entry)
+		}
+		seen[entry[:idx]] = entry[idx+1:]
+	}
+	if !strings.Contains(seen["PATH"], `C:\Program Files\Python311`) {
+		t.Fatalf("augmented PATH missing python dir: %q", seen["PATH"])
+	}
+	if !strings.Contains(seen["PATH"], `C:\Windows\System32`) {
+		t.Fatalf("augmented PATH lost original entry: %q", seen["PATH"])
+	}
+}
+
 // TestPeerExecEnvFor_DarwinKeysUnchanged：darwin 键集五键契约不变——现有
 // TestPeerExecEnv_MinimalAllowlist 之外再钉一层「不增键」。
 func TestPeerExecEnvFor_DarwinKeysUnchanged(t *testing.T) {
 	t.Setenv("PATH", "/usr/bin:/bin")
-	env := agentPeerExecEnvFor("darwin")
+	env := agentPeerExecEnvFor("darwin", nil)
 	allowed := map[string]bool{"PATH": true, "HOME": true, "TERM": true, "LANG": true, "TMPDIR": true}
 	for _, entry := range env {
 		idx := strings.IndexByte(entry, '=')
