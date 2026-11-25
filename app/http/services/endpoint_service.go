@@ -771,30 +771,35 @@ func (s *EndpointService) Close() error {
 // 这一组是 store CRUD 的直通包装:管理面是唯一调用方,刻意不做额外状态
 // 机(健康/并发的写路径仍只走本文件上面的 Report*/ResetHealth)。
 
-// ListEndpoints 全量列表(store 排序 priority,id 升序)。
+// ListEndpoints 全量列表(store 排序 priority,id 升序)。管理面专用,数据面勿用
+// (数据面走 Select/Acquire/Report*)。
 func (s *EndpointService) ListEndpoints() ([]*config.LLMEndpoint, error) { return s.store.List() }
 
 // GetEndpoint 单行;不存在返回 wrapped gorm.ErrRecordNotFound(handler 判 404)。
+// 管理面专用,数据面勿用(数据面走 Select)。
 func (s *EndpointService) GetEndpoint(id string) (*config.LLMEndpoint, error) {
 	return s.store.Get(id)
 }
 
 // CreateEndpoint 新建(校验/id 冲突错误由 store 归一,handler 映射 400/409)。
+// 管理面专用,数据面勿用。
 func (s *EndpointService) CreateEndpoint(e *config.LLMEndpoint) error { return s.store.Create(e) }
 
 // UpdateEndpoint 配置列白名单更新;健康列 clobber 由 store 白名单挡住。
+// 管理面专用,数据面勿用。
 func (s *EndpointService) UpdateEndpoint(e *config.LLMEndpoint) error { return s.store.Update(e) }
 
 // DeleteEndpoint 删除;builtin → storage.ErrBuiltinImmutable(handler 映射 409)。
+// 管理面专用,数据面勿用。
 func (s *EndpointService) DeleteEndpoint(id string) error { return s.store.Delete(id) }
 
-// TestEndpoint 连接测试直通(探测实现见 Test)。
+// TestEndpoint 连接测试直通(探测实现见 Test)。管理面专用,数据面勿用。
 func (s *EndpointService) TestEndpoint(id string) (bool, int, string) { return s.Test(id) }
 
-// GetPolicy 组策略读(无行=默认值,不落库)。
+// GetPolicy 组策略读(无行=默认值,不落库)。管理面专用,数据面勿用。
 func (s *EndpointService) GetPolicy() (*config.EndpointGroupPolicy, error) {
 	return s.store.GetPolicy()
 }
 
-// SetPolicy 组策略写(组键恒 auto,store 归一)。
+// SetPolicy 组策略写(组键恒 auto,store 归一)。管理面专用,数据面勿用。
 func (s *EndpointService) SetPolicy(p *config.EndpointGroupPolicy) error { return s.store.SetPolicy(p) }

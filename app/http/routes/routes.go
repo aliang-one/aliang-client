@@ -441,6 +441,7 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	// panic);鉴权=handler 内 RequireDashboardSession(与 quick-setup CRUD 同族)。
 	register("GET /api/endpoints", h.Endpoint.HandleList, http.MethodGet)
 	register("POST /api/endpoints", h.Endpoint.HandleCreate, http.MethodPost)
+	register("GET /api/endpoints/{id}", h.Endpoint.HandleGet, http.MethodGet)
 	register("PUT /api/endpoints/{id}", h.Endpoint.HandleUpdate, http.MethodPut)
 	register("DELETE /api/endpoints/{id}", h.Endpoint.HandleDelete, http.MethodDelete)
 	register("POST /api/endpoints/{id}/test", h.Endpoint.HandleTest, http.MethodPost)

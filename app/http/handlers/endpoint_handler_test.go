@@ -93,6 +93,8 @@ func endpointDo(t *testing.T, h *EndpointHandler, cookie *http.Cookie, method, p
 		h.HandleResetHealth(rec, r)
 	case method == http.MethodGet && strings.HasSuffix(path, "/api/endpoints"):
 		h.HandleList(rec, r)
+	case method == http.MethodGet && strings.Contains(path, "/api/endpoints/"):
+		h.HandleGet(rec, r)
 	case method == http.MethodPost && strings.HasSuffix(path, "/api/endpoints"):
 		h.HandleCreate(rec, r)
 	case method == http.MethodPut:
@@ -415,5 +417,75 @@ func TestEndpointHandlerSuccessEnvelope(t *testing.T) {
 	}
 	if env.Code != common.CodeSuccess || env.Msg != "success" {
 		t.Fatalf("信封 = %+v", env)
+	}
+}
+
+// GET 单条:存在 → 200 掩码形状;不存在 → 404(spec §11 权威条目)。
+func TestEndpointHandlerGetSingle(t *testing.T) {
+	h, cookie := newEndpointHandlerHarness(t)
+	rec := endpointCreateBody(t, h, cookie, map[string]interface{}{
+		"id": "ep-one", "name": "one", "base_url": "https://up.example.com",
+		"api_key": "sk-singlekey12345678", "protocol_anthropic": true,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = endpointDo(t, h, cookie, http.MethodGet, "/api/endpoints/ep-one", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	_, data := endpointDecode(t, rec)
+	if data["id"] != "ep-one" || data["api_key"] != "sk-s***5678" {
+		t.Fatalf("单条形状 = %#v", data)
+	}
+	if _, has := data["inflight"]; !has {
+		t.Fatalf("单条缺 inflight: %#v", data)
+	}
+	rec = endpointDo(t, h, cookie, http.MethodGet, "/api/endpoints/ep-ghost", "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("不存在 id code=%d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// Create 重复 id → 409(store 哨兵 ErrEndpointIDExists)。
+func TestEndpointHandlerCreateDuplicateConflict(t *testing.T) {
+	h, cookie := newEndpointHandlerHarness(t)
+	body := map[string]interface{}{
+		"id": "ep-dup", "name": "dup", "base_url": "https://up.example.com",
+		"api_key": "sk-dupkey123456789", "protocol_anthropic": true,
+	}
+	if rec := endpointCreateBody(t, h, cookie, body); rec.Code != http.StatusOK {
+		t.Fatalf("first create code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	rec := endpointCreateBody(t, h, cookie, body)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("重复 id code=%d, want 409; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// policy PUT 负值 → 400;fetch-models 对 builtin(无 base_url)→ 400;
+// DELETE 不存在 id → 200 幂等。
+func TestEndpointHandlerPolicyNegativeAndIdempotentDelete(t *testing.T) {
+	h, cookie := newEndpointHandlerHarness(t)
+
+	rec := endpointDo(t, h, cookie, http.MethodPut, "/api/endpoint-groups/auto/policy",
+		`{"failure_threshold":-1}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("负值 threshold code=%d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	rec = endpointDo(t, h, cookie, http.MethodPut, "/api/endpoint-groups/auto/policy",
+		`{"cooldown_sec":-5}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("负值 cooldown code=%d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = endpointDo(t, h, cookie, http.MethodPost, "/api/endpoints/"+storage.BuiltinEndpointID+"/fetch-models", "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("builtin fetch-models code=%d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = endpointDo(t, h, cookie, http.MethodDelete, "/api/endpoints/ep-never-existed", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("删除不存在 id code=%d, want 200 幂等; body=%s", rec.Code, rec.Body.String())
 	}
 }

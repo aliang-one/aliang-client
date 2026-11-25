@@ -19,6 +19,8 @@ import (
 	"net/http"
 	"strings"
 
+	"gorm.io/gorm"
+
 	"aliang.one/nursorgate/app/http/common"
 	"aliang.one/nursorgate/app/http/middleware"
 	"aliang.one/nursorgate/app/http/services"
@@ -121,6 +123,32 @@ func (h *EndpointHandler) HandleList(w http.ResponseWriter, r *http.Request) {
 	common.Success(w, map[string]interface{}{"endpoints": h.endpointViews(list)})
 }
 
+// HandleGet GET /api/endpoints/{id} — 单条(api_key 掩码 + inflight,形状与
+// 列表条目一致);不存在 → 404。
+func (h *EndpointHandler) HandleGet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !endpointRequireSession(w, r) {
+		return
+	}
+	if h.service == nil {
+		endpointServiceUnavailable(w)
+		return
+	}
+	id := idFromPath(w, r)
+	if id == "" {
+		return
+	}
+	ep, err := h.service.GetEndpoint(id)
+	if err != nil {
+		common.ErrorNotFound(w, "endpoint "+id+" 不存在")
+		return
+	}
+	common.Success(w, h.endpointViews([]*config.LLMEndpoint{ep})[0])
+}
+
 // endpointCreateRequest 是 POST 的请求体:LLMEndpoint 全字段 + enabled 三态。
 // Enabled 用 *bool:缺省=nil(默认 true),显式 false=建禁用行。
 type endpointCreateRequest struct {
@@ -172,6 +200,12 @@ func (h *EndpointHandler) HandleCreate(w http.ResponseWriter, r *http.Request) {
 		Enabled:           enabled,
 	}
 	if err := h.service.CreateEndpoint(ep); err != nil {
+		// 重复 id:store 归一为 storage.ErrEndpointIDExists(预查重 + sqlite
+		// UNIQUE 兜底两路都哨兵化),errors.Is 判定映射 409。
+		if errors.Is(err, storage.ErrEndpointIDExists) {
+			common.ErrorConflict(w, err.Error())
+			return
+		}
 		common.ErrorBadRequest(w, err.Error(), nil)
 		return
 	}
@@ -269,6 +303,11 @@ func (h *EndpointHandler) HandleUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.service.UpdateEndpoint(&merged); err != nil {
+		// TOCTOU 删除窗口:GET 成功后行被并发删除 → Update 报 not found → 404。
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			common.ErrorNotFound(w, "endpoint "+id+" 不存在")
+			return
+		}
 		common.ErrorBadRequest(w, err.Error(), nil)
 		return
 	}
@@ -277,6 +316,8 @@ func (h *EndpointHandler) HandleUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleDelete DELETE /api/endpoints/{id} — builtin → 409(ErrBuiltinImmutable)。
+// 不存在的 id 返回 200 幂等成功(store.Delete 对不命中报 nil,管理面重复
+// 删除/重试语义,与 S3 存储删除惯例一致;需要 404 语义的调用方先 GET)。
 func (h *EndpointHandler) HandleDelete(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)

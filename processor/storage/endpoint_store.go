@@ -24,6 +24,10 @@ const autoGroup = "auto"
 // 据此映射 409。文案从常量派生,避免字面量与 BuiltinEndpointID 漂移。
 var ErrBuiltinImmutable = errors.New("llm_endpoint: 内置 endpoint " + BuiltinEndpointID + " 不可变更")
 
+// ErrEndpointIDExists 标识 Create 撞主键(预查重命中或 sqlite UNIQUE 兜底)。
+// 哨兵化是为了 handler 能 errors.Is 判定映射 409,而不是匹配错误文案。
+var ErrEndpointIDExists = errors.New("llm_endpoint.id 已存在")
+
 // EndpointStore 是 llm_endpoints / endpoint_group_policy 两张表的数据层。
 // 只管落库与约束,不做路由选择(Task 2 service 层的职责)。
 type EndpointStore struct {
@@ -190,9 +194,16 @@ func (s *EndpointStore) Create(e *config.LLMEndpoint) error {
 		return err
 	}
 	if n > 0 {
-		return fmt.Errorf("llm_endpoint.id 已存在: %s", e.ID)
+		return fmt.Errorf("%w: %s", ErrEndpointIDExists, e.ID)
 	}
-	return s.db.Create(e).Error
+	if err := s.db.Create(e).Error; err != nil {
+		// sqlite 主键冲突的兜底路径(并发窗口):归一成哨兵,handler 同样 409。
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return fmt.Errorf("%w: %s", ErrEndpointIDExists, e.ID)
+		}
+		return err
+	}
+	return nil
 }
 
 // endpointConfigColumns 是 Update(REST/配置面)允许写穿的列白名单。健康列
