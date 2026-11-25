@@ -61,6 +61,13 @@ type Metadata struct {
 	// (就地处理),链长到 max_hops 即判放大上限。json:"-"——不落 TUN
 	// 元数据,只在 mesh 出口 payload(mesh-exit ExtraData)里编码。
 	MeshVia []string `json:"-"`
+
+	// IngressProxyFace 标记连接经统一入口的「代理面」(HTTP CONNECT/明文、
+	// socks5)进入——区别于 TUN、SSH 入口等其它入站。供回环/内网目标守卫
+	// (processor/tcp CheckProxyFaceDestination)判定:非回环来源的代理面
+	// 连接不得访问本机回环/内网目标(管理 API/agent runtime 的信任边界是
+	// 「来源为回环」,而代拨发生在网关进程里)。json:"-"——不落 TUN 元数据。
+	IngressProxyFace bool `json:"-"`
 }
 
 func (m *Metadata) DestinationAddrPort() netip.AddrPort {

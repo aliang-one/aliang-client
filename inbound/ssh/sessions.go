@@ -42,7 +42,7 @@ type sshSession struct {
 	Session
 	store   *sessionStore
 	blockFn func(BlockQuery) bool // 活视图黑名单查询（Server.blockedNow）；nil=不判
-	sshConn gossh.Conn            // 底层 SSH 连接（登记时写入；踢出/替换时关闭）
+	sshConn gossh.Conn            // 底层 SSH 连接（登记时写入；管理端踢出时关闭）
 }
 
 // sessionStore 是一个入口 Server 的进程内会话台账。全部读写走 st.mu；
@@ -59,12 +59,18 @@ func newSessionStore() *sessionStore {
 
 // register 登记一条已认证连接并返回会话句柄。meta 取握手元数据（User/
 // RemoteAddr），form/deviceID/fingerprint 取认证 Permissions（与
-// serveChannels 的观测面同源同值）。conns 是底层 SSH 连接（踢出/同节点
-// 替换时关闭它——关闭解除 serveChannels 阻塞，走 defer sess.close() 的
-// 正常拆除路径落关闭历史）。blockFn 是黑名单活视图（Server.blockedNow）。
+// serveChannels 的观测面同源同值）。conns 是底层 SSH 连接（管理端踢出时
+// 关闭它——关闭解除 serveChannels 阻塞，走 defer sess.close() 的正常拆除
+// 路径落关闭历史）。blockFn 是黑名单活视图（Server.blockedNow）。
 //
-// 同一 mesh 节点（同 device_id）重连而旧连接未断时替换旧会话：旧连接关闭
-// （Kicked=true，客户端表现为连接被断；防同节点双连接的路由抖动）。
+// 台账纯观测,每条连接一条会话:同一 mesh 设备(同 device_id)的多条连接
+// 共存,登记不得关闭任何既有连接。2026-11-15 引入的「同节点重连替换旧会话」
+// 与出口侧模型不兼容——ExitClient 对每条转发流各开一条 SSH 连接(无池,见
+// outbound/proxy/mesh/sshexit.go),于是同设备的第 2 条流一认证就顶掉第 1
+// 条在途流(2026-11-24 审计用生产 ExitClient 实测:5 条并发只剩最后 1 条;
+// 匹配键是 device_id 标签,两把钥同标签同样互踢,仅认证不开通道也踢)。
+// device_id 标签取自对端 authorized_keys 行的尾注释,由用户手填、可重复,
+// 不能充当「一个节点只有一条连接」的依据。
 func (st *sessionStore) register(meta gossh.ConnMetadata, form, deviceID, fingerprint string, blockFn func(BlockQuery) bool, conns gossh.Conn) *sshSession {
 	if st == nil {
 		return nil
@@ -72,20 +78,6 @@ func (st *sessionStore) register(meta gossh.ConnMetadata, form, deviceID, finger
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	now := time.Now().Unix()
-	if form == FormMesh && deviceID != "" {
-		for old := range st.active {
-			s := st.active[old]
-			if s.Form == FormMesh && s.DeviceID == deviceID {
-				s.Kicked = true
-				s.markClosedLocked(now)
-				if old.sshConn != nil {
-					_ = old.sshConn.Close()
-				}
-				delete(st.active, old)
-				break // device_id 唯一（公钥层已防重复），替换一处即止
-			}
-		}
-	}
 	sess := &sshSession{Session: Session{
 		SourceIP:    remoteIP(meta.RemoteAddr()),
 		User:        meta.User(),
@@ -145,7 +137,7 @@ func (sess *sshSession) close() {
 }
 
 // markClosedLocked 落关闭终态并转入环形历史头。调用方须持 st.mu；会话须
-// 已从在线表移除（或由调用方随后移除）。Kicked 已被置位的（踢出/替换路径
+// 已从在线表移除（或由调用方随后移除）。Kicked 已被置位的（管理端踢出路径
 // 预标记）保持不变——自然掉线不会覆盖踢出标记。
 func (s *sshSession) markClosedLocked(now int64) {
 	s.ClosedAt = now

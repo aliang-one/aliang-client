@@ -2,13 +2,19 @@
 // ① 黑名单活视图在认证期拦截（mesh 按指纹/device_id、bare 按指纹），命中
 //
 //	不进台账；② 指纹从认证 Permissions 落台账；③ Kick 关连接落 Kicked
-//	关闭历史；④ 同 mesh 节点重连替换旧会话（旧连接被断）。
+//	关闭历史；④ 同 mesh 节点的多条连接共存（台账纯观测，每连接一条会话）。
 package ssh
 
 import (
+	"context"
+	"fmt"
+	"io"
+	"net"
 	"path/filepath"
 	"testing"
 	"time"
+
+	M "aliang.one/nursorgate/inbound/tun/metadata"
 
 	gossh "golang.org/x/crypto/ssh"
 )
@@ -144,47 +150,124 @@ func TestKickDisconnectsAndMarksHistory(t *testing.T) {
 	}
 }
 
-func TestMeshReconnectReplacesStaleSession(t *testing.T) {
-	meshKey, meshSigner := newTestKey(t)
-	s := NewServer(RunConfig{MeshKeys: []MeshKey{{Key: meshKey, DeviceID: "dev-win"}}},
-		filepath.Join(t.TempDir(), IngressHostKeyFileName))
-	if err := s.Start(); err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Stop() })
-
-	// 第一条连接在线。
-	addr := serveConnVia(t, s)
-	conn1, err := dialIngress(t, addr, gossh.PublicKeys(meshSigner))
+// TestMeshSameDeviceConnectionsCoexist 同一 mesh 设备的多条连接必须共存
+// (2026-11-24 审计实证的缺陷):出口侧 ExitClient 对每条转发流各开一条 SSH
+// 连接(「每条连接一次独立握手,无池」),而台账登记曾把「同 device_id 的新
+// 连接」当作重连、认证瞬间关闭旧连接——用生产 ExitClient 实测:第 2 条流建立
+// 后第 1 条 1~2ms 内 EOF,5 条并发只剩最后 1 条。也就是说转发端上任一对端
+// 同一时刻至多 1 条转发生效流,并发请求/流式响应互相掐。
+//
+// 「重连替换旧会话」的前提是「一个节点一条连接」,与每流一连接模型不兼容;
+// 台账回归纯观测(每条连接一条会话),管理端踢出走 Kick。
+func TestMeshSameDeviceConnectionsCoexist(t *testing.T) {
+	// 回显目标 + 管线桩:把注入通道接到回显服务(证明流端到端活着)。
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("dial #1: %v", err)
+		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = echo.Close() })
+	go func() {
+		for {
+			c, err := echo.Accept()
+			if err != nil {
+				return
+			}
+			go func() { _, _ = io.Copy(c, c); _ = c.Close() }()
+		}
+	}()
+	swapTCPHandler(t, func(ctx context.Context, conn net.Conn, md *M.Metadata) error {
+		up, err := net.Dial("tcp", echo.Addr().String())
+		if err != nil {
+			return err
+		}
+		defer up.Close()
+		go func() { _, _ = io.Copy(up, conn) }()
+		_, _ = io.Copy(conn, up)
+		return nil
+	})
+
+	meshKey, meshSigner := newTestKey(t)
+	s, addr := startTestServer(t, RunConfig{
+		MeshKeys:    []MeshKey{{Key: meshKey, DeviceID: "dev-b"}},
+		ForwardGate: func() bool { return true },
+	})
+
+	openFlow := func(name string) (gossh.Conn, gossh.Channel) {
+		t.Helper()
+		conn, err := dialIngress(t, addr, gossh.PublicKeys(meshSigner))
+		if err != nil {
+			t.Fatalf("dial %s: %v", name, err)
+		}
+		ch, _, err := conn.OpenChannel(channelMeshExit, meshTCPExtra("example.org", 443))
+		if err != nil {
+			t.Fatalf("open mesh-exit %s: %v", name, err)
+		}
+		return conn, ch
+	}
+	roundtrip := func(ch gossh.Channel, payload string) {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() {
+			if _, err := ch.Write([]byte(payload)); err != nil {
+				done <- fmt.Errorf("write %q: %w", payload, err)
+				return
+			}
+			buf := make([]byte, len(payload))
+			if _, err := io.ReadFull(ch, buf); err != nil {
+				done <- fmt.Errorf("read echo %q: %w", payload, err)
+				return
+			}
+			if string(buf) != payload {
+				done <- fmt.Errorf("echo mismatch: %q", buf)
+				return
+			}
+			done <- nil
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("roundtrip %q did not complete (stream torn down or stalled)", payload)
+		}
+	}
+
+	conn1, ch1 := openFlow("#1")
+	roundtrip(ch1, "ping-1")
 	waitSession(t, s, func(s Session) bool { return s.Form == FormMesh })
 
-	// 同节点重连：旧会话被替换（在线表恒 1 条），旧连接被断。
-	conn2, err := dialIngress(t, addr, gossh.PublicKeys(meshSigner))
+	// 第 2 条流:同一设备标签、同一把钥。
+	conn2, ch2 := openFlow("#2")
+	roundtrip(ch2, "ping-2")
+	// 第 1 条流必须仍然活着(旧实现:第 2 条认证瞬间顶掉第 1 条)。
+	roundtrip(ch1, "ping-1-after-#2")
+	roundtrip(ch2, "ping-2-after-#2")
+
+	// 第 3 条:只认证、不开任何通道,同样不得影响在途流。
+	conn3, err := dialIngress(t, addr, gossh.PublicKeys(meshSigner))
 	if err != nil {
-		t.Fatalf("dial #2: %v", err)
+		t.Fatalf("dial #3: %v", err)
 	}
+	_, _, _ = conn3.SendRequest("keepalive@openssh.com", true, nil)
+	roundtrip(ch1, "ping-1-after-idle-#3")
+	roundtrip(ch2, "ping-2-after-idle-#3")
+
+	// 台账:三条在线、零关闭、零 kicked。
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(s.ClosedSessions()) == 1 {
-			break
-		}
+	for len(s.ActiveSessions()) < 3 && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	closed := s.ClosedSessions()
-	if len(closed) != 1 {
-		t.Fatalf("closed history = %d, want 1 (replaced stale session)", len(closed))
+	if n := len(s.ActiveSessions()); n != 3 {
+		t.Fatalf("active sessions = %d, want 3 (one per connection)", n)
 	}
-	if !closed[0].Kicked {
-		t.Fatal("replaced stale session must be marked kicked")
-	}
-	if n := len(s.ActiveSessions()); n != 1 {
-		t.Fatalf("active after reconnect = %d, want 1", n)
+	if closed := s.ClosedSessions(); len(closed) != 0 {
+		t.Fatalf("closed history = %d, want 0 (no connection may be evicted)", len(closed))
 	}
 	_ = conn1.Close()
 	_ = conn2.Close()
+	_ = conn3.Close()
+	waitClosed(t, s, 3)
 }
 
 // waitClosed 有界等待关闭历史达到 n 条。

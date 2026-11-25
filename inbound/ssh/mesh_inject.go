@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
+	"strings"
 	"sync/atomic"
 
 	"aliang.one/nursorgate/common/logger"
@@ -72,6 +74,12 @@ func handleMeshExitChannel(ctx context.Context, newCh gossh.NewChannel, extra []
 		reject("forward disabled (customer.mesh.forward_enable)")
 		return
 	}
+	// 目标 ACL(2026-11-24 审计):转发不等于把本机回环面交给对端。字面量与
+	// localhost 在这里判(Accept 前);域名在拨号时由 processor/tcp 解析后判。
+	if tgt.T == "tcp" && !meshExitLiteralTargetAllowed(tgt.H, tgt.P) {
+		reject("target not allowed (loopback/link-local targets are reserved; only the loopback AI base-URL form is forwarded)")
+		return
+	}
 
 	ch, chReqs, err := newCh.Accept()
 	if err != nil {
@@ -121,4 +129,23 @@ func injectMeshExitStream(ctx context.Context, ch gossh.Channel, connRemote net.
 	if err := tcphandler.GetHandler().Handle(ctx, conn, md); err != nil {
 		logger.Debug(fmt.Sprintf("SSH ingress mesh-exit conn_id=%s handle: %v", md.ConnID, err))
 	}
+}
+
+// meshExitLiteralTargetAllowed 报告 mesh-exit tcp 目标的字面量部分是否放行
+// (判定本体在 processor/tcp InjectedTargetAllowed,与拨号时的域名校验同源):
+//   - IP 字面量:回环仅放行 AI base-URL 形态(目标=回环 56432,出口链路委托
+//     的合法载荷);链路本地/未指定/组播拒绝;其余放行。
+//   - "localhost":按回环处理。
+//   - 其它域名:这里放行,拨号时解析后逐地址校验并钉住(processor/tcp
+//     dialDirect),防「域名指向 127.0.0.1」与 DNS 重绑定。
+func meshExitLiteralTargetAllowed(host string, port uint16) bool {
+	host = strings.Trim(strings.ToLower(strings.TrimSpace(host)), "[]")
+	if host == "localhost" {
+		return tcphandler.InjectedTargetAllowed(netip.MustParseAddr("127.0.0.1"), port)
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return true
+	}
+	return tcphandler.InjectedTargetAllowed(ip, port)
 }

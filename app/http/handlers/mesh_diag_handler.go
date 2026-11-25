@@ -234,21 +234,28 @@ func (h *MeshDiagHandler) HandleDiag(w http.ResponseWriter, r *http.Request) {
 // 文件(未生成/路径解析失败),不是错误态。device_id 即进程 state 值
 // (state 的唯一罗列,不设别名键)。
 type meshIdentityResponse struct {
-	DeviceID             string   `json:"device_id"`
-	IdentityFilePath     string   `json:"identity_file_path"`
-	IdentityFileDeviceID string   `json:"identity_file_device_id"`
-	BeaconSelfDeviceID   string   `json:"beacon_self_device_id"`
-	RosterSelfPresent    bool     `json:"roster_self_present"`
-	Mismatches           []string `json:"mismatches"`
+	DeviceID             string `json:"device_id"`
+	IdentityFilePath     string `json:"identity_file_path"`
+	IdentityFileDeviceID string `json:"identity_file_device_id"`
+	BeaconSelfDeviceID   string `json:"beacon_self_device_id"`
+	// RosterSelfPresent 如实透传「roster 缓存里有本机条目」。按 PhoneServer
+	// 契约恒为 false:GET /api/agent/mesh-roster 回包前会滤掉请求方自身
+	// (meshIdentityRoutes.ts,其路由测试钉死「同账号全量(滤 self)」)——
+	// 不是故障信号,不进 mismatches;本机身份是否上送成功看 core 日志里
+	// endpoint 含 /api/agent/mesh-identity 的 agent_server_call 行。
+	RosterSelfPresent bool     `json:"roster_self_present"`
+	Mismatches        []string `json:"mismatches"`
 }
 
 // HandleIdentity GET /api/mesh/identity 身份一致性比对(读面批 Task 6):
 // 四源只读取值,文件源健康时按钉死链式两两比对(state↔identity 文件、
 // identity 文件↔beacon self)不一致各产一条人话描述;文件源缺失(路径或
 // device_id 任一空)时链比较跳过,补 state↔beacon 直比回退对(I-1(a),
-// 脑裂不因文件缺席漏报);roster 已同步而缺本机条目再产一条(未同步时缓存
-// 空是合法态,不产——未同步≠不一致,误报会污染判读,同步态真值由
-// /api/mesh/diag 的 roster_sync 段另行可见)。全只读零副作用:身份文件
+// 脑裂不因文件缺席漏报)。roster 不参与不一致判定(2026-11-24 审计定案):
+// 服务端回包本就滤掉请求方自身,「已同步而缺本机条目」是每台健康设备的
+// 常态,旧实现把它报成 mismatch 会让 mesh-runbook 的身份脑裂症状族指向
+// 健康设备;roster_self_present 仍如实透传,同步态由 /api/mesh/diag 的
+// roster_sync 段可见。全只读零副作用:身份文件
 // 只读解析、state 只持锁读不生成(身份缺失=空串合法态,绝不走
 // CurrentDeviceID 的生成链)。mismatches 恒数组(nil seam/全一致=空数组,
 // 不 null)。
@@ -268,12 +275,8 @@ func (h *MeshDiagHandler) HandleIdentity(w http.ResponseWriter, r *http.Request)
 	if h.beaconSelfID != nil {
 		resp.BeaconSelfDeviceID = h.beaconSelfID()
 	}
-	// roster:先取同步态闸(synced=缓存已拉取过一轮,缺 self 才算不一致);
-	// 在册回查以进程 state 的 self 为键(self 未知=无从查起,false 合法)。
-	rosterSynced := false
-	if h.rosterSync != nil {
-		rosterSynced = h.rosterSync().Synced
-	}
+	// roster:在册回查以进程 state 的 self 为键(self 未知=无从查起,false
+	// 合法)。结果只透传不判不一致(见函数注释)。
 	rosterPresent := false
 	if h.rosterSelfPresent != nil && resp.DeviceID != "" {
 		rosterPresent = h.rosterSelfPresent(resp.DeviceID)
@@ -301,11 +304,6 @@ func (h *MeshDiagHandler) HandleIdentity(w http.ResponseWriter, r *http.Request)
 		resp.Mismatches = append(resp.Mismatches, fmt.Sprintf(
 			"身份文件源缺失,无法比对;进程 state 与 beacon self 不一致:%s vs %s(脑裂特征,文件链不可用)",
 			resp.DeviceID, resp.BeaconSelfDeviceID))
-	}
-	if resp.DeviceID != "" && rosterSynced && !rosterPresent {
-		resp.Mismatches = append(resp.Mismatches, fmt.Sprintf(
-			"roster 已同步但缺本机条目 device_id=%s——本机身份未上送或被服务端清册,自动组网将 fail-closed(候选仅展示)",
-			resp.DeviceID))
 	}
 	common.Success(w, resp)
 }

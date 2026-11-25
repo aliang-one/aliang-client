@@ -28,16 +28,20 @@ func HandleHttpConnection(conn net.Conn, reader *bufio.Reader, req *http.Request
 	// Extract metadata from HTTP request for transparent proxy handling
 	metadata, err := extractMetadataFromHTTP(req, conn)
 	if err != nil {
-		logger.Error(fmt.Sprintf("Failed to extract metadata from HTTP request: %v", err))
-		respWriter := NewCustomResponseWriter(conn)
-		respWriter.WriteHeader(http.StatusBadRequest)
-		respWriter.Write([]byte(fmt.Sprintf("Failed to process request: %v", err)))
-		respWriter.Flush()
+		logger.Info(fmt.Sprintf("Rejected plain-HTTP request from %s: %v", conn.RemoteAddr(), err))
+		writePlainHTTPErrorResponse(conn, http.StatusBadRequest, fmt.Sprintf("Failed to process request: %v", err))
 		return
 	}
 
 	logger.Debug(fmt.Sprintf("HTTP transparent proxy: hostname=%s, port=%d, srcIP=%s, dstIP=%s",
 		metadata.HostName, metadata.DstPort, metadata.SrcIP, metadata.DstIP))
+
+	// 代理面目标守卫:非回环来源不得经代理面访问本机回环/内网目标。
+	if err := tcp.CheckProxyFaceDestination(metadata); err != nil {
+		logger.Info(fmt.Sprintf("Rejected plain-HTTP request from %s: %v", conn.RemoteAddr(), err))
+		writePlainHTTPErrorResponse(conn, http.StatusForbidden, "Forbidden")
+		return
+	}
 
 	// Import tcp handler for unified TCP processing
 	tcpHandler := tcp.GetHandler()
@@ -45,10 +49,7 @@ func HandleHttpConnection(conn net.Conn, reader *bufio.Reader, req *http.Request
 	replayConn, err := newHTTPRequestReplayConn(conn, reader, req)
 	if err != nil {
 		logger.Error(fmt.Sprintf("Failed to rebuild HTTP request stream: %v", err))
-		respWriter := NewCustomResponseWriter(conn)
-		respWriter.WriteHeader(http.StatusBadGateway)
-		respWriter.Write([]byte(fmt.Sprintf("Failed to rebuild request stream: %v", err)))
-		respWriter.Flush()
+		writePlainHTTPErrorResponse(conn, http.StatusBadGateway, fmt.Sprintf("Failed to rebuild request stream: %v", err))
 		return
 	}
 
@@ -75,10 +76,31 @@ func HandleHttpConnection(conn net.Conn, reader *bufio.Reader, req *http.Request
 	logger.Debug(fmt.Sprintf("HTTP connection closed: %s:%d", metadata.HostName, metadata.DstPort))
 }
 
+// writePlainHTTPErrorResponse 是明文 HTTP 面的错误应答:状态行、头、体一次
+// 写成,Content-Length 与实际体一致。旧写法先 WriteHeader 再写体——头部发出
+// 时 Content-Length 已定为 0,错误体被客户端按定长丢弃(回环同步管道下则
+// 直接卡死在写体上)。
+func writePlainHTTPErrorResponse(conn net.Conn, status int, body string) {
+	resp := &http.Response{
+		Status:        fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		StatusCode:    status,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Close:         true,
+	}
+	_ = resp.Write(conn)
+}
+
 // extractMetadataFromHTTP extracts connection metadata from HTTP request
 func extractMetadataFromHTTP(req *http.Request, conn net.Conn) (*M.Metadata, error) {
 	metadata := &M.Metadata{
 		Network: M.TCP,
+		// 代理面来源标记:回环/内网目标守卫据此判定(明文 HTTP 是统一入口的
+		// 代理面之一)。
+		IngressProxyFace: true,
 	}
 
 	// Extract source
@@ -99,15 +121,16 @@ func extractMetadataFromHTTP(req *http.Request, conn net.Conn) (*M.Metadata, err
 		metadata.DstPort = uint16(localAddr.Port)
 	}
 
-	// Extract host and port from HTTP request. We only reject requests that
-	// explicitly target a non-loopback host; missing host falls back to the
-	// local listener address so the request can continue through routing.
+	// Extract host and port from HTTP request. 缺 Host 一律拒绝(HTTP/1.1 的
+	// 协议要求):旧实现回退到「监听地址」当目标——56432 绑 0.0.0.0 时那是本机
+	// 局域网口,非回环来源的无 Host 请求会被原样重放回自己的 56432,自连接
+	// 递归直到 fd 耗尽(2026-11-24 审计)。
 	host := strings.TrimSpace(req.Host)
 	if host == "" {
 		host = strings.TrimSpace(req.URL.Host)
 	}
 	if host == "" {
-		return metadata, nil
+		return nil, errors.New("missing Host header")
 	}
 
 	hostOnly, port, err := parseHTTPHostPort(host, metadata.DstPort)
