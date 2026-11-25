@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strings"
@@ -72,6 +73,15 @@ func (e *LLMEndpoint) Validate() error {
 	}
 	if e.Priority < 0 || e.MaxConcurrency < 0 {
 		return fmt.Errorf("llm_endpoint.priority/max_concurrency 必须 >= 0")
+	}
+	// models 必须是 JSON 字符串数组:Task 2 的 Select/ModelsUnion 要反序列化
+	// 它,落库非法 JSON 会在路由期静默炸。反序列化到 []string 一并卡住
+	// 「合法 JSON 但不是数组/元素不是字符串」的形态,单一检查覆盖全部形状。
+	if strings.TrimSpace(e.Models) != "" {
+		var modelIDs []string
+		if err := json.Unmarshal([]byte(e.Models), &modelIDs); err != nil {
+			return fmt.Errorf("llm_endpoint.models 必须是 JSON 字符串数组, got %q", e.Models)
+		}
 	}
 	if e.Builtin && e.BaseURL != "" {
 		return fmt.Errorf("llm_endpoint.builtin 行的 base_url 必须为空(走内置隧道)")

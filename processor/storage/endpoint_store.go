@@ -20,8 +20,9 @@ const BuiltinEndpointID = "builtin-aliang"
 // autoGroup 是本期唯一的组键(spec §5.2):组策略表预留多组,但本期恒 auto。
 const autoGroup = "auto"
 
-// ErrBuiltinImmutable 标识对内置行的删除被拒;service 层据此映射 409。
-var ErrBuiltinImmutable = errors.New("llm_endpoint: 内置 endpoint builtin-aliang 不可删除")
+// ErrBuiltinImmutable 标识对内置行的变更被拒(删除/摘 builtin);service 层
+// 据此映射 409。文案从常量派生,避免字面量与 BuiltinEndpointID 漂移。
+var ErrBuiltinImmutable = errors.New("llm_endpoint: 内置 endpoint " + BuiltinEndpointID + " 不可变更")
 
 // EndpointStore 是 llm_endpoints / endpoint_group_policy 两张表的数据层。
 // 只管落库与约束,不做路由选择(Task 2 service 层的职责)。
@@ -78,10 +79,11 @@ func (s *EndpointStore) Close() error {
 	if !s.ownsDB {
 		return nil
 	}
-	if sqlDB, err := s.db.DB(); err == nil {
-		return sqlDB.Close()
+	sqlDB, err := s.db.DB()
+	if err != nil {
+		return err
 	}
-	return nil
+	return sqlDB.Close()
 }
 
 // SeedBuiltin 以 INSERT OR IGNORE 语义幂等写入内置行:已存在的行(用户改过
@@ -126,6 +128,31 @@ func (s *EndpointStore) Get(id string) (*config.LLMEndpoint, error) {
 	return &e, nil
 }
 
+// validateBuiltinInvariants 钉死内置行不变量(spec §5.1: builtin=1 仅
+// id='builtin-aliang')。没有这条,Create 可用任意 id 插队 builtin 语义,
+// Update 可把用户行翻成 builtin 白嫖平台 relay 凭据;反方向(id 相同却
+// builtin=false)也一并堵死——否则 Delete 按 flag 判定就形同虚设。
+// 注意:这条必须在 store 层做,config.Validate 拦不住「空 base_url + 假
+// builtin id」的组合(它不知道保留 id 是什么,config 也不能反向 import storage)。
+func validateBuiltinInvariants(e *config.LLMEndpoint) error {
+	if e.Builtin {
+		if e.ID != BuiltinEndpointID {
+			return fmt.Errorf("llm_endpoint.builtin 行必须是 %s, got %s", BuiltinEndpointID, e.ID)
+		}
+		if !e.AutoGroup {
+			return fmt.Errorf("llm_endpoint.builtin 行 auto_group 不可关(恒 1)")
+		}
+		if e.Priority != 0 {
+			return fmt.Errorf("llm_endpoint.builtin 行 priority 恒 0, got %d", e.Priority)
+		}
+		return nil
+	}
+	if e.ID == BuiltinEndpointID {
+		return fmt.Errorf("llm_endpoint: %s 是保留 id,必须保持 builtin=true", BuiltinEndpointID)
+	}
+	return nil
+}
+
 // Create 新增端点。id 必填且唯一(预查重是为了给上层一个可映射 409 的清晰
 // 文案,而不是透传 sqlite 主键冲突)。
 //
@@ -153,6 +180,11 @@ func (s *EndpointStore) Create(e *config.LLMEndpoint) error {
 	if err := e.Validate(); err != nil {
 		return err
 	}
+	if err := validateBuiltinInvariants(e); err != nil {
+		return err
+	}
+	// Count-then-Create 非原子:并发窗口兜底走主键约束(sqlite 会报 UNIQUE
+	// 冲突),不会静默覆盖;这里提前拦只是为了可映射的 409 文案。
 	var n int64
 	if err := s.db.Model(&config.LLMEndpoint{}).Where("id = ?", e.ID).Count(&n).Error; err != nil {
 		return err
@@ -163,13 +195,30 @@ func (s *EndpointStore) Create(e *config.LLMEndpoint) error {
 	return s.db.Create(e).Error
 }
 
-// Update 整行保存。预查存在性是刻意的:gorm Save 对未命中的主键会静默转
-// INSERT(upsert),会把「改一条不存在的行」变成凭空造行,管理面必须报不存在。
+// endpointConfigColumns 是 Update(REST/配置面)允许写穿的列白名单。健康列
+// (health_status / consecutive_failures / cooldown_until / rate_limited_until /
+// last_error)刻意不在内:健康态的唯一写入口是 UpdateHealth,否则 Task 4 的
+// GET-merge-PUT 全行回写会用陈旧快照盖掉服务面刚写的健康态(评审 Important 3
+// 指出的 clobber)。新增健康列只进 UpdateHealth;新增配置列必须同步加进本表。
+var endpointConfigColumns = []string{
+	"name", "base_url", "api_key", "protocol_anthropic", "protocol_openai",
+	"auto_group", "priority", "max_concurrency", "models", "enabled", "builtin",
+}
+
+// Update 按白名单整行保存配置列。健康列不在写集里——调用方改了
+// HealthStatus 等字段也不会落库(健康写入走 UpdateHealth);created_at 同样
+// 不动(由建行时固定)。预查存在性是刻意的:gorm Save 对未命中的主键会静默
+// 转 INSERT(upsert),会把「改一条不存在的行」变成凭空造行,管理面必须报
+// 不存在。显式 Select + struct 让零值配置列(enabled=false 等)也照写,
+// 与 Save 的全字段语义在白名单内等价。
 func (s *EndpointStore) Update(e *config.LLMEndpoint) error {
 	if e == nil {
 		return errors.New("llm_endpoint: endpoint 不能为空")
 	}
 	if err := e.Validate(); err != nil {
+		return err
+	}
+	if err := validateBuiltinInvariants(e); err != nil {
 		return err
 	}
 	var n int64
@@ -179,13 +228,35 @@ func (s *EndpointStore) Update(e *config.LLMEndpoint) error {
 	if n == 0 {
 		return fmt.Errorf("endpoint %s 不存在: %w", e.ID, gorm.ErrRecordNotFound)
 	}
-	return s.db.Save(e).Error
+	return s.db.Model(e).Where("id = ?", e.ID).Select(endpointConfigColumns).Updates(e).Error
+}
+
+// UpdateHealth 是健康列的唯一写入口(窄更新缝):服务面记失败/恢复/冷却走
+// 这里,只动指定的五个健康列;REST 面(Update 白名单)写不到健康列,两边
+// 不再互相 clobber。
+func (s *EndpointStore) UpdateHealth(id string, status string, failures int, cooldownUntil, rateLimitedUntil int64, lastErr string) error {
+	return s.db.Model(&config.LLMEndpoint{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"health_status":        status,
+		"consecutive_failures": failures,
+		"cooldown_until":       cooldownUntil,
+		"rate_limited_until":   rateLimitedUntil,
+		"last_error":           lastErr,
+	}).Error
 }
 
 // Delete 删除端点;内置行恒拒(spec §5.1: builtin=1 的行 DELETE 返回 409)。
-// 对不存在的 id 幂等成功,由上层决定要不要先查。
+// 按 flag 判定而非 id 字符串:即使将来某条旁路(迁移/导入)造出带 builtin
+// 语义但 id 不同的行,这里也拦得住。对不存在的 id 幂等成功,由上层决定要
+// 不要先查。
 func (s *EndpointStore) Delete(id string) error {
-	if id == BuiltinEndpointID {
+	var e config.LLMEndpoint
+	if err := s.db.First(&e, "id = ?", id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		return err
+	}
+	if e.Builtin {
 		return ErrBuiltinImmutable
 	}
 	return s.db.Delete(&config.LLMEndpoint{}, "id = ?", id).Error
