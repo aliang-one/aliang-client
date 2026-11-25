@@ -68,3 +68,57 @@ func TestResolveAgentAICWDStillRejectsMissingDir(t *testing.T) {
 		t.Fatalf("missing dir %q accepted, want error", missing)
 	}
 }
+
+// 2026-11-25 线上事故:手机端目录解析不出时会把字面 "~" 发上来。解析层必须
+// 先展开 ~ 再做存在性校验,否则 "~" 永远被拒(Windows 上 os.Stat("~") 必败),
+// 与客户端「~ 即主目录」的意图相悖。
+func TestResolveAgentAICWDExpandsTildeToHome(t *testing.T) {
+	setAgentAuthorizedExecutionDirectoriesCache(nil)
+	t.Cleanup(func() { setAgentAuthorizedExecutionDirectoriesCache(nil) })
+
+	home := t.TempDir()
+	resolved, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	t.Setenv("HOME", resolved)
+	t.Setenv("USERPROFILE", resolved)
+
+	got, err := resolveAgentAICWD("~")
+	if err != nil {
+		t.Fatalf("resolveAgentAICWD(\"~\") 应展开为主目录,却报错: %v", err)
+	}
+	want, wantErr := cleanExistingAgentDirectory(resolved)
+	if wantErr != nil {
+		t.Fatalf("clean home: %v", wantErr)
+	}
+	if got != want {
+		t.Fatalf("resolveAgentAICWD(\"~\") = %q, want %q", got, want)
+	}
+}
+
+func TestResolveAgentAICWDExpandsTildeSubdir(t *testing.T) {
+	setAgentAuthorizedExecutionDirectoriesCache(nil)
+	t.Cleanup(func() { setAgentAuthorizedExecutionDirectoriesCache(nil) })
+
+	home := t.TempDir()
+	resolved, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	t.Setenv("HOME", resolved)
+	t.Setenv("USERPROFILE", resolved)
+
+	proj := filepath.Join(resolved, "proj")
+	if err := os.MkdirAll(proj, 0o700); err != nil {
+		t.Fatalf("mkdir proj: %v", err)
+	}
+
+	got, err := resolveAgentAICWD("~/proj")
+	if err != nil {
+		t.Fatalf("resolveAgentAICWD(\"~/proj\") 报错: %v", err)
+	}
+	if want, wantErr := cleanExistingAgentDirectory(proj); wantErr != nil || got != want {
+		t.Fatalf("resolveAgentAICWD(\"~/proj\") = %q (err %v), want %q (err %v)", got, err, want, wantErr)
+	}
+}

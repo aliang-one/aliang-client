@@ -930,6 +930,25 @@ type agentCoreShellPolicy struct {
 	run agentAIRun
 }
 
+// firstExistingExecutable 返回候选里第一个存在的普通文件路径,全不命中返回空串。
+func firstExistingExecutable(candidates []string) string {
+	for _, candidate := range candidates {
+		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// windowsGitBashCandidates 是 Git for Windows 的固定 bash 安装路径。
+func windowsGitBashCandidates() []string {
+	return []string{
+		`C:\Program Files\Git\bin\bash.exe`,
+		`C:\Program Files\Git\usr\bin\bash.exe`,
+		`C:\Program Files (x86)\Git\bin\bash.exe`,
+	}
+}
+
 // agentCoreShellArgs 返回某个 shell 执行「一条命令串」所需的固定参数。
 // 内核会把 baseArgs 原样拼在命令前面，所以这里必须给对。
 func agentCoreShellArgs(path string) []string {
@@ -952,6 +971,13 @@ func (p *agentCoreShellPolicy) Resolve(kind string) (string, []string, error) {
 			// 「Bash」工具跑出完全不同的语法。宁可直接失败，让模型改用
 			// PowerShell 工具，也不要静默换壳。
 			if _, err := exec.LookPath("bash"); err != nil {
+				// PATH 快照过期兜底(2026-11-25 线上事故):会话中途装 Git
+				// for Windows 不会刷新运行中 agent 的 PATH,LookPath 探不到
+				// bash,模型的备用 shell 被堵死。按 Git 固定安装路径补一轮
+				// 探测,再不行才报「没有可用的 bash」。
+				if fixed := firstExistingExecutable(windowsGitBashCandidates()); fixed != "" {
+					return fixed, agentCoreShellArgs(fixed), nil
+				}
 				return "", nil, fmt.Errorf("当前系统没有可用的 bash，请改用 PowerShell 工具")
 			}
 			path, err := resolveAgentShell("bash")
