@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime"
 	"strings"
 	"time"
 	"unsafe"
@@ -88,57 +89,81 @@ func queryWindowsTunInterfaceStatus(ifname string) (*windowsTunInterfaceStatus, 
 }
 
 func listWindowsTunInterfaces() ([]*windowsTunInterfaceStatus, error) {
-	// 2026-11-25 根因实验:与 tun_conflict_scan_windows.go 同款修复——15KB 在
-	// 20+ 网卡的机器上恒定溢出,改 128KB 一次到位,消除溢出-重试-垃圾循环。
-	size := uint32(128 * 1024)
-	for attempt := 0; attempt < 3; attempt++ {
-		buf := make([]byte, size)
-		first := (*windows.IpAdapterAddresses)(unsafe.Pointer(&buf[0]))
+	// 2026-11-25 4070 core 堆写坏取证定案,与 tun_conflict_scan_windows.go
+	// 同源同修:GetAdaptersAddresses 的 OVERFLOW-continue 旧形态存在 buffer
+	// 复用竞态窗口(内核链表的 IfIndex 等小整数落进已复用内存,覆写指针高位)。
+	// 修法:首查拿真实 size 一次分配+余量;成功后立即深拷贝;KeepAlive 锚定。
+	size := uint32(0)
+	if err := windows.GetAdaptersAddresses(
+		windows.AF_UNSPEC,
+		windows.GAA_FLAG_INCLUDE_ALL_INTERFACES,
+		0,
+		nil,
+		&size,
+	); err != nil && !errors.Is(err, windows.ERROR_BUFFER_OVERFLOW) {
+		size = 15 * 1024
+	}
+	if size < 15*1024 {
+		size = 15 * 1024
+	}
+	buf := make([]byte, size+4096)
+	first := (*windows.IpAdapterAddresses)(unsafe.Pointer(&buf[0]))
 
-		err := windows.GetAdaptersAddresses(
-			windows.AF_UNSPEC,
-			windows.GAA_FLAG_INCLUDE_ALL_INTERFACES,
-			0,
-			first,
-			&size,
-		)
+	var callSize uint32 = uint32(len(buf))
+	err := windows.GetAdaptersAddresses(
+		windows.AF_UNSPEC,
+		windows.GAA_FLAG_INCLUDE_ALL_INTERFACES,
+		0,
+		first,
+		&callSize,
+	)
+	if err != nil {
+		if errors.Is(err, windows.ERROR_BUFFER_OVERFLOW) {
+			buf = make([]byte, callSize+4096)
+			first = (*windows.IpAdapterAddresses)(unsafe.Pointer(&buf[0]))
+			callSize = uint32(len(buf))
+			err = windows.GetAdaptersAddresses(
+				windows.AF_UNSPEC,
+				windows.GAA_FLAG_INCLUDE_ALL_INTERFACES,
+				0,
+				first,
+				&callSize,
+			)
+		}
 		if err != nil {
-			if errors.Is(err, windows.ERROR_BUFFER_OVERFLOW) {
-				continue
-			}
 			return nil, err
 		}
-
-		items := make([]*windowsTunInterfaceStatus, 0, 8)
-		for adapter := first; adapter != nil; adapter = adapter.Next {
-			status := &windowsTunInterfaceStatus{
-				Name:        strings.TrimSpace(windows.UTF16PtrToString(adapter.FriendlyName)),
-				Description: strings.TrimSpace(windows.UTF16PtrToString(adapter.Description)),
-				Index:       adapter.IfIndex,
-				OperStatus:  adapter.OperStatus,
-				Addresses:   windowsAdapterAddresses(adapter),
-			}
-
-			row := windows.MibIfRow2{
-				InterfaceIndex: adapter.IfIndex,
-			}
-			if rowErr := windows.GetIfEntry2Ex(windows.MibIfEntryNormalWithoutStatistics, &row); rowErr == nil {
-				status.Alias = strings.TrimSpace(windows.UTF16ToString(row.Alias[:]))
-				status.MTU = row.Mtu
-				status.AdminStatus = row.AdminStatus
-				status.OperStatus = row.OperStatus
-				if status.Description == "" {
-					status.Description = strings.TrimSpace(windows.UTF16ToString(row.Description[:]))
-				}
-			}
-
-			items = append(items, status)
-		}
-
-		return items, nil
 	}
 
-	return nil, fmt.Errorf("获取 Windows 网络接口失败: 缓冲区调整后仍然失败")
+	items := make([]*windowsTunInterfaceStatus, 0, 8)
+	for adapter := first; adapter != nil; adapter = adapter.Next {
+		status := &windowsTunInterfaceStatus{
+			Name:        strings.TrimSpace(windows.UTF16PtrToString(adapter.FriendlyName)),
+			Description: strings.TrimSpace(windows.UTF16PtrToString(adapter.Description)),
+			Index:       adapter.IfIndex,
+			OperStatus:  adapter.OperStatus,
+			Addresses:   windowsAdapterAddresses(adapter),
+		}
+
+		row := windows.MibIfRow2{
+			InterfaceIndex: adapter.IfIndex,
+		}
+		if rowErr := windows.GetIfEntry2Ex(windows.MibIfEntryNormalWithoutStatistics, &row); rowErr == nil {
+			status.Alias = strings.TrimSpace(windows.UTF16ToString(row.Alias[:]))
+			status.MTU = row.Mtu
+			status.AdminStatus = row.AdminStatus
+			status.OperStatus = row.OperStatus
+			if status.Description == "" {
+				status.Description = strings.TrimSpace(windows.UTF16ToString(row.Description[:]))
+			}
+		}
+		runtime.KeepAlive(row) // GetIfEntry2Ex 写的是本栈帧上的结构,读完后显式锚定一次
+
+		items = append(items, status)
+	}
+	// 显式保活:遍历/字符串分配可能触发 GC,内核写入的 buf 必须存活到读毕。
+	runtime.KeepAlive(buf)
+	return items, nil
 }
 
 func windowsAdapterAddresses(adapter *windows.IpAdapterAddresses) []string {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -47,6 +48,10 @@ func runCore(cmd *cobra.Command, args []string) error {
 }
 
 func runCoreWithContext(ctx context.Context) error {
+	// 取证埋点(2026-11-25 4070 定案链):core 的致命故障默认走「打 Go 栈→
+	// exit(2)」,WER 抓不到任何现场;wer=crash+enableWER 让 RaiseFailFastException
+	// 交 WER 落完整 dump(原生栈+堆)。抓到写坏者后可回退本行。
+	debug.SetTraceback("wer")
 	ensureCoreRuntimeEnvironment()
 	auth.SetSessionOwnerProcess(true)
 
