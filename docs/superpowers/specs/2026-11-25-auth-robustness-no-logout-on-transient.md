@@ -60,7 +60,7 @@
 ### 3.4 前端 authFailure.js
 
 - `isAuthenticationFailure`：移除「裸 401 即失效」。改为：
-  - `responseStatus === 401` 且 body 命中 §2 **access** 拒绝语义清单（status unauthenticated / error session_expired|token_expired / code token_expired / message 含 local session is no longer valid / invalid authentication / token has been revoked / invalid access token / token expired）→ true。
+  - `responseStatus === 401` 且 body 命中 §2 **access** 拒绝语义清单（status unauthenticated / error session_expired|token_expired / code token_expired / message 含 local session is no longer valid / invalid authentication / token has been revoked / invalid access token / token expired）→ true。**注意**：前端读 HTTP envelope，后端读 auth JSON，两份清单形状不同是刻意设计，实现时勿「对齐」成同一字段集。
   - `responseStatus === 403` → false（403 不在前端触发失效；由后端 refresh 端点 403 或 snapshot 表达）。
   - snapshot `outcome === session_invalid`（reducer 层，`hard_invalid`/`unauthenticated`）→ 清身份（已是）。
   - 传输失败（fetch throw）不调用本函数（调用方 catch），不触发。
@@ -79,7 +79,9 @@
 
 ### 3.7 测试
 
-- 更新 `errors_test.go`：不可解析/空/未知 JSON 的 401 不再返回 ErrRefreshTokenInvalid/ErrSessionExpired（返回 nil）。新增用例钉死。现有「unknown 401 is terminal」「invalid JSON 401 is terminal」「local session is no longer valid」用例更新为期望 nil（local session 短语改为显式加入 `refreshRejectionPhrases` 后仍 terminal，单独钉死）。
+- 更新 `errors_test.go`：
+  - 不可解析/空/未知 JSON 的 401 → 期望 `nil`（不再 terminal）。
+  - `local session is no longer valid` 短语加入 `refreshRejectionPhrases` 后 → 仍期望 `ErrRefreshTokenInvalid`（terminal，单独钉死）。
 - `user_center_test.go:215` 的 `clearLocalSessionAfterExpiredAccessToken()` 预期更新（保持 SoftExpired 语义）。
 - `token_activate_test.go` profile-reject 用例：profile 401 明确拒绝仍 HardInvalid；新增 profile 401 不确定不 wipe 用例。
 - 前端 `authFailure.test.js` 裸 401 不触发（更新首个用例 envelope）。
