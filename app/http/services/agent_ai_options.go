@@ -228,6 +228,26 @@ const agentAIOptionFenceTag = "```aliang-options"
 // 的病态巨围栏回落普通截断，由渲染端的截断围栏容忍兜底（吞残块不外晒）。
 const agentAIOptionFencePreserveGraceRunes = 8192
 
+// agentAIOptionFenceBodyLooksLikeJSON 判定 tag 之后的文本形态是否像真实围栏
+// 体：tag 行只含 tag（允许水平空白与 \r 收行），下一行以 { 开头（允许行首
+// 空白）——对齐 agentAIOptionSystemPrompt 的 tag 行纯度约定。散文内联提及
+// 标签（同行还有正文）与 tag 行后跟非 JSON 正文都不满足，不触发保活（对抗
+// 评审坐实的误伤面：无关正文被当围栏残段延长带过传输）。
+func agentAIOptionFenceBodyLooksLikeJSON(afterTag string) bool {
+	i := 0
+	for i < len(afterTag) && (afterTag[i] == ' ' || afterTag[i] == '\t' || afterTag[i] == '\r') {
+		i++
+	}
+	if i >= len(afterTag) || afterTag[i] != '\n' {
+		return false
+	}
+	i++
+	for i < len(afterTag) && (afterTag[i] == ' ' || afterTag[i] == '\t') {
+		i++
+	}
+	return i < len(afterTag) && afterTag[i] == '{'
+}
+
 // truncateAgentTextOptionFenceAware 在 truncateAgentText 的传输限幅上叠加
 // 围栏保活：截断若切进 aliang-options 围栏（开标签已入窗、闭合 ``` 在窗外，
 // 或围栏整体在窗外），把闭合前的整段一并保留——接收端的静态选项卡解析
@@ -236,29 +256,43 @@ const agentAIOptionFencePreserveGraceRunes = 8192
 // 围栏位于 3490，4000 截断点切在 JSON 中间）。只延长不缩短：围栏完整落在
 // 截断窗口内时与 truncateAgentText 逐字节一致；原文自身未闭合（GLM 偶发
 // 退化）与超预算的病态巨围栏同样回落普通截断，渲染端负责兜底。
+//
+// 逐块扫描（对抗评审 minor 修正）：不锚最后一个 tag——尾部跟未闭合 tag 或
+// 巨围栏时，真正骑跨截断点的可能是更早的完整围栏，必须逐块找到「闭合越过
+// 窗口」的那一个做保活判定。
 func truncateAgentTextOptionFenceAware(value string, max int) string {
 	value = strings.TrimSpace(value)
 	if max <= 0 || utf8.RuneCountInString(value) <= max {
 		return truncateAgentText(value, max)
 	}
 	head := strings.TrimSpace(string([]rune(value)[:max]))
-	openIdx := strings.LastIndex(value, agentAIOptionFenceTag)
-	if openIdx < 0 {
-		return head
+	search := 0
+	for {
+		rel := strings.Index(value[search:], agentAIOptionFenceTag)
+		if rel < 0 {
+			return head
+		}
+		openAbs := search + rel
+		afterTag := value[openAbs+len(agentAIOptionFenceTag):]
+		closeRel := strings.Index(afterTag, "\n```")
+		// tag 行不纯（散文提及）或原文未闭合：不是可保活的围栏，看下一块。
+		if closeRel < 0 || !agentAIOptionFenceBodyLooksLikeJSON(afterTag) {
+			search = openAbs + len(agentAIOptionFenceTag)
+			continue
+		}
+		endAbs := openAbs + len(agentAIOptionFenceTag) + closeRel + len("\n```")
+		endRunes := utf8.RuneCountInString(value[:endAbs])
+		if endRunes <= max {
+			// 闭合在窗内：普通截断没切到它，继续找后面的。
+			search = endAbs
+			continue
+		}
+		if endRunes > max+agentAIOptionFencePreserveGraceRunes {
+			// 病态巨围栏超预算：其后围栏的终点只会更远，一并回落普通截断。
+			return head
+		}
+		return strings.TrimSpace(value[:endAbs])
 	}
-	rest := value[openIdx+len(agentAIOptionFenceTag):]
-	closeRel := strings.Index(rest, "\n```")
-	if closeRel < 0 {
-		// 原文自身未闭合：没有可保活的完整围栏，渲染端截断容忍负责兜底。
-		return head
-	}
-	end := openIdx + len(agentAIOptionFenceTag) + closeRel + len("\n```")
-	endRunes := utf8.RuneCountInString(value[:end])
-	if endRunes <= max || endRunes > max+agentAIOptionFencePreserveGraceRunes {
-		// 围栏本来就在窗口内（普通截断没切到它），或病态巨围栏超预算。
-		return head
-	}
-	return strings.TrimSpace(value[:end])
 }
 
 // buildAgentAIOptionFollowup 把用户的选择拼成下一轮的 user prompt。

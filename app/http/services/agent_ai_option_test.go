@@ -540,6 +540,15 @@ func TestTruncateAgentTextOptionFenceAware(t *testing.T) {
 	giant := strings.Repeat("析", 3900) + "```aliang-options\n" + strings.Repeat("巨", 20000) + "\n```"
 	unclosed := strings.Repeat("析", 3900) + "```aliang-options\n" + optionJSON // 原文自身未闭合
 
+	// 对抗评审坐实(minor):LastIndex 只锚最后一个 tag 样文本——尾部跟一段
+	// 未闭合 tag/巨围栏时,真正骑跨截断点的更早完整围栏仍被普通截断切断。
+	straddledThenDegenerate := strings.Repeat("析", 3960) + fence + strings.Repeat("尾", 100) + "```aliang-options\n" + optionJSON
+	straddledThenGiant := strings.Repeat("析", 3960) + fence + "```aliang-options\n" + strings.Repeat("巨", 20000) + "\n```"
+	fence1End := strings.Repeat("析", 3960) + fence // 骑跨围栏的闭合处即保活终点,其后尾文让位于传输上限
+	// 对抗评审坐实(major 同族):散文内联提及 tag(同行还有正文)+ 其后出现
+	// 无关代码块闭合行——不是围栏,不得触发保活延长。
+	proseMentionThenCodeBlock := strings.Repeat("析", 3990) + "提及```aliang-options 围栏写法\n```\n" + strings.Repeat("后", 300)
+
 	cases := []struct {
 		name string
 		in   string
@@ -551,6 +560,9 @@ func TestTruncateAgentTextOptionFenceAware(t *testing.T) {
 		{"围栏整体在窗外:延长带上围栏", beyondWindow, beyondWindow},
 		{"原文未闭合:回落普通截断", unclosed, truncateAgentText(unclosed, agentVibeTranscriptMaxContentRunes)},
 		{"病态巨围栏超预算:回落普通截断", giant, truncateAgentText(giant, agentVibeTranscriptMaxContentRunes)},
+		{"骑跨围栏后跟未闭合 tag:保活骑跨者,不被尾部退化拖累", straddledThenDegenerate, fence1End},
+		{"骑跨围栏后跟巨围栏:保活骑跨者", straddledThenGiant, fence1End},
+		{"散文内联提及 tag+无关代码块:不触发保活", proseMentionThenCodeBlock, truncateAgentText(proseMentionThenCodeBlock, agentVibeTranscriptMaxContentRunes)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
