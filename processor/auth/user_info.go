@@ -14,6 +14,7 @@ import (
 
 	"aliang.one/nursorgate/common/cache"
 	"aliang.one/nursorgate/common/logger"
+	"aliang.one/nursorgate/processor/config"
 )
 
 const authSessionDBPathEnv = "ALIANG_AUTH_SESSION_DB"
@@ -226,7 +227,10 @@ func getAuthSessionDB() (*gorm.DB, error) {
 			return
 		}
 
-		if err := db.AutoMigrate(&authTokenRecord{}, &authProfileRecord{}); err != nil {
+		// LLM endpoint 两表(56432 多 endpoint 聚合路由)同库搭车迁移:单库
+		// 单句柄纪律下,新表统一在这里建,storage 层只拿句柄不建表。
+		if err := db.AutoMigrate(&authTokenRecord{}, &authProfileRecord{},
+			&config.LLMEndpoint{}, &config.EndpointGroupPolicy{}); err != nil {
 			authSessionDBErr = fmt.Errorf("failed to migrate auth session tables: %w", err)
 			return
 		}
@@ -235,6 +239,13 @@ func getAuthSessionDB() (*gorm.DB, error) {
 	})
 
 	return authSessionDB, authSessionDBErr
+}
+
+// SharedAuthSessionDB 把共享句柄导给同进程其他 processor 包(endpoint store
+// 等):单库单句柄纪律下,外部不能二次打开 aliang.data,也不能自己建表——
+// 触发本单例时迁移已带出全部表。包内仍走未导出的 getAuthSessionDB。
+func SharedAuthSessionDB() (*gorm.DB, error) {
+	return getAuthSessionDB()
 }
 
 func saveUserInfoToSQLite(info *UserInfo) error {
