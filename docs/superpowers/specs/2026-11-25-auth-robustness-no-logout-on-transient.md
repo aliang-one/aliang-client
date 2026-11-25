@@ -17,13 +17,19 @@
 
 ## 2. 设计原则
 
-- **明确性原则**：登出/HardInvalid 只能由服务端**明确**的身份失效信号触发。明确信号定义为：
-  - HTTP 401 且 body 中包含明确的拒绝语义（`invalid refresh token` / `refresh token expired|revoked|is no longer valid` / `local session is no longer valid` / `token_revoked` / `access_token_invalid` / `token_expired`），或
-  - HTTP 403（权限撤销），或
-  - 服务端明确返回 `session_invalid` outcome。
-- **传输/网络/5xx/408/429/425/空 body/不可解析 body**：视为瞬时故障，进入 SoftExpired 恢复链（退避重试），**不**升级 HardInvalid，**不**清 sqlite，**不**团灭。
+- **明确性原则**：登出/HardInvalid 只能由服务端**明确**的身份失效信号触发。明确信号**逐 classifier 枚举**（前端/后端共用同一份清单，避免实现歧义）：
+  - **refresh 端点 401 明确拒绝短语**（`classifyRefreshSessionFailure` 匹配，body 的 `reason`/`code`/`message`/`error` 字段，大小写不敏感）：
+    - `reason` 或 `code` == `REFRESH_TOKEN_INVALID`
+    - `message`/`error` 含：`invalid refresh token`、`refresh token is no longer valid`、`refresh token expired`、`refresh token has been revoked`、`local session is no longer valid`
+    - 403 → `ErrRefreshTokenInvalid`（权限撤销，refresh 端点 403 视为拒绝）
+  - **access 端点 401 明确拒绝语义**（`classifyAccessTokenFailure` 匹配，body 的 `code`/`reason`/`message` 字段）：
+    - `code` 或 `reason` == `TOKEN_REVOKED` / `ACCESS_TOKEN_INVALID` / `TOKEN_EXPIRED`
+    - `message` 含：`token has been revoked`、`invalid access token`、`token expired`、`expired token`、`invalid authentication`
+    - 403 **不**在 access classifier 处理（access 端点 403 视为瞬时/无权限，保留会话重试；权限撤销通过 refresh 端点 403 或 snapshot `hard_invalid` 表达）
+  - **snapshot `outcome == session_invalid`**（`hard_invalid`/`unauthenticated` state，由 `BuildSessionSnapshotPayload` 产出，前端 reducer 据此清身份）——这是前端「明确失效」的唯一权威来源。
+- **传输/网络/5xx/408/429/425/空 body/不可解析 body/未知 JSON 401**：视为瞬时故障，进入 SoftExpired 恢复链（退避重试），**不**升级 HardInvalid，**不**清 sqlite，**不**团灭。
 - **恢复链**：SoftExpired 状态下 `runSoftExpiryRecovery` 已实现指数退避重试（0/5s/15s，生产无限重试），仅在 refresh 真正被永久拒绝时升级 HardInvalid。保持该语义，仅把「升级 HardInvalid 的门槛」收严。
-- **前端**：`isAuthenticationFailure` 不再把裸 401 当身份失效；改为只在 401 且 body 明确拒绝，或 snapshot state 为 `hard_invalid`/`unauthenticated` 时才触发 `syncUnauthenticatedAuthState`。传输失败/超时/5xx 不触发。
+- **前端**：`isAuthenticationFailure` 不再把裸 401 当身份失效；改为只在 401 且 body 命中上述 access 拒绝语义清单，或 snapshot state 为 `hard_invalid`/`unauthenticated` 时才触发 `syncUnauthenticatedAuthState`。传输失败/超时/5xx 不触发。
 - **agent 侧**：401 仍走恢复链（SoftExpired），但 transport/5xx 不得触发 `RecoverOrExpireLocalSession`（已有 `classifyRegisterFailure` 保留注册态，保持）；仅当服务端明确拒绝才升级。
 
 ## 3. 改动点（按层）
@@ -32,31 +38,34 @@
 
 - `classifyRefreshSessionFailure`：
   - 非 401（含 5xx/408/429/transport nil）→ `nil`（已是）。
-  - 401 但 body 不可解析/空/未知 JSON → **不再**默认 `ErrRefreshTokenInvalid`；改为返回 `nil`（视为瞬时/不确定），让上层进入 SoftExpired 重试而非 HardInvalid。仅当 body 明确包含拒绝语义时返回 `ErrRefreshTokenInvalid`。
-  - 保留 `messageFieldMatchesRefreshRejection` 的明确短语匹配；`reason`/`code` 为 `REFRESH_TOKEN_INVALID` 时匹配。
-  - 403 → 可视为 `ErrRefreshTokenInvalid`（权限撤销）。
+  - 401 但 body 不可解析/空/未知 JSON → **不再**默认 `ErrRefreshTokenInvalid`；改为返回 `nil`（视为瞬时/不确定），让上层进入 SoftExpired 重试而非 HardInvalid。仅当 body 命中 §2 refresh 明确拒绝短语清单时返回 `ErrRefreshTokenInvalid`。
+  - `refreshRejectionPhrases` 追加 `local session is no longer valid`（此前仅靠 fallback 命中），并保留 `reason`/`code` == `REFRESH_TOKEN_INVALID` 匹配。
+  - 403 → `ErrRefreshTokenInvalid`（权限撤销，refresh 端点 403 视为明确拒绝）。
 - `classifyAccessTokenFailure`：
   - 非 401 → `nil`（已是）。
   - 401 但 body 不可解析/空/未知 → **不再**默认 `ErrSessionExpired`；返回 `nil`（瞬时），上层保留会话并重试。
-  - 仅明确拒绝语义（revoked/invalid/expired）返回 `ErrSessionExpired`。
+  - 仅命中 §2 access 明确拒绝语义清单时返回 `ErrSessionExpired`。
+  - 403 **不**在本 classifier 处理（返回 `nil`），保留会话重试；权限撤销通过 refresh 端点 403 或 snapshot `hard_invalid` 表达。
 
 ### 3.2 RefreshSession 路径（processor/auth/token_activate.go）
 
-- refresh endpoint 401：仅在 `classifyRefreshSessionFailure` 返回非 nil 时调用 `clearLocalSessionAfterInvalidRefreshToken`（HardInvalid）；否则保持会话，返回包装错误，由 SoftExpired 恢复链重试。
+- refresh endpoint 401：仅在 `classifyRefreshSessionFailure` 返回非 nil（即命中 §2 refresh 明确拒绝清单）时调用 `clearLocalSessionAfterInvalidRefreshToken`（HardInvalid）；否则保持会话，返回**非终态**包装错误 `fmt.Errorf("refresh session inconclusive: %w", ErrSessionRecovering)`（不得是 `ErrSessionExpired`/`ErrRefreshTokenInvalid`，否则 `RestoreSession` 的 `isTerminalSessionError` 会误判终态中止 SoftExpired 恢复链），由 SoftExpired 恢复链重试。
 - transport 错误（`client.Do` 失败）：返回包装错误，**不**清会话，**不**升级。上层 SoftExpired 重试。
-- profile 端点 401：当前 `clearLocalSessionAfterExpiration` 无条件 wipe。改为：仅当 `classifyAccessTokenFailure` 明确拒绝时 wipe；否则保留会话并返回错误（SoftExpired 重试）。传输/5xx 不 wipe。
+- profile 端点 401：当前 `clearLocalSessionAfterExpiration` 无条件 wipe。改为：仅当 `classifyAccessTokenFailure` 返回 `ErrSessionExpired`（明确拒绝）时 wipe；否则保留会话并返回 `fmt.Errorf("profile sync after refresh inconclusive: %w", ErrSessionRecovering)`（非终态），由 SoftExpired 重试。传输/5xx 不 wipe。
 
 ### 3.3 clearLocalSessionAfterExpiredAccessToken / verifyCurrentSessionWithAuthMe
 
-- `verifyCurrentSessionWithAuthMe`：`/auth/me` 401 时先 refresh 探活（已有 `recoverSessionAfter401` 模式）；refresh 成功 → 保留会话；refresh 明确拒绝 → wipe；refresh 传输失败 → 保留会话重试。当前 `clearLocalSessionAfterExpiredAccessToken` → `RecoverOrExpireLocalSession` 已是 SoftExpired；仅需保证 transport 失败不升级 HardInvalid（`RecoverOrExpireLocalSession` 本身不会 wipe，`runSoftExpiryRecovery` 只在 refresh 永久拒绝时 wipe——保持）。
+- `verifyCurrentSessionWithAuthMe`：`/auth/me` 401 时先 refresh 探活（已有 `recoverSessionAfter401` 模式）；refresh 成功 → 保留会话；refresh 明确拒绝（`classifyRefreshSessionFailure` 命中清单）→ `clearLocalSessionAfterInvalidRefreshToken`（立即 HardInvalid）；refresh 传输失败/不确定 → 保留会话重试。当前 `clearLocalSessionAfterExpiredAccessToken` → `RecoverOrExpireLocalSession` 已是 SoftExpired；保持——它本身不 wipe，`runSoftExpiryRecovery` 仅在 refresh 永久拒绝时升级 HardInvalid。本点仅澄清：`verifyCurrentSessionWithAuthMe` 里「明确拒绝」指 refresh 探活返回明确拒绝，而非 access 401 本身；access 401 一律先走 SoftExpired 探活。
 
 ### 3.4 前端 authFailure.js
 
 - `isAuthenticationFailure`：移除「裸 401 即失效」。改为：
-  - `responseStatus === 401` 且 body 明确拒绝（status unauthenticated / error session_expired|token_expired / code token_expired / message 含 local session is no longer valid / invalid authentication / token has been revoked / invalid access token / token expired）→ true。
-  - `responseStatus === 403` → true。
+  - `responseStatus === 401` 且 body 命中 §2 **access** 拒绝语义清单（status unauthenticated / error session_expired|token_expired / code token_expired / message 含 local session is no longer valid / invalid authentication / token has been revoked / invalid access token / token expired）→ true。
+  - `responseStatus === 403` → false（403 不在前端触发失效；由后端 refresh 端点 403 或 snapshot 表达）。
+  - snapshot `outcome === session_invalid`（reducer 层，`hard_invalid`/`unauthenticated`）→ 清身份（已是）。
   - 传输失败（fetch throw）不调用本函数（调用方 catch），不触发。
-- `handleAuthenticationFailure` 调用点保持，但 5xx/超时不会进入（response.ok false 但 status 非 401/403 → false）。
+- `handleAuthenticationFailure` 调用点保持，但 5xx/超时不会进入（response.ok false 但 status 非 401 → false）。
+- 测试 `authFailure.test.js` 首个「recognizes HTTP 401」用例的 envelope 必须带明确拒绝 message（裸 401 不再合格）。
 
 ### 3.5 前端 auth store
 
@@ -70,9 +79,10 @@
 
 ### 3.7 测试
 
-- 更新 `errors_test.go`：不可解析/空/未知 JSON 的 401 不再返回 ErrRefreshTokenInvalid/ErrSessionExpired（返回 nil）。新增用例钉死。
+- 更新 `errors_test.go`：不可解析/空/未知 JSON 的 401 不再返回 ErrRefreshTokenInvalid/ErrSessionExpired（返回 nil）。新增用例钉死。现有「unknown 401 is terminal」「invalid JSON 401 is terminal」「local session is no longer valid」用例更新为期望 nil（local session 短语改为显式加入 `refreshRejectionPhrases` 后仍 terminal，单独钉死）。
 - `user_center_test.go:215` 的 `clearLocalSessionAfterExpiredAccessToken()` 预期更新（保持 SoftExpired 语义）。
-- 前端 `authFailure.test.js`（若存在）更新裸 401 不触发。
+- `token_activate_test.go` profile-reject 用例：profile 401 明确拒绝仍 HardInvalid；新增 profile 401 不确定不 wipe 用例。
+- 前端 `authFailure.test.js` 裸 401 不触发（更新首个用例 envelope）。
 
 ## 4. 不做的事
 
