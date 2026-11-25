@@ -457,7 +457,7 @@ func (m *agentAIManager) buildSessionSnapshotPayload(sessionID string) map[strin
 		for _, msg := range hist {
 			row := map[string]interface{}{
 				"role": msg.Role,
-				"text": truncateAgentText(msg.Content, agentVibeTranscriptMaxContentRunes),
+				"text": truncateAgentTextOptionFenceAware(msg.Content, agentVibeTranscriptMaxContentRunes),
 			}
 			if msg.MessageID != "" {
 				row["message_id"] = msg.MessageID

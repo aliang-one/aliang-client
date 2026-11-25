@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"aliang.one/nursorgate/common/logger"
 )
@@ -188,7 +189,7 @@ func aliangOptionsBalancedJSONPrefix(s string) (string, bool) {
 // json.Unmarshal + normalize 把关，闭合行不是真闸门。
 
 func extractUnclosedAgentAIOptionBlocks(output string) []agentAIOptionRequest {
-	const tag = "```aliang-options"
+	tag := agentAIOptionFenceTag
 	var out []agentAIOptionRequest
 	rest := output
 	for {
@@ -215,6 +216,49 @@ func extractUnclosedAgentAIOptionBlocks(output string) []agentAIOptionRequest {
 		}
 		return out
 	}
+}
+
+// agentAIOptionFenceTag 是 aliang-options 围栏开标签字面量（与
+// extractUnclosedAgentAIOptionBlocks 的截断判定同源）。
+const agentAIOptionFenceTag = "```aliang-options"
+
+// agentAIOptionFencePreserveGraceRunes 围栏保活的追加预算：截断点切进
+// aliang-options 围栏时，允许把完整围栏带过传输层的最大超出量。正常围栏受
+// agentAIOptionSystemPrompt（≤8 选项、字段一句话）约束在千字节量级；超预算
+// 的病态巨围栏回落普通截断，由渲染端的截断围栏容忍兜底（吞残块不外晒）。
+const agentAIOptionFencePreserveGraceRunes = 8192
+
+// truncateAgentTextOptionFenceAware 在 truncateAgentText 的传输限幅上叠加
+// 围栏保活：截断若切进 aliang-options 围栏（开标签已入窗、闭合 ``` 在窗外，
+// 或围栏整体在窗外），把闭合前的整段一并保留——接收端的静态选项卡解析
+// （围栏正则要闭合 ```、裸 JSON 兜底要配平 {}）对半截围栏双双失效
+// （2026-11-25 local-mwl6wqyvv5ysrg 手机端选项卡消失事故：4565 rune 消息、
+// 围栏位于 3490，4000 截断点切在 JSON 中间）。只延长不缩短：围栏完整落在
+// 截断窗口内时与 truncateAgentText 逐字节一致；原文自身未闭合（GLM 偶发
+// 退化）与超预算的病态巨围栏同样回落普通截断，渲染端负责兜底。
+func truncateAgentTextOptionFenceAware(value string, max int) string {
+	value = strings.TrimSpace(value)
+	if max <= 0 || utf8.RuneCountInString(value) <= max {
+		return truncateAgentText(value, max)
+	}
+	head := strings.TrimSpace(string([]rune(value)[:max]))
+	openIdx := strings.LastIndex(value, agentAIOptionFenceTag)
+	if openIdx < 0 {
+		return head
+	}
+	rest := value[openIdx+len(agentAIOptionFenceTag):]
+	closeRel := strings.Index(rest, "\n```")
+	if closeRel < 0 {
+		// 原文自身未闭合：没有可保活的完整围栏，渲染端截断容忍负责兜底。
+		return head
+	}
+	end := openIdx + len(agentAIOptionFenceTag) + closeRel + len("\n```")
+	endRunes := utf8.RuneCountInString(value[:end])
+	if endRunes <= max || endRunes > max+agentAIOptionFencePreserveGraceRunes {
+		// 围栏本来就在窗口内（普通截断没切到它），或病态巨围栏超预算。
+		return head
+	}
+	return strings.TrimSpace(value[:end])
 }
 
 // buildAgentAIOptionFollowup 把用户的选择拼成下一轮的 user prompt。
