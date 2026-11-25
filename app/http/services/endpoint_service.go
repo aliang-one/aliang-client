@@ -142,6 +142,11 @@ func newEndpointServiceWithStore(store *storage.EndpointStore) *EndpointService 
 //     ∧ 模型过滤 ∧ auto_group,按 priority、created_at 升序取首;
 //   - 候选为空 → 回落内置行(若其 enabled/协议/健康可用)→ 否则 ErrNoEndpoint。
 //
+// 错误契约(供 Task 3 路由层映射):两个哨兵 ErrNoEndpoint(503)/
+// ErrEndpointNotAvailable(404)可直接 errors.Is 判定;store 读失败返回的是
+// wrapped raw error(非哨兵),路由层应映射 500 而非 503——注册表读挂是服务端
+// 故障,不是「无可用 endpoint」。
+//
 // 内置行刻意不进自动候选池:它 priority 恒 0(两个协议 toggle 都开、不限模型),
 // 放进池里会永远排在 BYO 前面,BYO 语义整体失效。内置行的角色是兜底(回落),
 // 这也是 §6.1「空候选 → builtin 健康则回落」可被触达的唯一一致读法。
@@ -241,6 +246,11 @@ func (s *EndpointService) fallbackBuiltin(protocol string) (*config.LLMEndpoint,
 // 刻意只在「状态确实非 ok」时触发:ok 但计数>0 的行处于「计数中」阶段
 // (连续失败未达阈值),它的计数只能被 ReportSuccess 或下一条失败改写——
 // 每次路过 select 都清零会让摘除永远攒不满。
+//
+// 并发(quality fix Important 1):UpdateHealth 必须在 s.mu 内执行,与
+// ReportFailure 同一把锁。冷却到期正是「流量恢复再失败」的 designed operating
+// point——恢复写与失败摘除交错时,锁外的读改写会把刚写入的摘除/429 冷却
+// 覆盖复活。锁内重读当前行再判定,进一步收窄窗口。
 // 调用前提:该行的 rate_limited 已过期(两个调用点都先做了过滤),因此清
 // rate_limited_until 不会抹掉仍在生效的 429 冷却。
 func (s *EndpointService) recoverIfNeeded(e *config.LLMEndpoint, now int64) {
@@ -249,6 +259,19 @@ func (s *EndpointService) recoverIfNeeded(e *config.LLMEndpoint, now int64) {
 	}
 	if e.CooldownUntil > now {
 		return // 未到期,不该被恢复(调用点已过滤,双保险)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 锁内重读:进锁前到现在可能有并发 ReportFailure 改了状态/冷却,
+	// 以最新行再判一次,避免用陈旧快照覆盖新写入。
+	cur, err := s.store.Get(e.ID)
+	if err != nil {
+		logger.Warn(fmt.Sprintf("endpoint: %s 懒恢复重读失败(下次 select 重试): %v", e.ID, err))
+		return
+	}
+	if cur.HealthStatus == "ok" || cur.CooldownUntil > now || cur.RateLimitedUntil > now {
+		return // 已被并发路径处理(恢复/再摘除/再限流),不覆盖
 	}
 	if err := s.store.UpdateHealth(e.ID, storage.HealthUpdate{
 		Status: "ok", Failures: 0, CooldownUntil: 0, RateLimitedUntil: 0, LastErr: "",
@@ -400,6 +423,10 @@ func (s *EndpointService) ReportSuccess(id string) {
 
 // ResetHealth 手动重置健康(管理面「重置健康」按钮,spec §6.4):立即清零全部
 // 健康列并立即可选,不等冷却到期。
+//
+// 缺失 id 契约:store 的 UpdateHealth 是 UPDATE ... WHERE id=?,0 行受影响也
+// 返回 nil,本方法保持返回 nil——调用方(handler)如需区分「重置成功」与
+// 「id 不存在」,自行先 Get 判 404;此处不做存在性预查,避免 TOCTOU 双查。
 func (s *EndpointService) ResetHealth(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -433,7 +460,11 @@ func (s *EndpointService) currentPolicy() config.EndpointGroupPolicy {
 func (s *EndpointService) Acquire(id string, maxConcurrency int) (func(), error) {
 	if maxConcurrency <= 0 {
 		e, err := s.store.Get(id)
-		if err == nil {
+		if err != nil {
+			// 读不到行不静默当「不限并发」放行:那会在管理面刚删行的窗口里
+			// 悄悄撤掉并发保护。降级为不限并发(可用性优先),但必须留痕。
+			logger.Warn(fmt.Sprintf("endpoint: Acquire 读 %s 的 max_concurrency 失败,降级为不限并发: %v", id, err))
+		} else {
 			maxConcurrency = e.MaxConcurrency
 		}
 	}
@@ -667,18 +698,26 @@ func (s *EndpointService) probeModels(baseURL, apiKey string) (int, []string, er
 
 // ---- 模型并集(Task 3 的 /v1/models 聚合数据源)------------------------------
 
-// ModelsUnion 返回自动池内各 endpoint 的 models 并集(去重、字典序)。models=[]
-// (不限制)与内置行不贡献条目——前者没有具体清单,后者不该把平台隧道伪装成
-// 一个多模型目录;禁用行同样跳过。protocol 维度本期不区分(/v1/models 聚合是
-// 单端点 OpenAI 风格,spec §18)。
-func (s *EndpointService) ModelsUnion() []string {
+// ModelOwner 是 ModelsUnion 的条目:ID + 归属 endpoint 的 id(聚合响应里映射
+// owned_by)。同一模型 id 被多个 endpoint 声明时取第一个声明者(列表按
+// priority,id 排序,即最高优先级者)。
+type ModelOwner struct {
+	ID    string `json:"id"`
+	Owner string `json:"owner"`
+}
+
+// ModelsUnion 返回自动池内各 endpoint 的 models 并集(去重、字典序,带归属)。
+// models=[](不限制)与内置行不贡献条目——前者没有具体清单,后者不该把平台
+// 隧道伪装成一个多模型目录;禁用行同样跳过。protocol 维度本期不区分
+// (/v1/models 聚合是单端点 OpenAI 风格,spec §18)。
+func (s *EndpointService) ModelsUnion() []ModelOwner {
 	list, err := s.store.List()
 	if err != nil {
 		logger.Warn(fmt.Sprintf("endpoint: ModelsUnion 读注册表失败,返回空并集: %v", err))
-		return []string{}
+		return []ModelOwner{}
 	}
 	seen := map[string]bool{}
-	var out []string
+	var out []ModelOwner
 	for _, e := range list {
 		if e.ID == storage.BuiltinEndpointID || !e.Enabled {
 			continue
@@ -699,10 +738,10 @@ func (s *EndpointService) ModelsUnion() []string {
 			id = strings.TrimSpace(id)
 			if id != "" && !seen[id] {
 				seen[id] = true
-				out = append(out, id)
+				out = append(out, ModelOwner{ID: id, Owner: e.ID})
 			}
 		}
 	}
-	sort.Strings(out)
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }

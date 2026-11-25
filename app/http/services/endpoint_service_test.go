@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -787,12 +788,17 @@ func TestEndpointService_ModelsUnion(t *testing.T) {
 	createEndpoint(t, store, d)
 
 	got := svc.ModelsUnion()
-	if len(got) != 3 {
-		t.Fatalf("并集应去重排序且排除不限/禁用/内置, got %v", got)
+	want := []ModelOwner{
+		{ID: "deepseek-v3", Owner: "ep-b"},
+		{ID: "glm-4.6", Owner: "ep-a"},
+		{ID: "kimi-k2", Owner: "ep-a"}, // 重复声明取第一个(优先级最高)声明者
 	}
-	for i, want := range []string{"deepseek-v3", "glm-4.6", "kimi-k2"} {
-		if got[i] != want {
-			t.Fatalf("并集顺序/内容不符, want %v got %v", []string{"deepseek-v3", "glm-4.6", "kimi-k2"}, got)
+	if len(got) != len(want) {
+		t.Fatalf("并集应去重排序且排除不限/禁用/内置, got %+v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("并集条目不符 want %+v got %+v", want, got)
 		}
 	}
 }
@@ -808,5 +814,125 @@ func TestEndpointService_ErrorSentinels(t *testing.T) {
 	}
 	if ErrQueueTimeout.Error() == "" {
 		t.Fatalf("ErrQueueTimeout 文案异常: %v", ErrQueueTimeout)
+	}
+}
+
+// ---- quality fix:并发 Select ‖ ReportFailure 交错(Important 1)----------------
+
+func TestEndpointService_SelectDoesNotReviveConcurrentDisable(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+	createEndpoint(t, store, anthropicEP("ep-race", 10))
+
+	// 先把 endpoint 打成「disabled + 冷却已过期」:这正是流量恢复再失败的
+	// designed operating point——Select 的懒恢复与 ReportFailure 的摘除会
+	// 真实交错。循环多轮放大交错窗口。
+	for round := 0; round < 50; round++ {
+		markHealth(t, store, "ep-race", storage.HealthUpdate{
+			Status: "disabled", Failures: 3, CooldownUntil: time.Now().Unix() - 1, LastErr: "boom",
+		})
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); _, _ = svc.Select("anthropic", "", "") }()
+		go func() {
+			defer wg.Done()
+			// 阈值 3、当前计数 3:再失败一次即再次摘除。
+			svc.ReportFailure("ep-race", 500, "boom again")
+		}()
+		wg.Wait()
+
+		// 不变量:交错结束后不得停在「ok 且计数 0」的复活态——要么仍在冷却
+		// (摘除被恢复覆盖的反例),要么计数>0(摘除进行中)。两种都说明恢复
+		// 把并发写入的摘除抹掉了。
+		got := mustGet(t, store, "ep-race")
+		if got.HealthStatus == "ok" && got.ConsecutiveFailures == 0 {
+			t.Fatalf("round %d: 懒恢复覆盖并发摘除(endpoint 被复活): %+v", round, got)
+		}
+	}
+}
+
+// ---- quality fix:补充边界用例(Minor 5)--------------------------------------
+
+func TestEndpointService_AcquireGateRebuildOnLimitChange(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+	ep := anthropicEP("ep-rebuild", 10)
+	ep.MaxConcurrency = 1
+	createEndpoint(t, store, ep)
+
+	// 旧闸 cap=1:拿满后释放,让闸回到完全空闲(通道满、无排队)。
+	rel1, err := svc.Acquire("ep-rebuild", 1)
+	if err != nil {
+		t.Fatalf("acquire 1: %v", err)
+	}
+	rel1()
+	waitUntil(t, "闸回到空闲", time.Second, func() bool {
+		svc.mu.Lock()
+		defer svc.mu.Unlock()
+		g := svc.sems["ep-rebuild"]
+		return g != nil && g.waiting == 0 && len(g.sem) == cap(g.sem) && cap(g.sem) == 1
+	})
+
+	// 用户把 max_concurrency 改成 2:下一次 Acquire(0=以库里为准)应重建闸。
+	ep.MaxConcurrency = 2
+	if err := store.Update(ep); err != nil {
+		t.Fatal(err)
+	}
+	rel2, err := svc.Acquire("ep-rebuild", 0)
+	if err != nil {
+		t.Fatalf("acquire after rebuild: %v", err)
+	}
+	rel3, err := svc.Acquire("ep-rebuild", 0)
+	if err != nil {
+		t.Fatalf("acquire 3 after rebuild: %v", err)
+	}
+	svc.mu.Lock()
+	g := svc.sems["ep-rebuild"]
+	svc.mu.Unlock()
+	if cap(g.sem) != 2 {
+		t.Fatalf("闸未按新 max_concurrency 重建, cap=%d", cap(g.sem))
+	}
+	rel2()
+	rel3()
+}
+
+func TestEndpointService_FetchModelsMalformedJSON(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+
+	// 200 但 body 不是 JSON → 报错,不返回半成品列表。
+	srv, _ := modelsServer(t, http.StatusOK, `not-json-at-all`)
+	ep := anthropicEP("ep-bad", 10)
+	ep.BaseURL = srv.URL
+	createEndpoint(t, store, ep)
+	if _, err := svc.FetchModels("ep-bad"); err == nil {
+		t.Fatalf("畸形 JSON 应报错")
+	}
+
+	// 200 + 合法 JSON 但无可提取 id(data/models 都缺)→ 空列表不报错。
+	srv2, _ := modelsServer(t, http.StatusOK, `{"object":"list"}`)
+	ep2 := anthropicEP("ep-empty", 11)
+	ep2.BaseURL = srv2.URL
+	createEndpoint(t, store, ep2)
+	ids, err := svc.FetchModels("ep-empty")
+	if err != nil {
+		t.Fatalf("无可提取 id 应返回空列表: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("应返回空列表, got %v", ids)
+	}
+}
+
+func TestEndpointService_ReportFailureDeletedID(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+	createEndpoint(t, store, anthropicEP("ep-del", 10))
+
+	// 行被删后失败回报到达:不 panic、不造行,静默记日志放行。
+	if err := store.Delete("ep-del"); err != nil {
+		t.Fatal(err)
+	}
+	svc.ReportFailure("ep-del", 500, "boom")
+	svc.ReportSuccess("ep-del")
+
+	if _, err := store.Get("ep-del"); err == nil {
+		t.Fatalf("ReportFailure/ReportSuccess 不得重建已删行")
 	}
 }
