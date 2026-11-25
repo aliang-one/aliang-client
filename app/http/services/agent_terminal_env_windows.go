@@ -3,6 +3,8 @@
 package services
 
 import (
+	"strings"
+
 	"golang.org/x/sys/windows/registry"
 )
 
