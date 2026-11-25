@@ -745,3 +745,56 @@ func (s *EndpointService) ModelsUnion() []ModelOwner {
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
+
+// NewEndpointServiceForTest 是跨包测试注入缝(Task 4 的 REST handler 测试在
+// handlers 包,够不到包内 newEndpointServiceWithStore):挂一个 :memory: store
+// 的独立 service,与生产单例完全隔离。返回的 EndpointService 自持 store,
+// Close 关句柄。生产代码不得调用本函数(命名即契约)。
+func NewEndpointServiceForTest() (*EndpointService, error) {
+	store, err := storage.NewEndpointStoreForTest()
+	if err != nil {
+		return nil, err
+	}
+	return newEndpointServiceWithStore(store), nil
+}
+
+// Close 释放 service 持有的 store 句柄(测试构造自持 :memory: 库;生产单例
+// 复用 auth 共享句柄,store.Close 是 no-op,调用安全)。
+func (s *EndpointService) Close() error {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	return s.store.Close()
+}
+
+// ---- REST 管理面读写(spec §11,Task 4 handler 的 service 缝)------------------
+// 这一组是 store CRUD 的直通包装:管理面是唯一调用方,刻意不做额外状态
+// 机(健康/并发的写路径仍只走本文件上面的 Report*/ResetHealth)。
+
+// ListEndpoints 全量列表(store 排序 priority,id 升序)。
+func (s *EndpointService) ListEndpoints() ([]*config.LLMEndpoint, error) { return s.store.List() }
+
+// GetEndpoint 单行;不存在返回 wrapped gorm.ErrRecordNotFound(handler 判 404)。
+func (s *EndpointService) GetEndpoint(id string) (*config.LLMEndpoint, error) {
+	return s.store.Get(id)
+}
+
+// CreateEndpoint 新建(校验/id 冲突错误由 store 归一,handler 映射 400/409)。
+func (s *EndpointService) CreateEndpoint(e *config.LLMEndpoint) error { return s.store.Create(e) }
+
+// UpdateEndpoint 配置列白名单更新;健康列 clobber 由 store 白名单挡住。
+func (s *EndpointService) UpdateEndpoint(e *config.LLMEndpoint) error { return s.store.Update(e) }
+
+// DeleteEndpoint 删除;builtin → storage.ErrBuiltinImmutable(handler 映射 409)。
+func (s *EndpointService) DeleteEndpoint(id string) error { return s.store.Delete(id) }
+
+// TestEndpoint 连接测试直通(探测实现见 Test)。
+func (s *EndpointService) TestEndpoint(id string) (bool, int, string) { return s.Test(id) }
+
+// GetPolicy 组策略读(无行=默认值,不落库)。
+func (s *EndpointService) GetPolicy() (*config.EndpointGroupPolicy, error) {
+	return s.store.GetPolicy()
+}
+
+// SetPolicy 组策略写(组键恒 auto,store 归一)。
+func (s *EndpointService) SetPolicy(p *config.EndpointGroupPolicy) error { return s.store.SetPolicy(p) }
