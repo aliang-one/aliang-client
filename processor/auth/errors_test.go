@@ -96,8 +96,8 @@ func TestClassifyAccessTokenFailure_InvalidAuthentication(t *testing.T) {
 func TestClassifyAccessTokenFailure_UnknownJSON401(t *testing.T) {
 	body := `{"code":"SOME_UNKNOWN_CODE","message":"something unexpected"}`
 	got := classifyAccessTokenFailure(http.StatusUnauthorized, []byte(body))
-	if !errors.Is(got, ErrSessionExpired) {
-		t.Errorf("classifyAccessTokenFailure() = %v, want ErrSessionExpired (fallback)", got)
+	if got != nil {
+		t.Errorf("classifyAccessTokenFailure() = %v, want nil (unknown 401 treated as transient)", got)
 	}
 }
 
@@ -111,19 +111,26 @@ func TestClassifyAccessTokenFailure_Non401(t *testing.T) {
 	if got != nil {
 		t.Errorf("classifyAccessTokenFailure() = %v, want nil for 200", got)
 	}
+
+	// access classifier does not handle 403 — even with a terminal-looking body
+	// it must return nil and leave the decision to a higher layer.
+	got = classifyAccessTokenFailure(http.StatusForbidden, []byte(`{"code":"TOKEN_REVOKED","message":"token has been revoked"}`))
+	if got != nil {
+		t.Errorf("classifyAccessTokenFailure() = %v, want nil for 403 (access classifier ignores non-401)", got)
+	}
 }
 
 func TestClassifyAccessTokenFailure_InvalidJSON401(t *testing.T) {
 	got := classifyAccessTokenFailure(http.StatusUnauthorized, []byte(`this is not json`))
-	if !errors.Is(got, ErrSessionExpired) {
-		t.Errorf("classifyAccessTokenFailure() = %v, want ErrSessionExpired for unparseable 401", got)
+	if got != nil {
+		t.Errorf("classifyAccessTokenFailure() = %v, want nil for unparseable 401 (treated as transient)", got)
 	}
 }
 
 func TestClassifyAccessTokenFailure_EmptyBody401(t *testing.T) {
 	got := classifyAccessTokenFailure(http.StatusUnauthorized, []byte(``))
-	if !errors.Is(got, ErrSessionExpired) {
-		t.Errorf("classifyAccessTokenFailure() = %v, want ErrSessionExpired for empty 401 body", got)
+	if got != nil {
+		t.Errorf("classifyAccessTokenFailure() = %v, want nil for empty 401 body (treated as transient)", got)
 	}
 }
 
@@ -147,22 +154,28 @@ func TestClassifyRefreshSessionFailure_KnownPatterns(t *testing.T) {
 			wantErr:    ErrRefreshTokenInvalid,
 		},
 		{
-			name:       "non-401 returns nil",
-			statusCode: http.StatusForbidden,
+			name:       "non-401 (non-403) returns nil",
+			statusCode: http.StatusBadRequest,
 			body:       `{"code":401,"reason":"REFRESH_TOKEN_INVALID"}`,
 			wantErr:    nil,
 		},
 		{
-			name:       "unknown 401 is terminal",
-			statusCode: http.StatusUnauthorized,
-			body:       `{"code":401,"reason":"OTHER","message":"something else"}`,
+			name:       "403 returns ErrRefreshTokenInvalid",
+			statusCode: http.StatusForbidden,
+			body:       `{"code":401,"reason":"REFRESH_TOKEN_INVALID"}`,
 			wantErr:    ErrRefreshTokenInvalid,
 		},
 		{
-			name:       "invalid JSON 401 is terminal",
+			name:       "unknown 401 is transient",
+			statusCode: http.StatusUnauthorized,
+			body:       `{"code":401,"reason":"OTHER","message":"something else"}`,
+			wantErr:    nil,
+		},
+		{
+			name:       "invalid JSON 401 is transient",
 			statusCode: http.StatusUnauthorized,
 			body:       `not json`,
-			wantErr:    ErrRefreshTokenInvalid,
+			wantErr:    nil,
 		},
 		// The auth backend's scan/st_ refresh path returns a bare {"error": ...}
 		// with no code/reason/message fields. The classifier must still recognize
