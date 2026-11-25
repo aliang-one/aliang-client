@@ -751,8 +751,17 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 		"approvalsReviewer": "user",
 		"sandbox":           codexSandboxMode(run.readOnly),
 	}
+	// thread/fork（2026-11-25 线程 busy 询问）：run.forkFromSessionID 非空 =
+	// 用户在 busy 卡上选了「复制会话继续」。fork 把源线程历史复制成全新线程
+	// （daemon 实测：params {"threadId": 源id}，返回体 thread.forkedFromId 指
+	// 回源），源 rollout/写锁零接触。与 resume 互斥，fork 优先。
+	forkedFromID := ""
 	threadMethod := "thread/start"
-	if strings.TrimSpace(run.resumeSessionID) != "" {
+	if fork := strings.TrimSpace(run.forkFromSessionID); fork != "" {
+		threadMethod = "thread/fork"
+		threadParams["threadId"] = fork
+		forkedFromID = fork
+	} else if strings.TrimSpace(run.resumeSessionID) != "" {
 		threadMethod = "thread/resume"
 		threadParams["threadId"] = strings.TrimSpace(run.resumeSessionID)
 	}
@@ -782,7 +791,10 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 		if threadBound || threadID == "" {
 			return nil
 		}
-		record, err := m.confirmBinding(run.sessionID, "codex", threadID, run.bindingVersion)
+		// fork 二趟：本地锚若仍指向 fork 源线程，confirm 会报 mismatch——
+		// forkedFromID 传入做 fork 容忍（expected==fork 源才放行换绑），与
+		// 服务端 bindings 的 fork 放行语义镜像。
+		record, err := m.confirmBindingFork(run.sessionID, "codex", threadID, run.bindingVersion, forkedFromID)
 		if err != nil {
 			return err
 		}
@@ -802,6 +814,7 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 	turnStarted := false
 	completed := false
 	resumeMissing := false
+	threadBusy := false
 	turnStatus := ""
 	fileChangesByID := map[string]json.RawMessage{}
 	commandsByID := map[string]string{}
@@ -877,6 +890,15 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 				case "1":
 					if threadMethod == "thread/resume" && isAgentAIResumeMissing(detail) {
 						resumeMissing = true
+						goto done
+					}
+					if isAgentAICodexWriterConflict(detail) {
+						// 线程单写者冲突（2026-11-25 手机 resume VS Code 活会话事故）：
+						// 不在此处发 ai.error——驱动层拿 agentAIRunThreadBusy 先问
+						// 用户是否 fork（默认不 fork），询问不可用时才落
+						// codex_thread_busy 终态。terminalErr 仅留作降级文案底稿。
+						threadBusy = true
+						terminalErr = fmt.Sprintf("Codex app-server %s failed: %s", threadMethod, detail)
 						goto done
 					}
 					terminalErr = fmt.Sprintf("Codex app-server %s failed: %s", threadMethod, detail)
@@ -1221,6 +1243,11 @@ done:
 	if resumeMissing {
 		return agentAIRunResumeMissing
 	}
+	if threadBusy {
+		// 与 resumeMissing 同形：不在 pass 内发终态帧，驱动层决定询问 fork
+		// （默认否）还是直接落 codex_thread_busy。
+		return agentAIRunThreadBusy
+	}
 	if ctx.Err() != nil {
 		status, errMsg := agentAIRunStoppedStatus(run.activity, limiter)
 		if len(run.goalIdentity) > 0 {
@@ -1315,14 +1342,20 @@ done:
 	assistantOutput := output.String()
 	outMu.Unlock()
 	m.appendAssistantHistory(run.sessionID, run.runSeq, run.messageID, assistantOutput)
-	_ = writeJSON(map[string]interface{}{
+	donePayload := map[string]interface{}{
 		"type":              models.AgentEventAIDone,
 		"session_id":        run.sessionID,
 		"message_id":        agentAssistantMessageID(run.messageID),
 		"codex_thread_id":   threadID,
 		"source_session_id": threadID,
 		"native_goal":       nativeGoalSnapshot,
-	})
+	}
+	if forkedFromID != "" {
+		// fork 二趟成功：终态带 fork 证据，服务端据此把（可能已 confirmed 的）
+		// 绑定换绑到新线程——不换绑则后续手机回合永远 resume 回被占用的源线程。
+		donePayload["forked_from"] = forkedFromID
+	}
+	_ = writeJSON(donePayload)
 	return agentAIRunDone
 }
 

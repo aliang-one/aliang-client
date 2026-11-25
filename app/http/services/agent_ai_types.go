@@ -351,8 +351,18 @@ type agentAIRun struct {
 	resumeSessionID         string
 	reservedNativeSessionID string
 	bindingVersion          int
-	prompt                  string
-	freshPrompt             string
+	// forkFromSessionID 非空时本趟以 thread/fork 起线程（线程 busy 询问获用户
+	// 同意后的二趟）：把 fork 源线程的历史复制为一个全新 codex 线程再跑回合，
+	// 源线程/写锁/原进程零接触。fork 成功后 bindThread 落新 id，ai.done 帧附
+	// forked_from 供服务端把 confirmed 绑定换绑到新线程。与 resumeSessionID
+	// 互斥：驱动层设 forkFromSessionID 时必须清 resumeSessionID。
+	forkFromSessionID string
+	// threadBusyHandled 钉死「线程 busy 询问」每回合至多一次：fork 二趟若再撞
+	// writer-conflict（fork 也可能被单写者拒），直接走压平历史 fresh 兜底，
+	// 绝不再弹第二次询问卡。
+	threadBusyHandled bool
+	prompt            string
+	freshPrompt       string
 	attachments             []agentAIAttachment
 	// 服务端下发的附件下载白名单（SSRF 围栏），空则回落到环境变量。
 	attachmentAllowedHosts []string

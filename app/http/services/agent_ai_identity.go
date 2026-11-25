@@ -219,10 +219,25 @@ func (m *agentAIManager) confirmBinding(
 	sessionID, provider, nativeSessionID string,
 	bindingVersion int,
 ) (agentAIBindingRecord, error) {
+	return m.confirmBindingFork(sessionID, provider, nativeSessionID, bindingVersion, "")
+}
+
+// confirmBindingFork 是 confirmBinding 的 fork 容忍变体（2026-11-25 线程 busy
+// 询问）：forkedFrom 非空且本地锚恰好等于 fork 源时，mismatch 不再是错误而是
+// 「锚随 fork 前移」的合法换绑——用户在 busy 卡上显式选了复制会话继续，内核
+// 侧锚随之指向 fork 出的新线程；服务端 ai.session.bound 的 fork 放行与本处
+// 语义镜像。forkedFrom 为空时行为与 confirmBinding 完全一致。
+
+func (m *agentAIManager) confirmBindingFork(
+	sessionID, provider, nativeSessionID string,
+	bindingVersion int,
+	forkedFrom string,
+) (agentAIBindingRecord, error) {
 	nativeSessionID = strings.TrimSpace(nativeSessionID)
 	if nativeSessionID == "" {
 		return agentAIBindingRecord{}, fmt.Errorf("provider returned an empty native session id")
 	}
+	forkedFrom = strings.TrimSpace(forkedFrom)
 	m.mu.Lock()
 	session := m.sessions[sessionID]
 	existing := m.bindings[sessionID]
@@ -236,7 +251,7 @@ func (m *agentAIManager) confirmBinding(
 	if expected == "" && session != nil {
 		expected = strings.TrimSpace(session.reservedNativeSessionID)
 	}
-	if expected != "" && expected != nativeSessionID {
+	if expected != "" && expected != nativeSessionID && !(forkedFrom != "" && expected == forkedFrom) {
 		m.mu.Unlock()
 		return agentAIBindingRecord{}, fmt.Errorf("native session id mismatch: expected %s, got %s", expected, nativeSessionID)
 	}
