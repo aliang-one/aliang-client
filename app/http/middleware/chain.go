@@ -24,6 +24,9 @@ func GetDefaultMiddleware() []func(http.Handler) http.Handler {
 		TracingMiddleware,       // Outermost - first to process requests
 		StartupStatusMiddleware, // Gate APIs based on system startup status
 		LoggingMiddleware,       // Log all requests/responses
-		RecoveryMiddleware,      // Innermost - catch panics
+		// 远程管理面访问闸(2026-11-24):非回环来源的 /api/* 必须带有效
+		// dashboard 会话;放在 Logging 之内,被拒请求照常进访问日志。
+		RemoteDashboardAccessMiddleware,
+		RecoveryMiddleware, // Innermost - catch panics
 	}
 }

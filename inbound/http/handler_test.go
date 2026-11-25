@@ -6,7 +6,6 @@ import (
 	"io"
 	"net"
 	stdhttp "net/http"
-	"net/netip"
 	"net/url"
 	"testing"
 	"time"
@@ -130,7 +129,29 @@ func (c *tcpAddrConn) SetWriteDeadline(time.Time) error {
 	return nil
 }
 
-func TestExtractMetadataFromHTTP_AllowsMissingHostByFallingBackToLocalAddr(t *testing.T) {
+// 缺 Host 的请求必须拒绝。旧实现回退到「监听地址」当目标:56432 绑 0.0.0.0 时
+// 该地址是本机局域网口,非回环来源的无 Host 请求于是被网关原样重放回自己的
+// 56432——自连接递归,一条连接就能耗尽 fd(2026-11-24 审计)。
+func TestExtractMetadataFromHTTP_RejectsMissingHost(t *testing.T) {
+	req := &stdhttp.Request{
+		Method: stdhttp.MethodGet,
+		URL:    mustParseURL(t, "/health"),
+		Header: make(stdhttp.Header),
+	}
+	conn := &tcpAddrConn{
+		Conn:   nil,
+		local:  &net.TCPAddr{IP: net.ParseIP(lanListenIP), Port: 56432},
+		remote: &net.TCPAddr{IP: net.ParseIP(lanClientIP), Port: 41000},
+	}
+
+	if _, err := extractMetadataFromHTTP(req, conn); err == nil {
+		t.Fatal("expected a request without Host to be rejected")
+	}
+}
+
+// 回环监听 + 缺 Host 同样拒绝(不再有「回环就放行」的特例:请求行与头部完整
+// 性是协议要求,与来源无关)。
+func TestExtractMetadataFromHTTP_RejectsMissingHostOnLoopback(t *testing.T) {
 	req := &stdhttp.Request{
 		Method: stdhttp.MethodGet,
 		URL:    mustParseURL(t, "/health"),
@@ -142,15 +163,48 @@ func TestExtractMetadataFromHTTP_AllowsMissingHostByFallingBackToLocalAddr(t *te
 		remote: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 41000},
 	}
 
-	metadata, err := extractMetadataFromHTTP(req, conn)
+	if _, err := extractMetadataFromHTTP(req, conn); err == nil {
+		t.Fatal("expected a request without Host to be rejected on loopback too")
+	}
+}
+
+// 端到端:无 Host 的明文请求得到 400,且不进入管线。
+func TestRawHTTPConnectionRejectsHostlessRequest(t *testing.T) {
+	authority := auth.ResetSessionAuthorityForTest()
+	authority.NotifyLoggedIn(&auth.UserInfo{ID: 1})
+	t.Cleanup(func() { auth.ResetSessionAuthorityForTest() })
+	probe := stubPipeline(t)
+
+	client, server := net.Pipe()
+	t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handleRawConnection(&deadlinePassthroughConn{
+			Conn:   server,
+			local:  &net.TCPAddr{IP: net.ParseIP(lanListenIP), Port: 56432},
+			remote: &net.TCPAddr{IP: net.ParseIP(lanClientIP), Port: 41000},
+		})
+	}()
+	go func() {
+		_, _ = io.WriteString(client, "GET /health HTTP/1.1\r\nUser-Agent: hostless\r\n\r\n")
+	}()
+
+	_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	response, err := stdhttp.ReadResponse(bufio.NewReader(client), nil)
 	if err != nil {
-		t.Fatalf("extract metadata failed: %v", err)
+		t.Fatalf("read response: %v", err)
 	}
-	if got, want := metadata.DstIP, netip.MustParseAddr("127.0.0.1"); got != want {
-		t.Fatalf("unexpected dst ip: got %s want %s", got, want)
+	_, _ = io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != stdhttp.StatusBadRequest {
+		t.Fatalf("status=%d, want 400", response.StatusCode)
 	}
-	if got, want := metadata.DstPort, uint16(56432); got != want {
-		t.Fatalf("unexpected dst port: got %d want %d", got, want)
+	assertPipelineNotReached(t, probe)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handleRawConnection did not return")
 	}
 }
 
