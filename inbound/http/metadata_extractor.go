@@ -30,6 +30,8 @@ func ExtractMetadataFromCONNECT(req *http.Request, conn net.Conn) (*M.Metadata, 
 		metadata.SetHostName(host, M.BindingSourceCONNECT, 10*time.Minute)
 	}
 	metadata.DstPort = port
+	// 代理面来源标记:回环/内网目标守卫据此判定(CONNECT 是统一入口的代理面之一)。
+	metadata.IngressProxyFace = true
 
 	// Try to parse host as IP address
 	if ip := net.ParseIP(host); ip != nil {
@@ -107,6 +109,7 @@ func ExtractMetadataFromHTTP(req *http.Request, conn net.Conn) (*M.Metadata, err
 		metadata.SetHostName(hostOnly, M.BindingSourceHTTP, 10*time.Minute)
 	}
 	metadata.DstPort = port
+	metadata.IngressProxyFace = true
 
 	// Try to parse host as IP
 	if ip := net.ParseIP(hostOnly); ip != nil {

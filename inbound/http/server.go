@@ -10,10 +10,12 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"aliang.one/nursorgate/common/logger"
 	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
+	"aliang.one/nursorgate/processor/tcp"
 )
 
 // HTTP server state management
@@ -24,6 +26,20 @@ var (
 	httpMutex     sync.Mutex
 	isHttpRunning bool
 	connIDCounter int64
+)
+
+// 资源防护旋钮(var 仅为测试注入短值;默认值即生产值)。
+var (
+	// httpReadTimeout 是 HTTP 面读取请求头(请求行+头部)的期限。嗅探层在读完
+	// 首段后清掉了自己的读期限,ReadRequest 此前在无期限状态下等待——发半行
+	// 请求行就停住的客户端每条连接白占一个 fd + 一个 goroutine,且发生在会话
+	// 租约之前,任何来源都能触发。
+	httpReadTimeout = 15 * time.Second
+	// acceptErrorBackoff 是 accept 循环吃到非关闭类错误(fd 耗尽/EMFILE 等)
+	// 后的退避:裸 continue 在错误持续期间会空转打满 CPU 并刷爆日志环形缓冲。
+	acceptErrorBackoff = 100 * time.Millisecond
+	// listenTCP 是监听器创建缝(测试注入假监听器)。
+	listenTCP = net.Listen
 )
 
 // StartMitmHttp starts the HTTP CONNECT proxy server.
@@ -61,7 +77,7 @@ func startUnifiedIngress(fatalOnBindErr bool) {
 	// StopHttpProxy takes this same lock; this prevents a delayed start from
 	// binding after the stop path observed an empty listener.
 	listenAddr := config.UnifiedIngressListenAddr()
-	listener, err := net.Listen("tcp", listenAddr)
+	listener, err := listenTCP("tcp", listenAddr)
 	if err != nil {
 		isHttpRunning = false
 		httpMutex.Unlock()
@@ -103,6 +119,11 @@ func startUnifiedIngress(fatalOnBindErr bool) {
 			default:
 				// Other errors (should be rare, e.g., network issues)
 				logger.Debug(fmt.Sprintf("Accept error: %v", err))
+				// 退避:错误持续期间(fd 耗尽等)裸 continue 会空转打满 CPU。
+				select {
+				case <-gen.Done():
+				case <-time.After(acceptErrorBackoff):
+				}
 				continue
 			}
 		}
@@ -187,7 +208,12 @@ func handleRawConnection(conn net.Conn) {
 
 	// 读取客户端初始数据，检查是否为 CONNECT 请求
 	reader := bufio.NewReader(conn)
+	// 读期限只覆盖请求头:嗅探层已在读完首段后清掉自己的期限,这里不设限则
+	// 半截请求行能无限期占住连接(且发生在会话租约之前)。读到即清除,不污染
+	// 后续隧道流量。
+	_ = conn.SetReadDeadline(deadlineAfter(httpReadTimeout))
 	req, err := http.ReadRequest(reader)
+	_ = conn.SetReadDeadline(time.Time{})
 	if err != nil {
 		logger.Error(fmt.Sprintf("[CONN#%d] 读取请求失败: %v", connID, err))
 		return
@@ -195,17 +221,7 @@ func handleRawConnection(conn net.Conn) {
 
 	lease, err := auth.GetSessionAuthority().AcquireProxyLease(func() { _ = conn.Close() })
 	if err != nil {
-		response := &http.Response{
-			Status:        "503 Service Unavailable",
-			StatusCode:    http.StatusServiceUnavailable,
-			Proto:         "HTTP/1.1",
-			ProtoMajor:    1,
-			ProtoMinor:    1,
-			Body:          io.NopCloser(strings.NewReader("active session required")),
-			ContentLength: int64(len("active session required")),
-			Close:         true,
-		}
-		_ = response.Write(conn)
+		writeHTTPStatusResponse(conn, http.StatusServiceUnavailable, "active session required")
 		return
 	}
 	defer lease.Release()
@@ -232,6 +248,14 @@ func handleRawConnection(conn net.Conn) {
 
 		logger.Debug(fmt.Sprintf("[CONN#%d] 目标信息: %s:%d (IP:%s)", connID, metadata.HostName, metadata.DstPort, metadata.DstIP))
 
+		// 代理面目标守卫(200 应答之前):非回环来源不得让网关代拨本机回环/
+		// 内网目标——56431/56433 的信任边界是「来源为回环」,代拨发生在本进程。
+		if err := tcp.CheckProxyFaceDestination(metadata); err != nil {
+			logger.Info(fmt.Sprintf("[CONN#%d] 拒绝代理面请求: %v", connID, err))
+			writeHTTPStatusResponse(conn, http.StatusForbidden, "")
+			return
+		}
+
 		// Send 200 Connection Established
 		// IMPORTANT: Use raw write instead of http.Response for proper formatting
 		response200 := "HTTP/1.1 200 Connection Established\r\n\r\n"
@@ -252,4 +276,20 @@ func handleRawConnection(conn net.Conn) {
 		// 透明代理，基本不存在
 		HandleHttpConnection(conn, reader, req)
 	}
+}
+
+// writeHTTPStatusResponse 在 HTTP 面写一条定长错误应答(状态行+头+体一次
+// 写成,Content-Length 与实际体一致)。
+func writeHTTPStatusResponse(conn net.Conn, status int, body string) {
+	response := &http.Response{
+		Status:        fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		StatusCode:    status,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Close:         true,
+	}
+	_ = response.Write(conn)
 }

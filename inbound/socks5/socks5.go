@@ -106,6 +106,13 @@ func serve(conn net.Conn) error {
 		return fmt.Errorf("metadata: %w", err)
 	}
 
+	// 2.5) 目标守卫(成功应答之前):非回环来源不得经代理面访问本机回环/
+	// 内网目标(管理 API 的信任边界),违者 rep 0x02 断连。
+	if err := tcp.CheckProxyFaceDestination(md); err != nil {
+		_ = writeReply(conn, repNotAllowed)
+		return fmt.Errorf("destination not allowed: %w", err)
+	}
+
 	// 3) 会话租约(成功应答之前):无活跃会话 → rep 0x02 断连。
 	lease, err := auth.GetSessionAuthority().AcquireProxyLease(func() { _ = conn.Close() })
 	if err != nil {
@@ -229,6 +236,8 @@ func metadataFromRequest(conn net.Conn, req *socksRequest) (*M.Metadata, error) 
 		Network: M.TCP,
 		ConnID:  fmt.Sprintf("socks-%d", atomic.AddUint64(&socksConnCounter, 1)),
 		DstPort: req.port,
+		// 代理面来源标记:回环/内网目标守卫据此判定(socks5 是统一入口的代理面之一)。
+		IngressProxyFace: true,
 	}
 	if req.valid {
 		md.DstIP = req.ip

@@ -944,15 +944,18 @@ func (c *Config) EffectiveOpenVikingMode() string {
 type MeshConfig struct {
 	Enable        *bool `json:"enable,omitempty"`
 	ForwardEnable *bool `json:"forward_enable,omitempty"`
-	// PunchEnable UDP 打洞直连(mesh-udp-punch plan Task 11)。默认关:打洞
-	// 要本机直接对公网暴露 UDP 口,是让渡型能力,必须显式开启(nil=false,
-	// 与 ForwardEnable 同族三态)。Task 12 起被工厂/装配门消费。
+	// PunchEnable UDP 打洞直连(mesh-udp-punch plan Task 11)。默认开
+	// (nil=true,2026-11-24 用户拍板):mesh 已配置的节点默认具备打洞直连,
+	// 显式 false 才关——历史默认关让跨网文件传输静默落云中转,与「组网
+	// 优先直连」的产品预期相反。nil receiver(mesh 层整体缺失)恒 false,
+	// fail-closed 不变:未配置组网 ≠ 开打洞。让渡属性保留:关闭方随时可
+	// 显式 punch_enable:false 退出。
 	PunchEnable *bool `json:"punch_enable,omitempty"`
 	// AutoPeers 自动组网准入开关(customer.mesh.auto_peers,自动组网批次)。
 	// 默认关(nil=false):beacon 是明文 UDP,自动 peer 的信任锚=对端自报
 	// 自洽(账号哈希可嗅探/指纹公钥自报/自签),无带外权威——与
-	// ForwardEnable/PunchEnable 同族「让渡型默认关」,与总开关默认开刻意
-	// 相反。开启语义:同 LAN 且同账号(哈希相等)的自报对端自动获得 mesh
+	// ForwardEnable 同族「让渡型默认关」,与总开关默认开刻意相反。开启语义:
+	// 同 LAN 且同账号(哈希相等)的自报对端自动获得 mesh
 	// 准入/拨号凭据(可信局域网场景);消费面=ingress MeshAdmission 闭包、
 	// MeshDelegateNextHop 回查、tcp 执行回查、规则编译回查。跨信任域硬绑
 	// 定须平台账号级 roster(台账遗留)。
@@ -962,8 +965,9 @@ type MeshConfig struct {
 	// TrimSpace 规整,与 peers[].lan_addrs 同款纪律)。
 	StunServers []string `json:"stun_servers,omitempty"`
 	// PublicListen 本机监听口可被公网直连声明(punch-public-peer 批次)。
-	// 默认关(nil=false):声明=对公网暴露打洞监听口,让渡型能力,与
-	// PunchEnable 同族。语义:本机公网直挂(接口含公网 IP,B 侧自动判据
+	// 默认关(nil=false):声明=对公网暴露打洞监听口,让渡型能力(注意
+	// PunchEnable 已默认开,本字段仍默认关)。语义:本机公网直挂(接口含
+	// 公网 IP,B 侧自动判据
 	// 天然命中,无需本字段)或云 EIP 1:1 NAT(接口只见私网 IP,自动判据
 	// 漏判,须显式声明)。声明后候选 STUN-独立:classify 失败回落接口
 	// 快照(首个非回环 IPv4 : 监听口)。消费处与 EffectivePunchEnabled
@@ -1013,17 +1017,19 @@ func (c *MeshConfig) EffectiveForwardEnabled() bool {
 	return c != nil && c.ForwardEnable != nil && *c.ForwardEnable // 默认关(design §8)
 }
 
-// EffectivePunchEnabled UDP 打洞直连开关。默认关(nil=false):打洞直连
-// 要本机对公网暴露 UDP 口,是让渡型能力,必须显式开启——与
-// EffectiveForwardEnabled 同款「默认关」三态,而与总开关的默认开语义相反。
-// 依赖:生效前提是 mesh 总开关开着(保存期硬拒见 ValidateMeshDependency,
-// 运行期装配门 Task 12 与 EffectiveEnabled 合取)。
+// EffectivePunchEnabled UDP 打洞直连开关。默认开(nil=true,2026-11-24
+// 用户拍板):mesh 已配置的节点默认走打洞直连,显式 false 才关——与总开关
+// 的默认开语义对齐; ForwardEnable/AutoPeers/PublicListen 仍同族「默认关」
+// 三态不变。nil receiver(mesh 层整体缺失)恒 false fail-closed:未配置
+// 组网 ≠ 开打洞。依赖:生效前提是 mesh 总开关开着(保存期硬拒见
+// ValidateMeshDependency——按显式指针判,运行期装配门 Task 12 与
+// EffectiveEnabled 合取)。
 func (c *MeshConfig) EffectivePunchEnabled() bool {
-	return c != nil && c.PunchEnable != nil && *c.PunchEnable // 默认关
+	return c != nil && (c.PunchEnable == nil || *c.PunchEnable) // 默认开(nil=true);nil receiver 恒 false
 }
 
 // EffectiveAutoPeers 自动组网准入开关(自动组网批次)。默认关(nil=false):
-// 让渡型三态,与 EffectiveForwardEnabled/EffectivePunchEnabled 同族——
+// 让渡型三态,与 EffectiveForwardEnabled 同族——
 // beacon 明文自报信任锚缺带外权威(评审 major),显式开启才接受同账号
 // 自报对端作为 mesh 准入/拨号凭据。依赖:生效前提是 mesh 总开关开着
 // (消费方各自与总开关合取,此处不重复判)。
@@ -1052,7 +1058,8 @@ func (c *MeshConfig) EffectiveStunServers() []string {
 }
 
 // EffectivePublicListen 公网直连声明开关:三态指针默认关(nil=false),
-// 与 EffectivePunchEnabled 同族。nil receiver 安全。
+// 与 EffectiveForwardEnabled 同族(PunchEnable 已翻转默认开,本字段保持
+// 默认关)。nil receiver 安全。
 func (c *MeshConfig) EffectivePublicListen() bool {
 	return c != nil && c.PublicListen != nil && *c.PublicListen // 默认关
 }
@@ -1138,10 +1145,12 @@ func (c *Config) ValidateMeshDependency() error {
 	if c.Customer.Mesh.EffectiveEnabled() && !c.Customer.SSHIngress.IsEnabled() {
 		return fmt.Errorf("组网依赖 SSH 入口(ssh_ingress.enable):开启 customer.mesh.enable 前必须先开启 SSH 入口")
 	}
-	// punch 是 mesh 出口内的载体:总开关显式关而 punch 显式开 = 自相矛盾
-	// 配置,保存期硬拒(与 mesh↔SSH 依赖门同款只挂保存通道)。运行期装配门
-	// (Task 12)另与总开关合取,手改配置文件绕过校验也不会让 punch 单飞。
-	if c.Customer.Mesh.EffectivePunchEnabled() && !c.Customer.Mesh.EffectiveEnabled() {
+	// punch 是 mesh 出口内的载体:punch 默认开(nil=true)后「未写」不再
+	// 代表意图,矛盾判据收口到显式指针——总开关显式关而 punch 显式开 =
+	// 自相矛盾配置,保存期硬拒(与 mesh↔SSH 依赖门同款只挂保存通道)。
+	// 运行期装配门(Task 12)另与总开关合取,手改配置文件绕过校验也不会
+	// 让 punch 单飞。
+	if c.Customer.Mesh.PunchEnable != nil && *c.Customer.Mesh.PunchEnable && !c.Customer.Mesh.EffectiveEnabled() {
 		return fmt.Errorf("打洞直连依赖组网总开关(customer.mesh.enable):开启 customer.mesh.punch_enable 前必须先开启组网总开关")
 	}
 	return nil

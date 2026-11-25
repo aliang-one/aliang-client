@@ -360,6 +360,67 @@ func TestRestoreSessionTransientFailurePublishesRecoveringSnapshot(t *testing.T)
 	}
 }
 
+func TestRefreshSession_ProfileUnclear401DoesNotWipe(t *testing.T) {
+	baseDir := t.TempDir()
+	t.Setenv("HOME", filepath.Join(baseDir, "home"))
+	t.Setenv("ALIANG_CACHE_DIR", filepath.Join(baseDir, "cache"))
+	ResetAuthPersistenceForTest()
+	StopTokenRefresh()
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(func() {
+		StopTokenRefresh()
+		ResetAuthPersistenceForTest()
+		config.ResetGlobalConfigForTest()
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/refresh":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":{"access_token":"refreshed-access","refresh_token":"refreshed-refresh","expires_in":3600,"token_type":"Bearer"}}`))
+		case "/api/v1/user/profile":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"code":"SOME_UNKNOWN","message":"weird"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{APIServer: server.URL}})
+
+	if err := SaveUserInfo(&UserInfo{
+		AccessToken:  "stale-access",
+		RefreshToken: "stale-refresh",
+		TokenType:    "Bearer",
+		Username:     "cached-user",
+		Email:        "cached@example.com",
+		UpdatedAt:    time.Now(),
+	}); err != nil {
+		t.Fatalf("SaveUserInfo() error = %v", err)
+	}
+	ResetSessionAuthorityForTest()
+
+	_, err := RefreshSession("stale-refresh")
+	if err == nil {
+		t.Fatal("RefreshSession() error = nil, want non-nil inconclusive error")
+	}
+	if errors.Is(err, ErrSessionExpired) {
+		t.Fatalf("RefreshSession() error = %v, must not be ErrSessionExpired for unclear 401", err)
+	}
+	if errors.Is(err, ErrRefreshTokenInvalid) {
+		t.Fatalf("RefreshSession() error = %v, must not be ErrRefreshTokenInvalid for unclear 401", err)
+	}
+	if !errors.Is(err, ErrSessionRecovering) {
+		t.Fatalf("RefreshSession() error = %v, want ErrSessionRecovering (non-terminal)", err)
+	}
+	if hasUserInfo, loadErr := HasPersistedUserInfo(); loadErr != nil {
+		t.Fatalf("HasPersistedUserInfo() error = %v", loadErr)
+	} else if !hasUserInfo {
+		t.Fatal("expected persisted user info to be kept (session not wiped)")
+	}
+}
+
 func TestRefreshSession_RenewsAccessTokenAndRetainsRefreshTokenWhenOmitted(t *testing.T) {
 	baseDir, err := os.MkdirTemp("", "aliang-refresh-missing-token-*")
 	if err != nil {

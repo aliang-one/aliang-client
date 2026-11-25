@@ -180,10 +180,10 @@ type agentPeerPunchB struct {
 }
 
 // agentPunchConfigEnabled punch 载体配置门:customer.mesh.punch_enable
-// (让渡型能力,默认关,types.go EffectivePunchEnabled)。mesh 总开关的
-// 合取在保存期校验(ValidateMeshDependency 硬拒)与装配门(Task 12),
-// 这里按 Task 10 契约只读 punch 位——手改配置文件绕过校验的窗口由
-// Task 12 运行期装配门兜底。
+// (2026-11-24 起默认开,nil=true,types.go EffectivePunchEnabled;显式
+// false 可关)。mesh 总开关的合取在保存期校验(ValidateMeshDependency
+// 硬拒)与装配门(Task 12),这里按 Task 10 契约只读 punch 位——手改
+// 配置文件绕过校验的窗口由 Task 12 运行期装配门兜底。
 func agentPunchConfigEnabled() bool {
 	cfg := config.GetGlobalConfig()
 	if cfg == nil || cfg.Customer == nil {

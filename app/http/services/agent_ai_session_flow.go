@@ -718,6 +718,30 @@ func (m *agentAIManager) seedConfirmedBindingResumeLocked(session *agentAISessio
 	session.resumeSessionID = b.NativeSessionID
 }
 
+// runStartProjectPath 是 ai.run.start 收 project_path 的唯一入口:空值沿用
+// 既有;解析(resolveAgentAICWD,含 ~ 展开)通过才覆盖;解析失败保留既有值
+// 并留痕。返回 (收下的值, 是否发生覆盖)。
+//
+// 2026-11-25 线上事故:这里曾把载荷字符串裸赋值进 session(与 create() 的
+// resolveAgentAICWD 校验纪律不一致),手机端目录解析不出时兜底发出的字面
+// "~" 直达执行层,整局会话一碰 shell 就死在 chdir,直到触发防重试循环
+// 保险丝。脏 cwd 不允许打断续聊——解析失败一律保留既有值。
+func runStartProjectPath(raw, existing, sessionID string) (string, bool) {
+	candidate := strings.TrimSpace(raw)
+	if candidate == "" {
+		return existing, false
+	}
+	resolved, err := resolveAgentAICWD(candidate)
+	if err != nil {
+		logger.Warn(fmt.Sprintf("ai.run.start project_path rejected, keep existing session=%s raw=%q: %v", sessionID, candidate, err))
+		return existing, false
+	}
+	if resolved == existing {
+		return existing, false
+	}
+	return resolved, true
+}
+
 func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTerminalWriter) {
 	runID := strings.TrimSpace(remoteString(msg, "run_id"))
 	sessionID := strings.TrimSpace(remoteString(msg, "session_id"))
@@ -808,7 +832,11 @@ func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTer
 	}
 	if session := m.sessions[sessionID]; session != nil {
 		session.mode = firstNonEmpty(remoteString(msg, "mode"), session.mode, "vibe")
-		session.projectPath = firstNonEmpty(remoteString(msg, "project_path"), session.projectPath)
+		// project_path 只收解析通过的值(2026-11-25 事故);空值沿用既有——
+		// 与下方 model/effort 的「非空才覆盖」纪律同构。
+		if resolved, ok := runStartProjectPath(remoteString(msg, "project_path"), session.projectPath, sessionID); ok {
+			session.projectPath = resolved
+		}
 		session.provider = firstNonEmpty(remoteString(msg, "provider"), remoteString(msg, "tool"), session.provider)
 		session.model = strings.TrimSpace(remoteString(msg, "model"))
 		session.effort = strings.TrimSpace(remoteString(msg, "effort"))

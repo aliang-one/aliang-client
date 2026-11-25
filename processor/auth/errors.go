@@ -25,13 +25,16 @@ var (
 
 // refreshRejectionPhrases are lowercase substrings the auth backend emits (in
 // either the "message" or "error" field) to describe a rejected refresh
-// credential. A refresh endpoint 401 is terminal even when the body is not one
-// of these known shapes; the phrases are retained for diagnostics and tests.
+// credential. A 401 whose body matches one of these phrases (or carries the
+// REFRESH_TOKEN_INVALID reason/code) is a definitive terminal rejection;
+// unknown or unparseable 401 bodies are treated as transient so the SoftExpired
+// recovery chain can retry instead of wiping the session.
 var refreshRejectionPhrases = []string{
 	"invalid refresh token",
 	"refresh token is no longer valid",
 	"refresh token expired",
 	"refresh token has been revoked",
+	"local session is no longer valid",
 }
 
 // messageFieldMatchesRefreshRejection reports whether either the "message" or
@@ -52,6 +55,9 @@ func messageFieldMatchesRefreshRejection(envelope map[string]any) bool {
 }
 
 func classifyRefreshSessionFailure(statusCode int, body []byte) error {
+	if statusCode == http.StatusForbidden {
+		return ErrRefreshTokenInvalid
+	}
 	if statusCode != http.StatusUnauthorized {
 		return nil
 	}
@@ -61,7 +67,8 @@ func classifyRefreshSessionFailure(statusCode int, body []byte) error {
 	// very field we must match on.
 	var envelope map[string]any
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		return ErrRefreshTokenInvalid
+		// 无法解析的 401 视为瞬时,返回 nil 让上层进入 SoftExpired 重试而非清会话。
+		return nil
 	}
 
 	reason := strings.ToUpper(strings.TrimSpace(stringValue(envelope["reason"])))
@@ -73,12 +80,9 @@ func classifyRefreshSessionFailure(statusCode int, body []byte) error {
 		return ErrRefreshTokenInvalid
 	}
 
-	// A refresh endpoint has already authenticated the refresh credential before
-	// issuing a new access token. Its 401 is therefore a definitive rejection,
-	// including unknown JSON and the backend's "local session is no longer valid"
-	// response. Network errors and 5xx responses remain retryable because they do
-	// not prove that the credential is dead.
-	return ErrRefreshTokenInvalid
+	// 兜底 — 不明确的 401（未知 JSON/不可解析/空 body）视为瞬时，返回 nil 让上层
+	// 进入 SoftExpired 重试而非清会话。只有上面明确拒绝语义才返回 ErrRefreshTokenInvalid。
+	return nil
 }
 
 func classifyAccessTokenFailure(statusCode int, body []byte) error {
@@ -88,8 +92,9 @@ func classifyAccessTokenFailure(statusCode int, body []byte) error {
 
 	var envelope map[string]any
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		// 无法解析的 401 也应视为 session expired
-		return ErrSessionExpired
+		// 兜底 — 不明确的 401（未知 JSON/不可解析/空 body）视为瞬时，返回 nil 让上层
+		// 进入 SoftExpired 重试而非清会话。只有上面明确拒绝语义才返回 ErrSessionExpired。
+		return nil
 	}
 
 	code := strings.ToUpper(strings.TrimSpace(stringValue(envelope["code"])))
@@ -109,8 +114,9 @@ func classifyAccessTokenFailure(statusCode int, body []byte) error {
 		return ErrSessionExpired
 	}
 
-	// 兜底 — 任何来自 auth 端点的 401 都视为 session expired
-	return ErrSessionExpired
+	// 兜底 — 不明确的 401（未知 JSON/不可解析/空 body）视为瞬时，返回 nil 让上层
+	// 进入 SoftExpired 重试而非清会话。只有上面明确拒绝语义才返回 ErrSessionExpired。
+	return nil
 }
 
 func clearLocalSessionAfterInvalidRefreshToken() {

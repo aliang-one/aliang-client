@@ -9,6 +9,10 @@ vi.mock('../services/agentApi', () => ({
   uploadChatAttachment: vi.fn(),
 }));
 
+vi.mock('../stores/auth', () => ({
+  useAuthStore: () => ({ isAuthenticated: { value: true } }),
+}));
+
 vi.mock('./useDeviceSessions', async (importOriginal) => {
   const actual = await importOriginal();
   let shared = null;
@@ -203,6 +207,70 @@ describe('快照对账 idle 收窗（reconcileLocalSnapshot !snapshotRunning 分
     expect(conv.running).toBe(true);
     expect(conv.runActive).toBe(true);
     expect(conv.messages[1].status).toBe('running');
+  });
+});
+
+describe('运行错误的实时显示', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    FakeWebSocket.instances.length = 0;
+    globalThis.WebSocket = FakeWebSocket;
+  });
+
+  it.each(['流式中', null])('已有部分回复或没有气泡时，仍展示上游原因（%s）', async (partial) => {
+    const { conv, sock } = await mountZombieSession();
+    if (!partial) conv.messages.pop();
+    const error = '404 model_not_found';
+    const frame = { type: 'ai.error', session_id: 'sess-z', message_id: 'assistant_m-u1', error };
+    sock.onmessage({ data: JSON.stringify(frame) });
+    sock.onmessage({ data: JSON.stringify(frame) });
+    expect(conv.messages.filter(m => m.note === 'turn_failed')).toEqual([
+      expect.objectContaining({ content: error }),
+    ]);
+    if (partial) expect(conv.messages[1].content).toBe(partial);
+    expect(conv.running).toBe(false);
+  });
+
+  it('旧回合的错误出现在原提问下，下一轮继续接收回复', async () => {
+    const { conv, sock } = await mountZombieSession();
+    conv.messages.push({ role: 'user', messageId: 'm-u2', ts: 3 });
+    conv.messages.push({ role: 'assistant', content: '第二轮回复', status: 'running', ts: 4 });
+    sock.onmessage({ data: JSON.stringify({
+      type: 'ai.error', session_id: 'sess-z', message_id: 'assistant_m-u1',
+      error: 'Upstream access forbidden',
+    }) });
+    expect(conv.messages[2]).toMatchObject({ note: 'turn_failed', content: 'Upstream access forbidden' });
+    expect(conv.messages.at(-1)).toMatchObject({ content: '第二轮回复', status: 'running' });
+    expect(conv.runActive).toBe(true);
+  });
+
+  it('发送后只收到终态快照时，恢复当前回合失败原因并解锁发送', async () => {
+    const { chat, conv, sock } = await mountZombieSession();
+    conv.runActive = false;
+    conv.running = false;
+    conv.messages[1].status = 'done';
+    chat.inputText.value = '测试 DeepSeek';
+    const sending = chat.sendMessage();
+    await flushMicrotasks();
+    sock.onmessage({ data: JSON.stringify({ type: 'ai.session.created', session_id: 'sess-z' }) });
+    await sending;
+    const message = sock.sent.map(JSON.parse).find(frame => frame.type === 'ai.message');
+    const snapshot = (transcript) => sock.onmessage({ data: JSON.stringify({
+      type: 'ai.session.snapshot', session_id: 'sess-z', status: 'idle', transcript,
+    }) });
+    snapshot([
+      { role: 'user', message_id: 'm-u1', text: '问题' },
+      { role: 'system', text: '旧回合错误' },
+    ]);
+    expect(conv.messages.at(-1).status).toBe('running');
+    snapshot([
+      { role: 'user', message_id: message.message_id, text: message.content },
+      { role: 'system', text: '404 model_not_found' },
+    ]);
+    expect(conv.messages.at(-1)).toMatchObject({ note: 'turn_failed', content: '404 model_not_found' });
+    expect(findRunning(conv)).toBe(null);
+    chat.inputText.value = '重新发送';
+    expect(chat.sendDisabled.value).toBe(false);
   });
 });
 

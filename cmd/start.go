@@ -139,6 +139,15 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// 均漏接——roster 缓存永不填充,MeshRosterEntryFor 恒 miss,auto_peers
 	// 恒 fail-closed。sync.Once 幂等 + Mesh==nil 自守卫,失败仅日志不阻断。
 	services.StartMeshRosterSync()
+	// 出口委托缝启动接线(与 core.go 同款;2026-11-24 审计补漏):本机节点
+	// 标识 / egress peer 源 / TUN DNS 代转发源。start 形态进程永远不是平台
+	// WS 属主(agent 由 EnsureStarted 恒以独立子进程拉起),validateConfig 的
+	// 另一接线点在本进程永不运行——漏接则「平台流量代理」开关一开:平台请求
+	// 逐条 fail-loud、AI 流静默留本机(与开关关无异,且无日志),进程重启后
+	// 落 SoftExpired、入口代理暂停,直到把开关关掉。幂等,失败仅日志不阻断。
+	if m := services.GetSharedAgentService().TunnelManager(); m != nil {
+		m.WireMeshAssemblySeams(services.GetSharedAgentService().CurrentDeviceID)
+	}
 
 	// 启动服务器
 	logger.Info("Starting aliang server...")

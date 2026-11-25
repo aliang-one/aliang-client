@@ -98,7 +98,7 @@ func TestGetMeshExitPunchWiringMatrix(t *testing.T) {
 		}
 	})
 
-	t.Run("开关关(默认nil)→无udp(今日行为)", func(t *testing.T) {
+	t.Run("开关未写(nil=默认开)→udp进切片", func(t *testing.T) {
 		setMeshPunchDialConfig(t, keyPEM, peers, nil)
 		swapMeshPunchDialSource(t, wired())
 		handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
@@ -107,8 +107,8 @@ func TestGetMeshExitPunchWiringMatrix(t *testing.T) {
 			t.Fatalf("getMeshExitForExecution: %v", err)
 		}
 		names := exitTransportNames(t, client)
-		if containsString(names, "udp") {
-			t.Fatalf("punch 默认关时 transports 不应含 udp, got %v", names)
+		if !containsString(names, "udp") {
+			t.Fatalf("punch 默认开(2026-11-24 翻转)时 transports 应含 udp, got %v", names)
 		}
 	})
 

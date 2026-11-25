@@ -209,6 +209,12 @@ const (
 	// The pass emitted no assistant output; the caller should release the
 	// reserved binding, drop --session-id, and retry fresh once.
 	agentAIRunSessionIDInUse
+	// agentAIRunThreadBusy means codex rejected thread/resume|fork because the
+	// native thread is currently owned by another live codex client (single
+	// writer: 用户自己的 codex-tui/IDE 还开着)。The pass emitted no assistant
+	// output and NO terminal frame; the caller asks the user whether to fork
+	// the conversation (default: no fork → codex_thread_busy terminal error).
+	agentAIRunThreadBusy
 )
 
 type agentAIRunOutcome int
@@ -259,6 +265,9 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 			run.resumeSessionID = ""
 			run.prompt = firstNonEmpty(run.freshPrompt, run.prompt)
 			_ = m.runCodexAppServer(ctx, run, writeJSON)
+		}
+		if outcome == agentAIRunThreadBusy && ctx.Err() == nil {
+			m.handleAgentAICodexThreadBusy(ctx, &run, writeJSON)
 		}
 		return
 	}

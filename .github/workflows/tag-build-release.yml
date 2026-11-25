@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - '*'
+  # 手动兜底入口:UI 下拉只列分支,重建指定 tag 用 API 指定 ref 即可——
+  #   gh api -X POST repos/aliang-one/aliang-client/actions/workflows/tag-build-release.yml/dispatches -f ref=v1.1.117
+  # dispatch 走 tag ref,全套 checkout/VERSION 管线零改动;guard 的「非最新 tag 拒build」仅对 push 生效。
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -30,6 +34,25 @@ jobs:
         shell: bash
         run: |
           git fetch origin master
+          # v1.1.124 首跑实证:checkout@v4 取回的 tag 形态与裸 --tags fetch 的
+          # 预期形态冲突时,fetch 报「would clobber existing tag」且 --quiet 会
+          # 把报错一并吞掉、退出码 1——set -e 直接在无任何输出的情况下杀死
+          # 本步(两次重跑同签名复现)。--force 让本地 tag 对齐远端真值,
+          # clobber 从此不可能;去掉 --quiet 让任何残余故障可见。
+          git fetch origin --tags --force
+          # v1.1.117 复活事故(2026-11-24,11-21 同款已发生过一次):cleanup 删旧
+          # tag 后,GitLab push mirror 下轮同步把 GitLab 侧同名 tag 原样推回
+          # GitHub → push 事件触发全量构建 → 旧 release 重生按发布时间抢走
+          # Latest → cos-relay 盲跟 releases/latest 把旧版本刷进官网下载中心。
+          # 纵深防御:push 事件只放行当前最新 semver tag(常规发版推的就是
+          # 最新,不受影响);重建旧版本走 workflow_dispatch(人工主动操作,
+          # 不受此门限制)。on_master 输出复用作「是否放行构建」总开关。
+          NEWEST_TAG="$(git tag --list --sort=-v:refname | head -n1)"
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF_NAME}" != "${NEWEST_TAG}" ]; then
+            echo "on_master=false" >> "$GITHUB_OUTPUT"
+            echo "Tag ${GITHUB_REF_NAME} is not the newest tag (newest: ${NEWEST_TAG}). Stale-tag push skipped."
+            exit 0
+          fi
           TAG_COMMIT="$(git rev-list -n 1 "${GITHUB_REF_NAME}")"
           if git merge-base --is-ancestor "$TAG_COMMIT" origin/master; then
             echo "on_master=true" >> "$GITHUB_OUTPUT"

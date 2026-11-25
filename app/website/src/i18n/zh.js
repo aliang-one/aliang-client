@@ -909,7 +909,7 @@ export default {
   rules_proxyPassword: '密码',
   rules_proxyPasswordPlaceholder: '可选',
   rules_aiRules: 'Aliang 的 AI 加速',
-  rules_aiRulesDesc: '为各 AI 服务商开启加速分流，并用换行、逗号或分号分隔包含的域名。',
+  rules_aiRulesDesc: '这部分流量将会转发到 Aliang 的服务器进行加速和赋能。',
   // LOW#17：AI 提供商启用开关的可访问名称（checkbox aria-label + sr-only 文字）
   rules_enableAiRule: '启用该服务商规则',
   rules_noProviders: '后端尚未返回任何 AI 服务商。',
@@ -1105,7 +1105,7 @@ export default {
   mesh_keyPassphrase: '私钥口令',
   // 打洞直连(transfer-punch-stun):punch 开关 + STUN 列表;en.js 同段须成对
   mesh_punchEnable: '打洞直连（UDP 打洞）',
-  mesh_punchEnableHint: '与节点尝试 UDP 打洞直连（本机需对公网开放 UDP 端口，默认关闭）。',
+  mesh_punchEnableHint: '与节点尝试 UDP 打洞直连（本机需对公网开放 UDP 端口；默认开启，可显式关闭）。',
   // 公网直连声明(punch-public-peer):public_listen 开关;en.js 同段须成对
   mesh_publicListen: '公网直连声明',
   mesh_publicListenHint: '本机监听口可被对端公网直连（公网直挂或云 EIP 1:1 NAT 服务器勾选），默认关。',

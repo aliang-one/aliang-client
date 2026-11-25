@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -104,6 +105,24 @@ func runShell(ctx context.Context, kind string, input map[string]interface{}, en
 		return ErrorResult("%v", err)
 	}
 
+	// ProjectPath 先展开 ~ 再落 cmd.Dir(2026-11-25 线上事故):os/exec 不做
+	// 波浪号展开,字面 "~" 会让每条命令在执行前就死在 chdir(darwin 呈现为
+	// fork/exec ENOENT,Windows 呈现为「chdir ~: The system cannot find the
+	// file specified.」),模型无从理解、只会盲试,直到触发防重试循环保险丝
+	// 整局报废。目录不存在时同样直接给出可行动的报错,不再甩 cryptic 的
+	// chdir 失败。
+	projectDir := ""
+	if env.ProjectPath != "" {
+		expanded, expandErr := ExpandHome(strings.TrimSpace(env.ProjectPath))
+		if expandErr != nil {
+			expanded = strings.TrimSpace(env.ProjectPath)
+		}
+		if info, statErr := os.Stat(expanded); statErr != nil || !info.IsDir() {
+			return ErrorResult("项目目录不存在或不可达: %s（请改用存在的目录，或先让用户创建它）", expanded)
+		}
+		projectDir = expanded
+	}
+
 	timeout := defaultShellTimeout
 	if ms, ok := inputInt(input, "timeout"); ok && ms > 0 {
 		timeout = time.Duration(ms) * time.Millisecond
@@ -121,8 +140,8 @@ func runShell(ctx context.Context, kind string, input map[string]interface{}, en
 	// 进程会继承 stdout 管道并成为孤儿，导致 cmd.Run() 在超时后仍然无限等待。
 	// 详见 exec_unix.go 的文件注释与 2026-11-01 线上事故。
 	cmd := newToolCommandContext(runCtx, shellPath, args...)
-	if env.ProjectPath != "" {
-		cmd.Dir = env.ProjectPath
+	if projectDir != "" {
+		cmd.Dir = projectDir
 	}
 	if env.Env != nil {
 		cmd.Env = env.Env

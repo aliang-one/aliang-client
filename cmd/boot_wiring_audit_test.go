@@ -54,6 +54,12 @@ func TestBootMeshWiringAudit(t *testing.T) {
 			"tunnel.StartMeshLANAssembly(",
 			"tunnel.WireMeshAutoPeerProbe(",
 			"services.StartMeshRosterSync(",
+			// 出口委托缝(本机节点标识/egress peer 源/TUN DNS 代转发源):
+			// 2026-11-24 审计实证 start 形态漏接——liang-dev 这类「aliang --host
+			// + 独立 agent」部署里,该进程永远不是 WS 属主,validateConfig 的另一
+			// 接线点永不运行,四条缝「永远不接线」:开平台流量代理后平台请求逐
+			// 条 fail-loud、AI 流静默留本机,重启后落 SoftExpired、入口代理暂停。
+			".WireMeshAssemblySeams(services.GetSharedAgentService().CurrentDeviceID)",
 		})
 }
 

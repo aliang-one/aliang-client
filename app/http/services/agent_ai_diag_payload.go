@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"aliang.one/nursorgate/app/agentcore"
 	"aliang.one/nursorgate/app/http/models"
 )
 
@@ -128,6 +129,11 @@ func resolveAgentAICWD(raw string) (string, error) {
 			return "", err
 		}
 		cwd = home
+	} else if expanded, err := agentcore.ExpandHome(cwd); err == nil {
+		// 2026-11-25 线上事故:客户端目录解析不出时会把字面 "~" 发上来,
+		// 其语义就是主目录。这里先展开再做存在性校验,否则 Windows 上
+		// os.Stat("~") 必败,create 恒拒、runStart 恒回沿用,意图落空。
+		cwd = expanded
 	}
 	// Same confinement as the other phone-driven surfaces (see
 	// resolveAgentCWDWithConsent), but still without the authorized-list ACL:

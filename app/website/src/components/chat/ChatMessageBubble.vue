@@ -4,7 +4,11 @@
     <div
       v-if="msg.kind === 'system'"
       :data-testid="systemNoteTestId(msg.note)"
-      class="mx-auto w-fit max-w-full rounded-full border border-slate-200 bg-white/80 px-3 py-1 text-center text-xs text-slate-500 dark:border-slate-700 dark:bg-slate-800/80 dark:text-slate-400"
+      :role="msg.note === 'turn_failed' ? 'status' : undefined"
+      class="mx-auto w-fit max-w-full border px-3 py-1 text-xs"
+      :class="msg.note === 'turn_failed'
+        ? 'whitespace-pre-wrap break-words rounded-lg border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-800 dark:bg-rose-900/30 dark:text-rose-300'
+        : 'rounded-full border-slate-200 bg-white/80 text-center text-slate-500 dark:border-slate-700 dark:bg-slate-800/80 dark:text-slate-400'"
     >{{ msg.content }}</div>
     <template v-else>
       <!-- eyebrow 行：角色名 + 相对时间（title 显绝对时间）+ assistant 状态 -->

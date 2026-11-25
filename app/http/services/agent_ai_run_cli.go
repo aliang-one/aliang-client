@@ -496,6 +496,19 @@ func isAgentAISessionIDInUse(stderr string) bool {
 	return strings.Contains(lower, "session id") && strings.Contains(lower, "already in use")
 }
 
+// isAgentAICodexWriterConflict 识别 codex 0.172 线程存储的单写者冲突：目标
+// thread 正被另一个存活客户端（用户自己的 codex-tui/IDE，经 app-server
+// daemon）持有 thread-writer-locks 写锁，thread/resume|fork 被 -32600 拒绝。
+// 必须按文本分类而不能按 JSON-RPC code：-32600 同时被 "no rollout found"、
+// "Invalid request: missing field ..." 等错误复用（2026-11-25 daemon 实测）。
+// 案发现场原文："thread-store conflict: thread <id> already has an active writer"。
+
+func isAgentAICodexWriterConflict(detail string) bool {
+	lower := strings.ToLower(detail)
+	return strings.Contains(lower, "already has an active writer") ||
+		strings.Contains(lower, "thread-store conflict")
+}
+
 // captureAgentAIStderr reads everything from reader, storing the first cap
 // bytes into buf and discarding the rest. It never blocks the run on stderr
 // volume and bounds memory usage.

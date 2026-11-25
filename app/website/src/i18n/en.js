@@ -910,7 +910,7 @@ export default {
   rules_proxyPassword: 'Password',
   rules_proxyPasswordPlaceholder: 'Optional',
   rules_aiRules: 'Aliang AI Accelerator',
-  rules_aiRulesDesc: 'Enable accelerated routing per AI provider and list included domains, separated by new lines, commas, or semicolons.',
+  rules_aiRulesDesc: 'This traffic will be forwarded to Aliang\'s servers for acceleration and enhancement.',
   // LOW#17: accessible name for the per-provider enable switch (checkbox aria-label + sr-only text)
   rules_enableAiRule: 'Enable this provider\'s rules',
   rules_noProviders: 'No AI providers were returned by the backend yet.',
@@ -1106,7 +1106,7 @@ export default {
   mesh_keyPassphrase: 'Key passphrase',
   // UDP hole punching (transfer-punch-stun): punch toggle + STUN list; pair with zh.js
   mesh_punchEnable: 'UDP hole punching',
-  mesh_punchEnableHint: 'Try direct UDP hole-punched links with peers (opens a public UDP port on this device; off by default).',
+  mesh_punchEnableHint: 'Try direct UDP hole-punched links with peers (opens a public UDP port on this device; on by default, can be disabled).',
   // Public direct-dial declaration (punch-public-peer): public_listen toggle; pair with zh.js
   mesh_publicListen: 'Public direct-dial',
   mesh_publicListenHint: 'The mesh listen port on this device is reachable from the public internet (check on servers with a public IP or a cloud EIP 1:1 NAT); off by default.',

@@ -1052,3 +1052,69 @@ describe('RulesSettings SSH 连接测试与拓扑画布', () => {
     expect(btn.disabled).toBe(true);
   });
 });
+
+// —— 合并卡片布局契约（上游代理 + 代理规则同卡）——
+// 两张旧 section 已合并为一张卡：禁用代理时仅上游代理子块变灰（wrapper 边界），
+// 代理规则区（textarea/语法文档链接）不受代理开关连累。这里钉住 wrapper 边界，
+// 防止后续改动把变灰范围悄悄挪回整卡或挪丢规则区。i18n mock 原样回键，标题直接按 key 找。
+describe('RulesSettings 合并卡片布局契约', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(knownHostsEnvelope([]))));
+  });
+
+  afterEach(() => {
+    while (mountedApps.length) {
+      const { app, el } = mountedApps.pop();
+      app.unmount();
+      el.remove();
+    }
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const findHeading = (el, key) =>
+    [...el.querySelectorAll('h3')].find((h) => h.textContent === key);
+
+  it('上游代理与代理规则标题落在同一个 section（合并卡）', async () => {
+    const { el } = mountRules(sshConfig());
+    await flush();
+    const proxyH = findHeading(el, 'rules_customerProxy');
+    const rulesH = findHeading(el, 'rules_proxyRules');
+    expect(proxyH).toBeTruthy();
+    expect(rulesH).toBeTruthy();
+    expect(rulesH.closest('section')).toBe(proxyH.closest('section'));
+  });
+
+  it('禁用代理：变灰 wrapper 覆盖上游代理子块（开关仍可点击），不波及代理规则区', async () => {
+    const { el } = mountRules(sshConfig({ enable: false }));
+    await flush();
+    // opacity-70 全组件唯一：只出现在变灰 wrapper 上（其余均为 disabled:opacity-60）
+    const dim = el.querySelector('.opacity-70');
+    expect(dim).toBeTruthy();
+
+    const proxyH = findHeading(el, 'rules_customerProxy');
+    const rulesH = findHeading(el, 'rules_proxyRules');
+    expect(dim.contains(proxyH)).toBe(true);
+    expect(dim.contains(rulesH)).toBe(false);
+
+    // 开关在变灰子块内但未绑 disabled（opacity 不拦截指针事件），仍可点击恢复
+    const toggle = dim.querySelector('input[type="checkbox"]');
+    expect(toggle).toBeTruthy();
+    expect(toggle.disabled).toBe(false);
+
+    // 规则面（textarea + 语法文档链接）完全在变灰 wrapper 之外
+    const section = proxyH.closest('section');
+    const textarea = section.querySelector('textarea');
+    expect(textarea).toBeTruthy();
+    expect(dim.contains(textarea)).toBe(false);
+    expect(dim.querySelector('a')).toBeNull();
+    const docsLink = [...section.querySelectorAll('a')].find((a) => a.textContent === 'rules_docsLink');
+    expect(docsLink).toBeTruthy();
+  });
+
+  it('启用代理：合并卡内无变灰类', async () => {
+    const { el } = mountRules(sshConfig({ enable: true }));
+    await flush();
+    expect(el.querySelector('.opacity-70')).toBeNull();
+  });
+});

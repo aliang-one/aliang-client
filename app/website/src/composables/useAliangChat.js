@@ -488,7 +488,7 @@ export function runDoneNeedsSnapshot(conv, hadRunning) {
 //      帽截断孤儿头行（首条 user 行被截走）跳过——回合语义外。
 //   ② 锚 = 最后一个 userRow.message_id 命中本地 user 气泡的回合；无锚整体
 //      no-op（安全语义：本地气泡与 journal 无交集时不越权重排）。
-//   ③ 锚点前区域不动（同引用透传）；锚回合文本按修复律收敛：
+//   ③ 锚点前气泡复用原对象；锚回合文本按修复律收敛：
 //      - 已定谳（存在后续回合，或快照非 running）：journal 更长即替换（增长
 //        对齐 + 恢复尾巴片段——delta 尾巴与 journal 全文互不为前缀，2026-11-05
 //        「只看到 59 60」形态）；local ⊇ journal 前缀 = 旧对账连体垃圾特征，
@@ -531,12 +531,12 @@ export function reconcileLocalSnapshotMessages(localMessages, rows, opts = {}) {
     } else if (row.role === 'assistant' || row.role === 'system') {
       if (!rounds.length) continue; // 帽截断孤儿头行
       const r = rounds[rounds.length - 1];
-      if (row.role === 'assistant' && typeof row.text === 'string' && row.text) r.texts.push(row.text);
-      if (row.role === 'system' && typeof row.text === 'string' && row.text) {
+      if (typeof row.text !== 'string' || !row.text) continue;
+      if (row.role === 'system') {
         r.notes.push({ text: row.text, ts: tsOf(row), seq: chatMessageSeq(row) });
+        continue;
       }
-      // 该回合的 seq 取「本回合最后一条带 seq 的助手/系统行」——新建答案泡时
-      // 以它作为该气泡的先后依据（2026-11-10 身份化）。
+      r.texts.push(row.text);
       if (chatMessageSeq(row)) r.lastSeq = chatMessageSeq(row);
       r.lastTs = tsOf(row) || r.lastTs;
     }
@@ -568,7 +568,7 @@ export function reconcileLocalSnapshotMessages(localMessages, rows, opts = {}) {
   const foreign = rounds.slice(anchorIdx + 1);
   const block = local.slice(anchorLocalIdx + 1);
   const anchorTexts = anchorRound.texts.join('\n\n');
-  const settled = foreign.length > 0 || !snapshotRunning;
+  const settled = foreign.length > 0 || !snapshotRunning || anchorRound.notes.length > 0;
   const isPlainAsst = (m) => !!(m && m.role === 'assistant' && !m.kind && !m.note);
 
   // 外来回合 mid → 回合序号（复用判定用）
@@ -616,13 +616,13 @@ export function reconcileLocalSnapshotMessages(localMessages, rows, opts = {}) {
       result.changed = true;
     }
     const isLast = k === rounds.length - 1;
+    const streaming = isLast && snapshotRunning && !r.notes.length;
     const liveHere = liveBubble && isLast && snapshotRunning;
     const text = r.texts.join('\n\n');
     const answer = liveHere ? liveBubble : reuseAnswer;
     if (answer) {
       // 修复律与锚回合同源：流中末回合仅 journal 前缀增长（canAlign 语义）；
       // 定谳回合 journal 更长即替换（覆盖恢复尾巴片段形态）+ 连体前缀替换。
-      const streaming = isLast && snapshotRunning;
       if (text && text !== answer.content
         && (streaming
           ? text.startsWith(answer.content || '')
@@ -631,7 +631,7 @@ export function reconcileLocalSnapshotMessages(localMessages, rows, opts = {}) {
         answer.content = text;
         result.changed = true;
       }
-      answer.status = streaming ? 'running' : 'done';
+      if (answer.status !== 'error') answer.status = streaming ? 'running' : 'done';
       // seq 同步：只在真的变了时改写并记 changed（幂等契约：零改动必须
       // changed=false，否则调用方每轮都重赋值+落盘，渲染抖动）。
       if (r.lastSeq > 0 && answer.seq !== r.lastSeq) {
@@ -639,11 +639,11 @@ export function reconcileLocalSnapshotMessages(localMessages, rows, opts = {}) {
         result.changed = true;
       }
       out.push(answer);
-    } else if (text || (isLast && snapshotRunning)) {
+    } else if (text || streaming) {
       const fresh = {
         role: 'assistant',
         content: text,
-        status: (isLast && snapshotRunning) ? 'running' : 'done',
+        status: streaming ? 'running' : 'done',
         ts: r.lastTs || fallbackTs,
         ...(r.lastSeq > 0 ? { seq: r.lastSeq } : {}),
       };
@@ -652,10 +652,11 @@ export function reconcileLocalSnapshotMessages(localMessages, rows, opts = {}) {
       result.changed = true;
       if (fresh.status === 'running') result.createdRunning = true;
     }
-    for (const n of r.notes) {
-      out.push(deviceSystemNoteBubble(n.text, n.ts, n.seq || 0));
-      result.appended++;
-      result.changed = true;
+    if ((!mid || isOptionRow) && !reuseUser) {
+      for (const n of r.notes) {
+        out.push(deviceSystemNoteBubble(n.text, n.ts, n.seq));
+        result.appended++;
+      }
     }
   };
 
@@ -796,8 +797,43 @@ export function reconcileLocalSnapshotMessages(localMessages, rows, opts = {}) {
   for (let k = emittedK + 1; k < rounds.length; k++) {
     emitRound(k, null, null, (k === rounds.length - 1) ? anchorLive : null);
   }
+  // 快照也要补本地已有提问的失败说明。按 user ID 定位，保留已经实时展示的原因。
+  const notesByMessageId = new Map(rounds
+    .filter(r => r.notes.length && r.userRow.message_id)
+    .map(r => [String(r.userRow.message_id), r.notes]));
+  let messages = out;
+  if (notesByMessageId.size) {
+    messages = [];
+    let notes;
+    let roundStart = 0;
+    let failedMessageId = '';
+    const appendNotes = () => {
+      if (!notes) return;
+      const existing = messages.slice(roundStart);
+      for (const n of notes) {
+        if (existing.some(m => (m?.note === 'turn_failed'
+          && (m.failedMessageId === failedMessageId || (n.seq && m.seq === n.seq) || m.content === n.text))
+          || (m?.status === 'error' && m.content && n.text.endsWith(`：${m.content}`)))) continue;
+        messages.push({
+          ...deviceSystemNoteBubble(n.text, n.ts, n.seq),
+          failedMessageId,
+        });
+        result.appended++;
+      }
+    };
+    for (const m of out) {
+      if (m?.role === 'user') {
+        appendNotes();
+        failedMessageId = `assistant_${m.messageId}`;
+        notes = notesByMessageId.get(m.messageId);
+        roundStart = messages.length;
+      }
+      messages.push(m);
+    }
+    appendNotes();
+  }
   if (result.appended > 0 || result.closedRunning > 0) result.changed = true;
-  result.messages = out;
+  result.messages = messages;
   return result;
 }
 
@@ -2228,7 +2264,17 @@ export function useAliangChat() {
     const snapshotRunning = e.status === 'running';
     // 本端发送在途（create/ai.message 未落定）：run 可能刚要起跑，此刻的
     // idle 快照不是终态证据，绝不动消息列表（误收敛=假 done+delta 全丢）。
-    const inFlight = local.id === activeId.value && sending.value;
+    let inFlight = local.id === activeId.value && sending.value;
+    if (inFlight && !snapshotRunning) {
+      const latestUser = local.messages.findLast(m => m?.role === 'user');
+      const lastUserRow = rows.findLastIndex(row => row?.role === 'user');
+      // 断线期间可能错过 ai.error，sending 仍为 true。只有快照明确记录当前
+      // 提问的失败时才可收尾，旧回合的 idle 快照仍不得关掉新发送。
+      if (latestUser?.messageId && rows[lastUserRow]?.message_id === latestUser.messageId
+        && rows.slice(lastUserRow + 1).some(row => row?.role === 'system' && row.text)) {
+        inFlight = false;
+      }
+    }
     if (!inFlight && rows.length) {
       const res = reconcileLocalSnapshotMessages(local.messages, rows, {
         provider: local.provider || '',
@@ -3994,9 +4040,8 @@ export function useAliangChat() {
         return;
       }
       case 'ai.error': {
-        if (matchedById) disarmIdleWatchdog(conv); // B3：同 done 门控
-        const asst = findRunningAssistant(conv);
         if (!e.message_id) {
+          if (matchedById) disarmIdleWatchdog(conv);
           // create 阶段失败（典型：手输目录不存在）。亮在设置条上、结算确认门；
           // 不进消息流。目录未锁定（dirLocked 只在回显成功时置位），纠正路径后
           // 下一条消息重发 create 即成功。判定只用 message_id 单条件：运行期
@@ -4010,14 +4055,43 @@ export function useAliangChat() {
           saveToStorage();
           return;
         }
+        const messages = conv.messages;
+        const alreadyShown = messages.some(m => m?.note === 'turn_failed' && m.failedMessageId === e.message_id);
+        // 迟到的错误留在原回合，避免结束同一会话已经开始的下一轮。
+        const userIndex = matchedById ? messages.findIndex(m => m?.role === 'user'
+          && m.messageId && `assistant_${m.messageId}` === e.message_id) : -1;
+        const nextUser = userIndex < 0 ? -1 : messages.findIndex((m, i) => i > userIndex && m?.role === 'user');
+        if (alreadyShown && (userIndex < 0 || nextUser >= 0)) return;
+        const late = nextUser >= 0;
+        const asst = late ? null : findRunningAssistant(conv);
         if (asst) {
-          asst.status = 'error';
-          if (!asst.content) asst.content = e.error || t('chat_aiError');
+          if (asst.content || asst.thinking) asst.status = 'error';
+          else messages.splice(messages.indexOf(asst), 1);
+        }
+        if (!alreadyShown && (matchedById || asst)) {
+          const note = {
+            ...deviceSystemNoteBubble(e.error || t('chat_aiError'), now()),
+            failedMessageId: e.message_id,
+          };
+          if (late) {
+            note.ts = messages[nextUser - 1].ts;
+            messages.splice(nextUser, 0, note);
+          } else {
+            messages.push(note);
+          }
+          if (conv.id === activeId.value) scrollToBottom();
+        }
+        if (late) {
+          saveToStorage();
+          return;
         }
         // 收窗（endRunWindow）：asst 已先置 error，此处收剩余 running + flags。
         // matchedById 门控同 done/run.started：未命中帧不动 flags（他会话
         // 帧不得清活跃会话的 run 窗口）。
-        if (matchedById) endRunWindow(conv);
+        if (matchedById) {
+          disarmIdleWatchdog(conv);
+          endRunWindow(conv);
+        }
         clearApprovalsForSession(conv, e.session_id);
         finishRun(conv);
         return;

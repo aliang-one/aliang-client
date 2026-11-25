@@ -531,11 +531,15 @@ func TestMeshIdentityHandlerFileMissingAgreeNoFallback(t *testing.T) {
 	}
 }
 
-// TestMeshIdentityHandlerRosterMissingSelf 断言③:roster 已同步但缺本机
-// 条目恰产一条(点名缺失的 self 值);roster_self_present=false 透传。
-// seam 改参数捕获闭包:钉住 handler 回查键=进程 state 的 self(resp.DeviceID),
-// 不是 beacon self(M3 接线键)。
-func TestMeshIdentityHandlerRosterMissingSelf(t *testing.T) {
+// TestMeshIdentityHandlerRosterMissingSelfIsNotMismatch roster 已同步而缓存
+// 里没有本机条目,不是身份不一致(2026-11-24 审计定案):PhoneServer 的
+// GET /api/agent/mesh-roster 回包前会把请求方自己的条目滤掉(其路由测试钉死
+// 「同账号全量(滤 self)」),所以任何同步成功的设备 roster_self_present 恒为
+// false——旧实现在每台健康设备上都报「缺本机条目,自动组网将 fail-closed」,
+// 把 mesh-runbook 的身份脑裂症状族指向了健康设备。本用例钉:不产 mismatch;
+// roster_self_present 仍如实透传 false;回查键仍=进程 state 的 self
+// (resp.DeviceID,非 beacon self)。
+func TestMeshIdentityHandlerRosterMissingSelfIsNotMismatch(t *testing.T) {
 	h := meshIdentitySeams()
 	var lookupKey string
 	h.rosterSelfPresent = func(selfDeviceID string) bool {
@@ -552,7 +556,9 @@ func TestMeshIdentityHandlerRosterMissingSelf(t *testing.T) {
 	if data["roster_self_present"] != false {
 		t.Fatalf("roster_self_present = %v, want false", data["roster_self_present"])
 	}
-	assertMeshIdentityMismatch(t, data, "dev-1")
+	if mismatches := data["mismatches"].([]any); len(mismatches) != 0 {
+		t.Fatalf("roster 滤掉请求方自身是服务端契约,不得报不一致:mismatches = %v", mismatches)
+	}
 }
 
 // TestMeshIdentityHandlerRosterUnsyncedNotMismatch 诚实闸:roster 从未同步

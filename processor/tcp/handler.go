@@ -312,6 +312,14 @@ func (h *TCPConnectionHandler) Handle(ctx context.Context, originConn net.Conn, 
 	// Ensure we close the origin connection when done
 	defer originConn.Close()
 	connID := ensureTCPConnID(metadata)
+
+	// 代理面目标守卫:必须在协议分派之前生效——回环/私网目标的直拨短路、
+	// AI base-URL 的强制平台路由都在其后面。
+	if err := CheckProxyFaceDestination(metadata); err != nil {
+		logger.Warn(fmt.Sprintf("[TCP] conn_id=%s 拒绝代理面请求: %v (src=%s)", connID, err, metadata.SourceAddress()))
+		return err
+	}
+
 	sessionCtx, connectCtx, cancel := prepareTCPConnectionContexts(ctx, connID)
 	defer cancel()
 
@@ -755,7 +763,23 @@ func (h *TCPConnectionHandler) dialDirect(ctx context.Context, metadata *M.Metad
 			}
 			return nil, fmt.Errorf("dial direct: no destination (invalid IP and empty hostname)")
 		}
-		host = metadata.HostName
+		if metadata.MeshInjected {
+			// 注入流(mesh-exit 转发而来)的域名目标:解析后校验并钉住——域名
+			// 指向本机回环/链路本地(localhost、nip.io 类)即拒(入站口的字面量
+			// ACL 拦不住域名);钉住 DstIP 后拨号不再二次解析,杜绝 DNS 重绑定。
+			// 校验拒绝不是「目的地拨不通」,不记负缓存。
+			pinned, vetErr := vetInjectedHost(ctx, metadata.HostName, metadata.DstPort)
+			if vetErr != nil {
+				if key != "" {
+					dialNegCacheShared.settle(key, false)
+				}
+				return nil, vetErr
+			}
+			metadata.DstIP = pinned
+			host = pinned.String()
+		} else {
+			host = metadata.HostName
+		}
 	}
 	addr := net.JoinHostPort(host, fmt.Sprintf("%d", metadata.DstPort))
 	conn, err := dialer.DialContext(ctx, "tcp", addr)

@@ -11,7 +11,9 @@
 // 三态布尔语义（定死，与后端 Effective* 同源）：
 //   enable          nil → true   （mesh 是直连之上的增量出口，升级不许静默关）
 //   forward_enable  nil → false  （被转发是让渡型能力，默认关）
-//   punch_enable    nil → false  （UDP 打洞直连要本机对公网开口，让渡型能力，默认关）
+//   punch_enable    nil → true   （2026-11-24 默认开：mesh 已配置即打洞直连，
+//                                 显式 false 才关——与后端 EffectivePunchEnabled
+//                                 翻转同步；读侧仍恒产出显式布尔防 deep-merge 吞键）
 //   public_listen   nil → false  （公网直连声明,让渡型,仅公网直挂/EIP 1:1 NAT 服务器勾选）
 //   peer.relay      nil → true   （LAN 不可达时允许走中继载体）
 //   fallback.enable nil → false  （出口链路默认关）
@@ -80,9 +82,10 @@ export function normalizeMeshConfig(payload) {
   return {
     enable: typeof source.enable === 'boolean' ? source.enable : true,
     forward_enable: typeof source.forward_enable === 'boolean' ? source.forward_enable : false,
-    // punch_enable 透传（nil=false 让渡型默认关）：不透传 = 已配置的 true 值
-    // 会被卡片保存整块重写时静默丢掉（「保存 200 但永不落盘」缺陷族）。
-    punch_enable: typeof source.punch_enable === 'boolean' ? source.punch_enable : false,
+    // punch_enable（2026-11-24 默认开 nil=true，与后端 EffectivePunchEnabled 翻转
+    // 同步）：读侧恒产出显式布尔——不透传 = 已配置的值会被卡片保存整块重写时
+    // 静默丢掉（「保存 200 但永不落盘」缺陷族）；缺键归 true 是新默认语义。
+    punch_enable: typeof source.punch_enable === 'boolean' ? source.punch_enable : true,
     // public_listen(punch-public-peer):公网直连声明三态 nil=false。勾选后
     // B 侧打洞 result 帧声明 public,A 侧跳过 STUN classify 直拨——透传口径
     // 与 punch_enable 同族(漏透传=卡片整块重写时丢已勾选值)。
