@@ -365,6 +365,9 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		// classifyRefreshSessionFailure 返回 nil 时(403 以外 + 未知/不可解析 401)走下方
+		// 非终态分支——返回普通错误让 SoftExpired 恢复链重试而非清会话;只有明确拒绝
+		// (REFRESH_TOKEN_INVALID/403/拒绝短语)才 wipe。
 		if invalidTokenErr := classifyRefreshSessionFailure(resp.StatusCode, body); invalidTokenErr != nil {
 			if !authority.OperationCurrent(operation) {
 				return nil, ErrStaleSessionOperation
@@ -409,8 +412,16 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 		}
 		var profileAPIError *authenticatedAPIError
 		if errors.As(err, &profileAPIError) && profileAPIError.StatusCode == http.StatusUnauthorized {
-			clearLocalSessionAfterExpiration("refreshed access token rejected by profile endpoint")
-			return nil, fmt.Errorf("refreshed session rejected: %w", ErrSessionExpired)
+			// 只有明确拒绝语义(TOKEN_REVOKED/ACCESS_TOKEN_INVALID/TOKEN_EXPIRED/
+			// invalid authentication)才判终态清会话;未知/不可解析/空 body 的 401
+			// 视为瞬时,返回非终态 ErrSessionRecovering 保留会话让 SoftExpired 恢复链重试,
+			// 避免一次上游抖动/网关误答把用户踢下线。
+			if errors.Is(classifyAccessTokenFailure(profileAPIError.StatusCode, profileAPIError.Body), ErrSessionExpired) {
+				clearLocalSessionAfterExpiration("refreshed access token rejected by profile endpoint")
+				return nil, fmt.Errorf("refreshed session rejected: %w", ErrSessionExpired)
+			}
+			logger.Warn(fmt.Sprintf("Profile sync after refresh inconclusive (transient/unclear 401), keeping session for retry: %v", err))
+			return nil, fmt.Errorf("profile sync after refresh inconclusive: %w", ErrSessionRecovering)
 		}
 		logger.Warn(fmt.Sprintf("Profile sync after refresh failed, keeping last known user profile: %v", err))
 	} else {

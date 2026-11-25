@@ -74,7 +74,7 @@ Expected: FAIL（未知/不可解析 401 仍 terminal；local session 短语仅�
 
 在 `processor/auth/errors.go`：
 - `refreshRejectionPhrases` 追加 `"local session is no longer valid"`。
-- `classifyRefreshSessionFailure` 删除末尾兜底 `return ErrRefreshTokenInvalid`（约 82 行），改为 `return nil`；403 显式返回 `ErrRefreshTokenInvalid`。**同时删除/改写 75-81 行旧注释块**（「A refresh endpoint has already authenticated... Its 401 is therefore a definitive rejection, including unknown JSON...」），避免与新 nil 兜底行为矛盾。
+- `classifyRefreshSessionFailure` 删除末尾兜底 `return ErrRefreshTokenInvalid`（约 82 行），改为 `return nil`；403 显式返回 `ErrRefreshTokenInvalid`（**注意**：refresh 端点 403 = 明确拒绝 terminal，access 端点 403 不处理返回 nil——两者刻意不同，勿「对齐」）。**同时删除/改写 75-81 行旧注释块**（「A refresh endpoint has already authenticated... Its 401 is therefore a definitive rejection, including unknown JSON...」），避免与新 nil 兜底行为矛盾。
 
 ```go
 func classifyRefreshSessionFailure(statusCode int, body []byte) error {
@@ -193,6 +193,8 @@ Expected: FAIL（裸 401 仍 true）
 - 改为：仅当 `responseStatus === 401` 且 `envelopeLayers` 任一层命中明确拒绝语义（status unauthenticated / error session_expired|token_expired / code token_expired / message 含 local session is no longer valid / invalid authentication / token has been revoked / invalid access token / token expired / token revoked）→ true。
 - 403 不触发（移除任何 403→true 逻辑；当前无，保持）。
 - 其它 status → false。
+- **实现偏差（评审确认）**：实际实现不设 `responseStatus !== 401 → false` 的门——否则 nested terminal envelope（200 + `data.status=unauthenticated`，既有测试钉死）会误杀。401 与其它 status 一律要求 envelope 层命中明确拒绝语义；403 无拒绝证据自然 false。
+- `ACCESS_REJECTION_PHRASES` 须包含两条 Go 中间件真实文案（互不为子串，缺一不可）：`authenticated dashboard session is required`（dashboard_session.go:108 / remote_access.go:53）与 `authenticated session is required`（quick_setup_service.go ErrQuickSetupUnauthenticated）——移除裸 401 短路后这是真·会话过期触发登出的唯一信号路径，并有测试用例钉死该跨语言契约。
 
 ```js
 const ACCESS_REJECTION_PHRASES = [
