@@ -216,6 +216,24 @@ describe('reconcileLocalSnapshotMessages(回合分段对账:连体修复 + 外�
     expect(reconcileLocalSnapshotMessages(local, [], { fallbackTs: FALLBACK }).changed).toBe(false);
     expect(reconcileLocalSnapshotMessages([], [uRow('m1', '问', TS_A)], { fallbackTs: FALLBACK }).changed).toBe(false);
   });
+
+  it('从快照恢复本地已有回合的失败原因，重复对账只展示一次', () => {
+    const local = [uB('m1', 'GPT'), uB('m2', 'DeepSeek'), aB('', 'running')];
+    const rows = [
+      uRow('m1', 'GPT', TS_A, { seq: 1 }),
+      row(TS_A, { role: 'system', text: '这一轮执行失败：Upstream access forbidden', seq: 2 }),
+      uRow('m2', 'DeepSeek', TS_B, { seq: 3 }),
+      row(TS_B, { role: 'system', text: '这一轮执行失败：404 model_not_found', seq: 4 }),
+    ];
+    const first = reconcileLocalSnapshotMessages(local, rows);
+    expect(first.messages.filter(m => m.note === 'turn_failed').map(m => m.seq)).toEqual([2, 4]);
+    expect(first.messages.indexOf(local[1])).toBeGreaterThan(
+      first.messages.findIndex(m => m.seq === 2),
+    );
+    const replay = reconcileLocalSnapshotMessages(first.messages, rows);
+    expect(replay.changed).toBe(false);
+    expect(replay.messages).toEqual(first.messages);
+  });
 });
 
 describe('ensureAssistantBubble(run 窗口感知)', () => {

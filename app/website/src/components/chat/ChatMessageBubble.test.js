@@ -75,4 +75,13 @@ describe('ChatMessageBubble 复制链路', () => {
     await flush();
     expect(execCommand).not.toHaveBeenCalled();
   });
+
+  it('直接显示回合失败原因，并保持上游文本为纯文本', () => {
+    const content = '404 model_not_found\n<example>不支持该模型</example>';
+    const el = mountBubble({ role: 'assistant', kind: 'system', note: 'turn_failed', content });
+    const note = el.querySelector('[data-testid="chat-turn-failed-note"]');
+    expect(note.getAttribute('role')).toBe('status');
+    expect(note.textContent).toBe(content);
+    expect(note.querySelector('example')).toBeNull();
+  });
 });
