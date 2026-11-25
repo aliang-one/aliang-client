@@ -234,6 +234,7 @@ type upstreamCapture struct {
 	innerHeader bool
 	hosts       []string
 	bodies      []string
+	headers     []stdhttp.Header
 }
 
 func (c *upstreamCapture) record(r *stdhttp.Request, body string) {
@@ -243,6 +244,30 @@ func (c *upstreamCapture) record(r *stdhttp.Request, body string) {
 	_, c.innerHeader = r.Header["Authorization-Inner"]
 	c.hosts = append(c.hosts, r.Host)
 	c.bodies = append(c.bodies, body)
+	c.headers = append(c.headers, r.Header.Clone())
+}
+
+func (c *upstreamCapture) lastHeaders() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.headers) == 0 {
+		return nil
+	}
+	h := c.headers[len(c.headers)-1]
+	var out []string
+	for k := range h {
+		out = append(out, k)
+	}
+	return out
+}
+
+func (c *upstreamCapture) lastHeaderSnapshot() stdhttp.Header {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.headers) == 0 {
+		return nil
+	}
+	return c.headers[len(c.headers)-1].Clone()
 }
 
 func (c *upstreamCapture) snapshot() (auths []string, inner bool, hosts []string, bodies []string) {
@@ -303,6 +328,7 @@ func TestAIPathAnthropicForwardedByo(t *testing.T) {
 		"POST /v1/messages HTTP/1.1\r\n"+
 			"Host: 127.0.0.1:56432\r\n"+
 			"Authorization: sk-aliang-local\r\n"+
+			"X-Endpoint-Id: byo-1\r\n"+
 			"Content-Type: application/json\r\n"+
 			"Content-Length: "+fmt.Sprintf("%d", len(anthropicRequestBody))+"\r\n"+
 			"\r\n"+anthropicRequestBody)
@@ -338,6 +364,13 @@ func TestAIPathAnthropicForwardedByo(t *testing.T) {
 	}
 	if bodies[0] != anthropicRequestBody {
 		t.Fatalf("upstream body = %q, want %q", bodies[0], anthropicRequestBody)
+	}
+	// X-Endpoint-Id 是 56432 私有路由指令,命中后绝不泄漏到上游
+	// (quality-fix Minor 8)。
+	for _, h := range capture.lastHeaders() {
+		if strings.EqualFold(h, "X-Endpoint-Id") {
+			t.Fatalf("X-Endpoint-Id leaked to upstream: %v", capture.lastHeaderSnapshot())
+		}
 	}
 
 	calls, acquired, released, successes, _ := sel.snapshot()
@@ -553,6 +586,9 @@ func TestAIPathBuiltinFallsThroughTCPHandler(t *testing.T) {
 		"POST /v1/messages HTTP/1.1\r\n"+
 			"Host: 127.0.0.1:56432\r\n"+
 			"Authorization: sk-aliang-local\r\n"+
+			// 客户端伪造的 relay 注入头:路由层是最后一跳,builtin 重放必须剥
+			// (quality-fix Important 1;watcher 会无条件覆写,今天无害但口径统一)。
+			"Authorization-Inner: forged-inner-credential\r\n"+
 			"Content-Length: "+fmt.Sprintf("%d", len(anthropicRequestBody))+"\r\n"+
 			"\r\n"+anthropicRequestBody)
 
@@ -572,8 +608,8 @@ func TestAIPathBuiltinFallsThroughTCPHandler(t *testing.T) {
 	if got := req.Header.Get("Authorization"); got != "sk-aliang-local" {
 		t.Fatalf("Authorization = %q, want passthrough sk-aliang-local (relay injects Authorization-Inner, router must not)", got)
 	}
-	if _, present := req.Header["Authorization-Inner"]; present {
-		t.Fatal("router must not inject Authorization-Inner (invariant 3)")
+	if got, present := req.Header["Authorization-Inner"]; present {
+		t.Fatalf("builtin replay must strip client-supplied Authorization-Inner, got %v", got)
 	}
 	if metadata == nil || metadata.DstPort != 56432 || metadata.HostName != "127.0.0.1" {
 		t.Fatalf("metadata = %+v, want original 127.0.0.1:56432 shape (force-aliang route trigger)", metadata)
@@ -700,6 +736,59 @@ func TestAIPathModelsAggregation(t *testing.T) {
 
 // 用例 8:X-Endpoint-Id 显式指定 → 透传给 Select;不可用(协议不匹配等)→ 404。
 func TestAIPathExplicitEndpointID(t *testing.T) {
+	capture := &upstreamCapture{}
+	upstream := newFakeUpstream(t, capture)
+
+	sel := &fakeAISelector{selectQueue: []selectResult{{
+		id: "auto-zero-row", baseURL: upstream.URL, apiKey: "k-explicit", builtin: false,
+	}}}
+	setAISelectorForTest(t, sel)
+
+	client, handled := serveRawRequest(t,
+		"POST /v1/messages HTTP/1.1\r\n"+
+			"Host: 127.0.0.1:56432\r\n"+
+			"X-Endpoint-Id: auto-zero-row\r\n"+
+			"Content-Length: "+fmt.Sprintf("%d", len(anthropicRequestBody))+"\r\n"+
+			"\r\n"+anthropicRequestBody)
+
+	select {
+	case <-handled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not finish")
+	}
+
+	_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	resp, err := stdhttp.ReadResponse(bufio.NewReader(client), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != stdhttp.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%q", resp.StatusCode, string(respBody))
+	}
+
+	calls, _, _, _, _ := sel.snapshot()
+	if len(calls) != 1 || calls[0].explicitID != "auto-zero-row" || calls[0].protocol != "anthropic" {
+		t.Fatalf("select calls = %+v", calls)
+	}
+
+	// X-Endpoint-Id 是 56432 私有路由指令:命中转发后绝不泄漏到上游
+	// (quality-fix Minor 8)。upstreamCapture 记录全部头,这里断言没有
+	// X-Endpoint-Id 出现在上游请求里。
+	auths, _, _, _ := capture.snapshot()
+	if len(auths) != 1 {
+		t.Fatalf("upstream got %d requests, want 1", len(auths))
+	}
+	for _, h := range capture.lastHeaders() {
+		if strings.EqualFold(h, "X-Endpoint-Id") {
+			t.Fatalf("X-Endpoint-Id leaked to upstream: %v", capture.lastHeaderSnapshot())
+		}
+	}
+}
+
+// 用例 8b:显式点名不可用(协议不匹配等)→ 404 endpoint_not_available。
+func TestAIPathExplicitEndpointIDNotAvailable(t *testing.T) {
 	sel := &fakeAISelector{selectQueue: []selectResult{{
 		err: fmt.Errorf("endpoint: 指定 endpoint 不可用(不存在/未启用/协议不匹配): %w", ErrAIEndpointNotAvailable),
 	}}}
@@ -730,11 +819,6 @@ func TestAIPathExplicitEndpointID(t *testing.T) {
 	}
 	if !strings.Contains(string(respBody), "endpoint_not_available") {
 		t.Fatalf("body = %q, want endpoint_not_available", string(respBody))
-	}
-
-	calls, _, _, _, _ := sel.snapshot()
-	if len(calls) != 1 || calls[0].explicitID != "auto-zero-row" || calls[0].protocol != "anthropic" {
-		t.Fatalf("select calls = %+v", calls)
 	}
 }
 
@@ -806,4 +890,99 @@ func TestNonAIPathBypassesRouter(t *testing.T) {
 		t.Fatalf("select calls = %v, want none", calls)
 	}
 	_ = client
+}
+
+// quality-fix Minor 8:请求体 8MB+1 → 413,Select 不被调用。
+func TestAIPathBodyTooLargeReturns413(t *testing.T) {
+	sel := &fakeAISelector{
+		failOnSelect: func(protocol, model, explicitID string) {
+			t.Errorf("Select must not be called for oversized body (got protocol=%q)", protocol)
+		},
+	}
+	setAISelectorForTest(t, sel)
+
+	// 8MB+1 字节体:Content-Length 声明实际大小(读侧按 LimitReader 判超限)。
+	oversized := strings.Repeat("x", maxAIRequestBodyBytes+1)
+	client, handled := serveRawRequest(t,
+		"POST /v1/messages HTTP/1.1\r\n"+
+			"Host: 127.0.0.1:56432\r\n"+
+			"Content-Length: "+fmt.Sprintf("%d", len(oversized))+"\r\n"+
+			"\r\n"+oversized)
+
+	select {
+	case <-handled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("handler did not finish")
+	}
+
+	_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	resp, err := stdhttp.ReadResponse(bufio.NewReader(client), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != stdhttp.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413 body=%q", resp.StatusCode, string(respBody))
+	}
+	if !strings.Contains(string(respBody), "request_body_too_large") {
+		t.Fatalf("body = %q, want request_body_too_large", string(respBody))
+	}
+}
+
+// quality-fix Minor 8:重试耗尽(候选1 5xx → 候选2 5xx)→ 透传最后一次
+// 上游 5xx 响应(而非合成错误),两次 ReportFailure、一次 ReportSuccess 无。
+func TestAIPathRetryExhaustedPassesLast5xx(t *testing.T) {
+	capture := &upstreamCapture{}
+	upstream := newFakeUpstream(t, capture,
+		func(w stdhttp.ResponseWriter, r *stdhttp.Request) { plainBody(w, 502, `{"err":"first"}`) },
+		func(w stdhttp.ResponseWriter, r *stdhttp.Request) { plainBody(w, 503, `{"err":"second"}`) },
+	)
+
+	sel := &fakeAISelector{selectQueue: []selectResult{
+		{id: "cand-1", baseURL: upstream.URL, apiKey: "k1"},
+		{id: "cand-2", baseURL: upstream.URL, apiKey: "k2"},
+	}}
+	setAISelectorForTest(t, sel)
+
+	client, handled := serveRawRequest(t,
+		"POST /v1/messages HTTP/1.1\r\n"+
+			"Host: 127.0.0.1:56432\r\n"+
+			"Content-Length: "+fmt.Sprintf("%d", len(anthropicRequestBody))+"\r\n"+
+			"\r\n"+anthropicRequestBody)
+
+	select {
+	case <-handled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not finish")
+	}
+
+	_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	resp, err := stdhttp.ReadResponse(bufio.NewReader(client), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != stdhttp.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (candidate 2's response passed through) body=%q", resp.StatusCode, string(respBody))
+	}
+	if !strings.Contains(string(respBody), "second") {
+		t.Fatalf("body = %q, want the LAST upstream error body ({\"err\":\"second\"})", string(respBody))
+	}
+
+	_, _, _, successes, failures := sel.snapshot()
+	if len(successes) != 0 {
+		t.Fatalf("successes = %v, want none", successes)
+	}
+	if len(failures) != 2 ||
+		failures[0].id != "cand-1" || failures[0].status != 502 ||
+		failures[1].id != "cand-2" || failures[1].status != 503 {
+		t.Fatalf("failures = %+v, want cand-1/502 + cand-2/503", failures)
+	}
+
+	auths, _, _, _ := capture.snapshot()
+	if len(auths) != 2 || auths[0] != "Bearer k1" || auths[1] != "Bearer k2" {
+		t.Fatalf("auths = %v, want [Bearer k1 Bearer k2]", auths)
+	}
 }

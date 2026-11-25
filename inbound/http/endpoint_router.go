@@ -105,12 +105,24 @@ func aiRouteFor(method, path string) (protocol string, aggregate bool, ok bool) 
 
 // aiForwardResult 是一次转发尝试的结局。
 type aiForwardResult struct {
-	started   bool           // 已向客户端写出响应(状态行/头)
+	// started:已向客户端写出响应(状态行/头)——BYO 侧由本层写回时置位;
+	// 或 delegated-to-unobservable(builtin 链):tcp handler 全权接管连接,
+	// 本层无法探知响应头是否已写出,一律按「已开始」从严处理(绝不重试,
+	// 不变量 4)。未来维护者切勿因「started 恒 true」而给 builtin 开重试。
+	started   bool
 	completed bool           // 响应完整写完(started 且无中断)
 	status    int            // 上游 HTTP 状态;0 = 未收到响应(传输失败)
 	held      *http.Response // 收到但未透传的响应(429/5xx,留给重试耗尽时透传)
 	err       error          // 传输/流中断原因
 	configErr bool           // base_url 非法等 registry 数据问题(不计数不重试)
+}
+
+// errMsg 是 err 的安全字符串化:nil 时返回空串(防维护中的 nil-deref)。
+func (r aiForwardResult) errMsg() string {
+	if r.err == nil {
+		return ""
+	}
+	return r.err.Error()
 }
 
 // handleAIRequest 全权处理一条 AI path 请求:命中本函数即不回落透明代理。
@@ -175,7 +187,7 @@ func handleAIRequest(conn net.Conn, reader *bufio.Reader, req *http.Request, met
 			return
 		case res.started:
 			// 不变量 4:流已开始但中断——绝不切换 endpoint,断开收场。
-			aiSelector.ReportFailure(id, 0, res.err.Error())
+			aiSelector.ReportFailure(id, 0, res.errMsg())
 			logger.Warn(fmt.Sprintf("ai route: 流式响应中断,不重试 endpoint=%s status=%d err=%v", id, res.status, res.err))
 			return
 		}
@@ -195,7 +207,7 @@ func handleAIRequest(conn net.Conn, reader *bufio.Reader, req *http.Request, met
 		}
 
 		// 传输失败(无 HTTP 响应)。
-		aiSelector.ReportFailure(id, 0, res.err.Error())
+		aiSelector.ReportFailure(id, 0, res.errMsg())
 		if attempt < aiMaxAttempts {
 			logger.Warn(fmt.Sprintf("ai route: 上游不可达,重试 endpoint=%s err=%v attempt=%d", id, res.err, attempt))
 			continue
@@ -217,12 +229,20 @@ func forwardAIAttempt(conn net.Conn, reader *bufio.Reader, req *http.Request, me
 }
 
 // forwardAIBuiltinAttempt 内置 endpoint 转发:重放 conn = 请求头(以内存中的
-// body 重建 Content-Length)+ body 字节 + reader 残余。原 metadata 原样交给
-// tcp handler:目标 127.0.0.1:56432 命中 shouldForceAliangRoute → RouteToALiang,
+// body 重建 Content-Length;Authorization-Inner 由 aiSkipRequestHeaders 统一
+// 剥——客户端自带的同名头是伪造,watcher relay 会无条件覆写,路由层作为最后
+// 一跳必须先剥)+ body 字节 + reader 残余。原 metadata 原样交给 tcp handler:
+// 目标 127.0.0.1:56432 命中 shouldForceAliangRoute → RouteToALiang,
 // watcher relay 注入 Authorization-Inner(spec §7.2,不变量 3)。
 //
 // tcp handler 全程自管流式中继,路由层无法探知响应头是否已写出——因此内置
 // 链一律单次尝试,失败只 ReportFailure + 断开(不变量 4 的保守实现)。
+//
+// 已知风险(quality-fix 评审 Important 2,文档化不改行为):本委托用
+// context.Background() 无 deadline——accept 循环的读期限已在 handleRawConnection
+// 清除,builtin 链若卡死会持信号量永久阻塞、饿死整个 builtin endpoint。超时
+// 语义由 tcp handler/relay 层治理,本层不设 deadline;Task 5 内核接入时复核
+// (届时 registry 健康态会把卡死链计失败摘除,但摘除前已饿死窗口仍在)。
 func forwardAIBuiltinAttempt(conn net.Conn, reader *bufio.Reader, req *http.Request, metadata *M.Metadata, body []byte) aiForwardResult {
 	head, err := serializeAIReplayHead(req, body)
 	if err != nil {
@@ -255,7 +275,8 @@ func forwardAIByoAttempt(conn net.Conn, req *http.Request, body []byte, baseURL,
 	if apiKey != "" {
 		attemptReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
-	attemptReq.Header.Del("Authorization-Inner")
+	// Authorization-Inner 已由 copyAIUpstreamHeaders 统一剥(aiSkipRequestHeaders),
+	// 此处不再重复 Del。
 	attemptReq.Host = target.Host
 
 	logger.Info(fmt.Sprintf("ai route: BYO 转发 %s %s -> %s", req.Method, req.URL.Path, target.Host))
@@ -341,19 +362,24 @@ var aiHopByHopHeaders = []string{
 	"Transfer-Encoding", "Upgrade", "Proxy-Authenticate", "Proxy-Authorization",
 }
 
-// copyAIUpstreamHeaders 把客户端请求头透传到上游,剥掉逐跳头、路由指令头与
-// 定长框架头(框架由 body bytes + Go transport 重建)。
-func copyAIUpstreamHeaders(dst, src http.Header) {
-	skip := map[string]bool{}
+// aiSkipRequestHeaders 是转发/重放请求头时的统一跳过集(两处调用点共享:
+// copyAIUpstreamHeaders 的 BYO 直连、serializeAIReplayHead 的 builtin 重放)。
+// 逐跳头 + 定长框架头(由 body bytes/transport 重建)+ 路由指令头
+// (X-Endpoint-Id 是 56432 私有指令,绝不外泄)+ Authorization-Inner
+// (watcher relay 的注入凭据,客户端自带的同名头是伪造,路由层是最后一跳,
+// 必须剥——BYO/builtin 两侧口径一致)。
+var aiSkipRequestHeaders = func() map[string]bool {
+	m := map[string]bool{"Host": true, "Content-Length": true, "Authorization-Inner": true, "X-Endpoint-Id": true}
 	for _, h := range aiHopByHopHeaders {
-		skip[h] = true
+		m[h] = true
 	}
-	skip["Host"] = true
-	skip["Content-Length"] = true
-	skip["Authorization-Inner"] = true
-	skip["X-Endpoint-Id"] = true
+	return m
+}()
+
+// copyAIUpstreamHeaders 把客户端请求头透传到上游,剥掉 aiSkipRequestHeaders。
+func copyAIUpstreamHeaders(dst, src http.Header) {
 	for key, values := range src {
-		if skip[key] {
+		if aiSkipRequestHeaders[key] {
 			continue
 		}
 		for _, v := range values {
@@ -404,8 +430,7 @@ func serializeAIReplayHead(req *http.Request, body []byte) ([]byte, error) {
 		return nil, err
 	}
 	for key, values := range req.Header {
-		if strings.EqualFold(key, "Host") || strings.EqualFold(key, "Content-Length") ||
-			strings.EqualFold(key, "Transfer-Encoding") {
+		if aiSkipRequestHeaders[key] {
 			continue
 		}
 		for _, value := range values {
