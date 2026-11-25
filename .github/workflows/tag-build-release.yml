@@ -34,7 +34,12 @@ jobs:
         shell: bash
         run: |
           git fetch origin master
-          git fetch origin --tags --quiet
+          # v1.1.124 首跑实证:checkout@v4 取回的 tag 形态与裸 --tags fetch 的
+          # 预期形态冲突时,fetch 报「would clobber existing tag」且 --quiet 会
+          # 把报错一并吞掉、退出码 1——set -e 直接在无任何输出的情况下杀死
+          # 本步(两次重跑同签名复现)。--force 让本地 tag 对齐远端真值,
+          # clobber 从此不可能;去掉 --quiet 让任何残余故障可见。
+          git fetch origin --tags --force
           # v1.1.117 复活事故(2026-11-24,11-21 同款已发生过一次):cleanup 删旧
           # tag 后,GitLab push mirror 下轮同步把 GitLab 侧同名 tag 原样推回
           # GitHub → push 事件触发全量构建 → 旧 release 重生按发布时间抢走
