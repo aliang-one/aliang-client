@@ -208,7 +208,7 @@ func TestEndpointStore_UpdateHealthNarrowWrite(t *testing.T) {
 	stale.Name = "renamed"
 	stale.Priority = 99
 	stale.Enabled = false // bool 零值也要能写穿(Select+struct 语义),停用开关靠它
-	if err := s.UpdateHealth("h1", "cooldown", 3, 12345, 67890, "boom"); err != nil {
+	if err := s.UpdateHealth("h1", HealthUpdate{Status: "cooldown", Failures: 3, CooldownUntil: 12345, RateLimitedUntil: 67890, LastErr: "boom"}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.Get("h1")

@@ -231,16 +231,27 @@ func (s *EndpointStore) Update(e *config.LLMEndpoint) error {
 	return s.db.Model(e).Where("id = ?", e.ID).Select(endpointConfigColumns).Updates(e).Error
 }
 
+// HealthUpdate 是 UpdateHealth 的载荷。独立 struct 而非六个位置参数:其中两个
+// int64(CooldownUntil/RateLimitedUntil)相邻且语义相近,位置传参在调用点极易
+// 转置(2026-11-25 Task 1 质量评审指出),具名字段让每个调用点自证语义。
+type HealthUpdate struct {
+	Status           string // ok / disabled / cooldown
+	Failures         int    // 连续失败计数
+	CooldownUntil    int64  // 摘除冷却截止(unix 秒;0 = 未冷却)
+	RateLimitedUntil int64  // 429 冷却截止(unix 秒;0 = 未限流)
+	LastErr          string // 最近一次失败摘要(展示用)
+}
+
 // UpdateHealth 是健康列的唯一写入口(窄更新缝):服务面记失败/恢复/冷却走
 // 这里,只动指定的五个健康列;REST 面(Update 白名单)写不到健康列,两边
 // 不再互相 clobber。
-func (s *EndpointStore) UpdateHealth(id string, status string, failures int, cooldownUntil, rateLimitedUntil int64, lastErr string) error {
+func (s *EndpointStore) UpdateHealth(id string, u HealthUpdate) error {
 	return s.db.Model(&config.LLMEndpoint{}).Where("id = ?", id).Updates(map[string]interface{}{
-		"health_status":        status,
-		"consecutive_failures": failures,
-		"cooldown_until":       cooldownUntil,
-		"rate_limited_until":   rateLimitedUntil,
-		"last_error":           lastErr,
+		"health_status":        u.Status,
+		"consecutive_failures": u.Failures,
+		"cooldown_until":       u.CooldownUntil,
+		"rate_limited_until":   u.RateLimitedUntil,
+		"last_error":           u.LastErr,
 	}).Error
 }
 
