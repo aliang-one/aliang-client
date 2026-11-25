@@ -12,9 +12,10 @@ import (
 	"aliang.one/nursorgate/processor/config"
 )
 
-// builtinEndpointID 是内置 aliang 隧道行的固定主键(spec §5.3),整库唯一,
-// 不可删除、base_url 恒空(走默认隧道链路,凭据用登录态)。
-const builtinEndpointID = "builtin-aliang"
+// BuiltinEndpointID 是内置 aliang 隧道行的固定主键(spec §5.3),整库唯一,
+// 不可删除、base_url 恒空(走默认隧道链路,凭据用登录态)。跨包引用走本常量,
+// 避免字符串字面量在 services/inbound 各处漂移。
+const BuiltinEndpointID = "builtin-aliang"
 
 // autoGroup 是本期唯一的组键(spec §5.2):组策略表预留多组,但本期恒 auto。
 const autoGroup = "auto"
@@ -87,7 +88,7 @@ func (s *EndpointStore) Close() error {
 // 协议开关等)永不被覆盖,每次启动重复调用也无害。
 func (s *EndpointStore) SeedBuiltin() error {
 	row := &config.LLMEndpoint{
-		ID:     builtinEndpointID,
+		ID:     BuiltinEndpointID,
 		Name:   "Aliang 隧道（内置）",
 		APIKey: "", // 内置行走登录态,不需要 BYO key
 		// 两个协议开关都开:56432 承载全部 AI 流量,OpenAI 请求也必须能
@@ -127,12 +128,27 @@ func (s *EndpointStore) Get(id string) (*config.LLMEndpoint, error) {
 
 // Create 新增端点。id 必填且唯一(预查重是为了给上层一个可映射 409 的清晰
 // 文案,而不是透传 sqlite 主键冲突)。
+//
+// 默认值纪律:
+//   - priority:非 builtin 且未给(0)时归一为 50(spec §5.1 默认值);builtin
+//     由 SeedBuiltin 直插恒 0,永远第一,不受归一影响。
+//   - models:空串归一为 "[]"([..] = 不限制模型),避免 NULL/空串语义漂移。
+//   - enabled:由调用方显式给值——bool 零值会被原样落 0,store 层刻意不做
+//     默认(gorm default:1 会造成「无法显式建禁用行」的陷阱);REST handler
+//     (Task 4)对新建默认 true。
 func (s *EndpointStore) Create(e *config.LLMEndpoint) error {
 	if e == nil {
 		return errors.New("llm_endpoint: endpoint 不能为空")
 	}
 	if strings.TrimSpace(e.ID) == "" {
 		return fmt.Errorf("llm_endpoint.id 必填")
+	}
+	// 归一在 Validate 之前:校验看到的是归一后的形态。
+	if !e.Builtin && e.Priority == 0 {
+		e.Priority = 50
+	}
+	if strings.TrimSpace(e.Models) == "" {
+		e.Models = "[]"
 	}
 	if err := e.Validate(); err != nil {
 		return err
@@ -169,7 +185,7 @@ func (s *EndpointStore) Update(e *config.LLMEndpoint) error {
 // Delete 删除端点;内置行恒拒(spec §5.1: builtin=1 的行 DELETE 返回 409)。
 // 对不存在的 id 幂等成功,由上层决定要不要先查。
 func (s *EndpointStore) Delete(id string) error {
-	if id == builtinEndpointID {
+	if id == BuiltinEndpointID {
 		return ErrBuiltinImmutable
 	}
 	return s.db.Delete(&config.LLMEndpoint{}, "id = ?", id).Error
