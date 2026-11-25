@@ -47,4 +47,20 @@ describe('authentication failure classification', () => {
     expect(handleAuthenticationFailure(500, { msg: 'temporary failure' }, reconcile)).toBe(false);
     expect(reconcile).not.toHaveBeenCalled();
   });
+
+  // 非 401 的自由文本短语不是失效证据：网关把上游错误文本内嵌进 200/5xx 的
+  // msg 时（如 "Failed to fetch profile: ...token expired..."），不得把刻意
+  // 保留的瞬时故障翻成登出。结构性证据（status=unauthenticated）不受此限。
+  it('does not treat phrase-bearing non-401 messages as session invalidation', () => {
+    expect(
+      isAuthenticationFailure(200, { msg: 'Failed to fetch profile: upstream said token expired' })
+    ).toBe(false);
+    expect(
+      isAuthenticationFailure(500, { msg: 'token has been revoked (embedded upstream text)' })
+    ).toBe(false);
+    // 同为 200，结构性证据仍然成立（nested terminal envelope 原语义）。
+    expect(
+      isAuthenticationFailure(200, { data: { status: 'unauthenticated' } })
+    ).toBe(true);
+  });
 });

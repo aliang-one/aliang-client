@@ -37,19 +37,31 @@ const ACCESS_REJECTION_PHRASES = [
 
 export function isAuthenticationFailure(responseStatus, envelope) {
   // 裸 401/403 等状态码本身不再是失效证据（网关瞬时 401 不再触发登出
-  // reconcile）：401 与其它状态码一律要求 envelope 层命中明确拒绝语义；
-  // nested terminal envelope（如 200 + data.status=unauthenticated）保持原语义。
+  // reconcile）。证据分两档：
+  // - 结构性证据（status=unauthenticated / error / code 终态标记）不限状态码——
+  //   nested terminal envelope（如 200 + data.status=unauthenticated）保持原语义；
+  // - 自由文本短语（ACCESS_REJECTION_PHRASES）仅 401 可信：非 401 响应的
+  //   msg 可能内嵌上游透传文本（如 "Failed to fetch profile: ...token expired..."），
+  //   按短语误判会把网关刻意保留的瞬时故障翻成登出。
+  const phrasesAreEvidence = Number(responseStatus) === 401;
   return envelopeLayers(envelope).some((layer) => {
     const status = normalized(layer.status);
     const error = normalized(layer.error);
     const code = normalized(layer.code);
-    const message = normalized(layer.message || layer.msg);
-    return status === 'unauthenticated'
+    if (
+      status === 'unauthenticated'
       || error === 'session_expired'
       || error === 'token_expired'
       || code === 'token_expired'
       || code === 'token_revoked'
-      || ACCESS_REJECTION_PHRASES.some((phrase) => message.includes(phrase));
+    ) {
+      return true;
+    }
+    if (!phrasesAreEvidence) {
+      return false;
+    }
+    const message = normalized(layer.message || layer.msg);
+    return ACCESS_REJECTION_PHRASES.some((phrase) => message.includes(phrase));
   });
 }
 

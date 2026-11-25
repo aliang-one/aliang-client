@@ -197,8 +197,10 @@ func callUserCenterAPI(method, endpoint string, body any) ([]byte, error) {
 					return nil, ErrSessionExpired
 				}
 				// Do not expose a recoverable upstream 401 to the browser. The
-				// frontend correctly treats every local 401 as a hard-invalid signal,
-				// so a successful refresh must retry the original operation here.
+				// frontend no longer treats a bare 401 as a hard-invalid signal
+				// (authFailure requires explicit rejection evidence), but a
+				// recoverable 401 would still surface as a confusing failure —
+				// a successful refresh must retry the original operation here.
 				return callAuthenticatedAPI(method, endpoint, current.AccessToken, body)
 			}
 			// Transient: retain the session (and the freshly refreshed token) so
