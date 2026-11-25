@@ -109,41 +109,9 @@ func TestBuildAIStatusFromTrackerMatchesProviderKeysCaseInsensitively(t *testing
 	}
 }
 
-func TestAIStatusMenuIconUsesProviderIcon(t *testing.T) {
-	testCases := []struct {
-		name     string
-		provider AIProviderStatus
-		want     []byte
-	}{
-		{
-			name:     "openai detected",
-			provider: AIProviderStatus{Key: "openai", Enabled: true, Detected: true},
-			want:     GetProviderIcon("openai", true),
-		},
-		{
-			name:     "anthropic alias",
-			provider: AIProviderStatus{Key: "Claude", Enabled: true, Detected: true},
-			want:     GetProviderIcon("anthropic", true),
-		},
-		{
-			name:     "vscode inactive",
-			provider: AIProviderStatus{Key: "vscode", Enabled: true},
-			want:     GetProviderIcon("vscode", false),
-		},
-		{
-			name:     "unknown",
-			provider: AIProviderStatus{Key: "unknown", Enabled: true, Detected: true},
-			want:     nil,
-		},
-	}
-
-	for _, tc := range testCases {
-		got := AIStatusMenuIcon(tc.provider)
-		if string(got) != string(tc.want) {
-			t.Fatalf("%s: AIStatusMenuIcon() returned unexpected icon bytes", tc.name)
-		}
-	}
-}
+// TestAIStatusMenuIconUsesProviderIcon removed 2026-11-25: AIStatusMenuIcon was
+// removed along with menu-item SetIcon calls (GDI leak hot path on Windows).
+// Status is now conveyed by the ✅/⏳ title prefix only.
 
 func TestIsAcceptableQuitProxyStopResult(t *testing.T) {
 	testCases := []struct {

@@ -13,7 +13,11 @@ import (
 )
 
 func loadWindowsTunInterfaceSnapshotsNative() ([]tunInterfaceSnapshot, error) {
-	size := uint32(15 * 1024)
+	// 2026-11-25 根因实验:15KB 在 20+ 网卡的机器上恒定 ERROR_BUFFER_OVERFLOW
+	// (实测需要 ~100KB),每次溢出重试都让 15KB buffer 秒变垃圾、GC 回收、
+	// span 复用——与 0196 崩溃指纹(hi32→网卡 IfIndex)时序吻合。改用
+	// 128KB 初始值使调用一次成功,消除溢出-重试-垃圾循环。
+	size := uint32(128 * 1024)
 
 	for attempt := 0; attempt < tunMaxRetryAttempts; attempt++ {
 		buf := make([]byte, size)

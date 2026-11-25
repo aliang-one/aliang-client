@@ -88,7 +88,9 @@ func queryWindowsTunInterfaceStatus(ifname string) (*windowsTunInterfaceStatus, 
 }
 
 func listWindowsTunInterfaces() ([]*windowsTunInterfaceStatus, error) {
-	size := uint32(15 * 1024)
+	// 2026-11-25 根因实验:与 tun_conflict_scan_windows.go 同款修复——15KB 在
+	// 20+ 网卡的机器上恒定溢出,改 128KB 一次到位,消除溢出-重试-垃圾循环。
+	size := uint32(128 * 1024)
 	for attempt := 0; attempt < 3; attempt++ {
 		buf := make([]byte, size)
 		first := (*windows.IpAdapterAddresses)(unsafe.Pointer(&buf[0]))

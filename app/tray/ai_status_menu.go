@@ -29,19 +29,16 @@ func applyAIStatusMenu(header *systray.MenuItem, items []*systray.MenuItem, prov
 		}
 
 		item.SetTitle(title)
-		if icon := AIStatusMenuIcon(provider); len(icon) > 0 {
-			item.SetIcon(icon)
-		}
+		// 2026-11-25:去掉菜单项 SetIcon——每 2s syncState 刷新时 MenuItem.SetIcon
+		// 在 Windows 上每次新建 HBITMAP(上游 v1.2.2 不回收),是 GDI 泄漏的唯一点火
+		// 路径(83min 耗尽 10k 配额)。FormatAIStatusTitle 已带 ✅/⏳ 状态前缀,
+		// 视觉信息量不丢;主托盘图标走 SetIcon(带 md5 缓存)不受影响。
 		item.Show()
 	}
 
 	return true
 }
 
-func AIStatusMenuIcon(provider AIProviderStatus) []byte {
-	key := trayIconProviderKey(provider.Key)
-	if key == "" {
-		return nil
-	}
-	return GetProviderIcon(key, provider.Active || provider.Detected)
-}
+// AIStatusMenuIcon was removed 2026-11-25: menu-item icons eliminated the GDI
+// leak hot path on Windows (MenuItem.SetIcon → iconToBitmap → HBITMAP never freed).
+// Status is conveyed by the ✅/⏳ prefix in FormatAIStatusTitle instead.
