@@ -63,9 +63,7 @@ Expected: PASS
 
 - [ ] **Step 5: 写失败测试（refresh classifier 未知/不可解析 401 期望 nil + local session 短语仍 terminal）**
 
-在 `processor/auth/errors_test.go`：
-- `TestClassifyRefreshSessionFailure_KnownPatterns` 中「unknown 401 is terminal」「invalid JSON 401 is terminal」两用例期望改为 nil。
-- 「error field: local session is no longer valid」保持 `ErrRefreshTokenInvalid`（短语加入后 terminal）。
+在 `processor/auth/errors_test.go` 的表驱动用例 `TestClassifyRefreshSessionFailure_KnownPatterns` 中，把子用例「unknown 401 is terminal」「invalid JSON 401 is terminal」的 `wantErr` 改为 `nil`；「error field: local session is no longer valid」保持 `ErrRefreshTokenInvalid`（短语加入后 terminal）。（这些是表内子用例，非独立函数。）
 
 - [ ] **Step 6: 运行测试确认失败**
 
@@ -76,7 +74,7 @@ Expected: FAIL（未知/不可解析 401 仍 terminal；local session 短语仅�
 
 在 `processor/auth/errors.go`：
 - `refreshRejectionPhrases` 追加 `"local session is no longer valid"`。
-- `classifyRefreshSessionFailure` 删除末尾兜底 `return ErrRefreshTokenInvalid`（约 82 行），改为 `return nil`；403 显式返回 `ErrRefreshTokenInvalid`：
+- `classifyRefreshSessionFailure` 删除末尾兜底 `return ErrRefreshTokenInvalid`（约 82 行），改为 `return nil`；403 显式返回 `ErrRefreshTokenInvalid`。**同时删除/改写 75-81 行旧注释块**（「A refresh endpoint has already authenticated... Its 401 is therefore a definitive rejection, including unknown JSON...」），避免与新 nil 兜底行为矛盾。
 
 ```go
 func classifyRefreshSessionFailure(statusCode int, body []byte) error {
@@ -181,8 +179,7 @@ git commit -m "修复:refresh profile 不确定 401 返回非终态错误而非�
 
 - [ ] **Step 1: 写失败测试**
 
-在 `app/website/src/services/authFailure.test.js`：
-- 首个用例「recognizes HTTP 401」envelope 改为带明确拒绝 message（`{ code: 1001, msg: 'Token has expired' }` 已含 token expired 短语，保持 true），并新增用例：裸 401（`{}` envelope）→ `isAuthenticationFailure(401, {})` 期望 false；403 → false；500 → false（已有）。
+在 `app/website/src/services/authFailure.test.js`：现有首个用例 envelope `{ code: 1001, msg: 'Token has expired' }` 命中 `'token expired'` 短语，保持 true 不变。新增两个用例：裸 401（`isAuthenticationFailure(401, {})`）→ false；403（`isAuthenticationFailure(403, { msg: 'forbidden' })`）→ false。
 
 - [ ] **Step 2: 运行测试确认失败**
 
@@ -247,6 +244,8 @@ git commit -m "修复:前端裸 401/403 不再触发登出 reconcile"
 ---
 
 ### Task 4: 全量回归 + 验收
+
+> agent 侧 `recoverOrExpireAfterRegisterAuthRejection` / `handleHandshakeUnauthorized` 已只对 typed 401 触发 `RecoverOrExpireLocalSession`，transport/5xx 走 `classifyRegisterFailure` 保留注册态（spec §3.6「保持」）。本计划不改 agent 侧代码，仅在验收时确认其行为不变。
 
 - [ ] **Step 1: Go 全量 auth 相关测试**
 
