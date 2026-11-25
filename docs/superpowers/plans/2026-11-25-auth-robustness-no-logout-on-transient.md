@@ -193,6 +193,8 @@ Expected: FAIL（裸 401 仍 true）
 - 改为：仅当 `responseStatus === 401` 且 `envelopeLayers` 任一层命中明确拒绝语义（status unauthenticated / error session_expired|token_expired / code token_expired / message 含 local session is no longer valid / invalid authentication / token has been revoked / invalid access token / token expired / token revoked）→ true。
 - 403 不触发（移除任何 403→true 逻辑；当前无，保持）。
 - 其它 status → false。
+- **实现偏差（评审确认）**：实际实现不设 `responseStatus !== 401 → false` 的门——否则 nested terminal envelope（200 + `data.status=unauthenticated`，既有测试钉死）会误杀。401 与其它 status 一律要求 envelope 层命中明确拒绝语义；403 无拒绝证据自然 false。
+- `ACCESS_REJECTION_PHRASES` 须包含两条 Go 中间件真实文案（互不为子串，缺一不可）：`authenticated dashboard session is required`（dashboard_session.go:108 / remote_access.go:53）与 `authenticated session is required`（quick_setup_service.go ErrQuickSetupUnauthenticated）——移除裸 401 短路后这是真·会话过期触发登出的唯一信号路径，并有测试用例钉死该跨语言契约。
 
 ```js
 const ACCESS_REJECTION_PHRASES = [

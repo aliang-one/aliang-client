@@ -19,6 +19,19 @@ describe('authentication failure classification', () => {
     expect(handleAuthenticationFailure(401, {}, vi.fn())).toBe(false);
   });
 
+  // 跨语言契约钉死：dashboard/remote 中间件（dashboard_session.go:108 /
+  // remote_access.go:53）与 quick-setup（ErrQuickSetupUnauthenticated）的
+  // 真实 401 文案。这两条是移除裸 401 短路后真·会话过期仍能触发登出的
+  // 唯一信号路径，Go 侧文案改动时此用例必须同步。
+  it('recognizes Go middleware session-rejection phrases on 401', () => {
+    expect(
+      isAuthenticationFailure(401, { code: 101, msg: 'Authenticated dashboard session is required' })
+    ).toBe(true);
+    expect(
+      isAuthenticationFailure(401, { msg: 'authenticated session is required' })
+    ).toBe(true);
+  });
+
   it('does not treat 403 responses as session invalidation', () => {
     expect(isAuthenticationFailure(403, { msg: 'forbidden' })).toBe(false);
   });
