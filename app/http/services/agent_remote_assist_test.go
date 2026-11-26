@@ -511,6 +511,9 @@ type fakeAssistSpawner struct {
 	// 陷阱:立刻退出会让 waitTerminal 抢先清表,生命周期断言失真——这里
 	// 全部用 blockExit 长活)。
 	blockExit chan struct{}
+	// exitOnce 使 blockExit 只关一次(quiesce 与「进程死亡」驱动共用:
+	// 测试中途放行(tombstone 用例)后 quiesce 的 Cleanup 不得二关 panic)。
+	exitOnce sync.Once
 }
 
 func newFakeAssistSpawner() *fakeAssistSpawner {
@@ -520,6 +523,13 @@ func newFakeAssistSpawner() *fakeAssistSpawner {
 		alive:     make(map[string]bool),
 		blockExit: make(chan struct{}),
 	}
+}
+
+// releaseExit 放行全部假 waiter(幂等):模拟「进程死亡」——生产 kill 后
+// 真进程退出、waiter 归返、tombstone 落 history;假身 kill 只记数不归返,
+// 需要 tombstone 的用例显式调用本方法补上这步。
+func (f *fakeAssistSpawner) releaseExit() {
+	f.exitOnce.Do(func() { close(f.blockExit) })
 }
 
 func (f *fakeAssistSpawner) start(sessionID string, shell string, cwd string, rows int, cols int) (*agentTerminalSession, []io.Reader, error) {
@@ -627,7 +637,7 @@ func (h *assistHarness) quiesceFakeTerminals(t *testing.T) {
 		}
 	}
 	h.svc.terminal.mu.Unlock()
-	close(h.spawner.blockExit)
+	h.spawner.releaseExit()
 	deadline := time.Now().Add(5 * time.Second)
 	for len(pending) > 0 && time.Now().Before(deadline) {
 		for id := range pending {
@@ -1141,7 +1151,8 @@ func TestAssistViewSinkPanicDoesNotKillFanLoop(t *testing.T) {
 		panic("view sink exploded")
 	})
 	s.assist.RegisterViewSink(sid, "v-ok", healthy.fan)
-	// 多轮投递:panic 路径反复走,健康 sink 每轮都收到(循环没被第一爆带走)。
+	// 多轮投递:健康 sink 每轮都收到(循环没被第一爆带走);爆掉的
+	// v-boom 第一轮 panic 后即被自动注销,后续轮次不再触达(见下方注)。
 	for i := 0; i < 3; i++ {
 		h.fakeTerminalEmit(sid, "round")
 	}
@@ -1153,6 +1164,10 @@ func TestAssistViewSinkPanicDoesNotKillFanLoop(t *testing.T) {
 		t.Fatalf("healthy sink must keep receiving frames across a panicking sibling, got %d", len(healthy.frames))
 	}
 	// 终态路径的 panic 同样被吞:notifyAndClearViews 收摊收住爆掉的 sink。
+	// 注(Task 7 扇出错误自动注销语义):v-boom 在第一轮 panic 后即被
+	// fanOutToViews 自动注销,后续轮次只驱动健康 sink——本用例的断言
+	// (健康 sink 每轮都收到)不依赖爆掉 sink 的持续在册,勿误读为
+	// 「panic sink 反复重注册」。
 	s.assist.RegisterViewSink(sid, "v-boom-end", func(map[string]interface{}) error {
 		panic("end notify exploded")
 	})
@@ -1304,5 +1319,223 @@ func TestAssistTerminalCloseGiveUpOnBlockedCreate(t *testing.T) {
 	s.assistCloseTerminal(sid2) // 已无在途 create:立即杀
 	if !waitUntil(5*time.Second, func() bool { return !h.fakeTerminalAlive(sid2) }) {
 		t.Fatal("assistCloseTerminal must kill the delayed terminal once it has landed")
+	}
+}
+
+// ——— Task 7:观看 WS 的 services 侧形态 ———
+
+// TestAssistViewFanErrorAutoUnregisters 钉观看 WS 的扇出错误自动注销
+// (handler 观看连接的 fanFn 写失败=连接死/超时,P1 策略:任何 fan 错误→
+// 注销该 viewID,观看端重连=新注册;注册表不积累死 sink)。错误路径与
+// panic 路径都走注销(fanOneView 两者都按失败计)。
+func TestAssistViewFanErrorAutoUnregisters(t *testing.T) {
+	h := newTestAssistManagerWithFakeTerminal(t)
+	s := h.svc
+	sid, _ := s.assist.RequestAndSignal("")
+	if _, err := s.assist.OnRemoteFrame(map[string]interface{}{
+		"type": models.AgentEventAssistApproved, "session_id": sid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+		t.Fatal("terminal must be live")
+	}
+	healthy := &assistViewProbe{}
+	s.assist.RegisterViewSink(sid, "v-dead", func(frame map[string]interface{}) error {
+		return errors.New("write: broken pipe")
+	})
+	s.assist.RegisterViewSink(sid, "v-live", healthy.fan)
+	// 触发一次输出:死 sink 报错 → 自动注销。
+	h.fakeTerminalEmit(sid, "one")
+	if !waitUntil(5*time.Second, func() bool { return healthy.Got("one") }) {
+		t.Fatal("healthy sink must receive the frame")
+	}
+	// 注销是 fanOneView 返回错误后的下一步,中间隔着 recover/日志落盘——
+	// 有界等待而非裸断言(裸查会在窗口期假红,-race 下偶发)。
+	if !waitUntil(5*time.Second, func() bool {
+		s.assist.viewsMu.Lock()
+		defer s.assist.viewsMu.Unlock()
+		_, deadStill := s.assist.views[sid]["v-dead"]
+		return !deadStill
+	}) {
+		t.Fatal("erroring sink must be auto-unregistered after a fan failure")
+	}
+	s.assist.viewsMu.Lock()
+	_, liveStill := s.assist.views[sid]["v-live"]
+	s.assist.viewsMu.Unlock()
+	if !liveStill {
+		t.Fatal("healthy sibling must stay registered")
+	}
+	// 注销后的后续输出只到健康 sink(死 sink 不再被调用,也无错误堆积)。
+	h.fakeTerminalEmit(sid, "two")
+	if !waitUntil(5*time.Second, func() bool { return healthy.Got("two") }) {
+		t.Fatal("healthy sink must keep receiving after sibling auto-unregister")
+	}
+}
+
+// TestAssistReplayThenLiveOrderingUnderOneMutex 钉观看 WS 的回放续屏顺序
+// 契约(Task 7 拍板形态+实现期锁序修正,handler 的「注册 sink→回放→live」
+// 以 services 同包复刻):序列化由 sendReplay 的 outputGate 承担——回放块
+// 持 gate(快照+逐帧),live 帧的扇出在 copy 循环里同样于 gate 内(push+
+// writeJSON 同 gate),全局锁序恒 outputGate → view.mu,无环。测试形态:
+// fanFn 与回放 writeJSON 共用同一把 per-view writeMu 的收集出口(handler
+// 同构);回放调用**不持** view.mu(持了会与 copy 循环 gate→fan→view.mu
+// 成环——死锁);并发 live 扇出被 gate 挡住,顺序恒 replay* → live。
+func TestAssistReplayThenLiveOrderingUnderOneMutex(t *testing.T) {
+	h := newTestAssistManagerWithFakeTerminal(t)
+	s := h.svc
+	sid, _ := s.assist.RequestAndSignal("")
+	if _, err := s.assist.OnRemoteFrame(map[string]interface{}{
+		"type": models.AgentEventAssistApproved, "session_id": sid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+		t.Fatal("terminal must be live")
+	}
+	// 预灌 ring(admin 早期输出,观看端中途加入前的存量)。复制循环把
+	// push→上行→扇出整段收在 outputGate 临界区里——若不设屏障就注册
+	// sink,注册可能落进该段中间(窗口 push→扇出,等 ring 或等上行都只
+	// 是收窄它:上行先于扇出,见到上行仅证明扇出待发),随后登记的 sink
+	// 会把同一块先收成活帧(-race 下乱序假红)。收口:上行见到后对
+	// outputGate 做一次 Lock/Unlock 探针——互斥量保证此刻临界区(含扇出)
+	// 已完整走完,注册才发生,窗口归零。
+	h.fakeTerminalEmit(sid, "replay-bytes-1")
+	if !waitUntil(5*time.Second, func() bool { return h.upGot("replay-bytes-1") }) {
+		t.Fatal("uplink must carry the prefilled bytes")
+	}
+	if sess := s.terminal.get(sid); sess != nil {
+		sess.outputGate.Lock()
+		sess.outputGate.Unlock()
+	}
+
+	var writeMu sync.Mutex
+	probe := &assistViewProbe{}
+	viewWrite := func(v interface{}) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		if frame, ok := v.(map[string]interface{}); ok {
+			probe.mu.Lock()
+			probe.frames = append(probe.frames, frame)
+			probe.mu.Unlock()
+		}
+		return nil
+	}
+	fan := func(frame map[string]interface{}) error { return viewWrite(frame) }
+	s.assist.RegisterViewSink(sid, "view-1", fan)
+
+	// 并发 live 扇出:后台 goroutine 持续 emit;回放与 live 的互斥由
+	// outputGate 保证(copy 循环 push+fan 同 gate),不靠 view.mu。
+	go func() {
+		h.fakeTerminalEmit(sid, "live-after")
+	}()
+	// 回放:不持 view.mu(handler 纪律,见函数头注释)。
+	s.AssistTerminalReplayTo(sid, viewWrite)
+
+	// 等 live 帧落地(emit 是异步复制,waitUntil 消竞态)。
+	if !waitUntil(5*time.Second, func() bool { return probe.Got("live-after") }) {
+		t.Fatal("live frame must arrive after replay")
+	}
+
+	// 顺序断言:全部 replay 帧必须先于任何含 live 输出的 terminal.output 帧。
+	probe.mu.Lock()
+	defer probe.mu.Unlock()
+	seenLive := false
+	for _, f := range probe.frames {
+		typ, _ := f["type"].(string)
+		if typ == models.AgentEventTerminalReplay {
+			if seenLive {
+				t.Fatalf("replay frame after live frame: 乱序(回放必须先于 live): %+v", probe.frames)
+			}
+			continue
+		}
+		if typ == models.AgentEventTerminalOutput {
+			seenLive = true
+		}
+	}
+	if !seenLive {
+		t.Fatalf("必须见到 live 帧后于回放: %+v", probe.frames)
+	}
+}
+
+// spawnerRingHas 探协助 PTY 的 ring 是否已含给定字节(fakeTerminalEmit 的
+// 写入到 ring 落地是异步复制,waitUntil 配合消竞态)。
+func (h *assistHarness) spawnerRingHas(sid string, substr string) bool {
+	s := h.svc.terminal.get(sid)
+	if s == nil || s.ring == nil {
+		return false
+	}
+	return strings.Contains(string(s.ring.snapshot()), substr)
+}
+
+// TestAssistTerminalReplayToTombstone 钉 AssistTerminalReplayTo 的
+// tombstone 分支:会话已退(ring 落 history)后回放按 status=exited 形态
+// 发出;活跃会话分atcher(live ring+gate)与 requested 无会话 no-op 分支
+// 由 TestAssistReplayThenLiveOrderingUnderOneMutex 与 handler 等待模式
+// 用例各自钉住。
+func TestAssistTerminalReplayToTombstone(t *testing.T) {
+	h := newTestAssistManagerWithFakeTerminal(t)
+	s := h.svc
+	sid, _ := s.assist.RequestAndSignal("")
+	if _, err := s.assist.OnRemoteFrame(map[string]interface{}{
+		"type": models.AgentEventAssistApproved, "session_id": sid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+		t.Fatal("terminal must be live")
+	}
+	h.fakeTerminalEmit(sid, "tomb-replay")
+	if !waitUntil(5*time.Second, func() bool { return h.spawnerRingHas(sid, "tomb-replay") }) {
+		t.Fatal("ring must hold the emitted bytes")
+	}
+	// 终态:杀 PTY → tombstone 落 history(exit 帧走复合 writer 上行)。
+	if err := s.assist.End(AssistEndAdmin); err != nil {
+		t.Fatal(err)
+	}
+	if !waitUntil(5*time.Second, func() bool { return !h.fakeTerminalAlive(sid) }) {
+		t.Fatal("end must close the assist terminal")
+	}
+	// 假身的 kill 不归返 waiter(生产 kill 后真进程退出、waiter 归返):
+	// 显式放行 blockExit 模拟进程死亡,waitTerminal 才把会话归档成
+	// tombstone(quiesce 的 Cleanup 走同一幂等出口,不二关)。
+	h.spawner.releaseExit()
+	// history 读必须持 m.mu(waitTerminal 的归档写在锁内,quiesce 同款
+	// 纪律):裸读=与 recordTerminalHistoryLocked 竞态,-race 必红。
+	if !waitUntil(5*time.Second, func() bool {
+		s.terminal.mu.Lock()
+		defer s.terminal.mu.Unlock()
+		return s.terminal.history[sid] != nil
+	}) {
+		t.Fatal("tombstone must land in history after end")
+	}
+	// 回放:按 exited 形态发 terminal.replay 帧。
+	var mu sync.Mutex
+	var got []map[string]interface{}
+	s.AssistTerminalReplayTo(sid, func(v interface{}) error {
+		if frame, ok := v.(map[string]interface{}); ok {
+			mu.Lock()
+			got = append(got, frame)
+			mu.Unlock()
+		}
+		return nil
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) == 0 {
+		t.Fatal("tombstone replay must emit frames")
+	}
+	last := got[len(got)-1]
+	if last["type"] != models.AgentEventTerminalReplay {
+		t.Fatalf("回放帧 type = %v, want terminal.replay", last["type"])
+	}
+	if last["status"] != terminalReplayStatusExited {
+		t.Fatalf("回放 status = %v, want %s", last["status"], terminalReplayStatusExited)
+	}
+	if final, _ := last["final"].(bool); !final {
+		t.Fatalf("末帧必须 final=true: %v", last)
+	}
+	if data, _ := last["data"].(string); !strings.Contains(data, "tomb-replay") {
+		t.Fatalf("回放 data 应含存量字节: %q", data)
 	}
 }

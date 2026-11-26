@@ -677,6 +677,10 @@ func (m *remoteAssistManager) UnregisterViewSink(sid, viewID string) {
 // viewsMu 长持。每个 sink 独立 recover:fan 是外部代码,跑在 PTY 复制循环
 // goroutine(裸 go,panic 即杀进程)与钩子 drain 路径上,safeGo 同款纪律——
 // 单 sink 爆炸按失败计,循环继续。
+//
+// Task 7 起扇出错误语义升级:fan 报错(观看连接死/写超时)即自动注销该
+// viewID——P1 策略「任何 fan 错误→注销」,观看端重连=旧注销+新注册,注册
+// 表不积累死 sink(错误与 panic 都按失败计,同走注销)。
 func (m *remoteAssistManager) fanOutToViews(sid string, frame map[string]interface{}) {
 	m.viewsMu.Lock()
 	type viewSink struct {
@@ -689,7 +693,9 @@ func (m *remoteAssistManager) fanOutToViews(sid string, frame map[string]interfa
 	}
 	m.viewsMu.Unlock()
 	for _, s := range sinks {
-		m.fanOneView(sid, s.viewID, s.fn, frame, "view fan-out failed")
+		if m.fanOneView(sid, s.viewID, s.fn, frame, "view fan-out failed") != nil {
+			m.UnregisterViewSink(sid, s.viewID)
+		}
 	}
 }
 
@@ -741,7 +747,74 @@ func assistEndFrame(sid string, reason assistEndReason) map[string]interface{} {
 	}
 }
 
+// AssistRegisterViewSink / AssistUnregisterViewSink 观看 WS 的注册面
+// (Task 7 handler 腿;remoteAssistManager 未导出,同 AssistTerminalReplayTo
+// 的导出小壳先例)。注册纪律见 RegisterViewSink 文档:注册前必须确认会话
+// 在 requested/active(结束后注册=永不被通知的孤儿桶);连接退出必须注销。
+func (s *AgentService) AssistRegisterViewSink(sessionID, viewID string, fn func(map[string]interface{}) error) {
+	if s == nil || s.assist == nil {
+		return
+	}
+	s.assist.RegisterViewSink(sessionID, viewID, fn)
+}
+
+func (s *AgentService) AssistUnregisterViewSink(sessionID, viewID string) {
+	if s == nil || s.assist == nil {
+		return
+	}
+	s.assist.UnregisterViewSink(sessionID, viewID)
+}
+
+// AssistViewBucketEmpty 会话观看桶是否已空(测试观察缝:钉 handler 腿
+// 「连接退出必须注销」的回归;生产零调用)。
+func (s *AgentService) AssistViewBucketEmpty(sessionID string) bool {
+	if s == nil || s.assist == nil {
+		return true
+	}
+	s.assist.viewsMu.Lock()
+	defer s.assist.viewsMu.Unlock()
+	return len(s.assist.views[sessionID]) == 0
+}
+
+// AssistViewEndFrame 观看端终帧载荷(handler 在 register-vs-end 复检兜底
+// 分支补发;assistEndFrame 未导出,同族导出小壳)。
+func AssistViewEndFrame(sessionID string, reason string) map[string]interface{} {
+	return assistEndFrame(sessionID, assistEndReason(reason))
+}
+
 // ——— 服务侧接线:approved 激活/终态回收/复合 writer ———
+
+// AssistTerminalReplayTo 把协助会话的 ring 回放流发给 writeJSON(Task 7
+// 观看 WS 的续屏腿。计划允许的小偏差:sendReplay/attachHistory 挂在
+// agentTerminalManager 上且未导出,handlers 包不可达,按 SetDirForTest
+// 先例在 services 落一个导出小壳)。语义:
+//   - active 态(终端在册):live ring 回放,与 attachLive 同款 outputGate
+//     持锁纪律(回放帧与活输出互斥,zero seam);
+//   - 会话已退(tombstone):按 exited 形态回放;
+//   - 无会话(尚未建终端的 requested 态/未知名):no-op 优雅跳过——
+//     等待模式无 ring 可回,连接静默进入 live 等待。
+// attachToken 恒空串:观看端不是 attach 语义的请求方(无 token 路由),
+// 帧保持 legacy 字节形态。
+func (s *AgentService) AssistTerminalReplayTo(sessionID string, writeJSON agentTerminalWriter) {
+	if s == nil || s.terminal == nil || writeJSON == nil {
+		return
+	}
+	m := s.terminal
+	m.mu.Lock()
+	session := m.sessions[sessionID]
+	if session != nil {
+		// 引用先取、锁先释(单向锁序 m.mu → outputGate),gate 横跨快照与
+		// 每帧发送——回放帧绝不与活 output 交错(sendReplay 同款纪律)。
+		m.mu.Unlock()
+		m.sendReplay(sessionID, session.ring, terminalReplayStatusLive, &session.outputGate, "", writeJSON)
+		return
+	}
+	tomb := m.history[sessionID]
+	m.mu.Unlock()
+	if tomb != nil {
+		m.sendReplay(sessionID, tomb.ring, terminalReplayStatusExited, nil, "", writeJSON)
+	}
+}
 
 // assistTerminalCloseWaitCap 是关闭路径等待在途 create 的总窗上限:短窗
 // (agentTerminalCreateWaitTimeout,照手机腿 input 同款)内不落地时转后台

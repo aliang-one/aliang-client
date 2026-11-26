@@ -336,6 +336,10 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("GET /api/agent/assist/session", h.Agent.HandleAssistSession, http.MethodGet)
 	register("POST /api/agent/assist/end", h.Agent.HandleAssistEnd, http.MethodPost)
 	register("POST /api/agent/assist/cancel", h.Agent.HandleAssistCancel, http.MethodPost)
+	// 远程协助观看 WS(Task 7,spec §7.1):纯推送只读+回放续屏。真身在本
+	// runtime(会话闸/注册/回放/只读循环),core 侧闸门②+同源闸+proxy 透传
+	// (proxyAIStream,与聊天/网页终端同管线)。缺任一侧=404(双注册纪律)。
+	register("/api/agent/assist/stream", h.Agent.HandleAssistStream, http.MethodGet)
 	register("/api/agent/operations/events", h.Agent.HandleOperationEvents, http.MethodGet)
 	register("/api/agent/ai/stream", h.Agent.HandleAIStream, http.MethodGet)
 	register("/api/agent/ai/approval-hook", h.Agent.HandleAIApprovalHook, http.MethodPost)
