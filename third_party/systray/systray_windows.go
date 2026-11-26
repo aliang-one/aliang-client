@@ -5,6 +5,7 @@ package systray
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -31,6 +32,8 @@ var (
 
 	s32              = windows.NewLazySystemDLL("Shell32.dll")
 	pShellNotifyIcon = s32.NewProc("Shell_NotifyIconW")
+	// 本仓补丁:托盘图标屏幕矩形,面板窗口锚定用(见 TrayRect)。
+	pShell_NotifyIconGetRect = s32.NewProc("Shell_NotifyIconGetRect")
 
 	u32                    = windows.NewLazySystemDLL("User32.dll")
 	pCreateMenu            = u32.NewProc("CreateMenu")
@@ -155,6 +158,17 @@ func (nid *notifyIconData) delete() error {
 	return nil
 }
 
+// 本仓补丁:NOTIFYICONIDENTIFIER——Shell_NotifyIconGetRect 专用结构体,与上面的
+// notifyIconData(NOTIFYICONDATAW)是两个不同结构体,不得混用;字段名保持
+// Win32 原名防转录错位(cbSize 必须是本结构真实大小,见 TrayRect)。
+// https://learn.microsoft.com/en-us/windows/win32/api/shellapi/ns-shellapi-notifyiconidentifier
+type notifyIconIdentifier struct {
+	cbSize   uint32
+	hWnd     windows.Handle
+	uID      uint32
+	guidItem windows.GUID
+}
+
 // Contains information about a menu item.
 // https://msdn.microsoft.com/en-us/library/windows/desktop/ms647578(v=vs.85).aspx
 type menuItemInfo struct {
@@ -171,6 +185,13 @@ type menuItemInfo struct {
 // https://msdn.microsoft.com/en-us/library/windows/desktop/dd162805(v=vs.85).aspx
 type point struct {
 	X, Y int32
+}
+
+// 本仓补丁:RECT 结构——新版 golang.org/x/sys 已不再提供,库内自备
+// (风格同上游的 point),TrayRect 用。
+// https://msdn.microsoft.com/en-us/library/windows/desktop/dd162897(v=vs.85).aspx
+type rect struct {
+	Left, Top, Right, Bottom int32
 }
 
 // Contains information about loaded resources
@@ -279,7 +300,13 @@ func (t *winTray) wndProc(hWnd windows.Handle, message uint32, wParam, lParam ui
 	case t.wmSystrayMessage:
 		switch lParam {
 		case WM_RBUTTONUP, WM_LBUTTONUP:
-			t.showMenu()
+			// 本仓补丁:面板模式下左右键点击都交给面板回调(异步),不再弹
+			// 原生菜单;回调未设置(nil)保持上游行为 = 弹原生菜单兜底。
+			if panelClickFn != nil {
+				go panelClickFn()
+			} else {
+				t.showMenu()
+			}
 		}
 	case t.wmTaskbarCreated: // on explorer.exe restarts
 		t.muNID.Lock()
@@ -642,6 +669,10 @@ func (t *winTray) showMenu() error {
 	const (
 		TPM_BOTTOMALIGN = 0x0020
 		TPM_LEFTALIGN   = 0x0000
+		// 本仓补丁:TPM_RIGHTBUTTON——右键路径(WM_RBUTTONUP)弹出的菜单
+		// 也要跟踪右键选择,与系统托盘菜单行为一致。
+		TPM_RIGHTBUTTON = 0x0002
+		WM_NULL         = 0x0000
 	)
 	p := point{}
 	res, _, err := pGetCursorPos.Call(uintptr(unsafe.Pointer(&p)))
@@ -652,18 +683,59 @@ func (t *winTray) showMenu() error {
 
 	res, _, err = pTrackPopupMenu.Call(
 		uintptr(t.menus[0]),
-		TPM_BOTTOMALIGN|TPM_LEFTALIGN,
+		TPM_BOTTOMALIGN|TPM_LEFTALIGN|TPM_RIGHTBUTTON,
 		uintptr(p.X),
 		uintptr(p.Y),
 		0,
 		uintptr(t.window),
 		0,
 	)
+	// 本仓补丁:经典托盘菜单坑(KB135788)——本窗口已 SetForegroundWindow,
+	// TrackPopupMenu 返回后必须再喂窗口一条无害消息(WM_NULL),否则用户点击
+	// 托盘图标以外的区域菜单不收起,再次点击图标也弹不出菜单。
+	pPostMessage.Call(uintptr(t.window), WM_NULL, 0, 0)
 	if res == 0 {
 		return err
 	}
 
 	return nil
+}
+
+// 本仓补丁:HRESULT——Shell API 返回码原样带给调用方(S_FALSE=1 与真失败可
+// 区分),不映射成 errno 以免误导日志。
+type HRESULT uintptr
+
+func (h HRESULT) Error() string {
+	return fmt.Sprintf("Shell_NotifyIconGetRect: HRESULT=0x%08X", uint32(h))
+}
+
+// 本仓补丁:TrayRect 返回托盘图标的屏幕矩形(物理像素),面板窗口锚定用。
+// 真实 Win32 签名第二参是 RECT*(调用方分配好的矩形指针;MSDN 语法块里的
+// LPRECT* 是文档笔误,照抄会传 RECT** 导致脏写)。成功只认 ret==0(S_OK);
+// 其余 HRESULT 连同已填充的 rect 原样透传——S_FALSE(1)表示图标在溢出区,
+// 此时 Win10 给溢出箭头的矩形、Win11 给屏外坐标,是否可用由调用方判废。
+func TrayRect() (rect, error) {
+	const S_OK = 0
+	wt.muNID.RLock()
+	if wt.nid == nil {
+		wt.muNID.RUnlock()
+		return rect{}, fmt.Errorf("TrayRect: tray not initialized")
+	}
+	idf := notifyIconIdentifier{
+		cbSize: uint32(unsafe.Sizeof(notifyIconIdentifier{})),
+		hWnd:   wt.nid.Wnd,
+		uID:    wt.nid.ID,
+	}
+	wt.muNID.RUnlock()
+	var r rect
+	ret, _, _ := pShell_NotifyIconGetRect.Call(
+		uintptr(unsafe.Pointer(&idf)),
+		uintptr(unsafe.Pointer(&r)),
+	)
+	if ret != S_OK {
+		return r, HRESULT(ret)
+	}
+	return r, nil
 }
 
 func (t *winTray) delFromVisibleItems(parent, val uint32) {

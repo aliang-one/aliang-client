@@ -23,13 +23,47 @@ Apache-2.0(LICENSE 原样保留)。本目录的 go.mod 保持上游 module path 
 除本节所列外,其余文件逐字节 = 上游 v1.2.2。所有补丁处均有 `本仓补丁`
 注释锚点(升级时 grep 此词重放补丁)。
 
-### systray_windows.go(3 处)
+### systray.go(1 处,2026-11-26)
+
+1. `panelClickFn` + `SetPanelClickHook(fn func())`:面板模式点击回调。设置后
+   Windows 后端把托盘图标的左/右键点击交给回调(每次点击起新 goroutine
+   异步执行),不再弹原生菜单;nil(默认)= 上游行为,原生菜单兜底。只有
+   Windows 的 wndProc 读取此回调,其余平台后端不接线。
+
+### systray_windows.go(11 处;1~3=2026-11-20 GDI 修复,4~11=2026-11-26 面板胶水)
 
 1. proc 表新增 `pDeleteObject = g32.NewProc("DeleteObject")`。
 2. `iconToBitmap`:`pDrawIconEx` 失败路径上游直接 `return 0`,已创建的
    hMemBmp 无人接管 = 泄漏;补丁在返回前销毁。
 3. `MenuItem.SetIcon`:上游覆盖 `wt.menuItemIcons[id]` 前不销毁旧句柄,
    每次调用泄漏一个 HBITMAP(主泄漏点);补丁在覆盖前 `DeleteObject` 旧值。
+4. proc 表新增 `pShell_NotifyIconGetRect = s32.NewProc("Shell_NotifyIconGetRect")`
+   + 新增 `notifyIconIdentifier` 结构体(NOTIFYICONIDENTIFIER):与库内
+   `notifyIconData`(NOTIFYICONDATAW)是两个不同结构体,不得混用;字段名
+   保持 Win32 原名(cbSize/hWnd/uID/guidItem)防转录错位。(两处锚点)
+5. 新增 `rect` 结构体:新版 golang.org/x/sys 已不再提供 RECT,库内自备,
+   风格同上游的 `point`。
+6. 新增 `HRESULT` 类型 + 包级 `TrayRect()`:拿托盘图标屏幕矩形(面板窗口
+   锚定用)。要点:①cbSize 必须用 `uint32(unsafe.Sizeof(notifyIconIdentifier{}))`
+   表达式——该结构 x64 sizeof=40(已用编译期断言实编译验证),照抄上游
+   字面常量风格写 24 会让 API 恒 E_INVALIDARG 且被兜底静默掩盖;②Call 是
+   两参形态 `Call(uintptr(unsafe.Pointer(&idf)), uintptr(unsafe.Pointer(&r)))`
+   ——真实 Win32 签名第二参是 `RECT *`(调用方分配好的矩形指针),MSDN
+   语法块的 `LPRECT *` 是文档笔误,照抄会传 RECT** 导致脏写;③成功只认
+   `ret == 0`(S_OK),S_FALSE(1)= 图标在溢出区(Win10 给溢出箭头矩形 /
+   Win11 给屏外坐标),连同已填充的 rect 原样透传,由调用方判废。
+   (两处锚点)
+7. `wndProc` 的 WM_LBUTTONUP/WM_RBUTTONUP 分支:`panelClickFn != nil` 时
+   `go panelClickFn()`(面板模式),否则落回 `showMenu()` 原生菜单兜底。
+8. `showMenu` 两处:①TrackPopupMenu flags 加 `TPM_RIGHTBUTTON`(右键路径
+   WM_RBUTTONUP 弹出的菜单也要跟踪右键选择);②TrackPopupMenu 返回后
+   `PostMessageW(wnd, WM_NULL, 0, 0)`——经典托盘菜单坑(KB135788):本窗口
+   已 SetForegroundWindow,不喂一条无害消息则菜单点外不收起、二次点击
+   图标弹不出。(两处锚点)
+
+结构测试:`app/tray/systray_windows_patch_test.go` 的
+`TestSystrayWindowsPanelPatch` 钉住 4~11 的形态(含 cbSize 禁止字面常量、
+两参 Call、只认 S_OK 三条「照做必错」红线),同步上游漏重放即红。
 
 ### systray_darwin.m(9 处,2026-11-26)
 
@@ -66,7 +100,8 @@ gofmt 现代化——本目录以「逐字节忠实于上游 + 仅功能补丁�
 ## 升级流程
 
 上游若发新版:替换本目录为新版源码 → `grep -n 本仓补丁 systray_windows.go`
-按上文 3 处、`grep -n 本仓补丁 systray_darwin.m` 按上文 9 处重放补丁 →
+按上文 11 处、`grep -n 本仓补丁 systray_darwin.m` 按上文 9 处、
+`grep -n 本仓补丁 systray.go` 按上文 1 处重放补丁 →
 重新评估是否恢复被删文件 → 主仓按下一节双平台验证。
 
 ## 验证方式
@@ -74,13 +109,19 @@ gofmt 现代化——本目录以「逐字节忠实于上游 + 仅功能补丁�
 本目录是嵌套模块,主模块不认 `./third_party/systray/` 这种路径写法;编译
 验证要写 import 路径 `github.com/getlantern/systray`,由主仓的 replace 解析。
 
-### Windows(GDI)
+### Windows(GDI 与面板胶水)
 
-GDI 行为无法在 darwin 上运行时验证,分三层:
+GDI/托盘行为无法在 darwin 上运行时验证,分四层:
 1. 编译层:`GOOS=windows GOARCH=amd64 go build github.com/getlantern/systray`。
-2. 审阅层:补丁 diff 仅 3 处、语义直白(销毁即将被覆盖/丢弃的句柄)。
-3. 实机层:部署后在真机用 GetGuiResources 观测 companion 的 GDI 对象数,
-   AI 状态翻转下应保持平坦(不再线性增长)。
+2. 结构层:`go test ./app/tray/ -run TestSystrayWindowsPanelPatch`(用例在
+   `app/tray/systray_windows_patch_test.go`)钉住面板胶水的形态——公共层
+   hook、wndProc 点击分支、TrayRect(cbSize 必须 Sizeof 表达式且禁字面
+   常量/两参 Call/只认 S_OK)、showMenu(WM_NULL + TPM_RIGHTBUTTON),
+   每处带「本仓补丁」锚点,同步上游漏重放即红。
+3. 审阅层:GDI 三处补丁语义直白(销毁即将被覆盖/丢弃的句柄)。
+4. 实机层:部署后在真机用 GetGuiResources 观测 companion 的 GDI 对象数,
+   AI 状态翻转下应保持平坦(不再线性增长);面板接线任务落地后另验
+   TrayRect 矩形与点击回调(溢出区两态判废在接线层)。
 
 ### macOS(autorelease)
 
