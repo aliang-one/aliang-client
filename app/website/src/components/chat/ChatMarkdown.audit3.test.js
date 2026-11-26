@@ -13,12 +13,14 @@ vi.mock('../../utils/chatMarkdown', async (importOriginal) => {
 
 import { renderMarkdownSafe } from '../../utils/chatMarkdown';
 import ChatMarkdown from './ChatMarkdown.vue';
+import { noteChatFirstText } from '../../utils/chatTiming';
+
 
 function mountComponent(contentProps = {}) {
   const state = reactive({ content: '', ...contentProps });
   const el = document.createElement('div');
   document.body.appendChild(el); // M6 冒泡链需要真实文档
-  const app = createApp({ render: () => h(ChatMarkdown, { content: state.content }) });
+  const app = createApp({ render: () => h(ChatMarkdown, { content: state.content, timingMessage: state.timingMessage }) });
   app.mount(el);
   return { state, el, app };
 }
@@ -34,6 +36,39 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+});
+
+it('records the first-text timing after the render throttle commits to the DOM', async () => {
+  vi.useFakeTimers();
+  vi.stubGlobal('__CHAT_TIMING__', true);
+  const now = vi.spyOn(performance, 'now').mockReturnValue(90);
+  const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+  const message = {};
+  const { state, app, el } = mountComponent({ timingMessage: message });
+  try {
+    state.content = 'warm-up';
+    await flushTicks();
+    noteChatFirstText(state.timingMessage, {
+      run_id: 'run-sample', event_seq: 7, agent_emitted_at_ms: 1234,
+      delta: 'first text',
+    }, 10);
+    state.content = 'first text';
+    await flushTicks();
+    expect(log).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(80);
+    await flushTicks();
+    expect(el.querySelector('.chat-md').textContent).toContain('first text');
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith(
+      '[PERF] ai-first-text run=run-sample event_seq=7 receive_to_dom_ms=80',
+    );
+  } finally {
+    app.unmount();
+    el.remove();
+    vi.unstubAllGlobals();
+    now.mockRestore();
+    log.mockRestore();
+  }
 });
 
 describe('M1 大内容自适应渲染节流', () => {

@@ -47,6 +47,7 @@
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import { renderMarkdownSafe, extractAliangOptions, stripAliangOptions } from '../../utils/chatMarkdown';
 import { useI18n } from '../../i18n';
+import { noteChatTextDomCommit } from '../../utils/chatTiming';
 
 const { t } = useI18n();
 
@@ -73,6 +74,7 @@ const FEEDBACK_RESET_MS = 1500;
 
 const props = defineProps({
   content: { type: String, default: '' },
+  timingMessage: { type: Object, default: undefined },
   // 该会话在挂交互卡（ai.option.request upsert 的 optionCards）的 option_id
   // 集合：命中（且块自带 option_id）的静态卡隐藏——防交互卡/静态卡双份。
   // 只控静态卡显隐，正文 strip 围栏无条件执行（防双份正确流）。
@@ -169,6 +171,9 @@ let disposed = false;
 function enhance() {
   const root = rootRef.value;
   if (!root) return;
+  if (globalThis.__CHAT_TIMING__ === true && props.timingMessage && root.textContent.trim()) {
+    noteChatTextDomCommit(props.timingMessage);
+  }
   // markdown 图片异步解码撑高内容后不回锚(M6,2026-11-21 审计):load 在
   // img 上不冒泡,这里转发成可冒泡的 chat-md-img-load,祖先滚动容器
   // (ChatMessageList)按贴底态决定回底——上翻阅读不被劫持。

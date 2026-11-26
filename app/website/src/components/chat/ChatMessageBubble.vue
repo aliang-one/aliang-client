@@ -111,7 +111,7 @@
               </summary>
               <div class="mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap leading-relaxed text-slate-400 dark:text-slate-500">{{ msg.thinking }}</div>
             </details>
-            <ChatMarkdown :content="msg.content" :hidden-option-ids="hiddenOptionIds" />
+            <ChatMarkdown :content="msg.content" :hidden-option-ids="hiddenOptionIds" :timing-message="msg" />
             <!-- 图片附件缩略图条（assistant 侧预留，任何角色带图均渲染）。 -->
             <ChatAttachmentStrip
               v-if="msg.attachments && msg.attachments.length"

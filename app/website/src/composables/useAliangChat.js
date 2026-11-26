@@ -3,6 +3,7 @@ import { useI18n } from '../i18n';
 import { useNavigation } from './useNavigation';
 import { slashProviderFor } from '../utils/chatProvider';
 import { normalizeConversationTitle } from '../utils/chatTitle';
+import { noteChatFirstText } from '../utils/chatTiming';
 import { useAuthStore } from '../stores/auth';
 import { uploadChatAttachment } from '../services/agentApi';
 
@@ -2653,7 +2654,10 @@ export function useAliangChat() {
             console.log('[aliang-chat] frame', parsed.type, parsed.type === 'ai.delta' ? `len=${(parsed.delta || '').length}` : '');
           }
         }
-        handleAIEvent(parsed);
+        const timingReceipt = globalThis.__CHAT_TIMING__ === true &&
+          parsed?.type === 'ai.delta' && parsed.agent_emitted_at_ms !== undefined
+          ? performance.now() : undefined;
+        handleAIEvent(parsed, timingReceipt);
       };
       sock.onerror = (e) => {
         console.warn('[aliang-chat] ws error', e);
@@ -3781,7 +3785,7 @@ export function useAliangChat() {
     }
   }
 
-  function handleAIEvent(e) {
+  function handleAIEvent(e, timingReceipt) {
     if (!e || !e.type) return;
     // run 数据面入站帧证明管道活着：重连预算归零（纯快照握手不算——防
     // 「连上→回一帧→断」假活环境无限洗白预算；长跑 run 的偶发断线在健康
@@ -4045,6 +4049,9 @@ export function useAliangChat() {
           break;
         }
         conv.snapshotCatchupAt = 0;
+        if (timingReceipt !== undefined && matchedById && conv.id === activeId.value) {
+          noteChatFirstText(asst, e, timingReceipt);
+        }
         asst.content += delta;
         scrollToBottom();
         break;
