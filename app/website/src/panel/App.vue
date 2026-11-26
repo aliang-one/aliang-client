@@ -4,9 +4,10 @@
      区块组件:①状态头/②传输行(Task 8)/③AI 加速(Task 9)/④ENDPOINT
      (Task 10)已落地;⑤AI AGENT/⑥底部动作行仍是占位(Task 11),
      绝不提前实现。
-     ④ENDPOINT 的分隔线随区走(spec mockup endpoints() 自带前置 sep):
-     available=false 整区不渲染时连 sep 一起消失,故本文件不为④放静态 sep
-     ——③ 后的 sep 就是 ③/⑤ 之间的那条线。 -->
+     ④ENDPOINT 的分隔线放区尾并随整区显隐:available=false 整区不渲染时
+     连 trailing sep 一起消失,避免可用性切换出现孤线/双线,故本文件不为④
+     放静态 sep——③ 后的 sep 就是 ③/⑤ 之间的那条线(mockup 的 sep 不随
+     zone 走,随区显隐是实现层决定)。 -->
 <script setup>
 import { computed, provide, ref } from 'vue';
 import { useSummary } from './summary';
@@ -53,7 +54,7 @@ provide('panelToast', toast);
     <div class="sep"></div>
 
     <!-- ④ ENDPOINT:Anthropic 组 / OpenAI 组;available=false 整区不渲染
-         (spec §4.4 硬性降级);自带前置 sep,故此处无静态 sep(Task 10) -->
+         (spec §4.4 硬性降级);sep 随区尾显隐,故此处无静态 sep(Task 10) -->
     <EndpointZone />
 
     <!-- ⑤ AI AGENT:每内核一张卡片(24h 统计)(Task 11) -->

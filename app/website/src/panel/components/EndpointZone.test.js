@@ -305,7 +305,8 @@ describe('EndpointZone 挂载 DOM 契约', () => {
     expect(q(groups[1], '.g-current').textContent).toBe('deepseek-official');
     // 默认收起:无 open 类
     expect(groups[0].className).not.toContain('open');
-    // sep 随区走(mockup endpoints() 自带前置 sep;不渲染时连 sep 一起消失)
+    // sep 放区尾并随整区显隐(实现层决定,mockup 未含此 sep;整区不渲染时
+    // 连 sep 一起消失,不留孤线/双线)
     expect(q(el.parentElement, '.sep')).not.toBeNull();
   });
 
@@ -454,8 +455,11 @@ describe('EndpointZone 挂载 DOM 契约', () => {
 });
 
 describe('api 层纪律(拍板第 4 条:钉选未上线,api 层不得有 activate 调用)', () => {
-  it('api.js 不导出任何 activate/activateEndpoint 形态的动作', () => {
-    const keys = Object.keys(api);
-    expect(keys.filter((k) => /activate/i.test(k))).toEqual([]);
+  // 守卫必须打在【真实 api.js】上:本文件顶部的 vi.mock 工厂只 mock 组件
+  // 行为链路,拿它的键断言对未来「往 api.js 加 activateEndpoint」零保护力
+  // (评审指正)。vi.importActual 绕过 mock 拿磁盘上的真模块。
+  it('api.js 真实模块不导出任何 activate 形态的动作(vi.importActual 绕过顶部 mock)', async () => {
+    const real = await vi.importActual('../api');
+    expect(Object.keys(real).filter((k) => /activate/i.test(k))).toEqual([]);
   });
 });

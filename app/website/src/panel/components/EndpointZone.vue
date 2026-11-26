@@ -8,9 +8,9 @@
      任何请求——勾选圈仅反映服务端 current(自动调度此刻选中的行,与组头
      g-current 同源),点击不迁移。api 层无 activate 动作(契约硬约束)。
      降级硬约束:available=false 或 groups 缺失/空数组 → 整区不渲染,无空壳、
-     无「建设中」占位;前置 sep 随区走(mockup endpoints() 自带前置 sep,
-     不渲染时连 sep 一起消失,不留孤线)。AI 加速关(ai.enabled=false)→
-     整区 .zone.dimmed(降透明 0.35 + 锁交互,§6-4)。 -->
+     无「建设中」占位;sep 放区尾并随整区显隐(实现层决定,mockup 未含此
+     sep;不渲染时连 sep 一起消失,不留孤线/双线)。AI 加速关(ai.enabled
+     =false)→ 整区 .zone.dimmed(降透明 0.35 + 锁交互,§6-4)。 -->
 <script>
 import { computed, inject, ref } from 'vue';
 
@@ -151,8 +151,8 @@ export default {
 </script>
 
 <template>
-  <!-- sep 随区走:mockup endpoints() 自带前置 sep;整区不渲染时连 sep 一起
-       消失——App.vue 不再为④放静态 sep,避免可用性切换时出现孤线/双线。 -->
+  <!-- sep 放区尾并随整区显隐:整区不渲染时连 sep 一起消失——App.vue 不为④
+       放静态 sep,避免可用性切换时出现孤线/双线(实现层决定,mockup 未含)。 -->
   <template v-if="model.available">
     <div class="zone ep-zone" :class="{ dimmed: !model.aiOn }">
       <div
