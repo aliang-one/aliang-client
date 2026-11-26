@@ -5,14 +5,14 @@
      (summary.ai.providers[].detected),不可手动点亮;点击图标只读弹
      详情 toast。AI 加速关 → provider 行降透明 0.35 + 锁交互 + 行尾文案
      变「AI 加速已关 · 图标全灰」(§6-4)。
-     ⚠️ v1 开关降级为只读展示(2026-11-27 读码定案):服务端没有 AI 加速
-     专用开关端点(routes.go 仅 /api/tray/summary 只读 + /api/run/*;AI
-     规则归 /api/config/customer 整份 customer 配置 patch,见 SettingsPage
-     整表保存路径)。且 tray summary 的 ai.enabled 是派生值
-     (tray_summary.go:Enabled=len(providers)>0),providers 只含启用规则
-     ——面板「关」可 patch 全部家族 enble=false,但「开」无法还原此前启用
-     的家族集合(该数据不在托盘快照里),半能开关比只读更危险。故 switch
-     渲染 summary 值,点击 toast 引导去仪表盘。 -->
+     ⚠️ v1 开关降级为只读展示(2026-11-27 读码定案):无 AI 专用开关端点
+     (AI 规则写路径归 /api/config/customer 的 customer 配置维护——深合并
+     patch(mergeCustomerPayload → deepMergeJSONObjects),技术上可逐条
+     ai_rules.<key>.enble 部分 patch,仪表盘即逐家开关);且托盘快照只含
+     已启用家族(ai.enabled 是派生值:Enabled=len(providers)>0)——「关」
+     可全关,「开」无法还原此前启用集合(禁用家族不在快照里),半能开关
+     比只读更危险,故 v1 只读降级。switch 渲染 summary 值,点击 toast
+     引导去仪表盘。 -->
 <script>
 import { computed, inject } from 'vue';
 
