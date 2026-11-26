@@ -681,6 +681,11 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn, accounts ...s
 		}
 	}()
 
+	// Only this connection can renew its watches or emit their notifications.
+	// Disk lookup and writes stay off the reader and heartbeat goroutines.
+	var transcriptWatches chan map[string]interface{}
+	defer sessionCancel()
+
 	for {
 		var msg map[string]interface{}
 		if err := conn.ReadJSON(&msg); err != nil {
@@ -689,6 +694,30 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn, accounts ...s
 		// Any inbound traffic confirms the peer is alive; refresh the deadline so
 		// a chatty-but-pong-less peer isn't misclassified as dead.
 		resetReadDeadline()
+		if remoteString(msg, "type") == models.AgentEventAITranscriptWatch {
+			if !s.remoteControlAllowed() || account == "" || account != s.operationAccount() {
+				continue
+			}
+			if transcriptWatches == nil {
+				transcriptWatches = make(chan map[string]interface{}, maxAgentTranscriptWatches)
+				frames := transcriptWatches
+				safeGo("agent_transcript_watches", func() {
+					runAgentTranscriptWatches(sessionCtx, frames, func(sessionID string) error {
+						if sessionCtx.Err() != nil || account != s.operationAccount() || !s.remoteControlAllowed() {
+							return context.Canceled
+						}
+						return publishedWriter(map[string]interface{}{
+							"type": models.AgentEventAITranscriptChanged, "session_id": sessionID,
+						})
+					})
+				})
+			}
+			select {
+			case transcriptWatches <- msg:
+			default:
+			}
+			continue
+		}
 		s.handleRemoteAgentMessage(sessionCtx, msg, writeJSON)
 	}
 }
@@ -1479,6 +1508,7 @@ func agentCapabilities() []string {
 		"workspace_fingerprint_v1",
 		"file_transfer_v1",
 		"operation_progress_v1",
+		"ai_transcript_watch_v1",
 		// 设备互访阶段 1（spec §5.1）：一次性命令执行 + fetch 编排能力位。
 		// 服务端按位门控下发 peer.* 流量，老设备自动落「仅中继」兼容路径。
 		"peer_v1",

@@ -66,6 +66,8 @@ const (
 	AgentEventAIOptionRequest         = "ai.option.request"       // agent→server: 请求用户在多个方案中选择
 	AgentEventAIOptionResponse        = "ai.option.response"      // server→agent: 用户的选择结果
 	AgentEventAIOptionCancelled       = "ai.option.cancelled"     // 双向: 选择对话失活，作废待选
+	AgentEventAITranscriptWatch       = "ai.session.transcript.watch"
+	AgentEventAITranscriptChanged     = "ai.session.transcript.changed"
 	AgentEventAISessionSubscribe      = "ai.session.subscribe"    // server→agent: 订阅一个会话的实时事件（本机聊天 WS 与阶段3云端代订阅共用帧型）
 	AgentEventAISessionUnsubscribe    = "ai.session.unsubscribe"  // server→agent: 退订
 	AgentEventAISessionSnapshot       = "ai.session.snapshot"     // client→server: 订阅握手回包（转录+待审批+状态）
@@ -294,6 +296,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAIApprovalSync, Required: []string{"type"}, Optional: []string{"pending"}},
 				{Type: AgentEventAIApprovalCancelled, Required: []string{"type", "session_id"}, Optional: []string{"approval_ids", "reason"}},
 				// 跨端会话统一（spec 2026-10-28 §4.1）：agent 发——订阅握手回包 + 非致命运行期提示。
+				{Type: AgentEventAITranscriptChanged, Required: []string{"type", "session_id"}},
 				{Type: AgentEventAISessionSnapshot, Required: []string{"type", "session_id"}, Optional: []string{"transcript", "pending_approvals", "status"}},
 				{Type: AgentEventAIRunNotice, Required: []string{"type", "session_id", "code"}, Optional: []string{"message_id", "detail"}},
 				{Type: AgentEventAISessionClosed, Required: []string{"type", "session_id"}, Optional: []string{"run_id", "event_seq"}},
@@ -355,6 +358,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAIApprovalResponse, Required: []string{"type", "session_id", "approval_id", "decision"}, Optional: []string{"message_id", "scope", "raw", "delivery_id", "attempt"}, Emits: []string{AgentEventAIApprovalAck, AgentEventAIStatus, AgentEventAIError}},
 				{Type: AgentEventAIApprovalState, Required: []string{"type", "approval_id", "status"}, Optional: []string{"session_id"}},
 				// 跨端会话统一（spec 2026-10-28 §4.1）：agent 收——本机聊天 WS 与阶段3云端代订阅共用帧型。
+				{Type: AgentEventAITranscriptWatch, Required: []string{"type", "session_id"}, Optional: []string{"source_session_id", "provider", "enabled"}, Emits: []string{AgentEventAITranscriptChanged}},
 				{Type: AgentEventAISessionSubscribe, Required: []string{"type", "session_id"}},
 				{Type: AgentEventAISessionUnsubscribe, Required: []string{"type", "session_id"}},
 				{Type: AgentEventAIStop, Required: []string{"type", "session_id"}, Optional: []string{"run_id", "source_session_id"}, Emits: []string{AgentEventAIStatus}},
