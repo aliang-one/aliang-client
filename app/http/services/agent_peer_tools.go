@@ -130,6 +130,10 @@ func (e agentPeerHTTPStatusError) Error() string {
 // 回 201）。
 func (s *AgentService) doAgentServerJSON(ctx context.Context, method, endpoint string, payload interface{}) ([]byte, error) {
 	s.mu.Lock()
+	if account, _ := ctx.Value(operationSnapshotAccount{}).(string); account != "" && account != strings.TrimSpace(s.state.RegisteredUser) {
+		s.mu.Unlock()
+		return nil, errors.New("agent account changed")
+	}
 	authHeader := strings.TrimSpace(s.effectiveUserAuthorizationLocked(""))
 	deviceID := strings.TrimSpace(s.state.DeviceID)
 	registered := s.state.Registered

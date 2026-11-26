@@ -52,6 +52,7 @@
     >
       <span class="material-symbols-outlined text-lg">info</span>
     </button>
+    <slot name="tools" />
     <button
       v-if="activeId && !activeIsDevice"
       type="button"

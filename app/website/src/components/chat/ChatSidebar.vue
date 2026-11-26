@@ -13,6 +13,8 @@
   >
     <div class="flex items-center justify-between border-b border-slate-200 px-4 py-3 dark:border-slate-700">
       <h2 class="text-sm font-bold text-slate-900 dark:text-white">{{ t('chat_title') }}</h2>
+      <div class="flex items-center gap-1">
+        <slot name="tools" />
       <button
         type="button"
         class="rounded p-1 text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-700"
@@ -20,6 +22,7 @@
       >
         <span class="material-symbols-outlined text-lg">add</span>
       </button>
+      </div>
     </div>
 
     <div class="flex-1 overflow-y-auto py-1">

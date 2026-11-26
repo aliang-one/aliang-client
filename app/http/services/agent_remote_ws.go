@@ -190,7 +190,7 @@ func (s *AgentService) remoteConnectionLoop() {
 		handshake401Streak = 0
 		logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection connected endpoint=%s", sanitizeAgentEndpoint(wsURL)))
 
-		if err := s.runRemoteAgentSession(conn); err != nil {
+		if err := s.runRemoteAgentSession(conn, identity.account); err != nil {
 			logger.Warn(fmt.Sprintf("[AGENT-BOOT] remote_connection session_ended status=error error=%v", err))
 			if _, shouldRun := s.remoteConnectionSnapshot(); shouldRun {
 				s.setRemoteConnectionState(false, "disconnected", err.Error())
@@ -438,11 +438,15 @@ var (
 	agentRemoteMaxFrameBytes int64 = 8 << 20
 )
 
-func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
+func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn, accounts ...string) error {
 	// sessionCtx 是本条 WS 会话的生命周期：会话退出（断线/重连/停用）即取消，
 	// 让经注册表派发的工具调用（peer_exec 这类真实远端操作）不再 Background
 	// 孤儿到底（2026-11-05 审计盲点 4）。
-	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	account := s.operationAccount()
+	if len(accounts) > 0 {
+		account = accounts[0]
+	}
+	sessionCtx, sessionCancel := context.WithCancel(context.WithValue(context.Background(), operationConnectionAccount{}, account))
 	defer sessionCancel()
 	// Write deadline: a stuck write (peer stopped reading / NAT blackhole) must
 	// fail fast instead of blocking forever while holding writeMu.
@@ -463,6 +467,13 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 	// what triggers registration); the gate opens in the agent.registered handler.
 	s.armRegistrationGate()
 	publishedWriter := func(payload interface{}) error {
+		if frame, ok := payload.(map[string]interface{}); ok {
+			kind := remoteString(frame, "type")
+			if (kind == "operation.progress" || kind == "operation.reconcile") &&
+				(account == "" || account != s.operationAccount()) {
+				return errors.New("remote progress account changed")
+			}
+		}
 		if !s.waitForRegistration(agentRemoteRegistrationWait.Load()) {
 			return errors.New("remote agent not registered within deadline")
 		}
@@ -470,6 +481,11 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 	}
 	s.setCurrentRemoteWriter(publishedWriter)
 	defer s.clearCurrentRemoteWriter()
+	defer func() {
+		sessionCancel()
+		s.operations.setConnected(false)
+	}()
+	defer s.progress.supported.Store(false)
 	// writeJSON is an indirection: it always writes to the *current* live writer,
 	// not the closure captured here, so a reconnect reattaches in-flight runs.
 	writeJSON := func(payload interface{}) error {
@@ -722,6 +738,11 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 		return
 	}
 	switch msgType {
+	case "operation.progress.ack":
+		s.progress.acceptAck(msg)
+	case "operation.updated":
+		account, _ := ctx.Value(operationConnectionAccount{}).(string)
+		s.applyCloudOperation(account, msg)
 	case models.AgentEventRegistered:
 		logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection registered_ack server_device_id=%s", strings.TrimSpace(fmt.Sprint(msg["device_id"]))))
 		s.mu.Lock()
@@ -737,6 +758,12 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 		// registration). Both are idempotent (run_id+event_seq / approval-id
 		// keyed), so periodic re-hellos re-triggering them is safe.
 		s.markRegistrationReady()
+		supported, _ := msg["operation_progress_v1"].(bool)
+		s.progress.supported.Store(supported)
+		if account, _ := ctx.Value(operationConnectionAccount{}).(string); supported && account == s.operationAccount() {
+			s.refreshOperationMirror(ctx)
+			go s.flushOperationFinishes(ctx)
+		}
 		s.ai.replayPendingTerminals(writeJSON)
 		// 子 agent 终态帧断线暂存重放（2026-11-10 P2 #4，见
 		// agent_ai_subagent_journal.go）：断窗内被吞的 ai.subagent 终态帧在此
@@ -1277,6 +1304,7 @@ func (s *AgentService) DispatchLocalAI(msg map[string]interface{}, writeJSON fun
 type remoteConnectionIdentity struct {
 	authorization string
 	deviceID      string
+	account       string
 }
 
 func (s *AgentService) remoteConnectionSnapshot() (remoteConnectionIdentity, bool) {
@@ -1286,6 +1314,7 @@ func (s *AgentService) remoteConnectionSnapshot() (remoteConnectionIdentity, boo
 	identity := remoteConnectionIdentity{
 		authorization: authHeader,
 		deviceID:      strings.TrimSpace(s.state.DeviceID),
+		account:       strings.TrimSpace(s.state.RegisteredUser),
 	}
 	return identity, authHeader != "" && identity.deviceID != "" && s.state.Enabled && s.state.Registered
 }
@@ -1449,6 +1478,7 @@ func agentCapabilities() []string {
 		"goal_verify_v1",
 		"workspace_fingerprint_v1",
 		"file_transfer_v1",
+		"operation_progress_v1",
 		// 设备互访阶段 1（spec §5.1）：一次性命令执行 + fetch 编排能力位。
 		// 服务端按位门控下发 peer.* 流量，老设备自动落「仅中继」兼容路径。
 		"peer_v1",

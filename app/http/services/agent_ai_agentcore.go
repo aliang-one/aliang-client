@@ -1505,6 +1505,12 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// 内的 run 字段（matchedRuleID/policyVersion 等）产生数据竞争。一个门
 	// 罩住主层（含对子 agent 桥工具本身的审批）与子 run 内部工具审批两条
 	// 链——agentCoreSubagentTools 收到的就是这份已互斥化的闭包。
+	var progressTool *agentProgressTool
+	if run.allowsOperationProgress() && m.service != nil {
+		progressTool = newAgentProgressTool(m.service, run.sessionID, firstNonEmpty(run.runID, run.messageID))
+		registry.Register(progressTool)
+		defer progressTool.close()
+	}
 	approvalGate := newAgentCoreApprovalGate()
 	kernelApprove := approvalGate.wrap(m.agentCoreApprove(run, writeJSON))
 	// 内核不 import 日志包，这里把宿主 logger 包一层递进去（签名不同：
@@ -1587,8 +1593,13 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		// 0 时内核用默认值。子 agent 同参（见 agentCoreSubagentRunner）。
 		MaxIdenticalToolTurns: config.GetGlobalConfig().EffectiveAgentCoreMaxIdenticalToolTurns(),
 		Env:                   kernelEnv,
-		Approve:               kernelApprove,
-		Logf:                  kernelLogf,
+		Approve: func(ctx context.Context, req agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error) {
+			if progressTool != nil && req.ToolName == progressTool.Name() {
+				return agentcore.ApprovalResponse{Approved: true}, nil
+			}
+			return kernelApprove(ctx, req)
+		},
+		Logf: kernelLogf,
 		// 经 newAgentCoreEmit 包装：ctx 取消时关写端解除阻塞，僵尸写侧不再
 		// 挂死消费侧（AI run 韧性 L2）。
 		Emit:  emitFrame,

@@ -187,6 +187,7 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/agent/peer/note", agentHandler.HandlePeerNote)
 	mux.HandleFunc("/api/agent/peer/mcp", agentHandler.HandlePeerMcp)
 	mux.HandleFunc("/api/agent/peer/gates", agentHandler.HandlePeerGates)
+	mux.HandleFunc("/api/agent/operations/events", agentHandler.HandleOperationEvents)
 	mux.HandleFunc("/api/agent/ai/approval-hook", agentHandler.HandleAIApprovalHook)
 	// agent-as-MCP 工具面端点（spec §7）：真身在此（AI 管理器住本 runtime），
 	// core routes.go 侧同名注册只做 proxy 透传。缺任一侧 = 404（双注册教训，

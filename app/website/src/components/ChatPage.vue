@@ -17,7 +17,11 @@
       @rename-commit="commitRename"
       @rename-cancel="cancelRename"
       @rename-draft="renameDraft = $event"
-    />
+    >
+      <template #tools>
+        <OperationTrigger :count="activeOperationCount" :open="operationPanelOpen" @open="openOperations" />
+      </template>
+    </ChatSidebar>
 
     <!-- Main chat area -->
     <div class="flex flex-1 flex-col min-w-0">
@@ -38,7 +42,11 @@
         @rename-draft="renameDraft = $event"
         @delete="deleteConversation"
         @close="close"
-      />
+      >
+        <template #tools>
+          <OperationTrigger :count="activeOperationCount" :open="operationPanelOpen" @open="openOperations" />
+        </template>
+      </ChatHeader>
 
       <ChatSettingsBar
         :conversation="activeConversation"
@@ -113,6 +121,11 @@
         @select="onSubagentPanelSelect"
       />
 
+      <OperationPanel v-if="operationPanelOpen" :operations="operations" :connected="operationsConnected"
+        :synced-at="operationsSyncedAt" :can-open-session="canOpenOperationSession"
+        :initial-session-id="operationSessionId" :initial-source="operationSource"
+        @close="closeOperations" @open-session="openOperationSession" @open-subagents="showSubagentDetails" />
+
       <ChatComposer
         v-if="activeId"
         v-model="inputText"
@@ -157,7 +170,7 @@
 // 聊天页编排壳：状态与全部业务逻辑收在 useAliangChat（WS 生命周期/看门狗/
 // 帧路由/审批/steer/三源清单/持久化），渲染拆在 chat/ 组件树（侧栏、顶栏、
 // 设置条、消息列表、气泡、审批卡、输入区）。本文件只做组件接线。
-import { computed, ref, watch } from 'vue';
+import { computed, nextTick, ref, watch } from 'vue';
 import { useAliangChat } from '../composables/useAliangChat';
 import { useNavigation } from '../composables/useNavigation';
 import { useEscLayer } from '../composables/useEscStack';
@@ -171,6 +184,9 @@ import ChatComposerTools from './chat/ChatComposerTools.vue';
 import SubagentStatusBar from './chat/SubagentStatusBar.vue';
 import SubagentPanel from './chat/SubagentPanel.vue';
 import ChatInfoDrawer from './chat/ChatInfoDrawer.vue';
+import OperationTrigger from './chat/OperationTrigger.vue';
+import OperationPanel from './chat/OperationPanel.vue';
+import { useOperationActivity } from '../composables/useOperationActivity';
 
 const {
   activeApprovals,
@@ -254,6 +270,36 @@ const {
 // ESC 页面返回层的闸门来源(组件本身由 App.vue v-if 控制,这里是双保险条件)
 const { currentPage } = useNavigation();
 
+const { operations, activeCount: activeOperationCount, connected: operationsConnected, syncedAt: operationsSyncedAt } =
+  useOperationActivity();
+const operationPanelOpen = ref(false);
+const operationSessionId = ref('');
+const operationSource = ref('');
+let operationTrigger;
+function openOperations(trigger, sessionId = '', source = '') {
+  operationSessionId.value = sessionId;
+  operationSource.value = source;
+  operationTrigger = trigger;
+  operationPanelOpen.value = true;
+}
+function closeOperations() {
+  operationPanelOpen.value = false;
+  nextTick(() => operationTrigger?.focus());
+}
+function findOperationSession(id) {
+  return mergedConversations.value.find(conversation => conversation.aiSessionId === id || conversation.id === id);
+}
+function canOpenOperationSession(id) {
+  return Boolean(findOperationSession(id));
+}
+function openOperationSession(id) {
+  const conversation = findOperationSession(id);
+  if (!conversation) return;
+  closeOperations();
+  onSidebarItemClick(conversation);
+}
+
+
 // 子agent入口条挂载门（Task 7, spec 2026-11-07-subagent-panel §三）：仅
 // AliangCode（agentcore 归一）会话且有子agent条目时挂载；条目数据经
 // useAliangChat.activeSubagents（会话归属守卫在 getter 内）下传。
@@ -266,7 +312,16 @@ const activeIsAgentcore = computed(
 // result/tools 与 WS 断连窗口丢失的条目；关闭/取消选中回写 watchingTaskId
 // =null，M1 终态静默重拉钩子随之失活。
 const subagentPanelOpen = ref(false);
-function openSubagentPanel() {
+function openSubagentPanel(trigger) {
+  const sessionId = activeConversation.value?.aiSessionId;
+  if (sessionId && operations.value.some(row => row.session_id === sessionId && row.source_kind === 'subagent')) {
+    openOperations(trigger, sessionId, 'subagent');
+    return;
+  }
+  subagentPanelOpen.value = true;
+}
+function showSubagentDetails() {
+  closeOperations();
   subagentPanelOpen.value = true;
 }
 function closeSubagentPanel() {
@@ -355,4 +410,5 @@ useEscLayer('chat-recall-edit', cancelRecall, () => recallActive.value);
 // 抽屉、最后才退页面——与 z 序（940/950 > 930）一致。
 useEscLayer('chat-info-drawer', () => { infoDrawerOpen.value = false; }, () => infoDrawerOpen.value);
 useEscLayer('chat-subagent-panel', closeSubagentPanel, () => subagentPanelOpen.value);
+useEscLayer('chat-operation-panel', closeOperations, () => operationPanelOpen.value);
 </script>

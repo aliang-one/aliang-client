@@ -31,7 +31,13 @@ export function buildChatWsStub({
   return `
   window.__aiFrames = [];
   window.__snapshot = null;
-  window.EventSource = class { constructor() { setTimeout(() => this.onopen?.(), 0); } close() {} };
+  window.EventSource = class {
+    constructor(path) {
+      if (path === '/api/agent/operations/events') window.__operationSource = this;
+      setTimeout(() => this.onopen?.(), 0);
+    }
+    close() {}
+  };
   const __mode = ${JSON.stringify(mode)};
   const __createResponder = ${serializeResponder(CREATE_RESPONDERS, 'createResponder', createResponder)};
   const __aiMessageResponder = ${serializeResponder(MESSAGE_RESPONDERS, 'aiMessageResponder', aiMessageResponder)};

@@ -321,6 +321,7 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/openviking/apply", h.Agent.HandleOpenVikingApply, http.MethodPost)
 	// 设备门禁开关(GET 读本机现值,POST 部分更新落库)。
 	register("/api/agent/peer/gates", h.Agent.HandlePeerGates, http.MethodGet, http.MethodPost)
+	register("/api/agent/operations/events", h.Agent.HandleOperationEvents, http.MethodGet)
 	register("/api/agent/ai/stream", h.Agent.HandleAIStream, http.MethodGet)
 	register("/api/agent/ai/approval-hook", h.Agent.HandleAIApprovalHook, http.MethodPost)
 	// 网页终端(spec docs/superpowers/specs/2026-11-21-web-terminal-design.md):

@@ -162,6 +162,8 @@ type AgentService struct {
 	terminal              *agentTerminalManager
 	webTerminal           *webTerminalVault
 	ai                    *agentAIManager
+	progress              agentProgressTransport
+	operations            agentOperationMirror
 	tunnel                *tunnel.Manager
 	// Forwarded user credentials are process-local only. The session owner sends
 	// them through /api/agent/sync after login/restore/refresh; the agent never
@@ -572,6 +574,12 @@ func (s *AgentService) disableWithReasonMessage(reason string, message string) m
 	s.state.Enabled = false
 	s.state.Device = nil
 	s.state.RegisteredUser = ""
+	s.operations.mu.Lock()
+	s.operations.scopeLocked("")
+	s.operations.mu.Unlock()
+	s.progress.mu.Lock()
+	s.progress.terminal = nil
+	s.progress.mu.Unlock()
 	s.state.Registered = false
 	s.state.RemoteConnected = false
 	s.state.LastSyncAt = time.Now().UTC().Format(time.RFC3339)

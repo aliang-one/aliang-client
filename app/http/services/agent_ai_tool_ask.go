@@ -52,6 +52,7 @@ type agentToolAskRunContext struct {
 	deviceID  string
 	writeJSON agentTerminalWriter
 	nextSeq   atomic.Int64
+	progress  *agentProgressTool
 }
 
 type pendingToolAsk struct {
@@ -117,6 +118,9 @@ func (b *agentToolAskBridge) unregisterRun(token string) {
 		}
 	}
 	b.mu.Unlock()
+	if rc != nil && rc.progress != nil {
+		rc.progress.close()
+	}
 	for _, p := range doomed {
 		b.emitCancel(p.run, "", models.AgentToolAskReasonRunEnded)
 		b.deliverWaiter(p, models.AgentToolAskResponse{Status: models.AgentToolAskStatusExpired})
@@ -281,6 +285,23 @@ func (b *agentToolAskBridge) buildMCPServer() *mcp.Server {
 		}
 		return res, nil
 	})
+	progress := &agentProgressTool{}
+	server.AddTool(&mcp.Tool{Name: "report_progress", Description: progress.Description(), InputSchema: progress.InputSchema()},
+		func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			rc, ok := b.runLookup(toolAskTokenFromContext(ctx))
+			if !ok || rc.progress == nil {
+				return toolAskErrorResult("Progress is unavailable for this run."), nil
+			}
+			var input map[string]interface{}
+			if err := json.Unmarshal(req.Params.Arguments, &input); err != nil {
+				return toolAskErrorResult("Invalid progress input."), nil
+			}
+			result := rc.progress.Execute(ctx, input, nil)
+			if result.IsError {
+				return toolAskErrorResult(result.Content), nil
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: result.Content}}}, nil
+		})
 	for _, def := range agentPeerMCPBridgeTools() {
 		def := def
 		server.AddTool(&mcp.Tool{Name: def.name, Description: def.description, InputSchema: def.inputSchema},
@@ -503,6 +524,11 @@ func (m *agentAIManager) withAgentToolAskBridge(tool *agentAITool, run agentAIRu
 		runID = run.messageID
 	}
 	token := b.registerRun(run.sessionID, runID, writeJSON)
+	if run.allowsOperationProgress() && m.service != nil {
+		b.mu.Lock()
+		b.runs[token].progress = newAgentProgressTool(m.service, run.sessionID, runID)
+		b.mu.Unlock()
+	}
 	entry := map[string]interface{}{
 		"type":    "http",
 		"url":     toolAskBaseURL() + toolAskMCPURLPrefix + token,

@@ -9,7 +9,7 @@
     data-testid="chat-subagent-entry"
     class="mx-4 mb-2 flex min-h-[40px] shrink-0 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-1 text-xs text-slate-600 text-left transition hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-primary/30 md:min-h-0 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
     :aria-label="entryAriaLabel"
-    @click="emit('open')"
+    @click="emit('open', $event.currentTarget)"
   >
     <span
       v-if="runningCount > 0"
