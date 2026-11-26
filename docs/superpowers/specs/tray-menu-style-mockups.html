@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Aliang 托盘面板 · 交互原型 v3</title>
+<style>
+  :root {
+    --brand: #21C45D;
+    --brand-dim: rgba(33, 196, 93, 0.14);
+    --brand-glow: rgba(33, 196, 93, 0.45);
+    --danger: #E5484D;
+    --warn: #E6A23C;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: "Inter", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    min-height: 100vh;
+    background:
+      radial-gradient(ellipse 80% 60% at 20% 10%, rgba(33,196,93,0.10), transparent),
+      radial-gradient(ellipse 60% 50% at 85% 80%, rgba(90,140,255,0.10), transparent),
+      linear-gradient(160deg, #e8ece9 0%, #d3dad5 45%, #b9c4bd 100%);
+    padding: 48px 32px 80px;
+  }
+  body.dark {
+    background:
+      radial-gradient(ellipse 80% 60% at 20% 10%, rgba(33,196,93,0.12), transparent),
+      radial-gradient(ellipse 60% 50% at 85% 80%, rgba(90,140,255,0.08), transparent),
+      linear-gradient(160deg, #1a2320 0%, #121a16 50%, #0b1210 100%);
+  }
+
+  .page-head { max-width: 1180px; margin: 0 auto 36px; display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; flex-wrap: wrap; }
+  .page-head h1 { font-size: 22px; font-weight: 700; color: #1a2b20; letter-spacing: -0.02em; }
+  body.dark .page-head h1 { color: #e8f0ea; }
+  .page-head p { margin-top: 6px; font-size: 13px; color: #51655a; max-width: 700px; line-height: 1.6; }
+  body.dark .page-head p { color: #8fa396; }
+  .theme-toggle {
+    display: flex; gap: 4px; padding: 4px; border-radius: 10px;
+    background: rgba(255,255,255,0.55); border: 1px solid rgba(0,0,0,0.08);
+    backdrop-filter: blur(20px); cursor: pointer; user-select: none;
+  }
+  body.dark .theme-toggle { background: rgba(255,255,255,0.06); border-color: rgba(255,255,255,0.1); }
+  .theme-toggle span { padding: 6px 14px; font-size: 12.5px; font-weight: 600; border-radius: 7px; color: #4a5d52; transition: all 0.15s; }
+  body.dark .theme-toggle span { color: #8fa396; }
+  .theme-toggle span.on { background: var(--brand); color: #fff; }
+
+  .board { max-width: 1100px; margin: 0 auto; display: grid; grid-template-columns: 340px 340px; gap: 48px; justify-content: center; align-items: start; }
+  @media (max-width: 900px) { .board { grid-template-columns: 1fr; justify-items: center; } }
+
+  .plan { display: flex; flex-direction: column; gap: 12px; width: 100%; max-width: 340px; }
+  .plan-title { font-size: 15px; font-weight: 700; color: #1a2b20; display: flex; align-items: center; gap: 8px; }
+  body.dark .plan-title { color: #e8f0ea; }
+  .plan-desc { font-size: 12.5px; color: #51655a; line-height: 1.65; }
+  body.dark .plan-desc { color: #8fa396; }
+
+  /* ---------- 面板通用 ---------- */
+  .panel {
+    width: 100%; border-radius: 16px; overflow: hidden;
+    background: rgba(252, 254, 252, 0.72);
+    backdrop-filter: blur(28px) saturate(1.4);
+    -webkit-backdrop-filter: blur(28px) saturate(1.4);
+    border: 1px solid rgba(0, 0, 0, 0.10);
+    box-shadow: 0 18px 50px -12px rgba(10, 30, 18, 0.35), 0 2px 8px rgba(10, 30, 18, 0.10);
+    color: #17251d;
+    font-size: 13px;
+    user-select: none;
+  }
+  body.dark .panel {
+    background: rgba(22, 30, 26, 0.78);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    color: #e2ece6;
+  }
+  .sep { height: 1px; background: rgba(0,0,0,0.07); margin: 2px 0; }
+  body.dark .sep { background: rgba(255,255,255,0.07); }
+
+  .row { display: flex; align-items: center; gap: 10px; padding: 9px 14px; cursor: default; transition: background 0.12s; }
+  .row:hover { background: rgba(0,0,0,0.04); }
+  body.dark .row:hover { background: rgba(255,255,255,0.05); }
+  .row svg { flex-shrink: 0; }
+  .row .label { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .muted { color: #7d8f85; font-weight: 400; }
+  body.dark .muted { color: #7e9186; }
+
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .dot.green { background: var(--brand); box-shadow: 0 0 6px var(--brand-glow); }
+  .dot.gray { background: #9aa8a0; }
+  .dot.amber { background: var(--warn); box-shadow: 0 0 6px rgba(230,162,60,0.4); }
+  .dot.pulse { animation: pulse 2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
+  .spinner {
+    width: 13px; height: 13px; border-radius: 50%;
+    border: 2px solid rgba(0,0,0,0.12); border-top-color: var(--warn);
+    animation: spin 0.8s linear infinite;
+  }
+  body.dark .spinner { border-color: rgba(255,255,255,0.15); border-top-color: var(--warn); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .badge { font-size: 10.5px; font-weight: 700; padding: 2px 7px; border-radius: 999px; background: var(--brand); color: #fff; }
+  .badge.ghost { background: rgba(0,0,0,0.06); color: #51655a; font-weight: 600; }
+  body.dark .badge.ghost { background: rgba(255,255,255,0.08); color: #9db1a5; }
+  .badge.outline { background: transparent; color: #15803d; border: 1px solid rgba(33,196,93,0.4); font-weight: 600; }
+  body.dark .badge.outline { color: #4ade80; }
+  .badge.cool { background: rgba(230,162,60,0.13); color: #b97a1e; }
+  body.dark .badge.cool { color: #f0b357; }
+
+  .sec-head { display: flex; align-items: center; gap: 8px; padding: 10px 14px 4px; font-size: 10.5px; font-weight: 700; letter-spacing: 0.08em; color: #85988d; text-transform: uppercase; }
+  body.dark .sec-head { color: #6e8277; }
+  .sec-head::after { content: ""; flex: 1; height: 1px; background: rgba(0,0,0,0.05); }
+  body.dark .sec-head::after { background: rgba(255,255,255,0.06); }
+  .num { font-variant-numeric: tabular-nums; }
+
+  .a-head { display: flex; align-items: center; gap: 12px; padding: 14px 16px 12px; }
+  .a-logo {
+    width: 34px; height: 34px; border-radius: 10px; flex-shrink: 0;
+    background: linear-gradient(135deg, #2fd96e, #17a84c);
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 2px 8px rgba(33,196,93,0.35);
+    transition: all 0.3s;
+  }
+  .a-logo.off { background: linear-gradient(135deg, #9fb2a6, #6e8277); box-shadow: none; }
+  .a-head .t1 { font-size: 13.5px; font-weight: 700; }
+  .a-head .t2 { font-size: 11.5px; color: #7d8f85; margin-top: 1px; transition: color 0.2s; }
+  body.dark .a-head .t2 { color: #7e9186; }
+
+  .transport-row { display: flex; align-items: center; gap: 8px; margin: 2px 12px 10px; }
+  .t-btn {
+    height: 38px; min-width: 56px; padding: 0 14px; border-radius: 11px;
+    display: flex; align-items: center; justify-content: center; gap: 7px;
+    font-size: 12.5px; font-weight: 700;
+    background: rgba(0,0,0,0.05); cursor: pointer; transition: all 0.18s; flex-shrink: 0;
+    border: none; font-family: inherit; color: inherit;
+  }
+  body.dark .t-btn { background: rgba(255,255,255,0.07); }
+  .t-btn:active { transform: scale(0.96); }
+  .t-btn.start-idle { background: var(--brand-dim); color: #15803d; }
+  body.dark .t-btn.start-idle { color: #4ade80; }
+  .t-btn.stop-live { background: rgba(229,72,77,0.13); color: #d93840; box-shadow: inset 0 0 0 1px rgba(229,72,77,0.25); }
+  .t-btn.busy { background: rgba(230,162,60,0.12); color: #b97a1e; pointer-events: none; }
+  body.dark .t-btn.busy { color: #f0b357; }
+  .t-btn.sq { min-width: 38px; width: 38px; padding: 0; }
+  .t-btn.sq.busy svg { animation: spin 0.8s linear infinite; }
+  .transport-row.locked .t-btn, .transport-row.locked .seg { opacity: 0.45; pointer-events: none; }
+
+  .seg { flex: 1; display: flex; min-width: 0; border-radius: 10px; padding: 3px; background: rgba(0,0,0,0.05); border: 1px solid rgba(0,0,0,0.05); transition: opacity 0.2s; }
+  body.dark .seg { background: rgba(255,255,255,0.06); border-color: rgba(255,255,255,0.05); }
+  .seg .opt { flex: 1; text-align: center; font-size: 11.5px; font-weight: 600; padding: 5px 0; border-radius: 8px; color: #7d8f85; cursor: pointer; transition: all 0.15s; white-space: nowrap; }
+  .seg .opt.on { background: #fff; color: #17251d; box-shadow: 0 1px 4px rgba(0,0,0,0.12); }
+  body.dark .seg .opt { color: #7e9186; }
+  body.dark .seg .opt.on { background: rgba(255,255,255,0.14); color: #eef5f0; }
+
+  .prov-row { display: flex; align-items: center; gap: 6px; padding: 8px 12px; transition: opacity 0.25s; }
+  .prov-row.dimmed { opacity: 0.35; pointer-events: none; }
+  .prov {
+    width: 30px; height: 30px; border-radius: 9px;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.05); color: #a9b8af; cursor: pointer; position: relative; transition: all 0.2s;
+  }
+  body.dark .prov { background: rgba(255,255,255,0.06); color: #5f7268; }
+  .prov:hover { transform: translateY(-1px); background: rgba(0,0,0,0.08); }
+  body.dark .prov:hover { background: rgba(255,255,255,0.10); }
+  .prov.live { color: #17251d; box-shadow: inset 0 0 0 1.5px rgba(33,196,93,0.55); }
+  body.dark .prov.live { color: #eef5f0; }
+  .prov .p-dot {
+    position: absolute; right: -2px; bottom: -2px; width: 9px; height: 9px; border-radius: 50%;
+    background: var(--brand); border: 2px solid rgba(252,254,252,0.9);
+    transform: scale(0); transition: transform 0.2s cubic-bezier(0.34,1.56,0.64,1);
+  }
+  body.dark .prov .p-dot { border-color: rgba(22,30,26,0.9); }
+  .prov.live .p-dot { transform: scale(1); }
+  .prov-row .hint { flex: 1; text-align: right; font-size: 10.5px; color: #85988d; }
+  body.dark .prov-row .hint { color: #6e8277; }
+
+  .switch { width: 32px; height: 19px; border-radius: 999px; background: rgba(0,0,0,0.14); position: relative; cursor: pointer; flex-shrink: 0; transition: background 0.18s; }
+  body.dark .switch { background: rgba(255,255,255,0.14); }
+  .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 15px; height: 15px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.25); transition: left 0.18s; }
+  .switch.on { background: var(--brand); }
+  .switch.on::after { left: 15px; }
+
+  .zone { transition: opacity 0.25s; }
+  .zone.dimmed { opacity: 0.35; pointer-events: none; }
+
+  .ep-group { margin: 3px 12px; border-radius: 12px; background: rgba(0,0,0,0.03); border: 1px solid rgba(0,0,0,0.04); overflow: hidden; }
+  body.dark .ep-group { background: rgba(255,255,255,0.04); border-color: rgba(255,255,255,0.05); }
+  .ep-group .g-head { display: flex; align-items: center; gap: 8px; padding: 8px 11px; cursor: pointer; transition: background 0.12s; }
+  .ep-group .g-head:hover { background: rgba(0,0,0,0.03); }
+  body.dark .ep-group .g-head:hover { background: rgba(255,255,255,0.03); }
+  .ep-group .g-name { font-size: 12px; font-weight: 700; flex: 1; }
+  .ep-group .g-current { font-size: 10.5px; color: #7d8f85; max-width: 130px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  body.dark .ep-group .g-current { color: #7e9186; }
+  .ep-item { display: flex; align-items: center; gap: 8px; padding: 6px 11px 6px 13px; cursor: pointer; transition: background 0.12s; }
+  .ep-item:hover { background: rgba(0,0,0,0.04); }
+  body.dark .ep-item:hover { background: rgba(255,255,255,0.05); }
+  .ep-item .check { width: 14px; height: 14px; border-radius: 50%; border: 1.5px solid rgba(0,0,0,0.18); flex-shrink: 0; display: flex; align-items: center; justify-content: center; transition: all 0.18s; }
+  body.dark .ep-item .check { border-color: rgba(255,255,255,0.2); }
+  .ep-item.on .check { background: var(--brand); border-color: var(--brand); }
+  .ep-item .nm { font-size: 11.5px; font-weight: 600; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ep-item.off { opacity: 0.55; }
+  .ep-list { max-height: 0; overflow: hidden; transition: max-height 0.25s ease; }
+  .ep-group.open .ep-list { max-height: 200px; }
+  .chev { transition: transform 0.2s; }
+
+  .agent-card {
+    margin: 3px 12px; padding: 9px 11px; border-radius: 12px;
+    background: rgba(0,0,0,0.03); border: 1px solid rgba(0,0,0,0.04); cursor: pointer;
+    transition: background 0.14s, border-color 0.14s;
+  }
+  body.dark .agent-card { background: rgba(255,255,255,0.04); border-color: rgba(255,255,255,0.05); }
+  .agent-card:hover { background: rgba(33,196,93,0.06); border-color: rgba(33,196,93,0.16); }
+  .agent-card .top { display: flex; align-items: center; gap: 8px; }
+  .agent-card .name { font-size: 12px; font-weight: 700; flex: 1; }
+  .agent-card .stats { display: flex; gap: 5px; margin-top: 7px; }
+  .stat-chip { display: flex; align-items: center; gap: 5px; padding: 3px 8px; border-radius: 7px; font-size: 10.5px; font-weight: 600; background: rgba(0,0,0,0.05); color: #51655a; }
+  body.dark .stat-chip { background: rgba(255,255,255,0.06); color: #9db1a5; }
+  .stat-chip .cdot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+  .stat-chip.live { background: var(--brand-dim); color: #15803d; }
+  body.dark .stat-chip.live { color: #4ade80; }
+
+  .sess-list { max-height: 0; overflow: hidden; transition: max-height 0.25s ease; }
+  .agent-card.open .sess-list { max-height: 260px; }
+  .sess-item { display: flex; align-items: center; gap: 8px; padding: 6px 2px 6px 4px; border-top: 1px solid rgba(0,0,0,0.05); margin-top: 6px; }
+  body.dark .sess-item { border-top-color: rgba(255,255,255,0.05); }
+  .sess-item .sdot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+  .sess-item .sdot.run { background: var(--brand); box-shadow: 0 0 5px var(--brand-glow); }
+  .sess-item .sdot.idle { background: #9aa8a0; }
+  .sess-item .st { font-size: 11px; font-weight: 600; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sess-item .sm { font-size: 10px; color: #85988d; flex-shrink: 0; }
+  body.dark .sess-item .sm { color: #6e8277; }
+
+  .foot { display: flex; align-items: center; padding: 8px 10px; gap: 2px; border-top: 1px solid rgba(0,0,0,0.06); background: rgba(0,0,0,0.02); margin-top: 6px; }
+  body.dark .foot { border-top-color: rgba(255,255,255,0.06); background: rgba(255,255,255,0.02); }
+  .foot .f-btn {
+    flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px;
+    padding: 7px 0; border-radius: 8px; font-size: 11.5px; font-weight: 600; color: #4a5d52; cursor: pointer; transition: all 0.12s;
+    border: none; background: transparent; font-family: inherit;
+  }
+  body.dark .foot .f-btn { color: #8fa396; }
+  .foot .f-btn:hover { background: rgba(0,0,0,0.05); }
+  body.dark .foot .f-btn:hover { background: rgba(255,255,255,0.06); }
+  .foot .f-btn.danger:hover { color: var(--danger); background: rgba(229,72,77,0.08); }
+  .foot .ver { font-size: 10.5px; color: #85988d; padding-left: 8px; font-variant-numeric: tabular-nums; }
+  body.dark .foot .ver { color: #6e8277; }
+
+  /* toast */
+  #toast {
+    position: fixed; left: 50%; bottom: 36px; transform: translate(-50%, 20px);
+    padding: 9px 18px; border-radius: 12px; font-size: 12.5px; font-weight: 600;
+    background: rgba(23, 37, 29, 0.92); color: #eef5f0;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+    opacity: 0; pointer-events: none; transition: all 0.25s; z-index: 99;
+    backdrop-filter: blur(12px);
+  }
+  #toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+  .note { max-width: 1180px; margin: 44px auto 0; font-size: 12px; color: #51655a; line-height: 1.75; }
+  body.dark .note { color: #8fa396; }
+  .note b { color: #1a2b20; }
+  body.dark .note b { color: #dce8e0; }
+</style>
+</head>
+<body>
+
+<div class="page-head">
+  <div>
+    <h1>Aliang 托盘面板 · 交互原型 v3</h1>
+    <p>两个面板都是活的——试试：启停合一按钮（带「正在启动/停止」过渡态）、重启（旋转）、模式切换、AI 加速开关（图标点亮/熄灭联动）、endpoint 组展开与单选切换、agent 卡片展开看 24h 会话明细、底部按钮。演示数据虚构，动作用 toast 反馈。</p>
+  </div>
+  <div class="theme-toggle" onclick="document.body.classList.toggle('dark'); this.children[0].classList.toggle('on'); this.children[1].classList.toggle('on');">
+    <span class="on">浅色</span><span>深色</span>
+  </div>
+</div>
+
+<div class="board">
+  <div class="plan">
+    <div class="plan-title">面板 1 · 初始运行中</div>
+    <div class="plan-desc">深度模式 · AI 加速开 · Anthropic/OpenAI 已点亮</div>
+    <div id="panel1"></div>
+  </div>
+  <div class="plan">
+    <div class="plan-title">面板 2 · 初始已停止</div>
+    <div class="plan-desc">常规模式 · AI 加速开 · 图标全灰（未检测到使用）</div>
+    <div id="panel2"></div>
+  </div>
+</div>
+
+<div class="note">
+  <b>交互契约（实现时照此映射）</b>：<br>
+  ① <b>启停合一</b>：点击 → 进入过渡态（琥珀点「正在启动/停止…」、三控件全禁用、按钮显 spinner）→ 约 1s 后到达目标态。过渡期间重复点击无效（防抖）。<br>
+  ② <b>重启</b>：仅运行态可用；点击图标自转 + 同款过渡态「正在重启…」→ 回到运行态。<br>
+  ③ <b>模式切换</b>：即时切换选中态；运行中切换时状态头副标题同步（是否热切换由功能会话定，原型按热切换演示）。<br>
+  ④ <b>AI 加速开关</b>：关 → provider 图标行与 endpoint 区整体降透明并锁交互；开 → 恢复。<br>
+  ⑤ <b>provider 图标</b>：点亮 = 平台检测到使用（检测驱动，不可手动点）；点击查看该 provider 检测详情（toast 演示）。<br>
+  ⑥ <b>endpoint 组</b>：组头点击展开/收起（chevron 旋转 + max-height 动画）；列表项单选即激活（勾移动 + 组头 g-current 淡入更新）；冷却项不可选。<br>
+  ⑦ <b>agent 卡片</b>：点击展开 24h 会话明细（活跃绿点/空闲灰点 + 标题 + 来源 + 相对时间），再点收起。<br>
+  ⑧ <b>底部三键</b>：外部动作（仪表盘 / 设备互访 / 退出），点击给 toast——真实实现里分别是开浏览器 / 开互访页 / 弹退出确认。
+</div>
+
+<div id="toast"></div>
+
+<script>
+/* ============ 图标 ============ */
+const I = {
+  logo: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18M5 8l7-5 7 5M5 16l7 5 7-5"/></svg>`,
+  play: `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.5v13l11-6.5z"/></svg>`,
+  stop: `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>`,
+  restart: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36L21 8"/><path d="M21 3v5h-5"/></svg>`,
+  bolt: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h7l-1 8 10-12h-7z"/></svg>`,
+  bot: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="6" width="16" height="12" rx="3"/><path d="M12 6V3M8 3h8"/><circle cx="9" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="1" fill="currentColor" stroke="none"/></svg>`,
+  chevDown: `<svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.45"><path d="M6 9l6 6 6-6"/></svg>`,
+  chevRight: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.4"><path d="M9 18l6-6-6-6"/></svg>`,
+  check: `<svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 7"/></svg>`,
+  dashboard: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M3 9h18M8 21h8"/></svg>`,
+  phone: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="3" width="14" height="18" rx="3"/><path d="M10 18h4"/></svg>`,
+  quit: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>`,
+  providers: {
+    anthropic: `<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M12.2 4 5.6 20h3.1l1.2-3.1h6.3L17.4 20h3.1L13.9 4zM10.9 14l2-5.3 2 5.3z" transform="translate(-1.5,0)"/></svg>`,
+    openai: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><path d="M12 3c-2 1.2-2 3.6-2 3.6S8 5.4 6.2 6.4c-.6 2.3 1.2 4 1.2 4s-2.2.6-2.4 2.9c1.8 1.6 4 .9 4 .9s-.6 2.2 1 3.6c2.2-.5 3-2.8 3-2.8s.8 2.3 3 2.8c1.6-1.4 1-3.6 1-3.6s2.2.7 4-.9c-.2-2.3-2.4-2.9-2.4-2.9s1.8-1.7 1.2-4c-1.8-1-3.8.2-3.8.2S14 4.2 12 3z" transform="scale(0.82) translate(2.6,2.6)"/></svg>`,
+    cursor: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 6.5v11L12 22l8-4.5v-11z"/><path d="M4 6.5 12 11l8-4.5M12 11v11"/></svg>`,
+    gemini: `<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3c.6 3.8 3.2 6.4 7 7-3.8.6-6.4 3.2-7 7-.6-3.8-3.2-6.4-7-7 3.8-.6 6.4-3.2 7-7z"/></svg>`,
+    grok: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M5 19 19 5M12.5 12.5 19 19"/></svg>`,
+  },
+};
+
+/* ============ 演示数据 ============ */
+function demoState(running, mode) {
+  return {
+    running,
+    mode,                    // 'regular' | 'deep'
+    busy: null,              // null | 'starting' | 'stopping' | 'restarting'
+    aiOn: true,
+    providers: [
+      { id: 'anthropic', name: 'Anthropic',  detect: running ? 'live' : 'idle', detail: '检测到 3 个会话经此路由' },
+      { id: 'openai',    name: 'OpenAI',     detect: running ? 'live' : 'idle', detail: '检测到 1 个会话经此路由' },
+      { id: 'cursor',    name: 'Cursor',     detect: 'idle', detail: '支持检测 · 暂未发现使用' },
+      { id: 'gemini',    name: 'Gemini',     detect: 'na',   detail: '暂不支持检测（预留位）' },
+      { id: 'grok',      name: 'Grok',       detect: 'na',   detail: '暂不支持检测（预留位）' },
+    ],
+    epGroups: [
+      {
+        id: 'anthropic', name: 'Anthropic 组', open: false,
+        endpoints: [
+          { name: '内置 aliang 隧道', pri: 'P1', on: true,  cool: null },
+          { name: 'glm-coding-plan',  pri: 'P2', on: false, cool: null },
+          { name: 'byo-relay-02',     pri: '—',  on: false, cool: '冷却 3m' },
+        ],
+      },
+      {
+        id: 'openai', name: 'OpenAI 组', open: false,
+        endpoints: [
+          { name: 'deepseek-official', pri: 'P1', on: true, cool: null },
+          { name: 'kimi-proxy',        pri: 'P2', on: false, cool: null },
+        ],
+      },
+    ],
+    agents: [
+      {
+        name: 'aliangcode', open: false,
+        sessions: [
+          { title: '托盘菜单样式原型',   src: '网页', ago: '2 分钟前', st: 'run'  },
+          { title: '组网链路排查',       src: '终端', ago: '18 分钟前', st: 'run'  },
+          { title: 'endpoint 管理页联调', src: '网页', ago: '40 分钟前', st: 'idle' },
+        ],
+      },
+      {
+        name: 'claude-code', open: false,
+        sessions: [
+          { title: 'CLI 快速迁移脚本', src: '终端', ago: '3 小时前', st: 'idle' },
+          { title: '依赖升级排查',     src: '终端', ago: '5 小时前', st: 'idle' },
+        ],
+      },
+    ],
+  };
+}
+
+/* ============ 渲染 ============ */
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+function head(s) {
+  let t1, t2, dotCls, logoCls = 'a-logo';
+  if (s.busy === 'starting')      { t1 = '正在启动…'; t2 = '模式：' + (s.mode === 'deep' ? '深度' : '常规'); dotCls = 'dot amber pulse'; }
+  else if (s.busy === 'stopping') { t1 = '正在停止…'; t2 = ''; dotCls = 'dot amber pulse'; }
+  else if (s.busy === 'restarting'){ t1 = '正在重启…'; t2 = '当前模式：' + (s.mode === 'deep' ? '深度' : '常规'); dotCls = 'dot amber pulse'; }
+  else if (s.running) {
+    t1 = '代理运行中'; logoCls += '';
+    t2 = (s.mode === 'deep' ? '深度模式' : '常规模式') + ' · 127.0.0.1:56432';
+    dotCls = 'dot green pulse';
+  } else {
+    t1 = '代理已停止'; logoCls += ' off';
+    t2 = '下次启动 · ' + (s.mode === 'deep' ? '深度模式' : '常规模式');
+    dotCls = 'dot gray';
+  }
+  return `<div class="a-head">
+    <div class="${logoCls}">${I.logo}</div>
+    <div style="flex:1"><div class="t1">${t1}</div><div class="t2">${t2}</div></div>
+    ${s.busy ? `<div class="spinner"></div>` : `<div class="${dotCls}"></div>`}
+  </div>`;
+}
+
+function transport(s) {
+  const locked = !!s.busy;
+  let mainBtn, restartCls;
+  if (s.busy) {
+    const label = s.busy === 'starting' ? '启动中' : s.busy === 'stopping' ? '停止中' : '重启中';
+    mainBtn = `<button class="t-btn busy"><div class="spinner" style="border-top-color:currentColor"></div>${label}</button>`;
+    restartCls = 't-btn sq busy';
+  } else if (s.running) {
+    mainBtn = `<button class="t-btn stop-live" data-act="stop" title="停止代理">${I.stop}停止</button>`;
+    restartCls = 't-btn sq';
+  } else {
+    mainBtn = `<button class="t-btn start-idle" data-act="start" title="启动代理">${I.play}启动</button>`;
+    restartCls = 't-btn sq';
+  }
+  const restartBtn = `<button class="${restartCls}" data-act="restart" title="重启代理"${(!s.running && !s.busy) ? ' disabled style="opacity:0.35;pointer-events:none"' : ''}>${I.restart}</button>`;
+  return `<div class="transport-row${locked ? ' locked' : ''}">
+    ${mainBtn}${restartBtn}
+    <div class="seg">
+      <div class="opt${s.mode === 'regular' ? ' on' : ''}" data-act="mode" data-v="regular">常规</div>
+      <div class="opt${s.mode === 'deep' ? ' on' : ''}" data-act="mode" data-v="deep">深度</div>
+    </div>
+  </div>`;
+}
+
+function aiRows(s) {
+  const dim = !s.aiOn ? ' dimmed' : '';
+  const liveN = s.providers.filter(p => p.detect === 'live').length;
+  const detectable = s.providers.filter(p => p.detect !== 'na').length;
+  const provs = s.providers.map(p => `
+    <div class="prov${p.detect === 'live' ? ' live' : ''}" data-act="prov" data-v="${p.id}" title="${esc(p.name)} · ${esc(p.detail)}">
+      ${I.providers[p.id]}${p.detect === 'live' ? '<span class="p-dot"></span>' : ''}
+    </div>`).join('');
+  const hint = !s.aiOn ? 'AI 加速已关 · 图标全灰' : `检测到 ${liveN} / ${detectable}`;
+  return `
+    <div class="sep"></div>
+    <div class="row">
+      ${I.bolt}
+      <span class="label" style="font-weight:600">AI 加速</span>
+      <div class="switch${s.aiOn ? ' on' : ''}" data-act="ai" role="switch"></div>
+    </div>
+    <div class="prov-row${dim}">${provs}<span class="hint">${hint}</span></div>`;
+}
+
+function endpoints(s) {
+  const dim = !s.aiOn ? ' dimmed' : '';
+  const groups = s.epGroups.map(g => {
+    const current = g.endpoints.find(e => e.on);
+    const items = g.endpoints.map(e => `
+      <div class="ep-item${e.on ? ' on' : ''}${e.cool ? ' off' : ''}" data-act="ep" data-g="${g.id}" data-nm="${esc(e.name)}"${e.cool ? ' data-disabled="1"' : ''}>
+        <span class="check">${e.on ? I.check : ''}</span>
+        <span class="nm">${esc(e.name)}</span>
+        ${e.cool ? `<span class="badge cool">${esc(e.cool)}</span>` : `<span class="badge outline num">${esc(e.pri)}</span>`}
+      </div>`).join('');
+    return `<div class="ep-group${g.open ? ' open' : ''}" data-g="${g.id}">
+      <div class="g-head" data-act="epgroup" data-g="${g.id}">
+        ${I.providers[g.id]}
+        <span class="g-name">${esc(g.name)}</span>
+        <span class="g-current">${esc(current ? current.name : '')}</span>
+        ${I.chevDown.replace('class="chev"', `class="chev" style="opacity:0.45;transform:rotate(${g.open ? 180 : 0}deg)"`)}
+      </div>
+      <div class="ep-list">${items}</div>
+    </div>`;
+  }).join('');
+  return `<div class="zone${dim}"><div class="sec-head">ENDPOINT</div>${groups}</div>`;
+}
+
+function agents(s) {
+  const cards = s.agents.map(a => {
+    const runN = a.sessions.filter(x => x.st === 'run').length;
+    const idleN = a.sessions.length - runN;
+    const chips = [
+      runN ? `<span class="stat-chip live"><span class="cdot"></span>活跃 ${runN}</span>` : '',
+      idleN ? `<span class="stat-chip"><span class="cdot" style="opacity:0.4"></span>空闲 ${idleN}</span>` : '',
+      `<span class="stat-chip num">24h 共 ${a.sessions.length}</span>`,
+    ].join('');
+    const sess = a.sessions.map(x => `
+      <div class="sess-item">
+        <span class="sdot ${x.st}"></span>
+        <span class="st">${esc(x.title)}</span>
+        <span class="sm">${esc(x.src)} · ${esc(x.ago)}</span>
+      </div>`).join('');
+    return `<div class="agent-card${a.open ? ' open' : ''}" data-act="agent" data-nm="${esc(a.name)}">
+      <div class="top">${I.bot}<span class="name">${esc(a.name)}</span>${I.chevRight.replace('style="opacity:0.4"', `style="opacity:0.4;transition:transform 0.2s;transform:rotate(${a.open ? 90 : 0}deg)"`)}</div>
+      <div class="stats">${chips}</div>
+      <div class="sess-list">${sess}</div>
+    </div>`;
+  }).join('');
+  return `<div class="zone"><div class="sec-head">AI AGENT · 24H</div>${cards}</div>`;
+}
+
+function foot(s) {
+  return `<div class="foot">
+    <span class="ver">v1.1.124</span>
+    <button class="f-btn" data-act="dash">${I.dashboard}仪表盘</button>
+    <button class="f-btn" data-act="peers">${I.phone}设备互访</button>
+    <button class="f-btn danger" data-act="quit">${I.quit}退出</button>
+  </div>`;
+}
+
+function renderPanel(el, s) {
+  el.innerHTML = `<div class="panel">${head(s)}${transport(s)}${aiRows(s)}${endpoints(s)}${agents(s)}${foot(s)}</div>`;
+}
+
+/* ============ toast ============ */
+let toastTimer = null;
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 1800);
+}
+
+/* ============ 实例与交互 ============ */
+const P1 = { el: document.getElementById('panel1'), s: demoState(true, 'deep') };
+const P2 = { el: document.getElementById('panel2'), s: demoState(false, 'regular') };
+
+function paint(p) { renderPanel(p.el, p.s); }
+paint(P1); paint(P2);
+
+const TRANSITION_MS = 1100;
+
+function handle(p, act, v, target) {
+  const s = p.s;
+  switch (act) {
+    case 'start':
+    case 'stop':
+    case 'restart': {
+      if (s.busy) return;
+      if (act === 'restart' && !s.running) return;
+      const kind = act === 'start' ? 'starting' : act === 'stop' ? 'stopping' : 'restarting';
+      s.busy = kind;
+      paint(p);
+      setTimeout(() => {
+        if (act === 'start') s.running = true;
+        if (act === 'stop') s.running = false;
+        if (act === 'restart') s.running = true;
+        s.busy = null;
+        // 启动后 provider 重新检测演示：点亮 anthropic/openai
+        if (s.running) {
+          s.providers.forEach(pr => {
+            if (pr.id === 'anthropic' || pr.id === 'openai') pr.detect = 'live';
+          });
+        }
+        paint(p);
+        toast({ start: '代理已启动（' + (s.mode === 'deep' ? '深度' : '常规') + '模式）', stop: '代理已停止', restart: '代理已重启' }[act]);
+      }, TRANSITION_MS);
+      break;
+    }
+    case 'mode':
+      if (s.busy) return;
+      s.mode = v;
+      paint(p);
+      toast(s.running
+        ? '已切换为' + (v === 'deep' ? '深度' : '常规') + '模式（热切换演示，是否热切换由功能会话拍板）'
+        : '下次启动：' + (v === 'deep' ? '深度' : '常规') + '模式');
+      break;
+    case 'ai':
+      s.aiOn = !s.aiOn;
+      paint(p);
+      toast(s.aiOn ? 'AI 加速已开启' : 'AI 加速已关闭 · 供应商与 endpoint 区已锁定');
+      break;
+    case 'prov': {
+      const pr = s.providers.find(x => x.id === v);
+      if (pr) toast(pr.name + '：' + pr.detail);
+      break;
+    }
+    case 'epgroup': {
+      const gid = target.closest('.ep-group')?.dataset.g;
+      const g = s.epGroups.find(x => x.id === gid);
+      if (g) { g.open = !g.open; paint(p); }
+      break;
+    }
+    case 'ep': {
+      if (target.closest('[data-disabled]')) { toast('该 endpoint 冷却中，不可选'); return; }
+      const g = s.epGroups.find(x => x.id === target.closest('.ep-group').dataset.g);
+      if (!g) return;
+      g.endpoints.forEach(e => e.on = e.name === v);
+      paint(p);
+      toast(g.name + ' → ' + v);
+      break;
+    }
+    case 'agent': {
+      const nm = target.closest('.agent-card')?.dataset.nm;
+      const a = s.agents.find(x => x.name === nm);
+      if (a) { a.open = !a.open; paint(p); }
+      break;
+    }
+    case 'dash': toast('演示：打开仪表盘（真实实现 = 开浏览器）'); break;
+    case 'peers': toast('演示：打开设备互访（真实实现 = 开互访页）'); break;
+    case 'quit': toast('演示：弹退出确认（真实实现 = 确认后退出）'); break;
+  }
+}
+
+[P1, P2].forEach(p => {
+  p.el.addEventListener('click', e => {
+    const t = e.target.closest('[data-act]');
+    if (!t) return;
+    const disabled = t.closest('[data-disabled]');
+    if (disabled && t.dataset.act !== 'prov') return;
+    handle(p, t.dataset.act, t.dataset.v, t);
+  });
+});
+</script>
+</body>
+</html>
