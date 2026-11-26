@@ -17,8 +17,19 @@ import (
 	"aliang.one/nursorgate/app/http/routes"
 	"aliang.one/nursorgate/app/http/services"
 	"aliang.one/nursorgate/common/logger"
+	httpServer "aliang.one/nursorgate/inbound/http"
 	"aliang.one/nursorgate/processor/config"
 )
+
+// wireAIEndpointSelector 把 endpoint registry service 适配成 56432 AI path 的
+// 选择器(spec 2026-11-25 Task 3 接线)。挂在 StartHttpServer 是刻意的:所有
+// core 启动形态(cmd/start、cmd/core、tray、windows/linux autostart)都在
+// 56432 可能起口之前经过这里,是唯一覆盖全部路径的单点。GetEndpointService
+// 构造失败返回 nil → SetAIEndpointSelector(nil) = 路由层不激活,AI path 走
+// 原透明代理(降级安全,不允许 panic)。
+func wireAIEndpointSelector() {
+	httpServer.SetAIEndpointSelector(services.NewAIEndpointSelectorAdapter(services.GetEndpointService()))
+}
 
 var (
 	// mux is the custom request multiplexer for applying middleware
@@ -49,6 +60,9 @@ func StartHttpServer() error {
 
 	// 定义 HTTP 服务端口
 	port := config.ManagementListenAddr()
+
+	// LLM endpoint 路由层接线(幂等:registry service 是 sync.Once 单例)。
+	wireAIEndpointSelector()
 
 	// Initialize custom mux
 	mux = http.NewServeMux()

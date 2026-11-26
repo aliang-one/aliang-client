@@ -113,13 +113,22 @@ describe('renderComboContent', () => {
 			api_key: 'sk-{{x}}',
 			model: 'm',
 		});
-		expect(out).toBe('u=http://127.0.0.1:56432/v1 k=sk-{{x}} m=m');
+		// api_key 永远写入哨兵，不写入真实 key
+		expect(out).toBe('u=http://127.0.0.1:56432/v1 k=sk-aliang-local m=m');
 	});
 	it('handles missing variables by leaving placeholders', () => {
 		expect(renderComboContent('{{base_url}}', {})).toBe('{{base_url}}');
 	});
+	it('{{api_key}} 写入哨兵而非真实 key（quick-setup 装机值）', () => {
+		expect(renderComboContent('k={{api_key}}', { api_key: 'sk-real-antropik-key-12345' })).toBe('k=sk-aliang-local');
+		expect(renderComboContent('{{ api_key }}', { api_key: 'sk-anything' })).toBe('sk-aliang-local');
+		// null 值也写入哨兵：客户端配置里的值必定非空
+		expect(renderComboContent('k={{api_key}}', { api_key: null })).toBe('k=sk-aliang-local');
+		expect(renderComboContent('k={{api_key}}', {})).toBe('k={{api_key}}');
+	});
 	it('tolerates whitespace inside placeholders (same as validator)', () => {
-		expect(renderComboContent('{{ api_key }}', { api_key: 'sk-1' })).toBe('sk-1');
+		// api_key 永远写入哨兵，而非真实值（哪怕只是 'sk-1'）
+		expect(renderComboContent('{{ api_key }}', { api_key: 'sk-1' })).toBe('sk-aliang-local');
 	});
 	it('does not rescan replacement values even if they contain a known key token', () => {
 		const out = renderComboContent('u={{base_url}}', {
@@ -130,7 +139,8 @@ describe('renderComboContent', () => {
 	});
 	it('treats nullish input and values defensively', () => {
 		expect(renderComboContent(null)).toBe('');
-		expect(renderComboContent('{{api_key}}', { api_key: null })).toBe('');
+		// api_key 即使值为 null，占位符也被替换为哨兵（写入客户端配置的值必定非空）
+		expect(renderComboContent('{{api_key}}', { api_key: null })).toBe('sk-aliang-local');
 	});
 });
 

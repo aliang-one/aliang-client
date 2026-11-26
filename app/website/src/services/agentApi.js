@@ -228,6 +228,60 @@ export async function saveRoutingConfig(payload) {
   });
 }
 
+// —— LLM endpoint registry 管理面(spec 2026-11-25 §11,Task 4 REST 契约)——
+// GET 永不回显完整 api_key(服务端已掩码);PUT 的 api_key 空值=不改;builtin
+// 行禁删(409)/禁改 base_url 与 auto_group(400)。载荷形状由
+// utils/endpointSettings.js 的 endpointToPayload 统一产出。
+export async function getEndpoints() {
+  const data = await request('/api/endpoints', { method: 'GET' });
+  return Array.isArray(data?.endpoints) ? data.endpoints : [];
+}
+
+export async function createEndpoint(payload) {
+  return request('/api/endpoints', {
+    method: 'POST',
+    body: JSON.stringify(payload || {}),
+  });
+}
+
+export async function updateEndpoint(id, payload) {
+  return request(`/api/endpoints/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload || {}),
+  });
+}
+
+export async function deleteEndpoint(id) {
+  return request(`/api/endpoints/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+// → {ok, model_count, error}(探测结果是数据不是错误:200 信封携带)。
+export async function testEndpoint(id) {
+  return request(`/api/endpoints/${encodeURIComponent(id)}/test`, { method: 'POST' });
+}
+
+// → {models:[...]};不自动写库,前端展示确认后走 PUT(spec §10)。
+export async function fetchEndpointModels(id) {
+  const data = await request(`/api/endpoints/${encodeURIComponent(id)}/fetch-models`, { method: 'POST' });
+  return Array.isArray(data?.models) ? data.models : [];
+}
+
+export async function resetEndpointHealth(id) {
+  return request(`/api/endpoints/${encodeURIComponent(id)}/reset-health`, { method: 'POST' });
+}
+
+// 组策略(auto 组单行;GET/PUT /api/endpoint-groups/auto/policy)。
+export async function getEndpointPolicy() {
+  return request('/api/endpoint-groups/auto/policy', { method: 'GET' });
+}
+
+export async function setEndpointPolicy(payload) {
+  return request('/api/endpoint-groups/auto/policy', {
+    method: 'PUT',
+    body: JSON.stringify(payload || {}),
+  });
+}
+
 // —— 事件监听器(specs/005-event-listener):agent 本地 REST 代理 /api/listeners,
 // C1 评审定案=代理信封化转发——2xx 走 common.Success 重裹 {code:0,msg,data}
 // (data=云端对象,201/204 拍平 200),非 2xx 保留云端状态码且 msg 携带云端

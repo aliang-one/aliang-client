@@ -43,6 +43,17 @@ func HandleHttpConnection(conn net.Conn, reader *bufio.Reader, req *http.Request
 		return
 	}
 
+	// LLM endpoint 路由层(spec 2026-11-25 §6/§7):明文 AI path 全权处理,
+	// 命中必 return,永不回落透明代理(不变量 2);aiSelector 为 nil(未接线/
+	// registry 构造失败)时走原透明代理行为(降级安全)。目标守卫已在上面对
+	// AI path 生效(来源闸在 dispatch 层,与本分支无关)。
+	if aiSelector != nil {
+		if protocol, aggregate, ok := aiRouteFor(req.Method, req.URL.Path); ok {
+			handleAIRequest(conn, reader, req, metadata, protocol, aggregate)
+			return
+		}
+	}
+
 	// Import tcp handler for unified TCP processing
 	tcpHandler := tcp.GetHandler()
 

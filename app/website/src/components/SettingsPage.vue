@@ -180,6 +180,20 @@
             </template>
           </div>
 
+          <!-- LLM 端点管理(spec 2026-11-25 §10):56432 聚合路由的上游入口注册表。
+               自管 /api/endpoints REST 面,不经 customer 保存链;Esc 折叠由既有
+               proxySubTabEscActive 覆盖(endpoints ≠ 默认 proxy)。 -->
+          <div v-else-if="proxySubTab === 'endpoints'" class="flex flex-col gap-5">
+            <div
+              v-if="!isAuthenticated"
+              class="rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-8 text-center shadow-sm dark:border-slate-700 dark:bg-slate-900"
+            >
+              <h2 class="text-xl font-bold text-slate-900 dark:text-white">{{ t('settings_loginRequiredSettings') }}</h2>
+              <p class="text-sm text-slate-500 dark:text-slate-300">{{ t('settings_loginRequiredSettingsDesc') }}</p>
+            </div>
+            <EndpointManagerSettings v-else />
+          </div>
+
           <div v-else class="flex flex-col gap-5 lg:flex-row lg:items-start">
             <div class="flex min-w-0 flex-1 flex-col gap-5">
               <div
@@ -321,6 +335,7 @@ import { computed } from 'vue';
 import RulesSettings from './settings/RulesSettings.vue';
 import SshIngressSettings, { normalizeSSHIngressConfig } from './settings/SshIngressSettings.vue';
 import MeshSettings from './settings/MeshSettings.vue';
+import EndpointManagerSettings from './settings/EndpointManagerSettings.vue';
 import PlatformProxySettings from './settings/PlatformProxySettings.vue';
 import EgressTargetSettings from './settings/EgressTargetSettings.vue';
 import { normalizeMeshConfig } from './settings/MeshSettings.js';
@@ -639,6 +654,7 @@ export default {
     RulesSettings,
     SshIngressSettings,
     MeshSettings,
+    EndpointManagerSettings,
     PlatformProxySettings,
     EgressTargetSettings,
     UserInfoSettings,
@@ -667,11 +683,13 @@ export default {
   },
   data() {
     return {
-      // 代理设置页内子 tab:proxy=出口代理(默认);ingress=入口(SSH)与组网(mesh)。
+      // 代理设置页内子 tab:proxy=出口代理(默认);ingress=入口(SSH)与组网(mesh);
+      // endpoints=LLM 端点管理(spec 2026-11-25 §10,自管 /api/endpoints REST 面)。
       proxySubTab: 'proxy',
       proxySubTabs: [
         { key: 'proxy', labelKey: 'settings_subProxy' },
-        { key: 'ingress', labelKey: 'settings_subIngress' }
+        { key: 'ingress', labelKey: 'settings_subIngress' },
+        { key: 'endpoints', labelKey: 'settings_subEndpoints' }
       ],
       presetProviders: [],
       customerConfig: createDefaultCustomerConfig(),
