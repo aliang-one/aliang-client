@@ -72,6 +72,28 @@ describe('useToast', () => {
     expect(toast.toasts.value.length).toBe(0);
   });
 
+  it('去重:相同文案未消失不重复入队(kind 不同也算同一条的重复触发),返回在队 id(Minor-4)', () => {
+    const toast = useToast();
+    const first = toast.show('同一条');
+    expect(toast.toasts.value.length).toBe(1);
+    expect(toast.show('同一条', 'warn')).toBe(first); // 返回在队条目 id
+    expect(toast.toasts.value.length).toBe(1);
+    expect(toast.toasts.value[0].kind).toBe('success'); // 首条的 kind 不被改写
+    toast.show('另一条');
+    expect(toast.toasts.value.length).toBe(2); // 不同文案照常入队
+  });
+
+  it('去重只挡未消失的:3s 超时消失后同文案可再次入队(Minor-4)', () => {
+    const toast = useToast();
+    toast.show('再来');
+    expect(toast.toasts.value.length).toBe(1);
+    vi.advanceTimersByTime(3000); // 到期消失
+    expect(toast.toasts.value.length).toBe(0);
+    toast.show('再来');
+    expect(toast.toasts.value.length).toBe(1);
+    expect(toast.toasts.value[0].msg).toBe('再来');
+  });
+
   it('超限挤旧:上限 4 条,第 5 条入队时最旧一条被挤出且其超时被回收', () => {
     const toast = useToast();
     toast.show('旧1');

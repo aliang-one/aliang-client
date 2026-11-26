@@ -49,7 +49,7 @@ const PROV_ICONS = {
 //   { enabled, tiles, litCount, detectableCount, hint }:
 //     enabled         switch on 态(仅真值 true 为开,缺省视为关)
 //     tiles           图标池 5 家的渲染模型{key,label,live,reserved,title,detail}
-//     litCount        已点亮家数(只可能来自可检测 3 家)
+//     litCount        已点亮家数(=开态下 detected 的可检测家族;关态恒 0)
 //     detectableCount 分母=可检测家数 3(预留位不计入)
 //     hint            行尾文案:开=「检测到 N / 3」;关=固定降级文案(§6-4)
 // 防御纪律(spec §4.3 数据防御):providers 缺失/null/坏类型 → 全灰 +
@@ -76,13 +76,14 @@ export function aiSectionModel(ai) {
     });
   }
 
-  // 图标池固定 5 家:可检测 3 家按 detected 点亮;预留 2 家永不点亮
-  // (无检测通道,哪怕数据里混入 detected=true 的 gemini/grok 条目)。
+  // 图标池固定 5 家:可检测 3 家按「开关开 且 detected」点亮(关态整行已
+  // 降透明+行尾「图标全灰」,点亮会自相矛盾,故 live 加 enabled 闸);
+  // 预留 2 家永不点亮(无检测通道,哪怕数据里混入 detected=true 条目)。
   const tiles = [];
   for (const key of DETECTABLE_KEYS) {
     const entry = byKey.get(key) || null;
     const label = entry && entry.label ? entry.label : POOL_LABELS[key];
-    const live = entry !== null && entry.detected;
+    const live = enabled && entry !== null && entry.detected;
     tiles.push({
       key,
       label,
@@ -100,7 +101,10 @@ export function aiSectionModel(ai) {
       label,
       live: false, // 预留位永不点亮(§4.3「暂不支持检测」)
       reserved: true,
-      title: `${label} · 暂不支持检测`,
+      // 未来服务端 preset 纳入 gemini/grok 并带真实流量 detail → title 跟随
+      // 真实详情(否则点击弹真实 detail 与 title「暂不支持检测」矛盾);
+      // 纯占位(无数据条目/detail 空)保持「暂不支持检测」标记。
+      title: entry && entry.detail ? `${label} · ${entry.detail}` : `${label} · 暂不支持检测`,
       detail: entry ? entry.detail : '',
     });
   }
@@ -152,12 +156,11 @@ export default {
     <div class="ai-row">
       <span class="ai-ico" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h7l-1 8 10-12h-7z" /></svg></span>
       <span class="ai-label">AI 加速</span>
+      <!-- v1 只读降级:非真开关(点击只 toast 引导),不声明 switch 语义
+           (role/aria-checked 与键盘不可达不匹配),纯视觉 + title 即可 -->
       <div
         class="switch"
         :class="{ on: model.enabled }"
-        role="switch"
-        :aria-checked="model.enabled ? 'true' : 'false'"
-        aria-label="AI 加速开关"
         data-act="ai-switch"
         title="请到仪表盘开关 AI 加速"
         @click="onSwitch"

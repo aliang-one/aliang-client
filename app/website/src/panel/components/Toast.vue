@@ -30,10 +30,16 @@ function dismiss(id) {
 
 export function useToast() {
   function show(msg, kind = 'success') {
+    const text = String(msg);
+    // 去重(评审 Minor-4):相同文案尚未消失时不重复入队——连点/多组件同刻
+    // 弹同一提示会在 340px 窄面板刷屏(msg 为唯一身份,kind 不同也算同一条
+    // 提示的重复触发);返回在队那条的 id,调用方无感。文案消失后可再次入队。
+    const existing = toasts.value.find((t) => t.msg === text);
+    if (existing !== undefined) return existing.id;
     const id = ++seq;
     toasts.value.push({
       id,
-      msg: String(msg),
+      msg: text,
       kind: kind === KIND_WARN ? KIND_WARN : 'success',
     });
     // 超限挤旧(先挤再排超时,被挤那条的句柄经 dismiss 回收,不留残计时)。

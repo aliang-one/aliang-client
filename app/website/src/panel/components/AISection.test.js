@@ -147,12 +147,28 @@ describe('aiSectionModel 纯派生(spec §4.3 图标池/点亮/计数)', () => {
     }
   });
 
-  it('AI 加速关(enabled=false)→ hint 固定文案「AI 加速已关 · 图标全灰」', () => {
+  it('AI 加速关(enabled=false)→ detected 条目也不点亮(live 加 enabled 闸,防 dim 下绿描边与「图标全灰」矛盾),hint 固定文案', () => {
     const m = aiSectionModel(
       makeAI({ enabled: false, providers: [makeProv('anthropic', { detected: true })] })
     );
+    const byKey = Object.fromEntries(m.tiles.map((t) => [t.key, t]));
     expect(m.enabled).toBe(false);
+    expect(byKey.anthropic.live).toBe(false); // Minor-1:关态不透出点亮
+    expect(m.litCount).toBe(0);
     expect(m.hint).toBe('AI 加速已关 · 图标全灰');
+  });
+
+  it('预留位带数据条目(未来 preset 纳入)→ detail 透传,title 跟随真实详情不再标「暂不支持检测」(Minor-2)', () => {
+    const m = aiSectionModel(
+      makeAI({
+        providers: [makeProv('gemini', { detected: true, detail: '检测到 5 次流量经此路由' })],
+      })
+    );
+    const byKey = Object.fromEntries(m.tiles.map((t) => [t.key, t]));
+    expect(byKey.gemini.detail).toBe('检测到 5 次流量经此路由');
+    expect(byKey.gemini.title).toContain('检测到 5 次流量经此路由');
+    expect(byKey.gemini.title).not.toContain('暂不支持检测');
+    expect(byKey.gemini.live).toBe(false); // 点亮由图标池身份决定:预留位永不亮
   });
 
   it('key 归一大小写/空白与服务端 NormalizeAIProviderKey 同口径(Anthropic → anthropic)', () => {
@@ -190,13 +206,19 @@ describe('AISection 挂载 DOM 契约', () => {
     expect(q(el, '.prov[data-key="gemini"]').className).not.toContain('live');
     expect(q(el, '.prov-row').className).not.toContain('dimmed');
     expect(q(el, '.prov-row .hint').textContent).toBe('检测到 1 / 3');
+    // Minor-3:v1 只读降级非真开关,不声明 switch 语义(role/aria-checked)
+    expect(q(el, '[data-act="ai-switch"]').getAttribute('role')).toBeNull();
+    expect(q(el, '[data-act="ai-switch"]').getAttribute('aria-checked')).toBeNull();
   });
 
-  it('关:prov-row.dimmed(0.35+锁)+ hint「AI 加速已关 · 图标全灰」+ switch off', () => {
-    const { el } = mountSection({ ai: makeAI({ enabled: false, providers: [] }) });
+  it('关:prov-row.dimmed(0.35+锁)+ hint「AI 加速已关 · 图标全灰」+ switch off + detected 条目不透出点亮(Minor-1)', () => {
+    const { el } = mountSection({
+      ai: makeAI({ enabled: false, providers: [makeProv('anthropic', { detected: true })] }),
+    });
     expect(q(el, '.prov-row').className).toContain('dimmed');
     expect(q(el, '.prov-row .hint').textContent).toBe('AI 加速已关 · 图标全灰');
     expect(q(el, '[data-act="ai-switch"]').className).not.toContain('on');
+    expect(q(el, '.prov[data-key="anthropic"]').className).not.toContain('live'); // Minor-1
   });
 
   it('AI 关 → 点击被锁:provider 图标点击不弹 toast(锁交互 §6-4)', async () => {
@@ -262,6 +284,21 @@ describe('AISection 挂载 DOM 契约', () => {
     await flush();
     const t = useToast().toasts.value.at(-1);
     expect(t.msg).toBe('Gemini：暂无详情');
+  });
+
+  it('预留位带真实 detail(未来 preset 纳入)→ 点击弹真实详情(Minor-2)', async () => {
+    const { el } = mountSection({
+      ai: makeAI({
+        enabled: true,
+        providers: [makeProv('grok', { detected: true, detail: '检测到 2 次流量经此路由' })],
+      }),
+    });
+    q(el, '.prov[data-key="grok"]').click();
+    await flush();
+    const t = useToast().toasts.value.at(-1);
+    expect(t.kind).toBe('success');
+    expect(t.msg).toContain('Grok');
+    expect(t.msg).toContain('检测到 2 次流量经此路由');
   });
 
   it('点亮态随轮询回读变化(检测到→未检测到,tile 失去 live)', async () => {
