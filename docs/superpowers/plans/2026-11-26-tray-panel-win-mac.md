@@ -216,13 +216,11 @@ GOOS=windows GOARCH=amd64 go build github.com/getlantern/systray
 
 ---
 
-### Task 6: POST /api/tray/endpoint/activate
+### Task 6: POST /api/tray/endpoint/activate —— **已递延（用户 2026-11-27 拍板）**
 
-**Files:** Create `app/http/services/tray_endpoint.go` + `_test.go`
-
-契约：body `{"protocol":"anthropic","name":"..."}` → **薄委托** endpoint-service 现有激活语义（`grep -n "activate\|set-current" app/http/services/endpoint_service.go app/http/handlers/endpoint_handler.go`）；错误 400（cooldown/disabled）/404（组/名不存在）/503（registry 不可用），形状 `{"code":..,"msg":..}`。
-
-- [ ] 失败测试（委托 1 次、cooldown 400、未知名 404、registry nil 503）→ 红 → 实现 → 绿 → Commit（`新增:/api/tray/endpoint/activate——托盘单选即激活(委托 registry)`）
+> **递延原因**：Task 6 的 premise「薄委托 registry 现有激活语义」不成立——endpoint-manager 批从未实现任何形态的激活/钉选（`Select` 的显式点名是请求期临时行为、不落状态；policy 只管摘除策略；store 无 pin 列）。实现子代理穷尽定位后按禁令停工报 NEEDS_CONTEXT（正确行为）。
+> **钉选语义另立增量**：registry 加 pin 列/policy + `selectAuto` 优先 pin（pin 行健康可用直取、不可用回落 auto 池）+ service 方法 + handler。它改的是 56432 生产路由核心路径，值得独立设计+测试，不在托盘任务里顺手做。落地后面板 radio 单选即激活（summary 的 `current` 字段读的就是 selectAuto 口径，届时自动跟随钉选语义，无需返工）。
+> **对 Task 10 的影响**：面板 radio 点击降级为 toast「钉选能力即将上线」且不勾选（见 Task 10 合同修订）。
 
 ---
 
@@ -269,9 +267,9 @@ spec §4.3：⚡+开关（32×19）+ provider 行（Anthropic/OpenAI/Cursor 可�
 
 **Files:** `components/EndpointZone.vue`；Test: `EndpointZone.test.js`
 
-spec §4.4：`available=false`/字段缺失 → **整区不渲染**（v-if 无空壳）；组头展开收起（max-height .25s）；radio 单选即激活（乐观勾移+toast「组 → X」+失败回滚）；cooldown → 置灰 + 琥珀「冷却 Xm」（= `cooldown_remaining_sec/60` 向上取整）不可选；disabled →「已摘除」；rank=0 →「—」。**`ai.enabled=false` 时本区同样 `.dimmed` + 锁（二审 I6）。**
+spec §4.4：`available=false`/字段缺失 → **整区不渲染**（v-if 无空壳）；组头展开收起（max-height .25s）；~~radio 单选即激活~~ **（钉选后端未上线，用户 2026-11-27 拍板递延）：radio 点击 → toast「钉选能力即将上线」且不勾选、不发请求**；cooldown → 置灰 + 琥珀「冷却 Xm」（= `cooldown_remaining_sec/60` 向上取整）不可选；disabled →「已摘除」；rank=0 →「—」。**`ai.enabled=false` 时本区同样 `.dimmed` + 锁（二审 I6）。**
 
-vitest 必测：available=false 不渲染；cooldown 点击不发请求且显示分钟数；激活成功勾移/失败回滚；ai.enabled=false 整区 dimmed 且点击被锁。
+vitest 必测：available=false 不渲染；cooldown 点击不发请求且显示分钟数；**radio 点击（任意行，含 ok 行）只 toast、不勾选、不发请求**；ai.enabled=false 整区 dimmed 且点击被锁。
 
 - [ ] 同节奏；Commit（`新增:面板 ENDPOINT 区——单选即激活+降级+AI 关联动`）
 
@@ -306,6 +304,10 @@ Agent 区（§4.5）：标题「AI AGENT · 24H」；每内核一卡（🤖+名+
 > **M2 开工前的技术复核点（2026-11-26 讨论）**：窗口壳实现技术在 M1 上线后可重估一次——若届时想换 Wails v3，先做一次 30 分钟实验（给 aliang 链上 Wails 跑 core 服务，验证其包级 init 副作用无害）：实验通过 → 允许 Wails 子命令版壳；不过 → 维持本计划的纯原生壳。无论哪种，`internal/panelwin` 的 Host 接口不变，M1 的全部产出不受影响。
 
 ### Task 13: internal/panelwin——纯原生窗口壳
+
+> **⚠️ Task 7 评审固化的两条 M2 前端要求（Task 13 实现时必须满足）：**
+> 1. **宿主态样式门控**：panel 前端 main.js 已实现「探测宿主 → `document.documentElement.classList.add('hosted')`」，theme.css 已有 `html.hosted body { background: transparent }`——M2 原生壳必须 `drawsBackground=false`（macOS）/ WebView2 透明背景（Windows）+ 系统材质层铺底，否则半透明面板底色失去意义、毛玻璃验收必挂。结构测试加「.m 含 drawsBackground=false / NSVisualEffectView」断言。
+> 2. **WebMessage 协议冻结为 `quit`/`open` 两类型**（评审 M-1：前端已删除协议外 `panel_ready`）；宿主 handler 必须对未知类型默认忽略（结构测试加断言），不得崩。
 
 **Files:**
 - Create: `internal/panelwin/panelwin.go`（锚定纯函数 + Host 接口）、`panelwin_test.go`、`panelwin_darwin.go` + `panelwin_darwin.m`、`panelwin_windows.go`、`cmd/panel.go`
@@ -350,6 +352,10 @@ func (l *PanelLauncher) RetryFromFallback()
 
 ### Task 15: companion M2 接线——spawn/兜底/恢复项 + 手工验收
 
+**⚠️ Task 4 探针实测给本任务的两条硬要求：**
+1. **状态项窗口有约 800ms 的占位期**：创建后立即取 `TrayRect` 会拿到占位矩形（实测形态 (0,-33)）且 `ok=true`——接线层必须**现取现用**（点击时取，那时必然已摆放），禁止启动早期缓存矩形；或对「y≥屏高 或 x=0 且 y<0」形态判废（与 Windows S_FALSE 判废同型）。
+2. **`button.menu` 不可作接回判据**：AppKit 不把 `statusItem.menu` 传播到按钮视图的 menu（两态均空）——判接回状态用 `statusItem.menu` 本身 + action/target 是否摘除。
+
 **Files:**
 - Create: `app/tray/panel_bridge_m2.go` 接线扩展 + 测试追加
 - Modify: `app/tray/companion.go`、`companion_windows.go`
@@ -387,3 +393,21 @@ Linux 任何托盘能力；fyne-io/Wails 托盘与窗口栈；v4 协议/GUID；�
 - M1 上线后收集一轮真实使用反馈再进 M2，是两步走的本意。
 - 生产机不跑全量 go test（测试二进制污染 companion 日志的既有问题）；跑完看一眼日志。
 - 手工验证步骤必须真实执行并记录；跳过的写进任务备注，不得静默勾选。
+
+## 打磨清单（评审通过但非阻塞，收口批次处理）
+
+- Task 1 评审（c5659103）4 项 Minor：①错帧循环加「已跳帧数上限 / 单次 Send 总预算」；②超时错误文案附已跳错帧数以区分两种病因；③并发测试 `t.Cleanup` 补 `client.Close()` 防 shim flusher goroutine 泄漏；④asyncWriteConn 注释补「写侧失败路径不在本 shim 覆盖范围」。
+- 预存竞态立档：`internal/ipc/server.go:125/:155` 的 WaitGroup 误用（acceptLoop Add 与 stop Wait 并发，`-race` 概率性 FAIL，已在父提交复现）——单独小修收掉。
+- `app/tray/companion.go:185` 等启动期外部直连 `Connect()` 不经 sendMu：保持「只在启动期」现状即可，接线任务勿引入运行期直连。
+- Task 2 评审 I-1：`cmd/service_heartbeat_test.go` 用固定短睡眠（10ms 轮询 + 80/120ms 断言窗），慢 CI 腿（windows/ARM）有 flake 面——首次 tag 构建若此包红，按平台腿重跑即可，后续把固定 sleep 改「deadline 内轮询」；勿误判为托盘改造回归。
+- Task 8 评审 I-2（⚠️ 计划层自相矛盾，已按此修订执行）：原文「opacity .45 + pointer-events none + title『停止后可切换』」三件套互相抵消——`pointer-events:none` 与原生 disabled 都抑制 hover，title tooltip 永不触发，「解释为什么禁用」实际是死代码。已改为 title 上移到不禁用的容器层动态给，子元素保留禁用形态。后续写类似规格时禁用态的提示文案不要挂在禁用元素自身。
+- Task 8 评审 M-3/M-5（挂账）：看门狗强撤后迟到的回读不补成功 toast（状态头如实显示终态，可接受）；seg 为 div @click 无键盘路径（与 mockup 同构，托盘面板无键盘焦点场景，可接受）。
+- Task 10 评审 M-1/M-2（挂账）：组内条目全坏 → 组头照渲染零行（组头常显有信息价值，保持现状）；重复 protocol 组共享 expanded 键（服务端 bug 下的外观问题，dev 环境警告即可）。
+- Task 10 评审 M-3（测试卫生）：EndpointZone sep 断言经 document.body 全局查询，未来同文件并发挂载会误判——改组件根内直接查询更准。
+- Task 12 评审（挂账，随 httpURL 一并收）：①`panelClickFn` 跨 goroutine 无同步访问（onReady goroutine 写、AppKit 主线程/wndProc goroutine 读）——third_party 内改 `atomic.Pointer[func()]`（SetPanelClickHook 写侧 + darwin/windows 两读侧）一处改动闭环；②`httpURL` 跨 goroutine 无锁读（与既有 openDashboard 同暴露）——同批改 atomic.Pointer/mutex。
+- Task 8 评审收口遗留（走查时定）：容器级 rowHint title 会冒到**可用**的 main/restart 键 hover 上（该提示语义只属于 seg）——走查若觉干扰，给非禁用的 main/restart 恢复原生 title 即可。
+- Task 2 评审 M-2/M-3（可选）：两测试步骤可加步骤级 `timeout-minutes: 15`；darwin 条件可镜像 `MACOSX_DEPLOYMENT_TARGET: '12.0'`。首次 tag 构建后核对各腿 step 时长再定。
+- Task 5 评审 M-2（⚠️ 需用户对齐的 spec 缝隙）：endpoint「auto 池准入」spec §4.4 说 `priority=0/未设 → rank「—」`，但调度器 selectAuto 的池准入只看 `AutoGroup && !Builtin`（且 API Update 不重归一 priority=0）——此态行调度器会真选它（priority 0 排最前），面板却显示「—」且不进 current。实现忠实于已评审 spec，分歧在 spec↔调度器契约。二选一：面板池准入改 `AutoGroup && !Builtin`（优先级 0 行拿 rank，与调度器对齐），或 spec 记录该例外。**待拍板，暂维持 spec 口径。**
+- Task 5 评审 M-3：池模式（FailureDisable=false）下 cooldown 到期行 selectAuto 语义已可选用，面板仍显 disabled——非默认组合的展示分歧，加注释声明即可。
+- Task 5 评审 M-4（测试卫生）：未来时间戳容差分支、`trayRunSummaryFromStatus(nil)→nil`、「远端+有效 cookie」放行分支未覆盖；middleware 测试读真实持久化会话文件（只读）属既有暴露。
+- Task 5 评审 M-1 已修（405 method 校验）；I-1 已修（agents 子源 singleflight+TTL 快照，防 2s 轮询扫描堆叠）。
