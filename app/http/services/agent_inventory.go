@@ -28,15 +28,23 @@ const (
 	agentVibeDetailDefaultPageLimit    = 40
 	agentVibeDetailMaxPageLimit        = 100
 	agentVibeTranscriptMaxContentRunes = 4000
-	agentVibeIndexMaxLines             = 240
+	// codex session_index.jsonl 自 0.172.0 起停更(只剩存量 320+ 行),行上限
+	// 必须容得下全部存量;新会话活性走 rollout 文件面(见 codexStatusFreshnessWindow)。
+	agentVibeIndexMaxLines             = 400
 	agentVibeIndexMaxBytes             = 2 * 1024 * 1024
 	// 16MB：单条 jsonl 行的解析上限。CC 会把超大 tool_result（读大文件/长命
 	// 令输出）写成单行 >1MB 的记录（2026-09-27 liang-dev 会话 3d06bb04 事故：
 	// 1.1MB 行让旧 Scanner 静默中止，其后 316 条真实消息永久不可见），正常
 	// 大小量级必须照常解析；这个上限只挡病态行——跳过并告警，绝不中断扫描。
 	agentVibeJSONLMaxLineBytes        = 16 * 1024 * 1024
-	agentVibeSummaryMaxSessions       = 200
-	agentVibeSessionFileScanLimit     = 120
+	// 清单条数硬顶。200 是 init(2026-08-15)时代的防御值,当时全盘会话远小于
+	// 200 从未咬人;2026-11-26 实测单机磁盘 claude 索引 226 entries + codex 索引
+	// 320 行,200 闸开始真实吃数据(手机「会话列表不完整」根因)。600 覆盖本机
+	// 全量并留余量;流量代价实测每条约 800B,WS hello 60s 周期下 600 条 ≈
+	// +40MB/h(活跃机),远低于 8MiB 帧上限。两处截断(collect/overlay)共用
+	// truncateAgentVibeSessionsFair,禁止绕开它直切前缀。
+	agentVibeSummaryMaxSessions       = 600
+	agentVibeSessionFileScanLimit     = 300
 	agentVibeDetailCandidateFileLimit = 24
 	agentRecentFileWalkMaxEntries     = 6000
 	agentRecentFileWalkMaxDuration    = 500 * time.Millisecond
@@ -243,9 +251,7 @@ func overlayActiveAgentVibeSessions(snapshot agentSyncSnapshot, active []models.
 	sort.Slice(sessions, func(i, j int) bool {
 		return sessions[i].UpdatedAt > sessions[j].UpdatedAt
 	})
-	if len(sessions) > agentVibeSummaryMaxSessions {
-		sessions = sessions[:agentVibeSummaryMaxSessions]
-	}
+	sessions = truncateAgentVibeSessionsFair(sessions, agentVibeSummaryMaxSessions)
 	sort.Slice(projects, func(i, j int) bool {
 		return projects[i].LastActiveAt > projects[j].LastActiveAt
 	})
@@ -676,15 +682,69 @@ func probeAgentProjectStats(path string) {
 }
 
 func collectAgentVibeSessions(scanDirs []string) []models.AgentVibeSession {
-	sessions := append(collectCodexVibeSessions(scanDirs), collectClaudeVibeSessions(scanDirs)...)
+	claudeSessions, claudeDropped := collectClaudeVibeSessionsWithStats(scanDirs)
+	sessions := append(collectCodexVibeSessions(scanDirs), claudeSessions...)
 	sessions = append(sessions, collectAgentCoreVibeSessions(scanDirs)...)
 	sort.Slice(sessions, func(i, j int) bool {
 		return sessions[i].UpdatedAt > sessions[j].UpdatedAt
 	})
-	if len(sessions) > agentVibeSummaryMaxSessions {
-		sessions = sessions[:agentVibeSummaryMaxSessions]
+	// 截断唯一出口:与 overlayActiveAgentVibeSessions 共用公平采样。截断一旦
+	// 发生必须 WARN——截断静默发生正是「明明处理过怎么还有」反复出现的原因
+	// (10-18 WithStats 只做了可观测,dropped 计数仍被调用方 `_` 丢弃)。
+	before := len(sessions)
+	sessions = truncateAgentVibeSessionsFair(sessions, agentVibeSummaryMaxSessions)
+	if dropped := before - len(sessions); dropped > 0 {
+		logger.Warn(fmt.Sprintf("[AGENT-INVENTORY] vibe_sessions_truncated kept=%d dropped=%d cap=%d", len(sessions), dropped, agentVibeSummaryMaxSessions))
+	}
+	if claudeDropped > 0 {
+		logger.Warn(fmt.Sprintf("[AGENT-INVENTORY] claude_jsonl_walk_dropped dropped=%d cap=%d", claudeDropped, agentVibeSessionFileScanLimit))
 	}
 	return sessions
+}
+
+// truncateAgentVibeSessionsFair 是清单两处截断(collectAgentVibeSessions 与
+// overlayActiveAgentVibeSessions)的唯一出口:在按 UpdatedAt 降序的输入上做
+// per-provider 轮询采样,单一 provider 的会话洪峰不能把其它内核整族挤出推送
+// 窗口(2026-11-26:codex「出生即 closed+时间戳陈旧」曾系统性沉底,被 200 硬
+// 截断整族砍光)。输入不足 limit 原样返回;选中集合重新按 UpdatedAt 降序输出,
+// 消费端(服务端排序/手机活跃置顶)不感知采样语义。轮询桶序按各 provider 最新
+// 会话的首次出现序,输入有序故完全确定。
+func truncateAgentVibeSessionsFair(sessions []models.AgentVibeSession, limit int) []models.AgentVibeSession {
+	if limit <= 0 || len(sessions) <= limit {
+		return sessions
+	}
+	buckets := make(map[string][]models.AgentVibeSession)
+	order := make([]string, 0, 4)
+	for _, session := range sessions {
+		provider := session.Provider
+		if _, seen := buckets[provider]; !seen {
+			order = append(order, provider)
+		}
+		buckets[provider] = append(buckets[provider], session)
+	}
+	picked := make([]models.AgentVibeSession, 0, limit)
+	for len(picked) < limit {
+		progressed := false
+		for _, provider := range order {
+			bucket := buckets[provider]
+			if len(bucket) == 0 {
+				continue
+			}
+			picked = append(picked, bucket[0])
+			buckets[provider] = bucket[1:]
+			progressed = true
+			if len(picked) == limit {
+				break
+			}
+		}
+		if !progressed {
+			break
+		}
+	}
+	sort.Slice(picked, func(i, j int) bool {
+		return picked[i].UpdatedAt > picked[j].UpdatedAt
+	})
+	return picked
 }
 
 func collectCodexVibeSessions(scanDirs []string) []models.AgentVibeSession {
@@ -723,12 +783,23 @@ func collectCodexVibeSessions(scanDirs []string) []models.AgentVibeSession {
 		findRecentCodexSessionFiles(filepath.Join(home, ".codex", "archived_sessions"), agentVibeSessionFileScanLimit)...,
 	)
 	metaByID := make(map[string]models.AgentVibeSession)
+	// metaFileTime:原生 id → 源 rollout 文件的最新 mtime。codex 无 per-pid 活体
+	// 记录,这是唯一可用的活性钟;兼作同 ID 多文件的胜者判定钟。
+	metaFileTime := make(map[string]time.Time)
 	for _, path := range sessionFiles {
 		meta := readAgentVibeCodexSummary(path, scanDirs)
 		if meta.ID == "" {
 			continue
 		}
+		fileTime := codexRolloutFileTime(path)
+		// 同 ID 双文件(base + resumed 续跑:文件名含旧_新双 ID、session_meta 均
+		// 持旧 ID)。walker 按 mtime 新→旧返回,resumed 先到、旧 base 后到,盲覆盖
+		// 会把续开内容冲掉(2026-11-26 内容陈旧家族)。文件时间新者胜,旧者整体让位。
+		if prevTime, seen := metaFileTime[meta.ID]; seen && !fileTime.After(prevTime) {
+			continue
+		}
 		metaByID[meta.ID] = meta
+		metaFileTime[meta.ID] = fileTime
 	}
 	for i := range sessions {
 		sourceID := strings.TrimPrefix(sessions[i].ID, "codex_")
@@ -751,7 +822,13 @@ func collectCodexVibeSessions(scanDirs []string) []models.AgentVibeSession {
 			sessions[i].Transcript = meta.Transcript
 		}
 		sessions[i].CreatedAt = firstNonEmpty(sessions[i].CreatedAt, meta.CreatedAt)
-		sessions[i].UpdatedAt = firstNonEmpty(sessions[i].UpdatedAt, meta.UpdatedAt)
+		// 索引时间整体过时(session_index.jsonl 自 0.172.0 停更):取两源更新者。
+		// firstNonEmpty 会让陈旧索引时间戳压掉新鲜 rollout mtime——下游 PhoneServer
+		// 按 updated_at 喂 lastActiveAt,陈旧值会把进行中的会话推进 10min 静默
+		// sweeper 打成 timed out。
+		if compareRFC3339(meta.UpdatedAt, sessions[i].UpdatedAt) > 0 {
+			sessions[i].UpdatedAt = meta.UpdatedAt
+		}
 		delete(metaByID, sourceID)
 	}
 	for _, meta := range metaByID {
@@ -759,6 +836,18 @@ func collectCodexVibeSessions(scanDirs []string) []models.AgentVibeSession {
 		meta.Status = "closed"
 		meta.Mode = "vibe"
 		sessions = append(sessions, meta)
+	}
+	// codex 活性 overlay:codex 无 per-pid 活体记录(~/.codex 没有 ~/.claude/
+	// sessions/<pid>.json 的等价物,0.172.x 实证),唯一可用活性钟是 rollout 源
+	// 文件 mtime——窗口内视为进行中。与 claude 分支的差异:没有 isPidAlive 门,
+	// 写完最后一条即退出的会话会再显 running 至多一个窗口,衰减自封顶(见
+	// codexStatusFreshnessWindow 注释)。索引-only 行无源文件、无新鲜度条目,恒
+	// closed——0.172.0 停更后的幽灵索引行不会误报。
+	now := time.Now()
+	for i := range sessions {
+		if fileTime, ok := metaFileTime[strings.TrimPrefix(sessions[i].ID, "codex_")]; ok && !fileTime.IsZero() && now.Sub(fileTime) < codexStatusFreshnessWindow {
+			sessions[i].Status = "running"
+		}
 	}
 	return applyCodexExternalImportLedger(sessions, home)
 }
@@ -1451,6 +1540,19 @@ func wireAgentRenameSource(entry agentRenameCacheEntry) string {
 // in-flight turn. This decay is what keeps the branch from resurrecting the
 // pre-437bc99 "live process == forever running" bug.
 const claudeStatusFreshnessWindow = 3 * time.Minute
+
+// codexStatusFreshnessWindow bounds the freshness-derived "running" signal for
+// codex sessions. Codex keeps no per-pid status records (~/.codex has no
+// equivalent of ~/.claude/sessions/<pid>.json — verified on real 0.172.x), so
+// unlike the claude branch there is no isPidAlive gate; the only usable
+// liveness clock is the rollout source file's mtime. The window decays on its
+// own once the file stops growing, so a process that exited right after its
+// last write reads as "running" for at most one window — the same self-capping
+// semantics the claude branch leans on (pre-437bc99 lesson). Known limitation
+// (documented, accepted): if the codex TUI appends non-content lines while
+// idle, mtime freshness reads warm-idle as running; the upgrade path is
+// deriving lastMessageAt in the codex reader (claude precedent :1906).
+const codexStatusFreshnessWindow = 3 * time.Minute
 
 // claudeBusyReconcileTailBytes bounds the transcript tail read for the stale
 // busy reconcile: turn-end markers (system/turn_duration, written at turn end)
@@ -2572,6 +2674,18 @@ func fileUpdatedAt(path string) string {
 		return ""
 	}
 	return info.ModTime().UTC().Format(time.RFC3339)
+}
+
+// codexRolloutFileTime 是 codex 会话的活性钟兼同 ID 合并的胜者钟:源 rollout
+// 文件的 mtime(最后写入时刻)。文件名内嵌时间戳是会话起点,resumed 会话可能
+// 起点很老而仍在写——活性必须看 mtime,不看文件名。stat 失败返回零值(无活性
+// 信号,不参与升级)。
+func codexRolloutFileTime(path string) time.Time {
+	info, err := os.Stat(path)
+	if err != nil {
+		return time.Time{}
+	}
+	return info.ModTime()
 }
 
 func compareRFC3339(a string, b string) int {
