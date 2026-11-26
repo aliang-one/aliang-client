@@ -400,6 +400,31 @@ export default {
   chat_subagentReportPending: 'Running — report not ready yet',
   chat_subagentCopyReport: 'Copy report',
   chat_subagentCopied: 'Copied',
+  // Chat info drawer (spec 2026-11-26-chat-info-drawer-design): right
+  // slide-out conversation info panel. Paired 1:1 with zh.js
+  // (i18n.test.js key-set guard). Copy mirrors the phone DiagnosticsPanel
+  // (vibecoding/en.json session.diagnostics.*).
+  chat_infoEntry: 'Session info',
+  chat_infoSubagents: 'Subagents',
+  chat_infoSubagentsEmpty: 'No subagent activity this run',
+  chat_infoContext: 'Context usage',
+  chat_infoContextNone: 'No usage data yet — shown once a turn starts',
+  chat_infoContextRemaining: 'Remaining',
+  chat_infoTurns: 'Turns',
+  chat_infoCompactHint: 'The kernel auto-compacts history near 3/4 of the window; the used value drops to an estimate after compaction',
+  chat_infoRuntime: 'Run status',
+  chat_infoRuntimeNone: 'No run data yet',
+  chat_infoRuntimeFiles: 'Files touched',
+  chat_infoRuntimeGit: 'Git changes',
+  chat_infoRuntimeElapsed: 'Elapsed',
+  chat_infoStopReason: 'Stop reason',
+  chat_infoGuards: 'No-progress guards',
+  chat_infoGuardDup: 'Repeated tool',
+  chat_infoGuardErr: 'Consecutive errors',
+  chat_infoGuardTrunc: 'Truncation retries',
+  chat_infoFailure: 'Failure',
+  chat_infoFailureStatus: 'End status',
+  chat_infoFailureReason: 'Stop reason',
 
   // -- App --
   app_restoringSession: 'Restoring saved session...',

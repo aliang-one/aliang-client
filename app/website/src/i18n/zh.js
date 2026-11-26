@@ -399,6 +399,30 @@ export default {
   chat_subagentReportPending: '运行中，报告尚未生成',
   chat_subagentCopyReport: '复制报告',
   chat_subagentCopied: '已复制',
+  // 会话信息抽屉（spec 2026-11-26-chat-info-drawer-design）：右侧滑出的对话
+  // 信息面板，与 en.js 成对维护（i18n.test.js 守键集）。文案口径对齐手机端
+  // DiagnosticsPanel（vibecoding/zh.json session.diagnostics.*）。
+  chat_infoEntry: '会话信息',
+  chat_infoSubagents: '子agent',
+  chat_infoSubagentsEmpty: '本回合暂无子agent活动',
+  chat_infoContext: '上下文用量',
+  chat_infoContextNone: '暂无用量数据——回合开始后显示',
+  chat_infoContextRemaining: '剩余可用',
+  chat_infoTurns: '回合数',
+  chat_infoCompactHint: '上下文接近窗口 3/4 时内核自动压缩历史；压缩后已用值会回落为估算',
+  chat_infoRuntime: '运行状态',
+  chat_infoRuntimeNone: '尚无运行数据',
+  chat_infoRuntimeFiles: '触碰文件',
+  chat_infoRuntimeGit: 'Git 变更',
+  chat_infoRuntimeElapsed: '运行耗时',
+  chat_infoStopReason: '停止原因',
+  chat_infoGuards: '无进展守卫',
+  chat_infoGuardDup: '重复工具',
+  chat_infoGuardErr: '连续错误',
+  chat_infoGuardTrunc: '截断重试',
+  chat_infoFailure: '失败原因',
+  chat_infoFailureStatus: '结束状态',
+  chat_infoFailureReason: '终止真因',
 
   // -- App --
   app_restoringSession: '正在恢复会话…',
