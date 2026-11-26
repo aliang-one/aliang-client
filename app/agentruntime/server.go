@@ -187,6 +187,10 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/agent/peer/note", agentHandler.HandlePeerNote)
 	mux.HandleFunc("/api/agent/peer/mcp", agentHandler.HandlePeerMcp)
 	mux.HandleFunc("/api/agent/peer/gates", agentHandler.HandlePeerGates)
+	// 远程协助总开关 gates(spec 2026-11-26-remote-assist-design §7.1):GET 读 /
+	// POST 写 remote_assist_enabled,真身在本 runtime;core routes.go 侧同名
+	// 注册只做 proxy 透传。缺任一侧=404(双注册纪律,route_parity_test 兜底)。
+	mux.HandleFunc("/api/agent/assist/gates", agentHandler.HandleAssistGates)
 	mux.HandleFunc("/api/agent/operations/events", agentHandler.HandleOperationEvents)
 	mux.HandleFunc("/api/agent/ai/approval-hook", agentHandler.HandleAIApprovalHook)
 	// agent-as-MCP 工具面端点（spec §7）：真身在此（AI 管理器住本 runtime），

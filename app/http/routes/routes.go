@@ -321,6 +321,11 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/openviking/apply", h.Agent.HandleOpenVikingApply, http.MethodPost)
 	// 设备门禁开关(GET 读本机现值,POST 部分更新落库)。
 	register("/api/agent/peer/gates", h.Agent.HandlePeerGates, http.MethodGet, http.MethodPost)
+	// 远程协助总开关 gates(spec 2026-11-26-remote-assist-design §7.1):GET 读 /
+	// POST 写 remote_assist_enabled。真身在 user agent runtime,core 侧
+	// proxyIfNeeded 透传;双注册另一处 agentruntime/server.go(缺任一侧=404
+	// 透传,route_parity_test 兜底)。request/session/end 三端点是 Task 6。
+	register("/api/agent/assist/gates", h.Agent.HandleAssistGates, http.MethodGet, http.MethodPost)
 	register("/api/agent/operations/events", h.Agent.HandleOperationEvents, http.MethodGet)
 	register("/api/agent/ai/stream", h.Agent.HandleAIStream, http.MethodGet)
 	register("/api/agent/ai/approval-hook", h.Agent.HandleAIApprovalHook, http.MethodPost)

@@ -141,6 +141,13 @@ type agentState struct {
 	// 项目和会话才会被扫描并上传。空或 ScanDirectoriesEnabled=false 表示不过滤。
 	ScanDirectories        []string `json:"scan_directories,omitempty"`
 	ScanDirectoriesEnabled bool     `json:"scan_directories_enabled,omitempty"`
+
+	// RemoteAssistEnabled 远程协助总开关(spec 2026-11-26-remote-assist-design §7.1)。
+	// 零值纪律(§14 坑 6):键缺席=false,装机即无此功能——不进任何缺省 true
+	// 分支。挂 agentState 顶层而非 models.AgentDevice:Device 会被注册/同步
+	// 的服务端回显整体替换(webTerminal 同坑,见 agent_web_terminal.go 头注),
+	// 平台侧未识别该键前 Device 内放置会被每次 sync 冲回 false。
+	RemoteAssistEnabled bool `json:"remote_assist_enabled"`
 }
 
 type AgentService struct {
@@ -161,6 +168,7 @@ type AgentService struct {
 	client                *http.Client
 	terminal              *agentTerminalManager
 	webTerminal           *webTerminalVault
+	assist                *remoteAssistManager
 	ai                    *agentAIManager
 	progress              agentProgressTransport
 	operations            agentOperationMirror
@@ -270,6 +278,7 @@ func NewAgentService() *AgentService {
 		client:            &http.Client{Timeout: agentHTTPTimeout},
 		terminal:          newAgentTerminalManager(),
 		webTerminal:       newWebTerminalVault(),
+		assist:            newRemoteAssistManager(time.Now),
 		ai:                newAgentAIManager(),
 		sessionRefreshSig: make(chan struct{}, 1),
 	}
@@ -2726,6 +2735,7 @@ func (s *AgentService) applyRemoteDeviceSettings(msg map[string]interface{}) {
 	}
 	terminalDisabled := false
 	aiDisabled := false
+	assistDisabled := false
 	if name := remoteString(rawDevice, "name"); name != "" {
 		s.state.Device.Name = name
 	}
@@ -2760,6 +2770,12 @@ func (s *AgentService) applyRemoteDeviceSettings(msg map[string]interface{}) {
 		s.state.Device.AIControlEnabled = value
 		aiDisabled = !value
 	}
+	// remote_assist_enabled:设备 settings 推送同样可落地(键缺席=零值纪律
+	// false,不翻 true——remote_terminal 缺省 true 分支刻意不复刻)。
+	if value, ok := rawDevice["remote_assist_enabled"].(bool); ok {
+		s.state.RemoteAssistEnabled = value
+		assistDisabled = !value
+	}
 	s.state.LastSyncAt = time.Now().UTC().Format(time.RFC3339)
 	s.state.LastSyncStatus = "settings_updated"
 	s.state.LastSyncMessage = ""
@@ -2772,6 +2788,47 @@ func (s *AgentService) applyRemoteDeviceSettings(msg map[string]interface{}) {
 	if aiDisabled {
 		s.ai.closeAllWithReason("ai_control_disabled")
 	}
+	if assistDisabled {
+		s.assistEndForDisable()
+	}
+}
+
+// ——— 远程协助 P1:总开关读写面(Task 3) ———
+
+// RemoteAssistEnabled 读侧:gates 端点 GET / 状态面用。纯配置读,不做
+// enable/registered 复核(那是远端腿门的事;开关本身如实回显)。
+func (s *AgentService) RemoteAssistEnabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state.RemoteAssistEnabled
+}
+
+// SetRemoteAssistEnabled 写侧:落盘经 saveStateLocked(同 remote_terminal
+// 家族持久化路径)。翻 false 时活跃会话按 client_end 收口——照
+// webTerminal.onLock→closeAll 联动语义,但联动体在锁外执行(s.mu 与
+// assist.mu 无嵌套,锁纪律:持锁区禁调会取 s.mu 的函数)。Task 5 接线
+// 协助终端关闭,Task 4 接线云端终态广播——挂点即 assistEndForDisable。
+func (s *AgentService) SetRemoteAssistEnabled(enabled bool) {
+	s.mu.Lock()
+	s.state.RemoteAssistEnabled = enabled
+	if err := s.saveStateLocked(); err != nil {
+		logger.Warn(fmt.Sprintf("[ASSIST] persist remote_assist_enabled=%t failed error=%v", enabled, err))
+	}
+	s.mu.Unlock()
+	if !enabled {
+		s.assistEndForDisable()
+	}
+}
+
+// assistEndForDisable 关闸联动:总开关翻 false → 活跃/待审批会话统一按
+// AssistEndClient 终态收口。End 在 idle 态返回 errAssistNothingToEnd,
+// 属正常幂等路径,忽略。Task 5:会话 active 时同步关协助终端(Task 5 前
+// 终端接线尚不存在,End 即全部);Task 4:向云端广播 assist.ended 终帧。
+func (s *AgentService) assistEndForDisable() {
+	if s.assist == nil {
+		return
+	}
+	_ = s.assist.End(AssistEndClient)
 }
 
 // applyRemoteProjectSettings handles a project.settings.updated push: the server
