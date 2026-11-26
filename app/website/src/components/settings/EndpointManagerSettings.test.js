@@ -247,6 +247,32 @@ describe('EndpointManagerSettings LLM 端点管理卡', () => {
     expect(payload.auto_group).toBe(true);
   });
 
+  it('final-review finding 6:builtin 行 priority 输入禁用,载荷 priority 兜底 0(builtin 恒第一,Store 层拒绝非 0)', async () => {
+    const el = mountComp();
+    await flush();
+    const editButtons = [...el.querySelectorAll('button')]
+      .filter((b) => b.textContent.replace(/\s+/g, ' ').trim() === 'endpointManager_edit');
+    editButtons[0].click(); // builtin 行
+    await flush();
+    // 编辑弹窗内 priority 输入禁用(builtin 行 priority 恒 0)
+    expect(el.querySelector('[data-field="priority"]').disabled).toBe(true);
+    buttonByText(el, 'endpointManager_save').click();
+    await flush();
+    const payload = updateEndpoint.mock.calls[0][1];
+    // payload 侧兜底:即使表单残留非 0,线格式恒 0
+    expect(payload.priority).toBe(0);
+  });
+
+  it('普通行 priority 输入可用(禁用只针对 builtin)', async () => {
+    const el = mountComp();
+    await flush();
+    const editButtons = [...el.querySelectorAll('button')]
+      .filter((b) => b.textContent.replace(/\s+/g, ' ').trim() === 'endpointManager_edit');
+    editButtons[1].click(); // prov-a 行
+    await flush();
+    expect(el.querySelector('[data-field="priority"]').disabled).toBe(false);
+  });
+
   it('拉模型流程:POST fetch-models → 二级弹层展示 → 确认回填表单(不自动 PUT)→ 保存走 PUT', async () => {
     const el = mountComp();
     await flush();

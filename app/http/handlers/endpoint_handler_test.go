@@ -463,6 +463,61 @@ func TestEndpointHandlerCreateDuplicateConflict(t *testing.T) {
 	}
 }
 
+// final-review 必改 1:POST 不带 id(UI endpointToPayload 不下发 id)必须成功
+// 创建——handler 层生成 uuid,返回视图 id 非空且入库可 GET。这是 UI↔Go 缝合
+// 处的跨任务契约:两侧单测各自绿(handler 测试显式传 id、UI 测试 mock agentApi),
+// 缺这条就零覆盖。
+func TestEndpointHandlerCreateGeneratesIDWhenOmitted(t *testing.T) {
+	h, cookie := newEndpointHandlerHarness(t)
+
+	rec := endpointCreateBody(t, h, cookie, map[string]interface{}{
+		"name": "no-id-endpoint", "base_url": "https://up.example.com",
+		"api_key": "sk-noidkey1234567", "protocol_anthropic": true,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("无 id 创建 code=%d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	_, data := endpointDecode(t, rec)
+	// 返回视图必须是单视图(与 HandleGet/HandleUpdate 一致,final-review
+	// finding 4),且 id 非空。
+	id, _ := data["id"].(string)
+	if id == "" {
+		t.Fatalf("返回视图 id 为空: %#v", data)
+	}
+	if data["name"] != "no-id-endpoint" {
+		t.Fatalf("返回视图 name = %v", data["name"])
+	}
+	if _, isList := data["endpoints"]; isList {
+		t.Fatalf("Create 响应应为单视图而非数组信封: %#v", data)
+	}
+
+	// 入库可 GET(GET 单条 200 且同 id)。
+	rec = endpointDo(t, h, cookie, http.MethodGet, "/api/endpoints/"+id, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET 新建行 code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	_, data2 := endpointDecode(t, rec)
+	if data2["id"] != id {
+		t.Fatalf("GET 到的 id = %v, want %s", data2["id"], id)
+	}
+}
+
+// 显式 id 仍允许(管理面测试用):带了就原样落库。
+func TestEndpointHandlerCreateKeepsExplicitID(t *testing.T) {
+	h, cookie := newEndpointHandlerHarness(t)
+	rec := endpointCreateBody(t, h, cookie, map[string]interface{}{
+		"id": "ep-explicit", "name": "explicit", "base_url": "https://up.example.com",
+		"api_key": "sk-explicit12345", "protocol_anthropic": true,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("显式 id 创建 code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	_, data := endpointDecode(t, rec)
+	if data["id"] != "ep-explicit" {
+		t.Fatalf("显式 id 应原样保留, got %v", data["id"])
+	}
+}
+
 // policy PUT 负值 → 400;fetch-models 对 builtin(无 base_url)→ 400;
 // DELETE 不存在 id → 200 幂等。
 func TestEndpointHandlerPolicyNegativeAndIdempotentDelete(t *testing.T) {

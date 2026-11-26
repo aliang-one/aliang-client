@@ -33,12 +33,51 @@ func TestAIEndpointSelectorAdapterSelectSplitsRow(t *testing.T) {
 		t.Fatal("adapter must not be nil for a live service")
 	}
 
-	id, baseURL, apiKey, builtin, err := adapter.Select("anthropic", "", "")
+	id, baseURL, apiKey, builtin, err := adapter.Select("anthropic", "", "", "")
 	if err != nil {
 		t.Fatalf("select: %v", err)
 	}
 	if id != "byo-a" || baseURL != "http://127.0.0.1:9/a" || apiKey != "key-a" || builtin {
 		t.Fatalf("select split = (%q %q %q %v)", id, baseURL, apiKey, builtin)
+	}
+}
+
+// final-review 必改 2:adapter 的 excludeID 必须透传到 service Select——重试
+// attempt 排除上一失败行,命中下一候选(真切换缝)。
+func TestAIEndpointSelectorAdapterExcludeIDPassesThrough(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+	createEndpoint(t, store, &config.LLMEndpoint{
+		ID:                "byo-1",
+		Name:              "row-1",
+		BaseURL:           "http://127.0.0.1:9/1",
+		APIKey:            "key-1",
+		ProtocolAnthropic: true,
+		AutoGroup:         true,
+		Enabled:           true,
+		Priority:          5,
+		Models:            "[]",
+	})
+	createEndpoint(t, store, &config.LLMEndpoint{
+		ID:                "byo-2",
+		Name:              "row-2",
+		BaseURL:           "http://127.0.0.1:9/2",
+		APIKey:            "key-2",
+		ProtocolAnthropic: true,
+		AutoGroup:         true,
+		Enabled:           true,
+		Priority:          6,
+		Models:            "[]",
+	})
+
+	adapter := NewAIEndpointSelectorAdapter(svc)
+	id, _, _, _, err := adapter.Select("anthropic", "", "", "")
+	if err != nil || id != "byo-1" {
+		t.Fatalf("首次选择 = (%q, %v), want byo-1", id, err)
+	}
+	// 排除 byo-1 → byo-2。
+	id, _, _, _, err = adapter.Select("anthropic", "", "", "byo-1")
+	if err != nil || id != "byo-2" {
+		t.Fatalf("排除 byo-1 后 = (%q, %v), want byo-2(真切换)", id, err)
 	}
 }
 
@@ -88,13 +127,13 @@ func TestAIEndpointSelectorAdapterTranslatesSentinels(t *testing.T) {
 	// 真实 service 路径:显式点名不存在 → 404 哨兵;空注册表 → 503 哨兵。
 	svc, _ := newEndpointTestHarness(t)
 	adapter := NewAIEndpointSelectorAdapter(svc)
-	_, _, _, _, err := adapter.Select("anthropic", "", "missing-row")
+	_, _, _, _, err := adapter.Select("anthropic", "", "missing-row", "")
 	if !errors.Is(err, inboundhttp.ErrAIEndpointNotAvailable) {
 		t.Fatalf("explicit miss err = %v, want ErrAIEndpointNotAvailable", err)
 	}
 	// 空自动池 → 回落内置行(不报错,五返回值还原 builtin 行):这是
 	// 「空候选 + builtin 健康」的降级主路径,顺带钉死。
-	id, baseURL, _, builtin, err := adapter.Select("openai", "", "")
+	id, baseURL, _, builtin, err := adapter.Select("openai", "", "", "")
 	if err != nil {
 		t.Fatalf("builtin fallback err = %v", err)
 	}

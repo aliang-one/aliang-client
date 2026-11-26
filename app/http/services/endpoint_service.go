@@ -138,9 +138,14 @@ func newEndpointServiceWithStore(store *storage.EndpointStore) *EndpointService 
 // Select 选一个 endpoint:
 //   - explicitID 非空:直取该行,只校验存在/启用/协议匹配(健康与 auto_group
 //     旁路——显式指定是管理面/内核点名用途),失败返回 ErrEndpointNotAvailable;
+//     excludeID 对显式路径不生效(显式点名就是显式,重试排除只作用于自动选择);
 //   - 否则:enabled ∧ 协议 toggle ∧ 非 429 冷却 ∧ (ok ∨ 冷却已到期,到期即懒恢复)
-//     ∧ 模型过滤 ∧ auto_group,按 priority、created_at 升序取首;
+//     ∧ 模型过滤 ∧ auto_group ∧ id ∉ excludeIDs,按 priority、created_at 升序取首;
 //   - 候选为空 → 回落内置行(若其 enabled/协议/健康可用)→ 否则 ErrNoEndpoint。
+//
+// excludeIDs 是重试真切换的机制(final-review 必改 2):路由层重试 attempt 把
+// 上一失败 attempt 的 endpoint id 传入,Select 排除后天然命中下一候选——不传
+// 时单次失败不达摘除阈值,Select 仍会返回同一 endpoint,重试=同 endpoint 两枪。
 //
 // 错误契约(供 Task 3 路由层映射):两个哨兵 ErrNoEndpoint(503)/
 // ErrEndpointNotAvailable(404)可直接 errors.Is 判定;store 读失败返回的是
@@ -150,11 +155,15 @@ func newEndpointServiceWithStore(store *storage.EndpointStore) *EndpointService 
 // 内置行刻意不进自动候选池:它 priority 恒 0(两个协议 toggle 都开、不限模型),
 // 放进池里会永远排在 BYO 前面,BYO 语义整体失效。内置行的角色是兜底(回落),
 // 这也是 §6.1「空候选 → builtin 健康则回落」可被触达的唯一一致读法。
-func (s *EndpointService) Select(protocol, model, explicitID string) (*config.LLMEndpoint, error) {
+//
+// 签名演进:旧三参形态 Select(protocol, model, explicitID) → 现四参
+// Select(protocol, model, explicitID, excludeIDs ...)。变参尾部追加让既有
+// 调用点(agentCoreSelectEndpoint 等单次选择)零改动编译,重试路径显式传 id。
+func (s *EndpointService) Select(protocol, model, explicitID string, excludeIDs ...string) (*config.LLMEndpoint, error) {
 	if explicitID != "" {
 		return s.selectExplicit(protocol, explicitID)
 	}
-	ep, err := s.selectAuto(protocol, model)
+	ep, err := s.selectAuto(protocol, model, excludeIDs)
 	if err == nil {
 		return ep, nil
 	}
@@ -180,16 +189,26 @@ func (s *EndpointService) selectExplicit(protocol, id string) (*config.LLMEndpoi
 }
 
 // selectAuto 自动池选择。健康态语义(spec §6.4):cooldown_until <= now 即视为
-// 可用并当场懒恢复(回 ok、清零计数),不跑后台定时器。
-func (s *EndpointService) selectAuto(protocol, model string) (*config.LLMEndpoint, error) {
+// 可用并当场懒恢复(回 ok、清零计数),不跑后台定时器。excludeIDs 非空时
+// 过滤指定 id(重试真切换;排除后空候选由 Select 统一回落 builtin)。
+func (s *EndpointService) selectAuto(protocol, model string, excludeIDs []string) (*config.LLMEndpoint, error) {
 	list, err := s.store.List()
 	if err != nil {
 		return nil, fmt.Errorf("endpoint: 读注册表失败: %w", err)
+	}
+	excluded := map[string]bool{}
+	for _, id := range excludeIDs {
+		if id != "" {
+			excluded[id] = true
+		}
 	}
 	now := time.Now().Unix()
 	var best *config.LLMEndpoint
 	for _, e := range list {
 		if e.ID == storage.BuiltinEndpointID { // 内置行只做兜底,见 Select 注释
+			continue
+		}
+		if excluded[e.ID] { // 重试排除:失败过的行本轮不再入选
 			continue
 		}
 		if !e.Enabled || !endpointProtocolMatch(e, protocol) || !e.AutoGroup {
@@ -247,6 +266,12 @@ func (s *EndpointService) fallbackBuiltin(protocol string) (*config.LLMEndpoint,
 // (连续失败未达阈值),它的计数只能被 ReportSuccess 或下一条失败改写——
 // 每次路过 select 都清零会让摘除永远攒不满。
 //
+// 池模式守卫(final-review finding 5,严格不变量 6):failure_disable=0 时
+// 本方法不写任何健康列——「池模式不写任何健康状态」含清理陈旧态(残留
+// disabled 原样保留,直到管理员显式重置或切回摘除模式)。行的可用性已由
+// 调用点的过滤语义放行(status!=ok 且冷却过期即视为可用),跳过写库不影响
+// 本轮路由。
+//
 // 并发(quality fix Important 1):UpdateHealth 必须在 s.mu 内执行,与
 // ReportFailure 同一把锁。冷却到期正是「流量恢复再失败」的 designed operating
 // point——恢复写与失败摘除交错时,锁外的读改写会把刚写入的摘除/429 冷却
@@ -259,6 +284,11 @@ func (s *EndpointService) recoverIfNeeded(e *config.LLMEndpoint, now int64) {
 	}
 	if e.CooldownUntil > now {
 		return // 未到期,不该被恢复(调用点已过滤,双保险)
+	}
+	if !s.currentPolicy().FailureDisable {
+		// 池模式不写库(不变量 6):行在过滤语义上已可用,陈旧健康态原样保留。
+		logger.Info(fmt.Sprintf("endpoint: %s 冷却已到期(池模式,健康态不落库,陈旧态保留)", e.ID))
+		return
 	}
 
 	s.mu.Lock()

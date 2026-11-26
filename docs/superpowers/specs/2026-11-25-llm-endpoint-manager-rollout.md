@@ -17,7 +17,7 @@
 1. 仪表盘 → 设置 → 「LLM 端点管理」子页（`EndpointManagerSettings`）。
 2. 对照旧配置（设置页 agentcore 面板里的 `customer.agentcore_llm`）逐条**新增**：
    - 填 name、base_url、api_key；勾协议 toggle（Anthropic = `/v1/messages`，OpenAI = `/v1/chat/completions`）；auto 分组开启；priority 越小越优先。
-   - 填完 base_url + api_key 后点「拉取模型」确认上游可达，模型列表确认后再保存。
+   - **先保存端点**（保存后行上才有 id），再在列表行上点「测试连接」/「拉取模型」——拉取模型是行级按钮，依赖已保存的行（id）；拉到的模型列表确认回填编辑表单后，再点保存落库。顺序：保存端点 → 行上「拉取模型」→ 确认回填 → 再保存。
 3. 想让 registry 完全接管（旧字段彻底不参与），需在 agentcore 设置面板**清空旧字段**：把 `base_url` / `api_key` / `model` 等输入框清空后保存（`applyAgentCoreLLMClearing` 会把空串写入 patch.agentcore_llm，后端 deep-merge 后该字段不再命中）。**只清空想让 registry 接管的那些字段即可**（如只想让 registry 管 api_key，就只清 api_key）。
 4. 清空后无需重启：内核三解析点（`agentCoreBaseURL` / `agentCoreAuthToken` / `agentCoreEnsureUpstream`）每次出网实时读 registry，56432 数据面同样实时读。
 
@@ -34,7 +34,7 @@
 1. **内置链路不变**：不配任何 BYO endpoint，跑一条 agentcore 对话——应走 aliang 隧道成功（与升级前一致）。
 2. **BYO 接入**：设置 → LLM 端点管理 → 新增（真实上游 base_url + key）→ 「测试连接」应 ok 且报模型数 → 「拉取模型」返回列表 → 确认保存。
 3. **选中转发**：BYO priority 设小（优先于内置）→ 发一条对话 → 上游侧（或对话内容）确认走的是 BYO；列表页该行并发用量 inflight 出现过非 0。
-4. **失败摘除**：把 BYO 的 base_url 改成不可达地址（或上游停掉）→ 组策略保持默认（失败摘除开，阈值 3）→ 连发 3 条对话 → 第 3 条后该行健康徽标变 disabled（红）+ 显示最近错误 → 对话自动回落内置链路不中断。
+4. **失败摘除**：把 BYO 的 base_url 改成不可达地址（或上游停掉）→ 组策略保持默认（失败摘除开，阈值 3）→ 连发 3 条对话 → 第 3 条后该行健康徽标变 disabled（红）+ 显示最近错误 → **第 3 条失败后**，后续对话自动回落内置链路（前 3 条本身会把上游错误回给客户端——摘除发生在第 3 次失败落库之后，摘除前的请求原样透传）。另外单次失败（未达阈值）触发的一次重试会切到下一候选 endpoint，不是同 endpoint 重打。
 5. **冷却懒恢复**：等冷却到期（默认 300s）→ 再发一条对话 → 恢复走 BYO，徽标回 ok；或直接点「重置健康」立即恢复。
 6. **池模式**：组策略关「失败摘除」→ BYO 保持不可达再发对话 → 徽标恒 ok、不摘除（对话透传上游错误）；开回「失败摘除」恢复 §4.4 行为。
 7. **/v1/models 聚合**：`curl http://127.0.0.1:56432/v1/models` → 返回各 BYO models 并集（models=[] 的行与内置行不贡献）。

@@ -300,6 +300,63 @@ func TestEndpointService_SelectExplicitID(t *testing.T) {
 	}
 }
 
+// ---- Select:重试排除(excludeID,final-review 必改 2)-----------------------
+
+// excludeID 语义(「失败切下一 endpoint 重试一次」的需求拍板):
+//   - 自动选择路径排除该 id(重试不得再选同一 endpoint 两枪);
+//   - exclude 后仍有候选 → 取下一优先级;
+//   - exclude 后空候选 → 照旧回落 builtin;
+//   - explicitID 显式路径不受 exclude 影响(显式点名就是显式)。
+func TestEndpointService_SelectExcludeIDSkipsRow(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+	createEndpoint(t, store, anthropicEP("ep-first", 10))
+	createEndpoint(t, store, anthropicEP("ep-second", 20))
+
+	got, err := svc.Select("anthropic", "", "")
+	if err != nil || got.ID != "ep-first" {
+		t.Fatalf("基线应取 ep-first, got %s err=%v", got.ID, err)
+	}
+
+	// 排除首选 → 命中次选(真切换,而非同 endpoint 重打)。
+	got, err = svc.Select("anthropic", "", "", "ep-first")
+	if err != nil {
+		t.Fatalf("exclude 后 select: %v", err)
+	}
+	if got.ID != "ep-second" {
+		t.Fatalf("排除 ep-first 应取 ep-second, got %s", got.ID)
+	}
+
+	// 排除到只剩无候选 → 回落 builtin(不是 ErrNoEndpoint)。
+	got, err = svc.Select("anthropic", "", "", "ep-first", "ep-second")
+	if err != nil {
+		t.Fatalf("exclude 全部后应回落 builtin: %v", err)
+	}
+	if got.ID != storage.BuiltinEndpointID {
+		t.Fatalf("exclude 全部后应回落内置行, got %s", got.ID)
+	}
+
+	// exclude 未知 id:不影响正常选择。
+	got, err = svc.Select("anthropic", "", "", "no-such-id")
+	if err != nil || got.ID != "ep-first" {
+		t.Fatalf("exclude 不存在的 id 应保持首选, got %s err=%v", got.ID, err)
+	}
+}
+
+// explicitID 显式路径不受 exclude 影响:点名 ep-first 时即使 excludeID ==
+// ep-first 也照样返回它(重试排除只作用于自动选择)。
+func TestEndpointService_SelectExcludeIDIgnoredForExplicit(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+	createEndpoint(t, store, anthropicEP("ep-manual-x", 10))
+
+	got, err := svc.Select("anthropic", "", "ep-manual-x", "ep-manual-x")
+	if err != nil {
+		t.Fatalf("显式点名不受 exclude 影响: %v", err)
+	}
+	if got.ID != "ep-manual-x" {
+		t.Fatalf("显式点名应返回该行, got %s", got.ID)
+	}
+}
+
 // ---- ReportFailure:计数 / 摘除 / 429 / 4xx / 成功 ---------------------------
 
 func TestEndpointService_ReportFailureThresholdDisables(t *testing.T) {
@@ -428,6 +485,42 @@ func TestEndpointService_PoolModeWritesNothing(t *testing.T) {
 	if got.ConsecutiveFailures != 0 || got.HealthStatus != "ok" ||
 		got.CooldownUntil != 0 || got.RateLimitedUntil != 0 || got.LastError != "" {
 		t.Fatalf("池模式不得写任何健康状态: %+v", got)
+	}
+}
+
+// final-review finding 5(严格不变量 6):池模式(failure_disable=0)下
+// recoverIfNeeded 也不得写库——「池模式不写任何健康状态」含清理陈旧态。
+// 场景:池模式 + 残留 disabled 行 + 冷却过期 → Select 应返回该行(可用性
+// 优先:过滤语义上 status!=ok 且 cooldown 已过期即视为可用),
+// 但健康列零写入(禁用残留原样保留,直到管理员显式重置或切回摘除模式)。
+func TestEndpointService_PoolModeLazyRecoveryWritesNothing(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+	createEndpoint(t, store, anthropicEP("ep-pool", 10))
+
+	// 切池模式。
+	if err := store.SetPolicy(&config.EndpointGroupPolicy{
+		FailureDisable: false, FailureThreshold: 3, CooldownSec: 300, RateLimitCooldownSec: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 残留态:disabled + 冷却已过期(池模式前留下的陈旧摘除)。
+	markHealth(t, store, "ep-pool", storage.HealthUpdate{
+		Status: "disabled", Failures: 3, CooldownUntil: time.Now().Unix() - 5, LastErr: "old boom",
+	})
+
+	got, err := svc.Select("anthropic", "", "")
+	if err != nil {
+		t.Fatalf("池模式下过期残留行应可选: %v", err)
+	}
+	if got.ID != "ep-pool" {
+		t.Fatalf("应选中 ep-pool, got %s", got.ID)
+	}
+
+	// 健康列零写入:disabled 残留原样保留(不得被懒恢复清成 ok)。
+	row := mustGet(t, store, "ep-pool")
+	if row.HealthStatus != "disabled" || row.ConsecutiveFailures != 3 || row.LastError != "old boom" {
+		t.Fatalf("池模式懒恢复不得写健康列(不变量 6 含清理陈旧态): %+v", row)
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 
 	"aliang.one/nursorgate/app/http/common"
@@ -186,8 +187,15 @@ func (h *EndpointHandler) HandleCreate(w http.ResponseWriter, r *http.Request) {
 	if req.Enabled != nil {
 		enabled = *req.Enabled
 	}
+	// id 缺省时由 handler 生成 uuid(final-review 必改 1:UI endpointToPayload
+	// 不下发 id,store 又拒空 id——不生成则「新增端点」整个功能 400)。显式 id
+	// 仍允许(管理面/测试用)。
+	id := strings.TrimSpace(req.ID)
+	if id == "" {
+		id = uuid.NewString()
+	}
 	ep := &config.LLMEndpoint{
-		ID:                strings.TrimSpace(req.ID),
+		ID:                id,
 		Name:              strings.TrimSpace(req.Name),
 		BaseURL:           strings.TrimSpace(req.BaseURL),
 		APIKey:            req.APIKey,
@@ -209,7 +217,9 @@ func (h *EndpointHandler) HandleCreate(w http.ResponseWriter, r *http.Request) {
 		common.ErrorBadRequest(w, err.Error(), nil)
 		return
 	}
-	common.Success(w, h.endpointViews([]*config.LLMEndpoint{ep}))
+	// 成功响应为单视图(final-review finding 4:与 HandleGet/HandleUpdate 形状
+	// 一致,调用方不必按数组解包)。
+	common.Success(w, h.endpointViews([]*config.LLMEndpoint{ep})[0])
 }
 
 // endpointUpdateRequest 是 PUT 的请求体:全字段可选,零值=不改(指针区分

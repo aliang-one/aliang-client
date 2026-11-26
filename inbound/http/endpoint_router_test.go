@@ -75,7 +75,10 @@ type fakeAISelector struct {
 	mu sync.Mutex
 
 	selectQueue []selectResult
-	selectCalls []struct{ protocol, model, explicitID string }
+	selectCalls []struct {
+		protocol, model, explicitID string
+		excludeID                   string
+	}
 
 	acquired        []string
 	released        []string
@@ -90,10 +93,13 @@ type fakeAISelector struct {
 	releaseOnce func()
 }
 
-func (f *fakeAISelector) Select(protocol, model, explicitID string) (string, string, string, bool, error) {
+func (f *fakeAISelector) Select(protocol, model, explicitID, excludeID string) (string, string, string, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.selectCalls = append(f.selectCalls, struct{ protocol, model, explicitID string }{protocol, model, explicitID})
+	f.selectCalls = append(f.selectCalls, struct {
+		protocol, model, explicitID string
+		excludeID                   string
+	}{protocol, model, explicitID, excludeID})
 	if f.failOnSelect != nil {
 		f.failOnSelect(protocol, model, explicitID)
 	}
@@ -140,10 +146,16 @@ func (f *fakeAISelector) ModelsUnion() []map[string]any {
 	return f.modelsUnionData
 }
 
-func (f *fakeAISelector) snapshot() (calls []struct{ protocol, model, explicitID string }, acquired, released, successes []string, failures []recordedFailure) {
+func (f *fakeAISelector) snapshot() (calls []struct {
+	protocol, model, explicitID string
+	excludeID                   string
+}, acquired, released, successes []string, failures []recordedFailure) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]struct{ protocol, model, explicitID string }{}, f.selectCalls...),
+	return append([]struct {
+			protocol, model, explicitID string
+			excludeID                   string
+		}{}, f.selectCalls...),
 		append([]string{}, f.acquired...), append([]string{}, f.released...),
 		append([]string{}, f.successes...), append([]recordedFailure{}, f.failures...)
 }

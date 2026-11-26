@@ -307,6 +307,22 @@ describe('endpointToPayload 表单 → 服务端线格式', () => {
     expect(payload.api_key).toBe('sk-login');
   });
 
+  it('final-review finding 6:builtin 行 priority 兜底 0(表单残留非 0 也不上送,store 层拒 builtin priority≠0)', () => {
+    const payload = endpointToPayload({
+      name: 'builtin',
+      baseUrl: '',
+      apiKey: '',
+      protocolAnthropic: true,
+      protocolOpenAI: true,
+      autoGroup: true,
+      priority: '30', // 表单残留非 0(理论上 UI 已禁输入,兜底防脏态)
+      maxConcurrency: 0,
+      modelsText: '',
+      enabled: true,
+    }, true);
+    expect(payload.priority).toBe(0);
+  });
+
   it('api_key 空值不进 payload(PUT 语义:空=不改,§17 不变量 7)', () => {
     const payload = endpointToPayload({
       name: 'prov',

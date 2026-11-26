@@ -34,8 +34,11 @@ func NewAIEndpointSelectorAdapter(svc *EndpointService) inboundhttp.AIEndpointSe
 	return &aiEndpointSelectorAdapter{svc: svc}
 }
 
-func (a *aiEndpointSelectorAdapter) Select(protocol, model, explicitID string) (string, string, string, bool, error) {
-	ep, err := a.svc.Select(protocol, model, explicitID)
+func (a *aiEndpointSelectorAdapter) Select(protocol, model, explicitID, excludeID string) (string, string, string, bool, error) {
+	// excludeID 非空 = 路由层重试 attempt 传来的上一失败 endpoint id:透传给
+	// service 排除,天然命中下一候选(final-review 必改 2,「失败切下一
+	// endpoint 重试一次」)。显式路径的排除语义在 service Select 内处理。
+	ep, err := a.svc.Select(protocol, model, explicitID, excludeID)
 	if err != nil {
 		return "", "", "", false, translateAISelectorError(err)
 	}

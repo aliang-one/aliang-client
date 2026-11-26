@@ -40,10 +40,13 @@ import (
 type AIEndpointSelector interface {
 	// Select 选一个 endpoint:explicitID 非空为显式点名(管理面/内核指定);
 	// protocol 为 "anthropic"/"openai";model 为请求体里的 model 字段。
+	// excludeID 是重试 attempt 传来的上一失败 endpoint id:自动选择路径排除
+	// 它,保证「失败切下一 endpoint 重试一次」真的切换(final-review 必改 2);
+	// 显式点名路径不受 exclude 影响。首次 attempt 传空串。
 	// 错误契约:errors.Is 可判 ErrAINoEndpoint(→503)、
 	// ErrAIEndpointNotAvailable(→404)、ErrAIQueueTimeout(→503);
 	// 其它 wrapped raw error 由路由层映射 500(registry 读挂是服务端故障)。
-	Select(protocol, model, explicitID string) (id string, baseURL string, apiKey string, builtin bool, err error)
+	Select(protocol, model, explicitID, excludeID string) (id string, baseURL string, apiKey string, builtin bool, err error)
 	// Acquire 拿并发令牌;maxConcurrency 传 0 = 以 endpoint 行内配置为准。
 	// 返回的 release 必须恰好调用一次。
 	Acquire(id string, maxConcurrency int) (release func(), err error)
@@ -149,13 +152,17 @@ func handleAIRequest(conn net.Conn, reader *bufio.Reader, req *http.Request, met
 
 	model := extractAIModel(body)
 	explicitID := req.Header.Get("X-Endpoint-Id")
+	// excludeID 是重试真切换的缝(final-review 必改 2):上一失败 attempt 的
+	// endpoint id 传给 Select,自动路径排除后天然命中下一候选——不传则单次
+	// 失败不达摘除阈值时 Select 仍返回同一 endpoint,重试=同 endpoint 两枪。
+	excludeID := ""
 
 	for attempt := 1; attempt <= aiMaxAttempts; attempt++ {
-		id, baseURL, apiKey, builtin, err := aiSelector.Select(protocol, model, explicitID)
+		id, baseURL, apiKey, builtin, err := aiSelector.Select(protocol, model, explicitID, excludeID)
 		if err != nil {
 			status, code := mapAISelectorError(err)
-			logger.Warn(fmt.Sprintf("ai route: select 失败 protocol=%s model=%q explicit=%q attempt=%d status=%d code=%s err=%v",
-				protocol, model, explicitID, attempt, status, code, err))
+			logger.Warn(fmt.Sprintf("ai route: select 失败 protocol=%s model=%q explicit=%q exclude=%q attempt=%d status=%d code=%s err=%v",
+				protocol, model, explicitID, excludeID, attempt, status, code, err))
 			writeAIErrorBody(conn, status, code, "endpoint selection failed")
 			return
 		}
@@ -196,7 +203,10 @@ func handleAIRequest(conn net.Conn, reader *bufio.Reader, req *http.Request, met
 			aiSelector.ReportFailure(id, res.status, res.held.Status)
 			if attempt < aiMaxAttempts {
 				drainAndCloseAIResponse(res.held)
-				logger.Warn(fmt.Sprintf("ai route: 上游失败,重试 endpoint=%s status=%d attempt=%d", id, res.status, attempt))
+				// 重试切下一候选:把本失败 endpoint 记为 exclude,下次 Select
+				// 不再选它(429 与 5xx 同口径)。
+				excludeID = id
+				logger.Warn(fmt.Sprintf("ai route: 上游失败,重试并排除 endpoint=%s status=%d attempt=%d", id, res.status, attempt))
 				continue
 			}
 			// 重试耗尽:透传最后一次上游错误响应(比合成 502 信息量大)。
@@ -209,7 +219,9 @@ func handleAIRequest(conn net.Conn, reader *bufio.Reader, req *http.Request, met
 		// 传输失败(无 HTTP 响应)。
 		aiSelector.ReportFailure(id, 0, res.errMsg())
 		if attempt < aiMaxAttempts {
-			logger.Warn(fmt.Sprintf("ai route: 上游不可达,重试 endpoint=%s err=%v attempt=%d", id, res.err, attempt))
+			// 传输失败同样切下一候选(重试不是同 endpoint 重打)。
+			excludeID = id
+			logger.Warn(fmt.Sprintf("ai route: 上游不可达,重试并排除 endpoint=%s err=%v attempt=%d", id, res.err, attempt))
 			continue
 		}
 		logger.Warn(fmt.Sprintf("ai route: 重试耗尽,上游不可达 endpoint=%s err=%v", id, res.err))

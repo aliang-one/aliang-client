@@ -118,9 +118,11 @@ export function normalizeEndpointView(source) {
 }
 
 // 表单 → POST/PUT 线格式载荷。isBuiltin:builtin 行 base_url 恒空、auto_group
-// 恒 true(UI 禁改,这里兜一道防表单态残留;§17 不变量 8)。api_key 空值不进
-// 载荷——PUT 语义「空 = 不改」要求键缺省而非空串;POST 侧缺键 = 服务端空值,
-// 与「新端点无凭据」合法形态一致(非回环缺 key 已被 validate 挡住)。
+// 恒 true、priority 恒 0(UI 禁改,这里兜一道防表单态残留;§17 不变量 8——
+// store 层对 builtin 行 priority≠0 直接拒写,兜底防的是残留值静默 400)。
+// api_key 空值不进载荷——PUT 语义「空 = 不改」要求键缺省而非空串;POST 侧缺
+// 键 = 服务端空值,与「新端点无凭据」合法形态一致(非回环缺 key 已被
+// validate 挡住)。
 export function endpointToPayload(form, isBuiltin = false) {
   const f = form || {};
   const apiKey = String(f.apiKey || '').trim();
@@ -136,7 +138,7 @@ export function endpointToPayload(form, isBuiltin = false) {
     protocol_anthropic: f.protocolAnthropic === true,
     protocol_openai: f.protocolOpenAI === true,
     auto_group: isBuiltin ? true : f.autoGroup === true,
-    priority: Number(String(f.priority ?? '0').trim()) || 0,
+    priority: isBuiltin ? 0 : (Number(String(f.priority ?? '0').trim()) || 0),
     max_concurrency: Number(String(f.maxConcurrency ?? '0').trim()) || 0,
     models,
     enabled: f.enabled !== false,
