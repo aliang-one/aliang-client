@@ -394,7 +394,9 @@ func agentCoreEnsureUpstream(ctx context.Context) error {
 		if key := strings.TrimSpace(ep.APIKey); key != "" {
 			req.Header.Set("Authorization", "Bearer "+key)
 		}
-		client := &http.Client{Timeout: 2 * time.Second}
+		// 10s 对齐 endpoint 层 endpointModelsTimeout:慢网关拉 /v1/models 实测
+		// 5-6s(maids.ink),2s 会把可用端点误判不可达。TCP 拨测仍 2s 快速失败。
+		client := &http.Client{Timeout: 10 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
 			return fmt.Errorf("自定义 LLM 端点不可达(%s: %v)——请检查地址与服务状态后重试", base, err)

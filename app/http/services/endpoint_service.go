@@ -45,6 +45,10 @@ const (
 	endpointMaxQueue     = 32
 	endpointAcquireWait  = 30 * time.Second
 	endpointProbeTimeout = 2 * time.Second
+	// endpointModelsTimeout 是 /v1/models 模型列表拉取的 HTTP 超时。与 TCP 拨测
+	// 分离:实测有上游网关拉列表要 5-6s(2026-11-26 maids.ink 装机实证),2s 会把
+	// 可用网关误判成「拉取失败」;10s 覆盖慢网关,拨不通仍由 TCP 层 2s 快速失败。
+	endpointModelsTimeout = 10 * time.Second
 )
 
 // getPolicyFallback 是读组策略失败时的保底值:与 store 层默认策略同形
@@ -132,7 +136,7 @@ func newEndpointServiceWithStore(store *storage.EndpointStore) *EndpointService 
 		sems:        map[string]*endpointGate{},
 		inflight:    map[string]int{},
 		waitTimeout: endpointAcquireWait,
-		httpClient:  &http.Client{Timeout: endpointProbeTimeout},
+		httpClient:  &http.Client{Timeout: endpointModelsTimeout},
 	}
 }
 
