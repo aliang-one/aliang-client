@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
@@ -256,6 +257,69 @@ func TestAgentCoreEnsureUpstreamNilServiceDegrades(t *testing.T) {
 		t.Fatalf("nil service 应走原自愈链且探针可达: %v", err)
 	}
 	expectProbeDialed(t, accepted, "nil service 降级探针")
+}
+
+// ---- Select 返回错误 → 三处解析点全部回落继承链 -------------------------------
+
+// makeRegistrySelectError 起一个 registry 但让 Select("anthropic") 返回
+// ErrNoEndpoint：内置行 disabled + 远期冷却，auto 池无其他候选。
+func makeRegistrySelectError(t *testing.T) *EndpointService {
+	t.Helper()
+	svc, err := NewEndpointServiceForTest()
+	if err != nil {
+		t.Fatalf("起测试 registry: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.Close() })
+	stubAgentCoreEndpointService(t, svc)
+	now := time.Now().Unix()
+	if err := svc.store.UpdateHealth(storage.BuiltinEndpointID, storage.HealthUpdate{
+		Status:           "disabled",
+		Failures:         1,
+		CooldownUntil:    now + 86400,
+		RateLimitedUntil: 0,
+		LastErr:          "test select error",
+	}); err != nil {
+		t.Fatalf("标内置行 disabled: %v", err)
+	}
+	return svc
+}
+
+// Select error → baseURL 落继承链(env 回环原样采用)。
+func TestAgentCoreBaseURLSelectErrorFallsToInherited(t *testing.T) {
+	isolateAgentCoreRegistryEnv(t)
+	makeRegistrySelectError(t)
+	t.Setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:9999")
+
+	if got := agentCoreBaseURL(); got != "http://127.0.0.1:9999" {
+		t.Errorf("→ %q, want 继承链 env 值(Select 失败回落)", got)
+	}
+}
+
+// Select error → auth 落继承链(env，不打 user-center)。
+func TestAgentCoreAuthTokenSelectErrorFallsToInherited(t *testing.T) {
+	isolateAgentCoreRegistryEnv(t)
+	makeRegistrySelectError(t)
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "sk-from-env")
+	stubAgentCoreUserAPIKeys(t, func() ([]auth.UserAPIKey, error) {
+		t.Error("Select 失败且 env 有值时不该打 user-center")
+		return nil, nil
+	})
+
+	if got := agentCoreAuthToken(); got != "sk-from-env" {
+		t.Errorf("→ %q, want sk-from-env(Select 失败回落)", got)
+	}
+}
+
+// Select error → ensure upstream 落原自愈链(回环探针被拨)。
+func TestAgentCoreEnsureUpstreamSelectErrorFallsToSelfHeal(t *testing.T) {
+	makeRegistrySelectError(t)
+	accepted := setAgentCoreDelegateProbeEnv(t)
+	swapGlobalCustomerMeshFallback(t, false)
+
+	if err := agentCoreEnsureUpstream(context.Background()); err != nil {
+		t.Fatalf("Select 失败应走原自愈链且探针可达: %v", err)
+	}
+	expectProbeDialed(t, accepted, "Select 失败降级探针")
 }
 
 // ---- 共用脚手架 ---------------------------------------------------------------

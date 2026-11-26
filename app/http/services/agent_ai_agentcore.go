@@ -126,10 +126,12 @@ var agentCoreGetEndpointServiceFn = GetEndpointService
 func agentCoreSelectEndpoint() *config.LLMEndpoint {
 	svc := agentCoreGetEndpointServiceFn()
 	if svc == nil {
+		logger.Info("agentcore: endpoint registry 不可用(GetEndpointService 为 nil)，内核出网回落 env/settings 继承链")
 		return nil
 	}
 	ep, err := svc.Select("anthropic", "", "")
 	if err != nil {
+		logger.Warn(fmt.Sprintf("agentcore: endpoint registry Select 失败(%v)，内核出网回落 env/settings 继承链", err))
 		return nil
 	}
 	return ep
