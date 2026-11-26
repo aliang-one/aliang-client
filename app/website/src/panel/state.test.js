@@ -2,7 +2,7 @@
 // 覆盖:running / stopped / starting / stopping / restarting / error / logged_out
 // + 过渡态优先于远端 + connLost 优先于远端快照。
 import { describe, expect, it } from 'vitest';
-import { derivePanelState } from './state';
+import { allControlsDisabled, derivePanelState } from './state';
 
 // makeSummary 按 tray_summary.go 契约构造一份聚合快照(字段名即后端 JSON 契约)。
 function makeSummary({ isRunning = false, blockedCode = '', withRun = true } = {}) {
@@ -88,5 +88,23 @@ describe('derivePanelState 过渡态优先', () => {
 
   it('未知过渡态字符串视同无过渡(容错,不炸)', () => {
     expect(derivePanelState(makeSummary({ isRunning: false }), false, 'flying')).toBe('stopped');
+  });
+});
+
+describe('allControlsDisabled(传输行三控件全禁判定)', () => {
+  it('过渡态三控件全禁(spec §3:过渡行「三控件全禁」)', () => {
+    expect(allControlsDisabled('starting')).toBe(true);
+    expect(allControlsDisabled('stopping')).toBe(true);
+    expect(allControlsDisabled('restarting')).toBe(true);
+  });
+
+  it('未登录三键全禁(spec §3 未登录行)', () => {
+    expect(allControlsDisabled('logged_out')).toBe(true);
+  });
+
+  it('running/stopped/error 不全禁(error 态启动键恢复可用)', () => {
+    expect(allControlsDisabled('running')).toBe(false);
+    expect(allControlsDisabled('stopped')).toBe(false);
+    expect(allControlsDisabled('error')).toBe(false);
   });
 });

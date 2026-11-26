@@ -50,3 +50,13 @@ export function derivePanelState(summary, connLost, localTransition) {
   // 5) 常规二态。
   return isRunning ? 'running' : 'stopped';
 }
+
+// allControlsDisabled(kind) — 传输行「三控件全禁」判定(spec §3 矩阵):
+//   过渡态(starting/stopping/restarting):过渡行明确「三控件全禁」,
+//     这也是 §6-1 防抖的实现地基(主按钮点击入口先查本函数直接拒绝);
+//   logged_out:未登录行明确「三键全禁」(未登录不能启动)。
+// 其余三态不全禁:running(停止/重启可用)、stopped(启动可用)、
+// error(§3 出错行「启动恢复可用」,不许把用户锁死在错误态外)。
+export function allControlsDisabled(kind) {
+  return kind === 'starting' || kind === 'stopping' || kind === 'restarting' || kind === 'logged_out';
+}
