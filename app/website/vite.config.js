@@ -8,7 +8,15 @@ export default defineConfig({
     environment: 'jsdom',
   },
   build: {
-    outDir: 'dist'
+    outDir: 'dist',
+    // 双入口:仪表盘(index.html)与托盘面板(panel.html,Task 7)各自独立
+    // 打包——面板入口不进仪表盘 chunk 图,仪表盘重依赖也不进面板产物。
+    rollupOptions: {
+      input: {
+        main: 'index.html',
+        panel: 'panel.html'
+      }
+    }
   },
   server: {
     port: 5173,
