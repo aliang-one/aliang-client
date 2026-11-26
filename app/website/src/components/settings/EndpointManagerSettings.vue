@@ -486,7 +486,6 @@ export default {
       saving: false,
       fetchModelsOpen: false,
       fetchedModels: [],
-      fetchedTargetId: '',
       fetchedTargetRow: null,
       policy: emptyPolicy(),
       policyError: '',
@@ -551,11 +550,21 @@ export default {
       }
     },
     async savePolicy() {
-      // 与后端 SetPolicy 同源:三数值必须 ≥ 0(整数)。
+      // 与后端 SetPolicy 同源:三数值必须 ≥ 0(整数)。空串先显式拒绝——
+      // Number('')===0 会让空输入静默写 0(失败阈值 0 = 首败即摘除)。
+      const raw = {
+        failure_threshold: String(this.policy.failureThreshold ?? '').trim(),
+        cooldown_sec: String(this.policy.cooldownSec ?? '').trim(),
+        rate_limit_cooldown_sec: String(this.policy.rateLimitCooldownSec ?? '').trim(),
+      };
+      if (Object.values(raw).some((v) => v === '')) {
+        this.policyError = this.t('endpointManager_error_policyValues');
+        return;
+      }
       const numbers = {
-        failure_threshold: Number(String(this.policy.failureThreshold ?? '').trim()),
-        cooldown_sec: Number(String(this.policy.cooldownSec ?? '').trim()),
-        rate_limit_cooldown_sec: Number(String(this.policy.rateLimitCooldownSec ?? '').trim()),
+        failure_threshold: Number(raw.failure_threshold),
+        cooldown_sec: Number(raw.cooldown_sec),
+        rate_limit_cooldown_sec: Number(raw.rate_limit_cooldown_sec),
       };
       for (const value of Object.values(numbers)) {
         if (!Number.isInteger(value) || value < 0) {
@@ -680,7 +689,6 @@ export default {
       try {
         const models = await fetchEndpointModels(row.id);
         this.fetchedModels = models.filter((m) => typeof m === 'string' && m.trim());
-        this.fetchedTargetId = row.id;
         this.fetchedTargetRow = row;
         this.fetchModelsOpen = true;
       } catch (error) {
@@ -692,7 +700,6 @@ export default {
     closeFetchedModels() {
       this.fetchModelsOpen = false;
       this.fetchedModels = [];
-      this.fetchedTargetId = '';
       this.fetchedTargetRow = null;
     },
     // 确认后把 models 写进编辑表单(不自动 PUT);用户点保存才落库(spec §10)。

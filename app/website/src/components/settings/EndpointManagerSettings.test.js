@@ -327,6 +327,23 @@ describe('EndpointManagerSettings LLM 端点管理卡', () => {
     expect(setEndpointPolicy).not.toHaveBeenCalled();
     expect(el.textContent).toContain('endpointManager_error_policyValues');
   });
+
+  it('组策略空串拒:空输入不静默写 0(quality-fix #4,阈值 0=首败即摘除)', async () => {
+    const el = mountComp();
+    await flush();
+    setInput(el, 'policyThreshold', '');
+    buttonByText(el, 'endpointManager_policySave').click();
+    await flush();
+    expect(setEndpointPolicy).not.toHaveBeenCalled();
+    expect(el.textContent).toContain('endpointManager_error_policyValues');
+    // 恢复合法值后可正常保存(错误条撤离)
+    setInput(el, 'policyThreshold', '3');
+    buttonByText(el, 'endpointManager_policySave').click();
+    await flush();
+    expect(setEndpointPolicy).toHaveBeenCalledTimes(1);
+    expect(setEndpointPolicy.mock.calls[0][0].failure_threshold).toBe(3);
+    expect(el.textContent).not.toContain('endpointManager_error_policyValues');
+  });
 });
 
 describe('endpointHealthBadge / endpointToneClass 徽标纯函数', () => {

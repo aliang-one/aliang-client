@@ -1799,7 +1799,7 @@ export default {
   endpointManager_error_maxConcurrency: 'Max concurrency must be an integer of at least 0.',
   endpointManager_error_builtinBaseUrl: 'Builtin endpoint Base URL must stay empty (rides the platform tunnel).',
   endpointManager_error_models: 'Models must be a JSON array of strings.',
-  endpointManager_error_policyValues: 'Failure threshold and cooldowns must be integers of at least 0.',
+  endpointManager_error_policyValues: 'Failure threshold and cooldowns are required and must be integers of at least 0.',
 
   // -- ConfigSyncSettings --
   sync_title: 'Config Sync Center',

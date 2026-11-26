@@ -1796,7 +1796,7 @@ export default {
   endpointManager_error_maxConcurrency: '最大并发必须是不小于 0 的整数。',
   endpointManager_error_builtinBaseUrl: '内置端点的 Base URL 必须为空（走内置隧道）。',
   endpointManager_error_models: '模型列表必须是 JSON 字符串数组。',
-  endpointManager_error_policyValues: '失败阈值与冷却时长必须是不小于 0 的整数。',
+  endpointManager_error_policyValues: '失败阈值与冷却时长不能为空，且必须是不小于 0 的整数。',
 
   // -- ConfigSyncSettings --
   sync_title: '配置同步中心',
