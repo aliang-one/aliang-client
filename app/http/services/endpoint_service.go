@@ -91,6 +91,9 @@ type EndpointService struct {
 	waitTimeout time.Duration
 	// httpClient 用于上游探测(测试连接/拉模型);测试可注入替换。
 	httpClient *http.Client
+	// builtinProbeAddr 是 builtin 行测试连接的拨测目标(平台代理入口);
+	// 空时用生产默认 127.0.0.1:56432,测试注入假地址断言失败路径。
+	builtinProbeAddr string
 }
 
 var (
@@ -637,7 +640,21 @@ func (s *EndpointService) Test(id string) (bool, int, string) {
 	}
 	base := strings.TrimSpace(e.BaseURL)
 	if base == "" {
-		return false, 0, "内置 endpoint 走平台隧道,无独立探测目标(健康以转发链为准)"
+		// builtin 行真探测:拨本机平台代理入口(56432),与内核 agentCoreEnsureUpstream
+		// 对 builtin 的探针同口径——隧道健康以转发链为准,入口活着即可用。通了给
+		// 明确「可达」而非误报失败(2026-11-26 装机首测误导实证);不通给可自查文案。
+		dialAddr := s.builtinProbeAddr
+		if dialAddr == "" {
+			dialAddr = "127.0.0.1:56432"
+		}
+		conn, err := net.DialTimeout("tcp", dialAddr, endpointProbeTimeout)
+		if err != nil {
+			logger.Warn(fmt.Sprintf("endpoint: %s builtin 入口拨测失败 %s: %v", id, dialAddr, err))
+			return false, 0, fmt.Sprintf("平台隧道入口 %s 不可达: %v——请在仪表盘启动代理服务后重试", dialAddr, err)
+		}
+		_ = conn.Close()
+		logger.Info(fmt.Sprintf("endpoint: %s builtin 入口可达 %s(隧道健康以转发链为准)", id, dialAddr))
+		return true, 0, "平台隧道入口可达(内置链路健康以实际转发为准)"
 	}
 	// TCP 拨测:上游端口通不通,2s 封顶,失败摘要直接进管理面。
 	u, err := url.Parse(base)

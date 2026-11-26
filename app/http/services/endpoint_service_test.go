@@ -2,6 +2,7 @@ package services
 
 import (
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -854,10 +855,37 @@ func TestEndpointService_TestProbe(t *testing.T) {
 		t.Fatalf("死端口应不可达且带摘要: %v %d %q", ok, count, summary)
 	}
 
-	// 内置行无探测目标 → 明确报错。
+	// 内置行:拨测平台代理入口。注入死地址 → 不可达+可自查摘要;
+	// 真实回环入口由 TestEndpointService_TestBuiltinProbeReachable 单测覆盖。
+	svc.builtinProbeAddr = "127.0.0.1:1"
 	ok, _, summary = svc.Test(storage.BuiltinEndpointID)
 	if ok || summary == "" {
-		t.Fatalf("内置行探测应返回不可达与摘要: %v %q", ok, summary)
+		t.Fatalf("内置行入口不可达应返回失败与摘要: %v %q", ok, summary)
+	}
+}
+
+func TestEndpointService_TestBuiltinProbeReachable(t *testing.T) {
+	svc, _ := newEndpointTestHarness(t)
+
+	// 起一个真 TCP 监听当假「平台代理入口」,拨测应通且摘要说明语义。
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	svc.builtinProbeAddr = ln.Addr().String()
+	ok, count, summary := svc.Test(storage.BuiltinEndpointID)
+	if !ok || count != 0 || summary == "" {
+		t.Fatalf("内置行入口可达应 ok 且带语义摘要: %v %d %q", ok, count, summary)
 	}
 }
 
