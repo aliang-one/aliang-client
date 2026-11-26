@@ -6,14 +6,7 @@
      localTransition),本组件只读渲染,不发起任何动作。 -->
 <script>
 import { computed, inject } from 'vue';
-
-// modeLabel — run.mode 线上值→中文(app/http/models/run.go:http=常规 /
-// tun=深度);未知值返回空串,由各态副标题自行降级(不显示错误模式名)。
-function modeLabel(mode) {
-  if (mode === 'tun') return '深度';
-  if (mode === 'http') return '常规';
-  return '';
-}
+import { modeLabel } from '../state';
 
 // statusHeaderContent(kind, run) — 状态头七态内容派生(spec §3 矩阵)。
 //   kind:derivePanelState 的七态输出;run:parseSummary 归一后的 run

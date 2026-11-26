@@ -60,3 +60,13 @@ export function derivePanelState(summary, connLost, localTransition) {
 export function allControlsDisabled(kind) {
   return kind === 'starting' || kind === 'stopping' || kind === 'restarting' || kind === 'logged_out';
 }
+
+// modeLabel(mode) — run.mode 线上值→中文显示(app/http/models/run.go:
+// http=常规 / tun=深度)。未知值返回空串,由调用方自行降级(状态头省略
+// 模式段、传输行 toast 用通用文案)。StatusHeader/TransportRow 共用,
+// 派生词汇表只留这一份,防两处漂移。
+export function modeLabel(mode) {
+  if (mode === 'tun') return '深度';
+  if (mode === 'http') return '常规';
+  return '';
+}

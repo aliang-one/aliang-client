@@ -107,7 +107,8 @@ describe('TransportRow 模式 segmented(拍板 2:运行/过渡禁用,仅停止�
     const { el } = mountRow({ summaryInit: { isRunning: true, mode: 'http' } });
     const seg = q(el, '.seg');
     expect(seg.className).toContain('seg-disabled');
-    expect(seg.title).toContain('停止后可切换');
+    // I-2:禁用解释上移行容器(seg 子元素 pointer-events:none,title 不再生效)
+    expect(q(el, '.transport-row').title).toBe('停止后可切换模式');
     const regular = seg.querySelectorAll('.opt')[0];
     const deep = seg.querySelectorAll('.opt')[1];
     expect(regular.className).toContain('on'); // 服务端 http=常规
@@ -366,5 +367,107 @@ describe('TransportRow error / logged_out 态', () => {
     expect(restartProxy).not.toHaveBeenCalled();
     expect(deep.className).not.toContain('on');
     expect(useToast().toasts.value.length).toBe(0);
+  });
+});
+
+describe('TransportRow 评审收口批(在途闸/容器提示/错误人话化)', () => {
+  it('I-1 在途闸:setMode 挂起期间再点另一模式不双发,resolve 后选中与 toast 归位', async () => {
+    let resolveSetMode;
+    setMode.mockImplementation(() => new Promise((res) => { resolveSetMode = res; }));
+    const { el } = mountRow({ summaryInit: { isRunning: false, mode: 'http' } });
+    const regular = q(el, '.seg').querySelectorAll('.opt')[0];
+    const deep = q(el, '.seg').querySelectorAll('.opt')[1];
+    deep.click(); // 点深度:落盘在途
+    await nextTick();
+    expect(setMode).toHaveBeenCalledTimes(1);
+    expect(setMode).toHaveBeenCalledWith('tun');
+    expect(deep.className).toContain('on');
+    regular.click(); // 再点常规:被在途闸挡住
+    await flush();
+    expect(setMode).toHaveBeenCalledTimes(1); // 不双发
+    expect(regular.className).not.toContain('on'); // 常规未获选中
+    expect(useToast().toasts.value.length).toBe(0); // 无成功 toast
+    resolveSetMode({ status: 'switched' }); // 首个落盘完成
+    await flush();
+    expect(deep.className).toContain('on'); // 选中归位(深度)
+    const t = useToast().toasts.value.at(-1);
+    expect(t.kind).toBe('success');
+    expect(t.msg).toContain('下次启动生效');
+  });
+
+  it('M-1 在途回读不抢乐观选中(成功路径):回读值变化被闸,落盘完成选中归位', async () => {
+    let resolveSetMode;
+    setMode.mockImplementation(() => new Promise((res) => { resolveSetMode = res; }));
+    const ctx = mountRow({ summaryInit: { isRunning: false, mode: 'http' } });
+    const deep = q(ctx.el, '.seg').querySelectorAll('.opt')[1];
+    deep.click(); // 乐观深度,setMode('tun') 在途
+    await nextTick();
+    // 在途期间轮询回读到变化值(http→tun):watch 被闸,乐观选中不被改写
+    ctx.summary.value = makeSummary({ isRunning: false, mode: 'tun' });
+    await flush();
+    expect(deep.className).toContain('on');
+    expect(useToast().toasts.value.length).toBe(0); // 纯等落盘,无 toast
+    // 落盘成功:选中归位 + 成功 toast;pending 释放点按服务端值补对账
+    resolveSetMode({ status: 'switched' });
+    await flush();
+    expect(deep.className).toContain('on');
+    expect(useToast().toasts.value.at(-1).msg).toContain('下次启动生效');
+  });
+
+  it('M-1b 失败回滚后,后续轮询回读到的服务端变化照常采纳', async () => {
+    setMode.mockRejectedValueOnce(new Error('failed to persist ingress mode tun'));
+    const ctx = mountRow({ summaryInit: { isRunning: false, mode: 'http' } });
+    const regular = q(ctx.el, '.seg').querySelectorAll('.opt')[0];
+    const deep = q(ctx.el, '.seg').querySelectorAll('.opt')[1];
+    deep.click();
+    await flush();
+    expect(regular.className).toContain('on'); // 落盘失败:回滚到点击前选中
+    expect(useToast().toasts.value.at(-1).kind).toBe('warn');
+    // 服务端后续被外部改到 tun:轮询回读值变化 → 采纳,选中跟服务端走
+    ctx.summary.value = makeSummary({ isRunning: false, mode: 'tun' });
+    await flush();
+    expect(deep.className).toContain('on');
+    expect(regular.className).not.toContain('on');
+  });
+
+  it('I-2 禁用解释上移容器:running/过渡/logged_out 三档动态给,子元素不再带 title', async () => {
+    // running:容器解释 seg 为何禁用
+    const running = mountRow({ summaryInit: { isRunning: true } });
+    expect(q(running.el, '.transport-row').title).toBe('停止后可切换模式');
+    expect(q(running.el, '[data-act="main"]').getAttribute('title')).toBeNull();
+    expect(q(running.el, '[data-act="restart"]').getAttribute('title')).toBeNull();
+    expect(q(running.el, '.seg').getAttribute('title')).toBeNull();
+
+    // 过渡:三控件全禁,容器给统一执行中提示
+    const ctx = mountRow({ summaryInit: { isRunning: false } });
+    ctx.localTransition.value = 'starting';
+    await nextTick();
+    expect(q(ctx.el, '.transport-row').title).toBe('正在执行操作…');
+
+    // logged_out:三键全禁
+    const out = mountRow({ summaryInit: { isRunning: false, blockedCode: 'not_logged_in' } });
+    expect(q(out.el, '.transport-row').title).toBe('未登录，无法操作');
+
+    // stopped(控件可用):容器不提示
+    const idle = mountRow({ summaryInit: { isRunning: false } });
+    expect(q(idle.el, '.transport-row').title).toBe('');
+  });
+
+  it('M-2 错误 toast 人话化:超时类与网络类转译(服务端 msg 原样已由既有用例护住)', async () => {
+    // 超时类(api 层超时转译串)→ 明确提示重试
+    startProxy.mockRejectedValueOnce(new Error('POST /api/run/start 超时(10000ms)'));
+    let ctx = mountRow({ summaryInit: { isRunning: false } });
+    q(ctx.el, '[data-act="main"]').click();
+    await flush();
+    expect(useToast().toasts.value.at(-1).msg).toBe('代理操作超时，请重试');
+    mounted.pop().unmount();
+    document.body.innerHTML = '';
+    useToast().clear();
+    // 网络/HTTP 类(TypeError)→ 通用稍后重试
+    startProxy.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    ctx = mountRow({ summaryInit: { isRunning: false } });
+    q(ctx.el, '[data-act="main"]').click();
+    await flush();
+    expect(useToast().toasts.value.at(-1).msg).toBe('操作失败，请稍后重试');
   });
 });

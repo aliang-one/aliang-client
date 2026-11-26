@@ -10,19 +10,12 @@
      成功保留选中、失败回滚,summary 回读后一律以服务端为准。 -->
 <script setup>
 import { computed, inject, onUnmounted, ref, watch } from 'vue';
-import { allControlsDisabled, derivePanelState } from '../state';
+import { allControlsDisabled, derivePanelState, modeLabel } from '../state';
 import { restartProxy, setMode, startProxy, stopProxy } from '../api';
 
 // 数据层(纪律 M-4):经 App.vue 根壳 inject,绝不开第二条轮询。
 const { summary, connLost, panelState, localTransition } = inject('panelData');
 const toast = inject('panelToast');
-
-// modeLabel — run.mode 线上值→中文(http=常规 / tun=深度,models.RunMode)。
-function modeLabel(mode) {
-  if (mode === 'tun') return '深度';
-  if (mode === 'http') return '常规';
-  return '';
-}
 
 const busy = computed(() => localTransition.value !== null);
 const TRANSITION_LABELS = { starting: '启动中', stopping: '停止中', restarting: '重启中' };
@@ -93,7 +86,7 @@ async function onMain() {
     armConfirmWatchdog(what); // 成功后等回读;失败走 catch 立即撤
   } catch (err) {
     localTransition.value = null;
-    toast.show(err && err.message ? err.message : '代理操作失败', 'warn');
+    toast.show(humanizeActionError(err), 'warn');
   }
 }
 
@@ -107,7 +100,7 @@ async function onRestart() {
     armConfirmWatchdog('restarting');
   } catch (err) {
     localTransition.value = null;
-    toast.show(err && err.message ? err.message : '重启失败', 'warn');
+    toast.show(humanizeActionError(err), 'warn');
   }
 }
 
@@ -115,6 +108,10 @@ async function onRestart() {
 
 const selectedMode = ref('http');
 let lastServerMode = '';
+// 模式落盘在途闸:上一次 setMode 未返回前再点直接忽略(防连点双发);
+// 同时闸住下方回读采纳(M-1)——在途期间乐观选中优先,回读不改写,
+// pending 结束(成功保留/失败回滚)后由后续轮询回读对账到服务端真值。
+let modePending = false;
 // adoptServerMode — 采纳服务端模式回读值。只在「服务端值确实变了」或
 // 「过渡确认(进入新稳态)」时调用,本地点击的乐观选中不被轮询同值弹回。
 function adoptServerMode() {
@@ -131,18 +128,17 @@ watch(
     return run && typeof run.mode === 'string' ? run.mode : '';
   },
   (m) => {
+    if (modePending) return; // M-1:在途期间完全忽略,由 onMode finally 补对账
     if (m && m !== lastServerMode) adoptServerMode();
   },
   { immediate: true }
 );
 
-// 模式落盘在途闸:上一次 setMode 未返回前再点直接忽略(防连点双发)。
-let modePending = false;
-
 // onMode — 停止态点击:乐观选中 → setMode 落盘(拍板 2「下次启动生效」的
 // 服务端真身)→ 成功保留选中,summary 回读以服务端为准;失败回滚 + warn
-// toast 带服务端 msg。running/过渡态被 segDisabled + 本闸双重挡住
-// (SwitchMode 运行中调用会同步停代理且不拉起——拍板 2 禁用的原因)。
+// toast(经 humanizeActionError 转译)。running/过渡态被 segDisabled +
+// 本闸双重挡住(SwitchMode 运行中调用会同步停代理且不拉起——拍板 2 禁用
+// 的原因)。
 async function onMode(mode) {
   if (panelState.value !== 'stopped') return; // 拍板 2:仅停止态可点
   if (modePending) return;
@@ -156,9 +152,16 @@ async function onMode(mode) {
     toast.show(label ? `已切换为${label}模式（下次启动生效）` : '已切换模式（下次启动生效）');
   } catch (err) {
     selectedMode.value = previous;
-    toast.show(err && err.message ? err.message : '模式切换失败', 'warn');
+    toast.show(humanizeActionError(err), 'warn');
   } finally {
     modePending = false;
+    // M-1 对账:pending 释放点按服务端当前值补采纳——在途期间 watch 被
+    // 闸早退(lastServerMode 未推进),若此后回读值不再变化 watch 永不
+    // 触发,选中会与服务端真值持续打架;此处主动归一,成功路径乐观选中
+    // 与服务端同值不受影响。
+    const run = summary.value && summary.value.run;
+    const m = run && typeof run.mode === 'string' ? run.mode : '';
+    if (m && m !== lastServerMode) adoptServerMode();
   }
 }
 
@@ -172,36 +175,47 @@ const mainClass = computed(() => {
 // 主钮禁用:过渡防抖 + 未登录全禁(spec §3)。过渡态靠 .busy 的
 // pointer-events:none 保持琥珀可见;未登录加 .disabled 灰化。
 const mainDisabled = computed(() => allControlsDisabled(panelState.value));
-const mainTitle = computed(() => {
-  if (busy.value) return '';
-  if (panelState.value === 'logged_out') return '未登录，无法启动';
-  return panelState.value === 'running' ? '停止代理' : '启动代理';
-});
 // 重启禁用:仅 running 可用(§6-2);过渡态由行级 .locked 统一压暗,
 // 不叠 .off 双重透明。
 const restartDisabled = computed(() => !busy.value && panelState.value !== 'running');
 const restartBusy = computed(() => busy.value);
 // seg 禁用:running/过渡/error/logged_out 全禁,仅 stopped 可点(拍板 2)。
 const segDisabled = computed(() => panelState.value !== 'stopped');
-const segTitle = computed(() => {
+
+// 行容器提示(评审 I-2):被禁控件带 pointer-events:none,子元素 title
+// 永不显示——禁用解释统一上移到行容器按状态给,子元素不再各自带 title。
+// 仅在「存在被禁控件」的态给:过渡(三控件全禁)/running(seg 禁)/
+// logged_out(三键全禁);停止态控件可用不提示。
+const rowHint = computed(() => {
+  if (busy.value) return '正在执行操作…';
   const kind = panelState.value;
-  if (kind === 'running' || kind === 'starting' || kind === 'stopping' || kind === 'restarting') {
-    return '停止后可切换';
-  }
-  if (kind === 'logged_out') return '未登录，暂不可切换';
-  if (kind === 'error') return '状态异常，暂不可切换';
+  if (kind === 'running') return '停止后可切换模式';
+  if (kind === 'logged_out') return '未登录，无法操作';
   return '';
 });
+
+// 错误 toast 人话化(评审 M-2):api 层超时转译串(含「超时」)→ 明确提示
+// 重试;网络/HTTP 层错(TypeError / HTTP 状态码)→ 通用稍后重试;其余是
+// 服务端返回的人可读 msg(如 SwitchMode 的英文说明、登录闸文案),原样
+// 上屏——它好于任何技术转译串。
+function humanizeActionError(err) {
+  const msg = err && err.message ? String(err.message) : '';
+  if (!msg) return '操作失败，请稍后重试';
+  if (msg.includes('超时')) return '代理操作超时，请重试';
+  if (err instanceof TypeError || /HTTP \d+/.test(msg)) return '操作失败，请稍后重试';
+  return msg;
+}
 </script>
 
 <template>
-  <div class="transport-row" :class="{ locked: busy }">
+  <!-- 禁用解释在容器 title(评审 I-2):子元素 pointer-events:none 时自身
+       title 永不显示,统一按 panelState 在行容器给提示 -->
+  <div class="transport-row" :class="{ locked: busy }" :title="rowHint">
     <!-- 启停合一(§6-1):stopped 绿▶启动 / running 红⏹停止 / 过渡琥珀 spinner+文案 -->
     <button
       class="t-btn"
       :class="[mainClass, { disabled: panelState === 'logged_out' }]"
       :disabled="mainDisabled"
-      :title="mainTitle"
       type="button"
       data-act="main"
       @click="onMain"
@@ -222,7 +236,6 @@ const segTitle = computed(() => {
       class="t-btn sq"
       :class="{ busy: restartBusy, off: restartDisabled }"
       :disabled="restartDisabled"
-      title="重启代理"
       type="button"
       data-act="restart"
       @click="onRestart"
@@ -230,8 +243,8 @@ const segTitle = computed(() => {
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36L21 8" /><path d="M21 3v5h-5" /></svg>
     </button>
 
-    <!-- 模式 segmented(拍板 2):running/过渡禁用 + title「停止后可切换」 -->
-    <div class="seg" :class="{ 'seg-disabled': segDisabled }" :title="segTitle">
+    <!-- 模式 segmented(拍板 2):running/过渡禁用,解释在容器 title -->
+    <div class="seg" :class="{ 'seg-disabled': segDisabled }">
       <div class="opt" :class="{ on: selectedMode === 'http' }" data-act="mode" data-v="http" @click="onMode('http')">常规</div>
       <div class="opt" :class="{ on: selectedMode === 'tun' }" data-act="mode" data-v="tun" @click="onMode('tun')">深度</div>
     </div>
