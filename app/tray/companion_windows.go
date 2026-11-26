@@ -15,7 +15,6 @@ import (
 	"aliang.one/nursorgate/common/version"
 	"aliang.one/nursorgate/internal/ipc"
 	"aliang.one/nursorgate/internal/singleinstance"
-	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/setup"
 	"github.com/getlantern/systray"
 	"golang.org/x/sys/windows"
@@ -49,7 +48,7 @@ type CompanionApp struct {
 func NewCompanionApp() *CompanionApp {
 	return &CompanionApp{
 		ipcClient: ipc.NewClient(),
-		httpURL:   "http://" + config.DefaultManagementAddr,
+		httpURL:   panelDefaultBaseURL, // 基址字面拷贝三处归一,见 panel_bridge.go
 		done:      make(chan struct{}),
 	}
 }

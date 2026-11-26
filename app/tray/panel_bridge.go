@@ -45,15 +45,19 @@ var panelURLOpener = openPanelURLInBrowser
 // best-effort;同 companion_watchdog.go 的 registrationStuckNotifier 先例)。
 var panelNotifier = desktop.Notify
 
+// panelDefaultBaseURL 面板基址缺省值:core 管理面板默认地址。本文件无构建
+// 标签(两平台都能引用),两平台 companion 的 httpURL 初值与面板回退统一
+// 引用此常量,三处字面拷贝归一。
+const panelDefaultBaseURL = "http://" + config.DefaultManagementAddr
+
 // panelBaseURL 返回面板基址:companion 的 httpURL 由 start_http 响应刷新
 // (applyDashboardStartResponse;端口被占时 core 回退随机口),必须用运行时
-// 真实值而非写死默认口。空值仅是防御(两平台 NewCompanionApp 都有初值),
-// 回退表达式与两平台构造函数的初值同款。
+// 真实值而非写死默认口。空值仅是防御(两平台 NewCompanionApp 都有初值)。
 func (a *CompanionApp) panelBaseURL() string {
 	if a.httpURL != "" {
 		return a.httpURL
 	}
-	return "http://" + config.DefaultManagementAddr
+	return panelDefaultBaseURL
 }
 
 // panelURL 拼接面板页地址(/panel.html 由 core 仪表盘伺服,回环免 cookie)。

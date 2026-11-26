@@ -190,11 +190,14 @@ func TestPanelBridgeOnReadyWiringBothPlatforms(t *testing.T) {
 				if idx < quitIdx || idx < goIdx {
 					t.Fatalf("installPanelBridge 必须在菜单构建(%d)与 goroutine 启动(%d)之后,实际 %d", quitIdx, goIdx, idx)
 				}
-				// 挂接是 onReady 最后一句(其后仅允许注释/空白)。
-				remainder := strings.TrimSpace(body[idx+len("a.installPanelBridge()"):])
-				remainder = strings.TrimPrefix(remainder, "//")
-				if strings.TrimSpace(strings.Split(remainder, "\n")[0]) != "" {
-					t.Fatalf("installPanelBridge 之后 onReady 还有代码(挂接必须收尾):\n%s", remainder)
+				// 挂接是 onReady 最后一句:其后仅允许空白与整行 // 注释
+				// (按行剥离尾注释,宽容未来在挂接后补的说明性注释)。
+				for _, line := range strings.Split(body[idx+len("a.installPanelBridge()"):], "\n") {
+					line = strings.TrimSpace(line)
+					if line == "" || strings.HasPrefix(line, "//") {
+						continue
+					}
+					t.Fatalf("installPanelBridge 之后 onReady 还有代码(挂接必须收尾): %q", line)
 				}
 			})
 		}
@@ -238,6 +241,25 @@ func TestPanelBridgeOnReadyWiringBothPlatforms(t *testing.T) {
 			t.Fatal("panel_bridge.go 出现字面端口 56431:URL 必须用运行时真实端口(端口占用会回退随机口)")
 		}
 	})
+}
+
+// TestPanelBridgeSeamDefaultsNonNil 四个注入口的默认实现冒烟:它们是包级
+// var,未来重构写丢初始化器即静默变 nil——行为测试全走替身拦不住这种断链,
+// 要到生产首次点击才踩到(register/modeSetter 的 nil 调用发生在 onReady,
+// 直接带走 companion;opener/notifier 被 recover 吞掉表现为点击无响应)。
+func TestPanelBridgeSeamDefaultsNonNil(t *testing.T) {
+	if panelClickRegister == nil {
+		t.Fatal("panelClickRegister 默认实现为 nil(应指向 systray.SetPanelClickHook)")
+	}
+	if panelModeSetter == nil {
+		t.Fatal("panelModeSetter 默认实现为 nil(应指向平台 shim setTrayPanelMode)")
+	}
+	if panelURLOpener == nil {
+		t.Fatal("panelURLOpener 默认实现为 nil(应指向 openPanelURLInBrowser)")
+	}
+	if panelNotifier == nil {
+		t.Fatal("panelNotifier 默认实现为 nil(应指向 desktop.Notify)")
+	}
 }
 
 // trayFileSource 读取 app/tray 包内指定源文件(结构测试同款,路径相对本包)。
