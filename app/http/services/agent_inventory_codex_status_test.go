@@ -350,14 +350,17 @@ func TestOverlayActiveTruncatesFair(t *testing.T) {
 // 窗口过滤:超窗条目(含无时间/解析失败)从清单出局;窗内照常。过滤挂在
 // collect 唯一咽喉,且必须在 codex :754 时间戳修正之后跑——resumed 老会话
 // (索引钟陈旧、rollout mtime 新鲜)靠修正后的时间回窗,不需要特判。
+// fixture 时间相对 agentVibeRecentWindow 参数化构造,窗口调值不破测。
 func TestCollectAgentVibeSessionsRecentWindowOnly(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	cache.ResetCacheDirForTest()
 
-	fresh := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
-	stale := time.Now().Add(-20 * 24 * time.Hour)
+	// 窗口参数化构造:fresh 取半窗龄、stale 取两倍窗龄,调 agentVibeRecentWindow
+	// 任何值测试都不破(固定日期/固定天数迟早撞窗口——2026-11-26 教训)。
+	fresh := time.Now().Add(-agentVibeRecentWindow / 2).Truncate(time.Second)
+	stale := time.Now().Add(-2 * agentVibeRecentWindow).Truncate(time.Second)
 
 	// codex: 新鲜(rollout mtime 新)+ 陈旧(索引行,rollout mtime 也旧)+ 无时间索引行
 	freshID := "01awin000-0000-4000-8000-000000000010"

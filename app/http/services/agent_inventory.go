@@ -49,10 +49,12 @@ const (
 	// 跑在各源时间戳修正之后(claude=转录消息钟,codex=:754 修正后的 rollout
 	// mtime),resumed 老会话靠修正自动回窗;活跃 run 由 overlay 豁免(正在发生
 	// 压倒窗口)。解析不出时间=不能证明近期,按窗口语义出局。
-	// 实测收益(2026-11-26 本机):推送 600→~145 条/hello(-75% 出向流量),
-	// codex 0.172.0 死索引的 283 行陈旧+31 条无时间幽灵自然出清,服务端
+	// 实测收益(2026-11-26 本机,15d 档):推送 600→~145 条/hello(-75% 出向
+	// 流量),codex 0.172.0 死索引的 283 行陈旧+31 条无时间幽灵自然出清,服务端
 	// ai_sessions 单设备增长被「窗口内活跃量」封顶(此前逼近磁盘全量 5000+)。
-	agentVibeRecentWindow             = 15 * 24 * time.Hour
+	// 2026-11-26 用户拍板放宽到 30d:15 天边界在实际使用中偏紧,留翻旧账余量;
+	// 窗口测试的时间一律相对本常量构造,调值不再破测。
+	agentVibeRecentWindow             = 30 * 24 * time.Hour
 	agentVibeSummaryMaxSessions       = 600
 	agentVibeSessionFileScanLimit     = 300
 	agentVibeDetailCandidateFileLimit = 24
@@ -706,7 +708,9 @@ func collectAgentVibeSessions(scanDirs []string) []models.AgentVibeSession {
 		kept = append(kept, session)
 	}
 	if droppedOld := len(sessions) - len(kept); droppedOld > 0 {
-		logger.Debug(fmt.Sprintf("[AGENT-INVENTORY] vibe_sessions_window_dropped dropped=%d window_days=%d", droppedOld, int(agentVibeRecentWindow/(24*time.Hour))))
+		// Info 级:窗口出清是常态但「会话去哪了」必须可在生产日志里得到答案
+		// (/api/logs 只收 INFO+,Debug 在生产不可见——2026-11-26 验收时定的可观测缺口)。
+		logger.Info(fmt.Sprintf("[AGENT-INVENTORY] vibe_sessions_window_dropped dropped=%d window_days=%d", droppedOld, int(agentVibeRecentWindow/(24*time.Hour))))
 	}
 	sessions = kept
 	sort.Slice(sessions, func(i, j int) bool {
