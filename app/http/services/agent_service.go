@@ -612,6 +612,11 @@ func (s *AgentService) disableWithReasonMessage(reason string, message string) m
 	if releaseAuthHeader != "" && releaseDeviceID != "" {
 		s.dispatchDeviceRelease(releaseAuthHeader, releaseDeviceID)
 	}
+	// 远程协助 P1(Task 4):用户侧禁用/登出按 client_end 收口(计划语义),
+	// 且先于连接拆除执行——writer 尚活,assist.cancel 有机会送达云端。后续
+	// forceDisconnectRemote 的 assistEndForConnectionDown 落在已终态上,
+	// errAssistNothingToEnd 幂等吞掉。
+	s.assistEndForDisable()
 	s.forceDisconnectRemote(reason)
 	return status
 }
@@ -2821,14 +2826,33 @@ func (s *AgentService) SetRemoteAssistEnabled(enabled bool) {
 }
 
 // assistEndForDisable 关闸联动:总开关翻 false → 活跃/待审批会话统一按
-// AssistEndClient 终态收口。End 在 idle 态返回 errAssistNothingToEnd,
-// 属正常幂等路径,忽略。Task 5:会话 active 时同步关协助终端(Task 5 前
-// 终端接线尚不存在,End 即全部);Task 4:向云端广播 assist.ended 终帧。
+// AssistEndClient 终态收口(Task 4:终态后经 EndAndSignal 上行 assist.cancel,
+// 云端收口房间)。End 在 idle 态返回 errAssistNothingToEnd,属正常幂等路径,
+// 忽略。Task 5:会话 active 时同步关协助终端。
 func (s *AgentService) assistEndForDisable() {
 	if s.assist == nil {
 		return
 	}
-	_ = s.assist.End(AssistEndClient)
+	// 信令失败不回滚终态(云侧 device_offline 语义自愈),错误仅记日志——
+	// 关闸是本地权威决策,不该被网络状态否决。
+	if _, err := s.assist.EndAndSignal(AssistEndClient); err != nil && !errors.Is(err, errAssistNothingToEnd) {
+		logger.Warn(fmt.Sprintf("[ASSIST] end for disable failed error=%v", err))
+	}
+}
+
+// assistEndForConnectionDown 连接级终态联动(forceDisconnectRemote/
+// remoteLoopExitCleanup 不可恢复分支,Task 4):活跃协助会话按
+// AssistEndDeviceRestart 收口——spec §5 状态机的「核心进程重启」终因,
+// §14 坑 3 明文设备重连后勿复活。上行 assist.end 预期失败(writer 已随
+// 连接拆除,非本调用目标),目标仅本地状态收敛;云端由 device_offline/
+// admin_timeout 自愈。信号失败仅记日志,不影响收口。
+func (s *AgentService) assistEndForConnectionDown() {
+	if s.assist == nil {
+		return
+	}
+	if _, err := s.assist.EndAndSignal(AssistEndDeviceRestart); err != nil && !errors.Is(err, errAssistNothingToEnd) {
+		logger.Warn(fmt.Sprintf("[ASSIST] end for connection down failed error=%v", err))
+	}
 }
 
 // applyRemoteProjectSettings handles a project.settings.updated push: the server

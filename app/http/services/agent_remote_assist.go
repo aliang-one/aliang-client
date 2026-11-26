@@ -1,7 +1,7 @@
 package services
 
-// remote-assist P1:会话状态机权威。纯逻辑,clock 注入可测;网络信令与
-// 终端接线由 assistOnRemoteFrame / activateTerminal 挂接(Task 4/5)。
+// remote-assist P1:会话状态机权威 + 云端信令接线(Task 4)。状态迁移 clock
+// 注入可测;终端接线由 onActivated/onEnded 钩子挂接(Task 5)。
 // 威胁模型与授权边界见 spec docs/superpowers/specs/2026-11-26-remote-assist-design.md §10。
 
 import (
@@ -10,6 +10,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"aliang.one/nursorgate/app/http/models"
+	"aliang.one/nursorgate/common/logger"
 )
 
 const (
@@ -74,6 +77,16 @@ type remoteAssistManager struct {
 	lastSessionID string
 
 	lastEnded time.Time // 冷却锚点(仅非过期终态落点,见 finishLocked)
+
+	// onActivated/onEnded 状态迁移后的外部联动钩子(Task 5 终端腿接线:
+	// approved 即建协助 PTY、终态即关闭)。nil=无联动。锁纪律:钩子一律
+	// 锁外投递(见 runPendingHooks)——钩子会取终端管理器等其他锁,禁止与
+	// m.mu 嵌套(mac-agent 1.1.120 s.mu 锁内二次加锁自死锁同型事故)。
+	onActivated func(sessionID string)
+	onEnded     func(sessionID string, reason assistEndReason)
+	// hooksPending 锁内固化的待投递钩子闭包(钩子引用与参数在迁移当下取值,
+	// 避免锁外重读字段的数据竞争),解锁后 runPendingHooks 统一投递。
+	hooksPending []func()
 }
 
 func newRemoteAssistManager(now func() time.Time) *remoteAssistManager {
@@ -81,6 +94,43 @@ func newRemoteAssistManager(now func() time.Time) *remoteAssistManager {
 		now = time.Now
 	}
 	return &remoteAssistManager{now: now}
+}
+
+// OnActivated 设置批准激活钩子(approved 迁移提交后锁外调用,sessionID 为
+// 已激活会话)。重复设置覆盖前者。Task 5 接线协助终端创建。
+func (m *remoteAssistManager) OnActivated(fn func(sessionID string)) {
+	m.mu.Lock()
+	m.onActivated = fn
+	m.mu.Unlock()
+}
+
+// OnEnded 设置终态钩子(任意路径收敛 ended 后锁外调用,含云端 end 帧、
+// 本地撤销/禁用、pending 过期与时长上限懒扫)。Task 5 接线协助终端关闭
+// 与观看页收摊。
+func (m *remoteAssistManager) OnEnded(fn func(sessionID string, reason assistEndReason)) {
+	m.mu.Lock()
+	m.onEnded = fn
+	m.mu.Unlock()
+}
+
+// enqueueHookLocked 前提:持锁。钩子引用与参数在此刻固化。
+func (m *remoteAssistManager) enqueueHookLocked(fn func()) {
+	if fn != nil {
+		m.hooksPending = append(m.hooksPending, fn)
+	}
+}
+
+// runPendingHooks 锁外调用:投递并清空队列。绝不持锁执行——钩子可能再入
+// manager(如 Task 5 终端关闭回调里调 Snapshot),sync.Mutex 不可重入,锁内
+// 执行即自死锁。
+func (m *remoteAssistManager) runPendingHooks() {
+	m.mu.Lock()
+	pending := m.hooksPending
+	m.hooksPending = nil
+	m.mu.Unlock()
+	for _, fn := range pending {
+		fn()
+	}
 }
 
 var (
@@ -93,34 +143,146 @@ var (
 	errAssistNothingToEnd = errors.New("assist: nothing to end")
 )
 
+// ---------------------------------------------------------------------------
+// assist 信令上行 writer 缝(Task 4,agentPunchFrameSink 同族范式)
+// ---------------------------------------------------------------------------
+
+// assistFrameSink 是 assist 信令帧的注入出口(集成测试与诊断面缝,仅测试
+// 装置置位,生产路径恒 nil):*AndSignal 的自发帧与 OnRemoteFrame 的回帧
+// 均经 assistFrameWriter 投出。刻意只服务 assist 帧族——不新增给 assist
+// 之外路径用的全局可变缝(计划铁律)。
+var assistFrameSinkMu sync.RWMutex
+var assistFrameSinkFn func(map[string]interface{}) error
+
+func assistFrameSinkLoad() func(map[string]interface{}) error {
+	assistFrameSinkMu.RLock()
+	defer assistFrameSinkMu.RUnlock()
+	return assistFrameSinkFn
+}
+
+// AssistSetFrameSink 注入 assist 信令帧出口:sink 非 nil 时 assist 帧一律经
+// sink 投出(调用方自行收集/路由),nil 恢复生产默认(currentRemoteWriterFunc)。
+// 生产路径恒不置位,零影响。进程级全局:测试用完必须恢复 nil(见
+// newTestAssistManagerWithSink 的 Cleanup 纪律),否则污染同包其他测试。并发安全。
+func AssistSetFrameSink(sink func(map[string]interface{}) error) {
+	assistFrameSinkMu.Lock()
+	assistFrameSinkFn = sink
+	assistFrameSinkMu.Unlock()
+}
+
+// SetFrameSink 管理器侧的缝注入糖(测试按计划行文经 manager 注入;缝本体
+// 是进程级全局,见 AssistSetFrameSink)。
+func (m *remoteAssistManager) SetFrameSink(sink func(map[string]interface{}) error) {
+	AssistSetFrameSink(sink)
+}
+
+// assistFrameWriter assist 信令上行 writer(agentPunchFrameWriter 同构):
+// 测试缝 sink 优先,生产回落 currentRemoteWriterFunc(断连 nil 即失败——
+// 信令发不出去就报错,不该静默吞掉让用户等一个永远不会被审批的会话)。
+func assistFrameWriter() func(interface{}) error {
+	return func(v interface{}) error {
+		if payload, ok := v.(map[string]interface{}); ok {
+			if sink := assistFrameSinkLoad(); sink != nil {
+				return sink(payload)
+			}
+		}
+		w := currentRemoteWriterFunc()
+		if w == nil {
+			return errors.New("agent assist: remote writer offline")
+		}
+		return w(v)
+	}
+}
+
+// assistFrame 信令帧骨架:载荷保持最小(session_id 恒带;设备身份字段由
+// 平台侧从连接取,设备不自带,见计划附录 A 帧契约)。
+func assistFrame(typ string, sessionID string) map[string]interface{} {
+	return map[string]interface{}{"type": typ, "session_id": sessionID}
+}
+
 func (m *remoteAssistManager) Request(message string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	sid, _, err := m.requestLocked(message)
+	return sid, err
+}
+
+// requestLocked 前提:持锁。created=本次新建会话(区别于 requested 态的
+// 同态留言更新)——RequestAndSignal 据此决定信令失败时是否回滚。
+func (m *remoteAssistManager) requestLocked(message string) (string, bool, error) {
 	now := m.now()
 	// 冷却窗口从「回到 idle」起算,只防终态后的连发骚扰(spec §10 限频)。
 	// pending 过期豁免锚点(见 finishLocked)——过期已含 5 分钟自然等待,
 	// 立即重申是合法路径。
 	if m.session == nil && !m.lastEnded.IsZero() && now.Sub(m.lastEnded) < assistRequestCooldown {
-		return "", errAssistCooldown
+		return "", false, errAssistCooldown
 	}
 	if m.session != nil {
 		switch m.stateLocked() {
 		case assistStateRequested:
 			m.session.message = strings.TrimSpace(message) // 同态更新留言
-			return m.session.id, nil
+			return m.session.id, false, nil
 		case assistStateActive:
-			return "", errAssistBusy
+			return "", false, errAssistBusy
 		}
 	}
 	id := fmt.Sprintf("%s%d", assistIDPrefix, now.UnixNano())
 	m.session = &remoteAssistSession{id: id, message: strings.TrimSpace(message), requestedAt: now}
 	m.endReason = ""
-	return id, nil
+	return id, true, nil
+}
+
+// RequestAndSignal 申请协助 + 上行 assist.request。信令发不出去(离线/断连)
+// 时直接失败让调用方呈现,不静默——发不出去的申请永远不会进 admin 队列。
+// 本次新建的会话随即回滚到纯净 idle(不置粘性 ended、不设 60s 冷却锚,基础
+// 设施抖动不该让用户吃连发冷却,spec §10 冷却针对的是「终态已触达 admin
+// 队列」的骚扰面);同态留言更新路径信令失败不回滚(原会话早已在队列里,
+// 保留旧留言继续等审批)。
+func (m *remoteAssistManager) RequestAndSignal(message string) (string, error) {
+	m.mu.Lock()
+	sid, created, err := m.requestLocked(message)
+	m.mu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	frame := assistFrame(models.AgentEventAssistRequestUp, sid)
+	frame["message"] = strings.TrimSpace(message)
+	if err := assistFrameWriter()(frame); err != nil {
+		if created {
+			m.rollbackCreated(sid)
+		}
+		return "", err
+	}
+	return sid, nil
+}
+
+// rollbackCreated 信令未送达的新建会话回滚。仅当状态仍是 requested 且
+// session id 未变才回滚(解锁到写失败的窗口里云端帧可能已改状态,那种情况
+// 以现状为准不回滚,白盒守卫见 TestAssistRollbackGuardKeepsApprovedSession)。
+//
+// 单调用方假设:RequestAndSignal 的入口自 Task 6 起是唯一 HTTP 端点(每请求
+// 串行),不存在「A 新建+信令失败」与「B 同态更新+信令成功」并发交错——
+// 若未来出现双调用方,A 的回滚可抹掉 B 已上行的会话(云端按 pending_expired
+// 自愈、本地无脏态,但体验断档),届时须加 signaled-since-creation 标记。
+func (m *remoteAssistManager) rollbackCreated(sid string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.session != nil && m.session.approvedAt.IsZero() && m.session.id == sid {
+		m.session = nil
+		m.endReason = ""
+	}
 }
 
 func (m *remoteAssistManager) Cancel() error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	err := m.cancelLocked()
+	m.mu.Unlock()
+	m.runPendingHooks()
+	return err
+}
+
+// cancelLocked 前提:持锁。
+func (m *remoteAssistManager) cancelLocked() error {
 	if m.stateLocked() != assistStateRequested {
 		return errAssistNotPending
 	}
@@ -128,32 +290,67 @@ func (m *remoteAssistManager) Cancel() error {
 	return nil
 }
 
+// CancelAndSignal 撤销申请 + 上行 assist.cancel(附录 A #4:客户端发起的
+// 收口恒 cancel 帧型,云端无需动作仅同步房间)。终态先本地落定,信令失败
+// 不回滚(撤销意图已达成,云侧 room 定时器与 device_offline 语义自愈),
+// 错误照实上抛由 HTTP 调用方(Task 6)决定是否呈现。
+func (m *remoteAssistManager) CancelAndSignal() error {
+	m.mu.Lock()
+	sid := ""
+	if m.session != nil {
+		sid = m.session.id
+	}
+	err := m.cancelLocked()
+	m.mu.Unlock()
+	m.runPendingHooks()
+	if err != nil {
+		return err
+	}
+	return assistFrameWriter()(assistFrame(models.AgentEventAssistCancel, sid))
+}
+
 func (m *remoteAssistManager) CloudApproved(sessionID string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.stateLocked() != assistStateRequested {
+		m.mu.Unlock()
 		return errAssistNotPending
 	}
 	if m.session.id != sessionID {
+		m.mu.Unlock()
 		return errAssistIDMismatch
 	}
 	m.session.approvedAt = m.now()
+	if fn := m.onActivated; fn != nil {
+		sid := m.session.id
+		m.enqueueHookLocked(func() { fn(sid) })
+	}
+	m.mu.Unlock()
+	m.runPendingHooks()
 	return nil
 }
 
 func (m *remoteAssistManager) CloudRejected(sessionID string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.stateLocked() != assistStateRequested || m.session.id != sessionID {
+		m.mu.Unlock()
 		return errAssistNotPending
 	}
 	m.finishLocked(AssistEndAdmin) // 拒绝按 admin 侧终态计,审计同源
+	m.mu.Unlock()
+	m.runPendingHooks()
 	return nil
 }
 
 func (m *remoteAssistManager) End(reason assistEndReason) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	err := m.endLocked(reason)
+	m.mu.Unlock()
+	m.runPendingHooks()
+	return err
+}
+
+// endLocked 前提:持锁。
+func (m *remoteAssistManager) endLocked(reason assistEndReason) error {
 	if m.stateLocked() == assistStateIdle {
 		return errAssistNothingToEnd
 	}
@@ -161,22 +358,55 @@ func (m *remoteAssistManager) End(reason assistEndReason) error {
 	return nil
 }
 
+// EndAndSignal 本地终态收口 + 上行信令。上行帧型按附录 A #4 分流:客户端
+// 发起的收口(client_end,撤销申请/结束会话/总开关关闸)恒 assist.cancel;
+// 设备侧原因(device_restart 等)走 assist.end 带 reason(帧族注释:该帧
+// 双向)。信令失败不回滚终态(本地已终态,云侧自愈语义见 CancelAndSignal),
+// 错误照实上抛。idle 时返回 errAssistNothingToEnd 且不上行——禁用路径的
+// 常态幂等分支。
+func (m *remoteAssistManager) EndAndSignal(reason assistEndReason) (string, error) {
+	m.mu.Lock()
+	sid := ""
+	if m.session != nil {
+		sid = m.session.id
+	}
+	err := m.endLocked(reason)
+	m.mu.Unlock()
+	m.runPendingHooks()
+	if err != nil {
+		return "", err
+	}
+	var frame map[string]interface{}
+	if reason == AssistEndClient {
+		frame = assistFrame(models.AgentEventAssistCancel, sid)
+	} else {
+		frame = assistFrame(models.AgentEventAssistEnd, sid)
+		frame["reason"] = string(reason)
+	}
+	return sid, assistFrameWriter()(frame)
+}
+
 func (m *remoteAssistManager) CloudEnd(sessionID string, reason assistEndReason) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.stateLocked() == assistStateIdle || (m.session != nil && m.session.id != sessionID) {
+		m.mu.Unlock()
 		return errAssistIDMismatch
 	}
 	m.finishLocked(reason)
+	m.mu.Unlock()
+	m.runPendingHooks()
 	return nil
 }
 
 // Sweep 收敛时间驱动的终态:pending 5 分钟未审批过期,active 超 2 小时上限。
-// 由 Snapshot 懒扫驱动(网络层亦可周期调用,Task 4 定)。
+// 由 Snapshot 懒扫驱动(网络层亦可周期调用,Task 4 定)。懒扫落终态同样触发
+// 终态钩子(Task 5 的时长上限关终端依赖它),故 Snapshot/Sweep/AdvanceClock
+// 三个收敛入口解锁后统一 runPendingHooks。
 func (m *remoteAssistManager) Sweep() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.sweepLocked()
+	m.mu.Unlock()
+	m.runPendingHooks()
 }
 
 // sweepLocked 前提:持锁,且 requested/active 分支必有活跃会话(stateLocked
@@ -223,24 +453,32 @@ func (m *remoteAssistManager) finishLocked(reason assistEndReason) {
 	if m.session == nil {
 		return
 	}
+	sid := m.session.id
 	now := m.now()
 	m.endReason = reason
 	m.endedAt = now
-	m.lastSessionID = m.session.id
+	m.lastSessionID = sid
 	if reason != AssistEndExpired {
 		m.lastEnded = now
 	}
 	m.session = nil
+	// 终态钩子锁外投递(锁纪律见 onEnded 字段注释):钩子引用与参数在此刻
+	// 固化,runPendingHooks 解锁后统一执行——Task 5 的关闭终端联动绝不持
+	// m.mu 跑。
+	if fn := m.onEnded; fn != nil {
+		m.enqueueHookLocked(func() { fn(sid, reason) })
+	}
 }
 
 // Snapshot 当前状态快照。读路径懒扫一次,过期/时长上限在读取时即收敛,
 // 无需独立定时器。终态后会话槽位已释放,按粘性终态字段回填 SessionID。
+// 懒扫可能落终态,钩子在解锁后投递(锁纪律见 runPendingHooks)。
 func (m *remoteAssistManager) Snapshot() remoteAssistSnapshot {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.sweepLocked()
+	var snap remoteAssistSnapshot
 	if m.session != nil {
-		snap := remoteAssistSnapshot{
+		snap = remoteAssistSnapshot{
 			SessionID:   m.session.id,
 			State:       m.stateLocked(),
 			Message:     m.session.message,
@@ -249,17 +487,17 @@ func (m *remoteAssistManager) Snapshot() remoteAssistSnapshot {
 		if !m.session.approvedAt.IsZero() {
 			snap.ApprovedAt = m.session.approvedAt.Format(time.RFC3339)
 		}
-		return snap
-	}
-	if m.endReason != "" {
-		return remoteAssistSnapshot{
+	} else if m.endReason != "" {
+		snap = remoteAssistSnapshot{
 			SessionID: m.lastSessionID,
 			State:     assistStateEnded,
 			EndReason: m.endReason,
 			EndedAt:   m.endedAt.Format(time.RFC3339),
 		}
 	}
-	return remoteAssistSnapshot{} // idle
+	m.mu.Unlock()
+	m.runPendingHooks()
+	return snap // endReason=="" 时 snap 为零值=idle
 }
 
 // AdvanceClock 推进注入时钟并立即收敛(仅测试用:生产构造 clockAdvance 为
@@ -267,9 +505,96 @@ func (m *remoteAssistManager) Snapshot() remoteAssistSnapshot {
 // 推进+收敛在同一临界区内完成,共享时钟的写与懒扫读不构成竞争。
 func (m *remoteAssistManager) AdvanceClock(d time.Duration) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.clockAdvance != nil {
 		m.clockAdvance(d)
 	}
 	m.sweepLocked()
+	m.mu.Unlock()
+	m.runPendingHooks()
+}
+
+// ---------------------------------------------------------------------------
+// 云端下行帧分派(Task 4):assist.approved / rejected / end / state
+// ---------------------------------------------------------------------------
+
+// OnRemoteFrame 处理云端下行 assist 帧(handleRemoteAgentMessage 的 assist
+// case 直调;诊断/集成测试亦可直投),驱动状态机并返回需要写回云端的帧
+// ——分派路径刻意把 writer 知识留在调用方(经 writeJSON 上行),manager
+// 只做纯分派,与 *AndSignal 家族(自发信令,内部走 assistFrameWriter)分工。
+//
+// 帧语义(计划附录 A):
+//   - assist.approved{session_id}:requested→active,触发 onActivated 钩子
+//     (锁外投递,Task 5 终端腿)。无回帧。
+//   - assist.rejected{session_id}:requested→ended(admin_end)。无回帧。
+//   - assist.end{session_id,reason}:→ended(reason);reason 为必填契约字段,
+//     缺失即拒帧。无回帧(设备侧状态已终态,云端不需要设备确认)。
+//   - assist.state:P1 仅记录日志(房间状态镜像留给 P2+),不改状态、无回帧。
+//
+// 幂等与守卫:
+//   - session_id 不匹配/状态不符返回错误且不改状态(manager 守卫本就如此,
+//     防串会话);调用方(handleRemoteAgentMessage)将错误转成 error 帧
+//     上抛,读循环不受影响。
+//   - 已终会话的重复 end 帧(云端重发/时序竞争)幂等吞掉:返回 nil 不报错
+//     ——读循环不得因云端补帧错误风暴。判定按粘性终态字段:state==ended
+//     且(空闲槽位或 id 匹配刚终会话)即视为重复投递。
+func (m *remoteAssistManager) OnRemoteFrame(msg map[string]interface{}) ([]map[string]interface{}, error) {
+	switch remoteString(msg, "type") {
+	case models.AgentEventAssistApproved:
+		if err := m.CloudApproved(remoteString(msg, "session_id")); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	case models.AgentEventAssistRejected:
+		if err := m.CloudRejected(remoteString(msg, "session_id")); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	case models.AgentEventAssistEnd:
+		sid := remoteString(msg, "session_id")
+		reason := remoteString(msg, "reason")
+		if reason == "" {
+			// reason 是契约必填字段(附录 A #3/#4):缺失帧拒收,不得静默
+			// 替换成某个默认原因——审计终态必须真实。
+			return nil, fmt.Errorf("assist: end frame missing reason (session=%s)", sid)
+		}
+		dup, err := m.cloudEndOnce(sid, assistEndReason(reason))
+		if err != nil {
+			return nil, err
+		}
+		if dup {
+			logger.Info(fmt.Sprintf("[ASSIST] cloud end frame for already-ended session session_id=%s reason=%s (duplicate, swallowed)", sid, reason))
+		}
+		return nil, nil
+	case models.AgentEventAssistState:
+		// P1 仅记录日志(计划附录 A #5:房间状态镜像留给 P2+);帧到达证明
+		// 房间侧仍在关注本会话,落一条观测日志即可,不改状态、不回帧。
+		logger.Info(fmt.Sprintf("[ASSIST] cloud state frame session_id=%s state=%s",
+			remoteString(msg, "session_id"), remoteString(msg, "state")))
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("assist: unsupported frame type %q", remoteString(msg, "type"))
+	}
+}
+
+// cloudEndOnce 幂等收敛:重复投递判定与终态迁移同一临界区,消除先查后改
+// (isDuplicateEnd → CloudEnd 两段锁)的竞态窗口——窗口内终态恰落定会让
+// CloudEnd 的 idle 守卫报 id mismatch,分派臂误发一帧 agent.error 给合法
+// 的重复投递。守卫语义与 CloudEnd 逐字一致(idle/错 id → errAssistIDMismatch,
+// 状态不变),Task 2 的 CloudEnd 守卫面不受影响。
+func (m *remoteAssistManager) cloudEndOnce(sid string, reason assistEndReason) (dup bool, err error) {
+	m.mu.Lock()
+	// 重复投递:粘性终态存在,且当前无活跃会话(idle)或活跃会话 id 与粘性
+	// 终态 id 一致;id 不一致的活跃会话不是重复帧,走下方守卫拒绝。
+	if m.endReason != "" && (m.session == nil || m.session.id == sid) {
+		m.mu.Unlock()
+		return true, nil
+	}
+	if m.stateLocked() == assistStateIdle || (m.session != nil && m.session.id != sid) {
+		m.mu.Unlock()
+		return false, errAssistIDMismatch
+	}
+	m.finishLocked(reason)
+	m.mu.Unlock()
+	m.runPendingHooks()
+	return false, nil
 }
