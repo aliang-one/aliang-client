@@ -308,6 +308,27 @@ jobs:
           fi
           go mod download
 
+      # DEBT-07 首步:发布 CI 按平台跑 go test,在换托盘底座/改托盘代码之前
+      # 把现有测试变成发布闸门。测试步骤不显式设 GOOS/GOARCH——runner 本身
+      # 就是 matrix 对应平台,原生跑测试即可;CGO_ENABLED 镜像构建步骤,
+      # 保证 app/tray(systray 底座,走 cgo)的测试环境与构建完全一致。
+      # 注意:app/tray 在 Linux 不编译,勿加进 linux 的测试清单。
+      - name: Run Go tests (linux)
+        if: matrix.goos == 'linux'
+        shell: bash
+        env:
+          CGO_ENABLED: ${{ matrix.cgo_enabled }}
+        run: |
+          go test ./internal/ipc/... ./internal/singleinstance/... ./cmd/...
+
+      - name: Run Go tests (windows/darwin)
+        if: matrix.goos == 'windows' || matrix.goos == 'darwin'
+        shell: bash
+        env:
+          CGO_ENABLED: ${{ matrix.cgo_enabled }}
+        run: |
+          go test ./app/tray/... ./internal/ipc/... ./internal/singleinstance/... ./cmd/...
+
       - name: Build Go binary
         shell: bash
         env:

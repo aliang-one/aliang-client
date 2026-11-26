@@ -99,3 +99,15 @@ func systray_on_exit() {
 func systray_menu_item_selected(cID C.int) {
 	systrayMenuItemSelected(uint32(cID))
 }
+
+// 本仓补丁:面板模式托盘点击出口——从 AppKit 主线程(systray_darwin.m 的
+// trayClicked:)进来,与 Windows 侧 wndProc 的点击分支对齐:非阻塞地把
+// panelClickFn 丢 goroutine 执行(回调耗时/并发/panic 契约见 SetPanelClickHook
+// 注释),绝不在 AppKit 主线程做耗时工作;hook 为 nil(未进面板模式)则忽略。
+//
+//export systray_tray_clicked
+func systray_tray_clicked() {
+	if panelClickFn != nil {
+		go panelClickFn()
+	}
+}

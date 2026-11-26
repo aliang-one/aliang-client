@@ -824,6 +824,12 @@ func NewEndpointServiceForTest() (*EndpointService, error) {
 	return newEndpointServiceWithStore(store), nil
 }
 
+// SetBuiltinProbeAddrForTest 注入内置行拨测地址:handlers 层测试与 service 层
+// 双分支(真监听→可达文案/死端口→不可达文案)对齐用——本机 core 常驻监听
+// 56432 时,不注入的断言会「本地永远红、CI 永远绿」。生产实例不经此入口,
+// 拨测地址恒走默认 127.0.0.1:56432。
+func (s *EndpointService) SetBuiltinProbeAddrForTest(addr string) { s.builtinProbeAddr = addr }
+
 // Close 释放 service 持有的 store 句柄(测试构造自持 :memory: 库;生产单例
 // 复用 auth 共享句柄,store.Close 是 no-op,调用安全)。
 func (s *EndpointService) Close() error {

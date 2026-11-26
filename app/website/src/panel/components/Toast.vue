@@ -1,0 +1,85 @@
+<!-- Toast.vue — 面板轻提示:队列堆叠 + 3s 自动消失 + 成功/警告两语义色。
+     useToast() 从本文件命名导出(模块级单例):启停按钮/endpoint 单选/provider
+     详情等后续组件(App 承接的 Task 8-11 交互)共用同一个队列与同一个
+     <Toast/> 挂载点,接口约定 toast.show(msg, kind)。 -->
+<script>
+import { ref } from 'vue';
+
+// 单条 toast 存活时长(spec §5「不要长时动画」口径下的轻提示预算)。
+const TOAST_TTL_MS = 3000;
+// 队列容量上限(M-2):340px 窄面板堆不下无限条,超限挤掉最旧一条并回收
+// 其超时句柄,防连发场景(如 restart 的 stop/start 两次反馈)叠穿屏幕。
+const MAX_TOASTS = 4;
+// 语义色只认两档:警告归 warn,其余一律归 success(容错,不炸未知输入)。
+const KIND_WARN = 'warn';
+
+// 模块级单例状态:跨组件共享一个队列。
+const toasts = ref([]);
+let seq = 0;
+const timers = new Map(); // id → setTimeout 句柄(clear 时统一回收)
+
+function dismiss(id) {
+  const idx = toasts.value.findIndex((t) => t.id === id);
+  if (idx !== -1) toasts.value.splice(idx, 1);
+  const timer = timers.get(id);
+  if (timer !== undefined) {
+    clearTimeout(timer);
+    timers.delete(id);
+  }
+}
+
+export function useToast() {
+  function show(msg, kind = 'success') {
+    const text = String(msg);
+    // 去重(评审 Minor-4):相同文案尚未消失时不重复入队——连点/多组件同刻
+    // 弹同一提示会在 340px 窄面板刷屏(msg 为唯一身份,kind 不同也算同一条
+    // 提示的重复触发);返回在队那条的 id,调用方无感。文案消失后可再次入队。
+    const existing = toasts.value.find((t) => t.msg === text);
+    if (existing !== undefined) return existing.id;
+    const id = ++seq;
+    toasts.value.push({
+      id,
+      msg: text,
+      kind: kind === KIND_WARN ? KIND_WARN : 'success',
+    });
+    // 超限挤旧(先挤再排超时,被挤那条的句柄经 dismiss 回收,不留残计时)。
+    while (toasts.value.length > MAX_TOASTS) {
+      dismiss(toasts.value[0].id);
+    }
+    timers.set(
+      id,
+      setTimeout(() => dismiss(id), TOAST_TTL_MS)
+    );
+    return id;
+  }
+
+  // clear:立即清空队列并回收所有未触发的超时(测试隔离/面板收起时用)。
+  function clear() {
+    for (const timer of timers.values()) clearTimeout(timer);
+    timers.clear();
+    toasts.value.splice(0, toasts.value.length);
+  }
+
+  return { toasts, show, clear };
+}
+
+// 组件本体:只渲染队列,不含业务。
+export default {
+  name: 'PanelToast',
+  setup() {
+    const { toasts: items } = useToast();
+    return { items };
+  },
+};
+</script>
+
+<template>
+  <div class="toast-wrap" aria-live="polite">
+    <TransitionGroup name="toast">
+      <div v-for="t in items" :key="t.id" class="toast" :class="`toast-${t.kind}`">
+        <span class="toast-dot" aria-hidden="true"></span>
+        <span class="toast-msg">{{ t.msg }}</span>
+      </div>
+    </TransitionGroup>
+  </div>
+</template>

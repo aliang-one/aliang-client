@@ -1,0 +1,148 @@
+/* theme.css — 托盘面板视觉 token + 容器基础样式。
+   数值全部抄自交互原型 docs/superpowers/specs/tray-menu-style-mockups.html
+   的 CSS 与样式 spec §5 色板表(2026-11-26 方案 A 定稿),两处已逐项核对一致。
+   深浅色跟随系统 prefers-color-scheme(CSS media query,无 JS 介入)。
+   材质分工:模糊由宿主系统材质层负责(Windows DWM 亚克力 / macOS
+   NSVisualEffectView);浏览器直开(无宿主模式)时本文件的 backdrop-filter
+   直接呈现 mockup 效果——两处取值一致:blur(28px) saturate(1.4)。 */
+
+:root {
+  /* ---- 品牌语义色(mockup :root 原值) ---- */
+  --brand: #21c45d;
+  --brand-dim: rgba(33, 196, 93, 0.14);
+  --brand-glow: rgba(33, 196, 93, 0.45);
+  --danger: #e5484d;
+  --warn: #e6a23c;
+
+  /* ---- 浅色面(默认;spec §5) ---- */
+  --panel-bg: rgba(252, 254, 252, 0.72);
+  --panel-border: rgba(0, 0, 0, 0.1);
+  --text-main: #17251d;
+  --text-muted: #7d8f85;
+  --sep: rgba(0, 0, 0, 0.07);
+  --hover: rgba(0, 0, 0, 0.04);
+
+  /* ---- 几何常量 ---- */
+  --panel-width: 340px;
+  --panel-radius: 16px;
+}
+
+/* 深色面:跟随系统(spec §5「深浅色跟 prefers-color-scheme」)。 */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --panel-bg: rgba(22, 30, 26, 0.78);
+    --panel-border: rgba(255, 255, 255, 0.1);
+    --text-main: #e2ece6;
+    --text-muted: #7e9186;
+    --sep: rgba(255, 255, 255, 0.07);
+    --hover: rgba(255, 255, 255, 0.05);
+  }
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* 页面底(M1 无宿主模式专用):浏览器直开 panel.html 时给一层中性渐变垫底
+   (mockup 背景的简化版),让 340px 面板可直观看。
+   M2 宿主态由下方 html.hosted body 规则切成透明——原生壳 drawsBackground
+   =false,页面不透明渐变会盖住系统材质。 */
+body {
+  font-family: 'Inter', -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  background: linear-gradient(160deg, #e8ece9 0%, #d3dad5 45%, #b9c4bd 100%);
+}
+@media (prefers-color-scheme: dark) {
+  body {
+    background: linear-gradient(160deg, #1a2320 0%, #121a16 50%, #0b1210 100%);
+  }
+}
+
+/* 宿主态(I-1):<html> 带 hosted 类(main.js 经 isHosted() 探测后添加)
+   时页面本体必须透明,背景交系统材质层;!important 压过上方浅深两段渐变。
+   .panel 的 backdrop-filter 刻意保留:无宿主时它是唯一模糊来源,有宿主
+   材质时叠加一次无副作用。 */
+html.hosted body {
+  background: transparent !important;
+}
+
+/* ---- 面板容器(mockup .panel 原值) ---- */
+.panel {
+  width: var(--panel-width);
+  margin: 0 auto;
+  border-radius: var(--panel-radius);
+  overflow: hidden;
+  background: var(--panel-bg);
+  backdrop-filter: blur(28px) saturate(1.4);
+  -webkit-backdrop-filter: blur(28px) saturate(1.4);
+  border: 1px solid var(--panel-border);
+  box-shadow:
+    0 18px 50px -12px rgba(10, 30, 18, 0.35),
+    0 2px 8px rgba(10, 30, 18, 0.1);
+  color: var(--text-main);
+  font-size: 13px;
+  user-select: none;
+}
+
+/* 分隔线(mockup .sep 原值)——六区块之间的水平缝。 */
+.sep {
+  height: 1px;
+  background: var(--sep);
+  margin: 2px 0;
+}
+
+/* ---- Toast(spec §3 语义色:绿=成功,琥珀=警告/退避) ---- */
+.toast-wrap {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  z-index: 999;
+  pointer-events: none;
+}
+.toast {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 300px;
+  padding: 6px 12px;
+  border-radius: 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  background: var(--panel-bg);
+  backdrop-filter: blur(28px) saturate(1.4);
+  -webkit-backdrop-filter: blur(28px) saturate(1.4);
+  border: 1px solid var(--panel-border);
+  box-shadow: 0 6px 18px -6px rgba(10, 30, 18, 0.3);
+  color: var(--text-main);
+}
+.toast-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.toast-success .toast-dot {
+  background: var(--brand);
+  box-shadow: 0 0 5px var(--brand-glow);
+}
+.toast-warn .toast-dot {
+  background: var(--warn);
+  box-shadow: 0 0 5px rgba(230, 162, 60, 0.4);
+}
+
+/* TransitionGroup 进出场(spec §5 微动效预算内的 0.18s)。 */
+.toast-enter-active,
+.toast-leave-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+.toast-enter-from,
+.toast-leave-to {
+  opacity: 0;
+  transform: translateY(6px);
+}

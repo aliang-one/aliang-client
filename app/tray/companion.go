@@ -13,13 +13,14 @@ import (
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/common/version"
 	"aliang.one/nursorgate/internal/ipc"
-	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/setup"
 	"github.com/getlantern/systray"
 )
 
 const (
-	companionHTTPURL = "http://" + config.DefaultManagementAddr
+	// companionHTTPURL dashboard 根地址缺省值,值统一引用 panelDefaultBaseURL
+	// (基址字面拷贝三处归一,见 panel_bridge.go)。
+	companionHTTPURL = panelDefaultBaseURL
 )
 
 // CompanionApp is the macOS tray companion that communicates with Core via IPC.
@@ -107,6 +108,10 @@ func (a *CompanionApp) onReady() {
 		go a.syncStateLoop()
 		go a.agentWatchdogLoop()
 	}()
+
+	// M1 托盘面板接线(收尾动作):左右键点击 → panel.html。必须位于菜单
+	// 构建完成之后——面板模式会摘掉原生菜单,提前摘会把空菜单钉上状态项。
+	a.installPanelBridge()
 }
 
 func (a *CompanionApp) onExit() {

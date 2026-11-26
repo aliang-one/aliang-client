@@ -21,6 +21,13 @@ import (
 // services 包测试注入缝)+ handler,并签发一枚真实 dashboard session cookie。
 // 完全不碰真实数据目录,也不污染 GetEndpointService 单例。
 func newEndpointHandlerHarness(t *testing.T) (*EndpointHandler, *http.Cookie) {
+	_, h, cookie := newEndpointHandlerHarnessSvc(t)
+	return h, cookie
+}
+
+// newEndpointHandlerHarnessSvc 同 newEndpointHandlerHarness,另返回底层
+// service:动作端点测试(内置行真探测双分支)需要注入拨测地址。
+func newEndpointHandlerHarnessSvc(t *testing.T) (*services.EndpointService, *EndpointHandler, *http.Cookie) {
 	t.Helper()
 	svc, err := services.NewEndpointServiceForTest()
 	if err != nil {
@@ -45,7 +52,7 @@ func newEndpointHandlerHarness(t *testing.T) (*EndpointHandler, *http.Cookie) {
 		t.Fatal("未签发 dashboard session cookie")
 	}
 	t.Cleanup(middleware.ResetDashboardSessionForTest)
-	return NewEndpointHandler(svc), cookie
+	return svc, NewEndpointHandler(svc), cookie
 }
 
 // endpointDo 发一个带 session 的请求并返回 recorder。{id} 段用占位符
@@ -304,18 +311,40 @@ func TestEndpointHandlerDeleteBuiltinConflict(t *testing.T) {
 }
 
 // test / fetch-models / reset-health 三动作端点。
+// (用带 svc 的 harness:builtin 行走真探测,需注入拨测地址做双分支断言。)
 func TestEndpointHandlerActionEndpoints(t *testing.T) {
-	h, cookie := newEndpointHandlerHarness(t)
+	svc, h, cookie := newEndpointHandlerHarnessSvc(t)
 
-	// test:内置行拨平台代理入口(本机 56432 常驻 → ok=true + 语义摘要)。
-	// 不可达路径由 TestEndpointService_TestProbe 的死址注入单测覆盖。
+	// test:builtin 行走真探测(5a9ef7af),与 service 层双分支对齐——
+	// 真监听入口 → 200 + ok=true + 可达文案;死端口 → 200 + ok=false +
+	// 可自查文案。都不 5xx。(不可达的单测兜底另见 service 层 TestEndpointService_TestProbe。)
+	reachable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(reachable.Close)
+	svc.SetBuiltinProbeAddrForTest(strings.TrimPrefix(reachable.URL, "http://"))
 	rec := endpointDo(t, h, cookie, http.MethodPost, "/api/endpoints/"+storage.BuiltinEndpointID+"/test", "")
 	if rec.Code != http.StatusOK {
-		t.Fatalf("builtin test code=%d body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("builtin test(可达) code=%d body=%s", rec.Code, rec.Body.String())
 	}
 	_, data := endpointDecode(t, rec)
 	if ok, _ := data["ok"].(bool); !ok {
-		t.Fatalf("内置行 test 应 ok=true(平台入口可达): %#v", data)
+		t.Fatalf("内置行入口可达应 ok=true: %#v", data)
+	}
+	if summary, _ := data["error"].(string); !strings.Contains(summary, "平台隧道入口可达") {
+		t.Fatalf("可达摘要文案不符: %#v", data)
+	}
+
+	// 死端口分支:ok=false + 摘要带「不可达」可自查(仍是 200 不是 5xx)。
+	svc.SetBuiltinProbeAddrForTest("127.0.0.1:1")
+	rec = endpointDo(t, h, cookie, http.MethodPost, "/api/endpoints/"+storage.BuiltinEndpointID+"/test", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("builtin test(不可达) code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	_, data = endpointDecode(t, rec)
+	if ok, _ := data["ok"].(bool); ok {
+		t.Fatalf("内置行入口不可达应 ok=false: %#v", data)
+	}
+	if summary, _ := data["error"].(string); !strings.Contains(summary, "不可达") {
+		t.Fatalf("不可达摘要应可自查: %#v", data)
 	}
 
 	// fetch-models:fake 上游返回 OpenAI 形态列表,不落库。

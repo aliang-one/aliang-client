@@ -25,21 +25,33 @@ type Client struct {
 	httpURL   string
 	mu        sync.Mutex
 	connected bool
+
+	// sendMu 是请求级互斥:同一连接上一次只允许一个「写请求→读响应」
+	// 往返。2s 轮询 goroutine 与点击处理 goroutine 并发共用同一 Client,
+	// 无互斥时两个请求同时在途,先到读的 goroutine 会拿走最早入队的
+	// 响应(串位)。Send 全程持锁,重拨判断与 HTTP 回退也一并串行。
+	sendMu sync.Mutex
+
+	// readTimeout 是单次读/写帧的 deadline 时长。默认 requestTimeout;
+	// 测试可注入更小值(同包测试直接改字段)验证超时语义,全局常量不动。
+	readTimeout time.Duration
 }
 
 // NewClient creates a new IPC client.
 func NewClient() *Client {
 	return &Client{
-		transport: NewTransport(),
-		httpURL:   defaultHTTPBaseURL,
+		transport:   NewTransport(),
+		httpURL:     defaultHTTPBaseURL,
+		readTimeout: requestTimeout,
 	}
 }
 
 // NewClientWithHTTP creates a new IPC client with custom HTTP URL.
 func NewClientWithHTTP(httpURL string) *Client {
 	return &Client{
-		transport: NewTransport(),
-		httpURL:   httpURL,
+		transport:   NewTransport(),
+		httpURL:     httpURL,
+		readTimeout: requestTimeout,
 	}
 }
 
@@ -47,8 +59,9 @@ func NewClientWithHTTP(httpURL string) *Client {
 // (测试注入用)。
 func NewClientWithTransport(transport Transport, httpURL string) *Client {
 	return &Client{
-		transport: transport,
-		httpURL:   httpURL,
+		transport:   transport,
+		httpURL:     httpURL,
+		readTimeout: requestTimeout,
 	}
 }
 
@@ -92,6 +105,11 @@ func (c *Client) Close() error {
 // Send sends an IPC request and returns the response.
 // If IPC fails, it falls back to HTTP for development mode.
 func (c *Client) Send(action string, args interface{}) (*Response, error) {
+	// 请求级互斥覆盖 Send 全程:重拨判断、IPC 往返、HTTP 回退都串行。
+	// 没有它,两个并发 Send 的写/读会在同一连接上交错,响应串位。
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+
 	// Try IPC first. 断线状态先拨一次:core 换代(服务重启/崩溃恢复)后旧
 	// 管道已死,不重拨则 start_http/sync_agent_auth/stop_http 这些
 	// IPC-only 动作在 HTTP 回退里硬报错、永远失效(companion 的
@@ -127,20 +145,37 @@ func (c *Client) sendIPC(action string, args interface{}) (*Response, error) {
 		Args:   reqArgs,
 	}
 
+	// 每次写/读前拨 deadline:服务端半死(收包不回包)时,Send 在
+	// readTimeout 内带错返回,而不是永久阻塞读。
+	if err := conn.SetDeadline(time.Now().Add(c.readTimeout)); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("[IPC] set deadline error: %w", err)
+	}
+
 	// Send request
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		c.Close()
 		return nil, fmt.Errorf("[IPC] send error: %w", err)
 	}
 
-	// Read response
-	var resp Response
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		c.Close()
-		return nil, fmt.Errorf("[IPC] recv error: %w", err)
+	// 读响应循环:按 ID 过滤,跳过不属于本请求的帧(上一轮漏读的迟到
+	// 响应等杂帧),只认 ID 匹配的那帧,绝不把错帧当本次结果。每次读
+	// 单独拨 deadline,错帧再多也有界。
+	decoder := json.NewDecoder(conn)
+	for {
+		if err := conn.SetDeadline(time.Now().Add(c.readTimeout)); err != nil {
+			c.Close()
+			return nil, fmt.Errorf("[IPC] set deadline error: %w", err)
+		}
+		var resp Response
+		if err := decoder.Decode(&resp); err != nil {
+			c.Close()
+			return nil, fmt.Errorf("[IPC] recv error: %w", err)
+		}
+		if resp.ID == reqID {
+			return &resp, nil
+		}
 	}
-
-	return &resp, nil
 }
 
 func (c *Client) sendHTTP(action string, args interface{}) (*Response, error) {

@@ -111,6 +111,23 @@ func Quit() {
 	quitOnce.Do(quit)
 }
 
+// 本仓补丁:面板模式点击回调。设置后,后端把托盘图标的左/右键点击都交给
+// 回调(每次点击起新 goroutine 异步执行),不再弹原生菜单;nil(默认)保持
+// 上游行为 = 点击弹原生菜单(原生菜单兜底模式)。读取此回调的是 Windows 的
+// wndProc 与 macOS 的 systray_tray_clicked(2026-11-26 面板胶水接入 darwin)。
+// 应在 Run/Register 之前设置;运行期切换的时序责任由面板接线层自担。
+var panelClickFn func()
+
+// SetPanelClickHook 注册托盘图标点击回调(面板模式)。
+// fn 为 nil 时恢复原生菜单兜底模式。
+// 回调契约:应快速返回——每次点击都会起新 goroutine,耗时回调会按连点
+// 次数无上限堆积 goroutine;回调可能并发执行(双击 = 两个并发回调),
+// 串行化由接线层负责;回调 panic 发生在无 recover 的 goroutine 上,
+// 会终止整个进程。
+func SetPanelClickHook(fn func()) {
+	panelClickFn = fn
+}
+
 // AddMenuItem adds a menu item with the designated title and tooltip.
 // It can be safely invoked from different goroutines.
 // Created menu items are checkable on Windows and OSX by default. For Linux you have to use AddMenuItemCheckbox

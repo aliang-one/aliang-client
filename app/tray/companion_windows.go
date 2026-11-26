@@ -15,7 +15,6 @@ import (
 	"aliang.one/nursorgate/common/version"
 	"aliang.one/nursorgate/internal/ipc"
 	"aliang.one/nursorgate/internal/singleinstance"
-	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/setup"
 	"github.com/getlantern/systray"
 	"golang.org/x/sys/windows"
@@ -49,7 +48,7 @@ type CompanionApp struct {
 func NewCompanionApp() *CompanionApp {
 	return &CompanionApp{
 		ipcClient: ipc.NewClient(),
-		httpURL:   "http://" + config.DefaultManagementAddr,
+		httpURL:   panelDefaultBaseURL, // 基址字面拷贝三处归一,见 panel_bridge.go
 		done:      make(chan struct{}),
 	}
 }
@@ -104,6 +103,11 @@ func (a *CompanionApp) onReady() {
 		goWithCompanionTrace("syncStateLoop", a.syncStateLoop)
 		goWithCompanionTrace("agentWatchdogLoop", a.agentWatchdogLoop)
 	})
+
+	// M1 托盘面板接线(收尾动作):左右键点击 → panel.html。Windows 侧
+	// panelClickFn 非 nil 即接管左右键(wndProc 分支),无摘菜单动作;挂接
+	// 仍放在菜单构建完成之后,与 macOS 侧时序语义保持一致。
+	a.installPanelBridge()
 }
 
 func (a *CompanionApp) onExit() {
