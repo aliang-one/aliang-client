@@ -1031,6 +1031,12 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 		// create 异步离读循环/input·resize·close 保持 inline 的契约注释
 		// 见该函数)。本腿的 enabled 闸给 remoteTerminalEnabled。
 		s.setRemoteConnectionState(true, "online", "")
+		// assist- 前缀帧归协助腿(Task 5):前置门控,返回 true=本帧已被协助
+		// 腿处置(放行 input/resize 或拒绝),不得再走手机腿;false=无前缀帧
+		// 继续下方手机腿原路径(既有行为零改动)。
+		if s.handleAssistTerminalFrame(msg, writeJSON) {
+			return
+		}
 		// 手机腿无连接 sink 身份(nil):网页孤儿回收链不涉手机腿
 		s.DispatchTerminalFrame(msg, writeJSON, nil, s.remoteTerminalEnabled)
 	case models.AgentEventTerminalQuotaResolved:

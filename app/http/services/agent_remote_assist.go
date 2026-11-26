@@ -87,6 +87,12 @@ type remoteAssistManager struct {
 	// hooksPending 锁内固化的待投递钩子闭包(钩子引用与参数在迁移当下取值,
 	// 避免锁外重读字段的数据竞争),解锁后 runPendingHooks 统一投递。
 	hooksPending []func()
+
+	// views 是观看端扇出注册表(Task 5,设备本地;Task 7 观看 WS 注册进来):
+	// 会话 id → viewID(连接身份) → 扇出函数。与 m.mu 分锁——扇出在 PTY 输出
+	// 复制循环上调用,不得与状态迁移锁互相牵制。
+	viewsMu sync.Mutex
+	views   map[string]map[string]assistViewFan
 }
 
 func newRemoteAssistManager(now func() time.Time) *remoteAssistManager {
@@ -148,9 +154,10 @@ var (
 // ---------------------------------------------------------------------------
 
 // assistFrameSink 是 assist 信令帧的注入出口(集成测试与诊断面缝,仅测试
-// 装置置位,生产路径恒 nil):*AndSignal 的自发帧与 OnRemoteFrame 的回帧
-// 均经 assistFrameWriter 投出。刻意只服务 assist 帧族——不新增给 assist
-// 之外路径用的全局可变缝(计划铁律)。
+// 装置置位,生产路径恒 nil):*AndSignal 的自发帧、OnRemoteFrame 的回帧,以
+// 及协助 PTY 输出复合 writer 的上行腿(任务 5 起,terminal.output/exit/
+// error 同走此缝)均经 assistFrameWriter 投出。刻意只服务 assist 帧族——
+// 不新增给 assist 之外路径用的全局可变缝(计划铁律)。
 var assistFrameSinkMu sync.RWMutex
 var assistFrameSinkFn func(map[string]interface{}) error
 
@@ -597,4 +604,348 @@ func (m *remoteAssistManager) cloudEndOnce(sid string, reason assistEndReason) (
 	m.mu.Unlock()
 	m.runPendingHooks()
 	return false, nil
+}
+
+// ---------------------------------------------------------------------------
+// 协助终端腿(Task 5):approved 激活 PTY、终态回收、观看端扇出注册表。
+//
+// ID 方案(刻意):终端 session_id == 状态机会话 id(两者同为 assist-<nanos>,
+// 一个 id 两个子系统)。前缀即路由键——remote-WS 终端帧分派点据此把 assist-
+// 前缀帧导给协助腿门控(见 handleAssistTerminalFrame),云端/审计全链同 id
+// 可对账,跨子系统再映射 id 的复杂度不值得。
+//
+// 保活语义铁律(spec §14 坑 2):协助终端经 createWithSink 落进 m.sessions
+// 与手机腿会话同池同族——断线走 markAllDetached 保留、30m idle 才回收;
+// connSink 恒 nil 故永不进网页腿 orphanTimers 延迟回收链(那链只由
+// ScheduleWebOrphanClose 登记,网页腿专属)。
+// ---------------------------------------------------------------------------
+
+// isActiveSession 报告 sid 是否当前 active 会话(id 匹配+active 态,单锁内
+// 取值)。协助终端帧门控与激活钩子再验共用;刻意不内嵌懒扫——门控是读路径,
+// 时长上限的收敛由 Snapshot 懒扫/周期 Sweep 驱动,边界秒级的残留输入无实害。
+func (m *remoteAssistManager) isActiveSession(sid string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.session != nil && m.session.id == sid && m.stateLocked() == assistStateActive
+}
+
+// assistViewFan 观看端扇出出口:一条观看连接的写出口。viewID=连接身份
+// (观看端重连=旧 viewID 注销+新 viewID 注册,由 Task 7 观看 WS 调用)。
+type assistViewFan func(map[string]interface{}) error
+
+// RegisterViewSink 注册观看端扇出出口(会话→viewID→扇出)。同一会话允许多
+// 观看连接(spec §13-3 默认);幂等覆盖同 viewID。
+//
+// Task 7 观看 WS 调用纪律:注册前必须先确认会话仍 active(isActiveSession)
+// ——收摊路径 notifyAndClearViews 是「先删桶再调 sink」,结束后才注册的观看
+// 端会得到一个永不被通知的孤儿桶(收不到 assist.end);连接退出必须
+// UnregisterViewSink 防桶泄漏。
+func (m *remoteAssistManager) RegisterViewSink(sid, viewID string, fn assistViewFan) {
+	m.viewsMu.Lock()
+	if m.views == nil {
+		m.views = make(map[string]map[string]assistViewFan)
+	}
+	if m.views[sid] == nil {
+		m.views[sid] = make(map[string]assistViewFan)
+	}
+	m.views[sid][viewID] = fn
+	m.viewsMu.Unlock()
+}
+
+// UnregisterViewSink 注销观看端(连接退出/会话收摊)。会话最后一个 sink 注销
+// 后连会话桶一起清,防键累积。
+func (m *remoteAssistManager) UnregisterViewSink(sid, viewID string) {
+	m.viewsMu.Lock()
+	if sinks := m.views[sid]; sinks != nil {
+		delete(sinks, viewID)
+		if len(sinks) == 0 {
+			delete(m.views, sid)
+		}
+	}
+	m.viewsMu.Unlock()
+}
+
+// fanOutToViews 把一帧扇给该会话全部在册观看端。单路失败仅记日志不阻断他路
+// (复制循环的帧照常出),扇出快照锁内取、锁外执行——PTY 输出路径不与
+// viewsMu 长持。每个 sink 独立 recover:fan 是外部代码,跑在 PTY 复制循环
+// goroutine(裸 go,panic 即杀进程)与钩子 drain 路径上,safeGo 同款纪律——
+// 单 sink 爆炸按失败计,循环继续。
+func (m *remoteAssistManager) fanOutToViews(sid string, frame map[string]interface{}) {
+	m.viewsMu.Lock()
+	type viewSink struct {
+		viewID string
+		fn     assistViewFan
+	}
+	sinks := make([]viewSink, 0, len(m.views[sid]))
+	for id, fn := range m.views[sid] {
+		sinks = append(sinks, viewSink{viewID: id, fn: fn})
+	}
+	m.viewsMu.Unlock()
+	for _, s := range sinks {
+		m.fanOneView(sid, s.viewID, s.fn, frame, "view fan-out failed")
+	}
+}
+
+// notifyAndClearViews 收摊:先给全部在册观看端发终帧(assist.end{reason})再
+// 清空该会话注册表。观看端收到终帧后由服务端关闭连接(Task 7)。返回被通知
+// 的 sink 数(观测用)。recover 纪律同 fanOutToViews。
+func (m *remoteAssistManager) notifyAndClearViews(sid string, frame map[string]interface{}) int {
+	m.viewsMu.Lock()
+	type viewSink struct {
+		viewID string
+		fn     assistViewFan
+	}
+	sinks := make([]viewSink, 0, len(m.views[sid]))
+	for id, fn := range m.views[sid] {
+		sinks = append(sinks, viewSink{viewID: id, fn: fn})
+	}
+	delete(m.views, sid)
+	m.viewsMu.Unlock()
+	notified := 0
+	for _, s := range sinks {
+		if m.fanOneView(sid, s.viewID, s.fn, frame, "view end notify failed") == nil {
+			notified++
+		}
+	}
+	return notified
+}
+
+// fanOneView 投递单路观看端:错误与 panic 都按失败计(仅日志,不阻断他路;
+// panic 不 recover 即顺 Go 语义杀全进程,带走所有活 PTY)。
+func (m *remoteAssistManager) fanOneView(sid, viewID string, fn assistViewFan, frame map[string]interface{}, failLog string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Warn(fmt.Sprintf("[ASSIST] %s session_id=%s view=%s panic=%v", failLog, sid, viewID, r))
+			err = fmt.Errorf("view sink panicked: %v", r)
+		}
+	}()
+	if err = fn(frame); err != nil {
+		logger.Warn(fmt.Sprintf("[ASSIST] %s session_id=%s view=%s error=%v", failLog, sid, viewID, err))
+	}
+	return err
+}
+
+// assistEndFrame 观看端终帧(assist.end 双向帧族的设备侧用途)。
+func assistEndFrame(sid string, reason assistEndReason) map[string]interface{} {
+	return map[string]interface{}{
+		"type":       models.AgentEventAssistEnd,
+		"session_id": sid,
+		"reason":     string(reason),
+	}
+}
+
+// ——— 服务侧接线:approved 激活/终态回收/复合 writer ———
+
+// assistTerminalCloseWaitCap 是关闭路径等待在途 create 的总窗上限:短窗
+// (agentTerminalCreateWaitTimeout,照手机腿 input 同款)内不落地时转后台
+// 续等的界。cwd 冷缓存解析实测可超 10s(见 WarmAgentAuthorizedExecutionDirectories
+// 注释),30s 覆盖之。var(非 const)同 agentTerminalCreateWaitTimeout 处理:
+// 测试缩短它以触达放弃分支。
+var assistTerminalCloseWaitCap = 30 * time.Second
+
+// wireAssistTerminalLeg 接线协助终端腿:approved 激活建 PTY、终态关 PTY+观看
+// 端收摊。NewAgentService 构造期一次性调用(照 webTerminal.onLock 构造期注入
+// 先例:早于任何流量,评审指令);测试夹具亦可直调。OnActivated/OnEnded 本就
+// 是覆盖式设置,无需额外幂等防。
+func (s *AgentService) wireAssistTerminalLeg() {
+	if s.assist == nil {
+		return
+	}
+	s.assist.OnActivated(s.assistOnActivated)
+	s.assist.OnEnded(s.assistOnEnded)
+}
+
+// assistOnActivated approved 激活联动(状态机锁外投递):池满即终态收口
+// terminal_limit(上行让云端与 admin 得知,而不是挂着 active 却无终端可用;
+// spec §14 坑 1——手机在用会话不被挤掉),有坑则建会话专属 PTY。
+//
+// enabled 不复查:approved 帧本身经 remoteAgentMessageRequiresEnabledDevice
+// 门,disabled 设备收不到它。
+func (s *AgentService) assistOnActivated(sessionID string) {
+	if s.terminal == nil || s.assist == nil {
+		return // 防御:半构造服务不进腿(接线体依赖两字段)
+	}
+	// 会话在钩子排队期间可能已被终态(批准/过期边界竞态:两钩子可由不同
+	// goroutine 各自 drain,runPendingHooks 无全局串行化),再验 active 才动。
+	if !s.assist.isActiveSession(sessionID) {
+		return
+	}
+	if !s.terminal.hasHeadroom() {
+		if _, err := s.assist.EndAndSignal(AssistEndTerminalLimit); err != nil {
+			logger.Warn(fmt.Sprintf("[ASSIST] terminal_limit end failed session_id=%s error=%v", sessionID, err))
+		}
+		return
+	}
+	msg := map[string]interface{}{
+		"type":       models.AgentEventTerminalCreate,
+		"session_id": sessionID,
+		// cwd 留空:引擎 resolveAgentTerminalCWD→resolveAgentCWDFallbackHome
+		// 兜底——有同步项目目录时落首个授权目录,零目录时落家目录(与手机腿
+		// create 的空 cwd 同语义)。rows/cols 缺省:引擎 normalizeTerminal
+		// Dimension 落 24/80。
+	}
+	// create 照手机腿派发点(DispatchTerminalFrame create 臂)同款离读循环:
+	// beginCreate 同步登记(紧随的 terminal.input 可等待)+ safeGo 异步起跑
+	// ——createWithSink 本体是阻塞调用(shell 解析/cwd 解析/进程起跑),本钩
+	// 子跑在 WS 读循环与懒扫路径上,不得内联。顺序保持:激活与终态钩子的同
+	// 一会话竞态由 close 路径的 waitForCreate 兜(见 assistCloseTerminal)。
+	release := s.terminal.beginCreate(sessionID)
+	safeGo("assist.terminal.create", func() {
+		defer release()
+		s.terminal.createWithSink(msg, s.assistTerminalCompositeWriter(sessionID), nil)
+	})
+}
+
+// assistOnEnded 终态联动(状态机锁外投递):关协助 PTY(创建在途也兜住)+
+// 观看端收终帧收摊。
+//
+// 时序真相(评审勘误):m.close 只是触发异步 session.kill(),terminal.exit
+// 帧由 waitTerminal 的 goroutine 在进程死后才发;而 notifyAndClearViews 在
+// 本钩子 goroutine 上同步执行——注册表几乎总是先清空,观看端收不到
+// terminal.exit(至多抢到竞态尾巴)。观看页生命周期以 assist.end 为唯一终
+// 态信标,**不得等 terminal.exit**(Task 7 观看 WS 收 assist.end 即关连接)。
+func (s *AgentService) assistOnEnded(sessionID string, reason assistEndReason) {
+	if s.terminal == nil {
+		return
+	}
+	s.assistCloseTerminal(sessionID)
+	if s.assist != nil {
+		s.assist.notifyAndClearViews(sessionID, assistEndFrame(sessionID, reason))
+	}
+}
+
+// assistCloseTerminal 关闭协助 PTY。快批快收竞态(approve 后云端立刻 end):
+// 先按手机腿 input 同款短窗等待在途 create 落地再杀(get==nil 不发 close,
+// 避免 m.close 对无会话路径补发的 exit 帧误导 admin);短窗内仍不落地(cwd
+// 冷缓存解析可超 10s)转后台续等有界窗口,读循环不挂长。session id 全局唯一
+// (nanos),迟到的关闭只可能落在本会话自己的 PTY 上,跨会话误杀不存在;
+// 后台续等也放弃的极端残局由闲置回收兜底(attached idle 24h / detach 30m)。
+func (s *AgentService) assistCloseTerminal(sid string) {
+	if s.assistWaitCreateSettled(sid, agentTerminalCreateWaitTimeout) {
+		s.assistKillTerminal(sid)
+		return
+	}
+	safeGo("assist.terminal.close", func() {
+		if s.assistWaitCreateSettled(sid, assistTerminalCloseWaitCap) {
+			s.assistKillTerminal(sid)
+			return
+		}
+		logger.Warn(fmt.Sprintf("[ASSIST] terminal close gave up waiting for in-flight create session_id=%s (idle reaper will collect)", sid))
+	})
+}
+
+// assistWaitCreateSettled 等在途 create 收尾:creating 表无本会话条目(已
+// 落地或从未起跑)即真;cap 窗口内逐轮续等(agentTerminalCreateWaitTimeout
+// 单轮),超窗放弃返回 false。
+func (s *AgentService) assistWaitCreateSettled(sid string, cap time.Duration) bool {
+	deadline := time.Now().Add(cap)
+	for s.assistCreateInFlight(sid) {
+		if time.Now().After(deadline) {
+			return false
+		}
+		s.terminal.waitForCreate(sid, agentTerminalCreateWaitTimeout)
+	}
+	return true
+}
+
+// assistCreateInFlight 只读探针:creating 表是否仍有本会话在途 create。
+// agent_terminal.go 本任务只许加 hasHeadroom(硬约束 2),探针落本文件同包
+// 读内表,零引擎行为改动。
+func (s *AgentService) assistCreateInFlight(sid string) bool {
+	s.terminal.mu.Lock()
+	defer s.terminal.mu.Unlock()
+	_, ok := s.terminal.creating[sid]
+	return ok
+}
+
+// assistKillTerminal 杀在册协助会话(get==nil 跳过——PTY 已自然退出或从未
+// 建成,补发的合成 exit 帧只会误导)。close 走引擎标准路径:kill 后出口帧由
+// waitTerminal 经会话 liveWriter(=复合 writer)回放扇出。
+func (s *AgentService) assistKillTerminal(sid string) {
+	if s.terminal.get(sid) == nil {
+		return
+	}
+	s.terminal.close(map[string]interface{}{
+		"type":       models.AgentEventTerminalClose,
+		"session_id": sid,
+	}, s.assistTerminalCompositeWriter(sid))
+}
+
+// assistTerminalCompositeWriter 协助 PTY 的输出复合 writer(engine
+// agentTerminalWriter 形态,createWithSink 直接受用并经 swapConn 成为会话
+// liveWriter):每帧两路——
+//  1. 上行恒走 assistFrameWriter()(每次写入动态解析:测试缝或当前连接
+//     writer),admin 重连后活输出自然跟上,无需重 attach;
+//  2. terminal.output/exit/error 扇给观看端注册表。terminal.created 刻意不
+//     扇:观看 xterm 是纯文本镜像,created/resized 是交互腿的控制帧,观看页
+//     生命周期由 assist.state/assist.end 驱动(Task 7)。quota challenge/
+//     resolved 帧同样不扇(仅上行)——那是 admin 与设备的裁决面,文本镜像
+//     无需感知。
+//
+// 不对称性(P1 刻意接受):admin 断连时输出在上行腿落地丢弃,观看端仍全量
+// 收到——用户实时围观是本特性优先级最高的面;admin 重连后由 ring 回放补齐。
+// 断连期上行失败不逐帧告警(ring 已留底,逐帧 warn=日志风暴);观看端写失败
+// 仅记日志,两路互不阻断。
+func (s *AgentService) assistTerminalCompositeWriter(sid string) agentTerminalWriter {
+	return func(v interface{}) error {
+		frame, ok := v.(map[string]interface{})
+		if !ok {
+			// 非标载荷(防御):只上行,不扇出
+			return assistFrameWriter()(v)
+		}
+		upErr := assistFrameWriter()(frame)
+		switch remoteString(frame, "type") {
+		case models.AgentEventTerminalOutput, models.AgentEventTerminalExit, models.AgentEventTerminalError:
+			if s.assist != nil {
+				s.assist.fanOutToViews(sid, frame)
+			}
+		}
+		return upErr
+	}
+}
+
+// ——— remote-WS 终端帧分派点前置门控 ———
+
+// handleAssistTerminalFrame 在 remote-WS terminal 帧分派调用点
+// (handleRemoteAgentMessage 的 terminal 四帧 case)前置:assist- 前缀帧归协
+// 助腿门控(enabled+active+id 匹配→放行 input/resize 走 DispatchTerminal
+// Frame;其余 assist- 前缀帧型拒,quota.resolved 裁决臂除外,见下),无前缀
+// 帧返回 false 走手机腿原路径(零改动)。返回 true = 本帧已被协助腿处置
+// (放行或拒绝),调用方不得再走手机腿。
+//
+// 拒绝面语义(P1 帧契约,计划附录 A:设备侧只收 input/resize 下行):
+//   - terminal.create:创建在批准时由设备自授权完成,云端永不创建 assist
+//     终端——收到即拒(防云侧缺陷/串帧凭空起 PTY)。
+//   - terminal.close:关闭来自状态机 End(admin 敲 exit 使 PTY 自然退出、
+//     云端随后收口 assist.end),直接 close 帧不在 P1 契约内——拒。
+//   - 其余(replay/sessions 等):replay 是云端房间侧职责,一律拒防残帧。
+//   - 唯一例外:terminal.quota.resolved 裁决走 handleRemoteAgentMessage 的
+//     独立 case,不经本门——「裁决必须照常送达」优先于前缀拒面(裁决对
+//     无会话 id 幂等吞掉),「一律拒」以上表述均以本例外为准。
+func (s *AgentService) handleAssistTerminalFrame(msg map[string]interface{}, writeJSON func(interface{}) error) bool {
+	sid := remoteString(msg, "session_id")
+	if !strings.HasPrefix(sid, assistIDPrefix) {
+		return false // 无前缀=手机腿会话,原路径处置
+	}
+	if !s.RemoteAssistEnabled() {
+		_ = writeJSON(agentTerminalErrorPayload(sid, errors.New("remote assist is disabled for this device")))
+		return true
+	}
+	// active+id 匹配单锁内取值:会话刚结束/串会话的残留输入在此拒,防死
+	// 会话输入打到无主 PTY 上。
+	if s.assist == nil || !s.assist.isActiveSession(sid) {
+		_ = writeJSON(agentTerminalErrorPayload(sid, errors.New("terminal session not available: assist session is not active")))
+		return true
+	}
+	switch remoteString(msg, "type") {
+	case models.AgentEventTerminalInput, models.AgentEventTerminalResize:
+		// 放行走统一分派口(connSink=nil:手机腿语义,无网页孤儿身份)。分派
+		// 口内对 input/resize 复核 remoteTerminalEnabled 闸——远程终端总闸关
+		// 时 settings 推送本就 closeAll 全部会话,协助终端同族受闸一致。
+		s.DispatchTerminalFrame(msg, writeJSON, nil, s.remoteTerminalEnabled)
+		return true
+	default:
+		_ = writeJSON(agentTerminalErrorPayload(sid, errors.New("terminal frame not accepted: assist session only takes input/resize from cloud")))
+		return true
+	}
 }

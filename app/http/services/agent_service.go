@@ -290,6 +290,10 @@ func NewAgentService() *AgentService {
 	// (构造期陈旧镜像),状态读一律在 proxy 之后(runtime 角色)。
 	s.webTerminal.onLock = func() { s.terminal.closeAll() }
 	s.webTerminal.startSweep()
+	// 远程协助 P1(Task 5):协助终端腿接线(approved 激活建 PTY/终态关
+	// PTY+观看扇出收摊),构造期一次性注入——照 webTerminal.onLock 先例,早
+	// 于任何流量;钩子是覆盖式设置无需幂等防。
+	s.wireAssistTerminalLeg()
 	s.ai.loadPendingTerminals()
 	// 审批请求投递 journal 回灌(L1,2026-11-01):上次进程未确认送达的审批
 	// 请求,注册成功后重放(服务端 intake 幂等)。

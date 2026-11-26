@@ -1,8 +1,12 @@
 package services
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
+	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -482,5 +486,823 @@ func TestAssistRemoteFramesRequireEnabledDevice(t *testing.T) {
 		if !remoteAgentMessageRequiresEnabledDevice(typ) {
 			t.Fatalf("assist frame %s must be behind the enabled-device gate", typ)
 		}
+	}
+}
+
+// ——— Task 5:协助终端腿(approved 激活 + session 前缀门控 + 池余量) ———
+
+// fakeAssistSpawner 协助腿专用假 startProcess:假 PTY 的 stdin 是可回读的
+// buffer(断言输入),stdout 是可注入的管道(驱动输出扇出),kill 会话即死
+// (记 kill 计数)。照 fakeTerminalSpawner(agent_terminal_attach_test.go)
+// 夹具骨架,加输入/输出探针。
+type fakeAssistSpawner struct {
+	mu      sync.Mutex
+	spawned int
+	killed  int
+	cwds    []string
+	// inputBufs 按会话 id 记假 PTY 的 stdin(buffer 输入断言)。
+	inputBufs map[string]*bytes.Buffer
+	// emitPipes 按会话 id 记假 PTY 的输出管道写端(测试注入输出)。
+	emitPipes map[string]*io.PipeWriter
+	// alive 按会话 id 记 PTY 是否仍在被 kill 之前(真 exit 走管道关闭语义,
+	// 此处 kill 计数即关闭)。
+	alive map[string]bool
+	// exitDone 控制假 waiter 的归返(默认 nil=立即退出,与手机腿夹具同款
+	// 陷阱:立刻退出会让 waitTerminal 抢先清表,生命周期断言失真——这里
+	// 全部用 blockExit 长活)。
+	blockExit chan struct{}
+}
+
+func newFakeAssistSpawner() *fakeAssistSpawner {
+	return &fakeAssistSpawner{
+		inputBufs: make(map[string]*bytes.Buffer),
+		emitPipes: make(map[string]*io.PipeWriter),
+		alive:     make(map[string]bool),
+		blockExit: make(chan struct{}),
+	}
+}
+
+func (f *fakeAssistSpawner) start(sessionID string, shell string, cwd string, rows int, cols int) (*agentTerminalSession, []io.Reader, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.spawned++
+	f.cwds = append(f.cwds, cwd)
+	f.alive[sessionID] = true
+	stdin := &bytes.Buffer{}
+	f.inputBufs[sessionID] = stdin
+	pipeReader, pipeWriter := io.Pipe()
+	f.emitPipes[sessionID] = pipeWriter
+	handle := &agentTerminalHandle{
+		input: nopWriteCloser{Writer: stdin},
+		wait: func() (int, error) {
+			<-f.blockExit
+			return 0, nil
+		},
+		kill: func() error {
+			f.mu.Lock()
+			f.killed++
+			f.alive[sessionID] = false
+			f.mu.Unlock()
+			return nil
+		},
+		close: func() error { return nil },
+	}
+	return newAgentTerminalSession(sessionID, shell, cwd, handle, false, rows, cols), []io.Reader{pipeReader}, nil
+}
+
+// spawnedCount 已 spawn 的假 PTY 总数(收尾静默用)。
+func (f *fakeAssistSpawner) spawnedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.spawned
+}
+
+// assistHarness 绑 assist manager + 假终端引擎的 AgentService 装置:
+// startProcess 换假、wireAssistTerminalLeg 接线、上行 sink 收帧。
+// Cleanup 纪律(次序刻意,LIFO):先放行假 PTY 并静等每个会话的 exit 帧
+// 落上行缝,再摘缝——exit 帧经复合 writer 上行,若在摘缝后才写,
+// assistFrameWriter 会回落 currentRemoteWriterFunc → 触发共享 AgentService
+// 构造(重量级副作用,测试绝不引入)。
+type assistHarness struct {
+	svc          *AgentService
+	spawner      *fakeAssistSpawner
+	up           []map[string]interface{}
+	upMu         sync.Mutex
+	collectFrame func(map[string]interface{}) error
+}
+
+func newTestAssistManagerWithFakeTerminal(t *testing.T) *assistHarness {
+	t.Helper()
+	dir := t.TempDir()
+	setAgentAuthorizedExecutionDirectoriesCache([]string{dir})
+	t.Cleanup(func() { setAgentAuthorizedExecutionDirectoriesCache(nil) })
+
+	// 预置 authorized 目录缓存让 resolveAgentTerminalCWD 走授权分支而非
+	// 全量扫描(冷扫描秒级,测试噪音)。
+	h := &assistHarness{spawner: newFakeAssistSpawner()}
+	// 可变时钟(照 newTestAssistManager 桩):测试经 AdvanceClock 跳 60s 冷却
+	// 与时间窗,免真实 sleep。
+	tick := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	h.svc = &AgentService{
+		terminal: newAgentTerminalManager(),
+		assist:   newRemoteAssistManager(func() time.Time { return tick }),
+	}
+	h.svc.assist.clockAdvance = func(d time.Duration) { tick = tick.Add(d) }
+	// 门控复核 RemoteAssistEnabled(服务 s.mu 下的 state 顶层字段),夹具
+	// 直接置位(生产由 NewAgentService 装载持久化态);Enabled+Registered
+	// +nil Device 让 remoteTerminalEnabled 同放行(放行的 input 走统一
+	// 分派口的 enabled 闸)。
+	h.svc.mu.Lock()
+	h.svc.state.RemoteAssistEnabled = true
+	h.svc.state.Enabled = true
+	h.svc.state.Registered = true
+	h.svc.mu.Unlock()
+	h.svc.terminal.startProcess = h.spawner.start
+	t.Cleanup(func() { AssistSetFrameSink(nil) })
+	h.collectFrame = func(f map[string]interface{}) error {
+		h.upMu.Lock()
+		h.up = append(h.up, f)
+		h.upMu.Unlock()
+		return nil
+	}
+	AssistSetFrameSink(h.collectFrame)
+	h.svc.wireAssistTerminalLeg()
+	t.Cleanup(func() { h.quiesceFakeTerminals(t) })
+	return h
+}
+
+// quiesceFakeTerminals 放行全部假 PTY(blockExit)并静等每个「此刻仍在 live
+// 表」会话的 exit 帧落上行缝。期望集取快照于放行前:fake waiter 被 kill 后仍
+// 卡在 blockExit,waitTerminal 未走完 active 分支的会话放行后各回一帧 exit;
+// 已不在表的(closeAll 清场、composite 合成路径)走 inactive 分支不回帧,不
+// 计入。waiter 为 nil 的白盒会话(池占位)无 goroutine,不计入。超时硬失败,
+// 防止静默退化成上面注释的共享服务构造。
+func (h *assistHarness) quiesceFakeTerminals(t *testing.T) {
+	t.Helper()
+	h.svc.terminal.mu.Lock()
+	pending := make(map[string]bool, len(h.svc.terminal.sessions))
+	for id, sess := range h.svc.terminal.sessions {
+		if sess != nil && sess.waiter != nil {
+			pending[id] = true
+		}
+	}
+	h.svc.terminal.mu.Unlock()
+	close(h.spawner.blockExit)
+	deadline := time.Now().Add(5 * time.Second)
+	for len(pending) > 0 && time.Now().Before(deadline) {
+		for id := range pending {
+			if h.upHasExitFor(id) {
+				delete(pending, id)
+			}
+		}
+		if len(pending) == 0 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if len(pending) > 0 {
+		missing := make([]string, 0, len(pending))
+		for id := range pending {
+			missing = append(missing, id)
+		}
+		t.Fatalf("quiesce: exit frames missing for %v (uplink seam must see them before removal)", missing)
+	}
+}
+
+func (h *assistHarness) upSnapshot() []map[string]interface{} {
+	h.upMu.Lock()
+	defer h.upMu.Unlock()
+	return append([]map[string]interface{}(nil), h.up...)
+}
+
+// upOfTypes 取上行帧里指定类型(保序)。
+func (h *assistHarness) upOfTypes(want ...string) []map[string]interface{} {
+	set := make(map[string]bool, len(want))
+	for _, t := range want {
+		set[t] = true
+	}
+	var out []map[string]interface{}
+	for _, p := range h.upSnapshot() {
+		if t, ok := p["type"].(string); ok && set[t] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// upHasData 报告上行是否已出现含该子串的 terminal.output 帧(输出腿断言)。
+func (h *assistHarness) upHasData(substr string) bool {
+	for _, p := range h.upOfTypes(models.AgentEventTerminalOutput) {
+		if strings.Contains(fmt.Sprint(p["data"]), substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// upGot 保留计划测试草稿里的语义名(uplinkGot 同义)。
+func (h *assistHarness) upGot(substr string) bool { return h.upHasData(substr) }
+
+// upHasExitFor 报告该会话的 terminal.exit 帧是否已落上行缝。
+func (h *assistHarness) upHasExitFor(sid string) bool {
+	for _, p := range h.upOfTypes(models.AgentEventTerminalExit) {
+		if p["session_id"] == sid {
+			return true
+		}
+	}
+	return false
+}
+
+// fakeTerminalCWD 返回协助会话 PTY 的 cwd(空=未创建)。
+func (h *assistHarness) fakeTerminalCWD(sid string) string {
+	if s := h.svc.terminal.get(sid); s != nil {
+		return s.cwd
+	}
+	return ""
+}
+
+// fakeTerminalAlive 报告 PTY 是否仍在引擎 live 表且未被 kill。
+func (h *assistHarness) fakeTerminalAlive(sid string) bool {
+	if h.svc.terminal.get(sid) == nil {
+		return false
+	}
+	h.spawner.mu.Lock()
+	defer h.spawner.mu.Unlock()
+	return h.spawner.alive[sid]
+}
+
+// fakeTerminalEmit 从假 PTY 注入输出字节(驱动复制循环→复合 writer 双腿)。
+func (h *assistHarness) fakeTerminalEmit(sid string, data string) {
+	h.spawner.mu.Lock()
+	w := h.spawner.emitPipes[sid]
+	h.spawner.mu.Unlock()
+	if w == nil {
+		return
+	}
+	_, _ = w.Write([]byte(data))
+}
+
+// assistViewProbe 测试用观看端探针:收帧+收终帧即关。
+type assistViewProbe struct {
+	mu     sync.Mutex
+	frames []map[string]interface{}
+	closed bool
+}
+
+func (p *assistViewProbe) fan(frame map[string]interface{}) error {
+	p.mu.Lock()
+	p.frames = append(p.frames, frame)
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *assistViewProbe) Got(substr string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, f := range p.frames {
+		if strings.Contains(fmt.Sprint(f["data"]), substr) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *assistViewProbe) endFrame() (map[string]interface{}, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, f := range p.frames {
+		if t, _ := f["type"].(string); t == models.AgentEventAssistEnd {
+			return f, true
+		}
+	}
+	return nil, false
+}
+
+// waitUntil 轮询断言辅助:cond 在超时前变真返回 true。
+func waitUntil(timeout time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return cond()
+}
+
+func TestAssistTerminalLifecycle(t *testing.T) {
+	h := newTestAssistManagerWithFakeTerminal(t)
+	sid, err := h.svc.assist.RequestAndSignal("")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// approved → 终端异步创建(create 离钩子体跑)。cwd=授权目录首项(零
+	// 同步目录设备上则落家目录——resolveAgentCWDFallbackHome 兜底,引擎
+	// 语义被既有 cwd fallback 测试族钉住)。
+	if _, err := h.svc.assist.OnRemoteFrame(map[string]interface{}{
+		"type": models.AgentEventAssistApproved, "session_id": sid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+		t.Fatal("terminal must be created at approval with home cwd")
+	}
+
+	// output 经复合 writer:同时写上行 sink 与观看扇出。
+	probe := &assistViewProbe{}
+	h.svc.assist.RegisterViewSink(sid, "view1", probe.fan)
+	h.fakeTerminalEmit(sid, "hello")
+	if !waitUntil(5*time.Second, func() bool { return h.upGot("hello") && probe.Got("hello") }) {
+		t.Fatalf("output must fan out to both uplink and view sinks (up=%v view=%d frames)",
+			h.upOfTypes(models.AgentEventTerminalOutput), len(probe.frames))
+	}
+
+	// End → 终端关闭、观看 sink 收 assist.end{reason}、注册表清空。
+	if err := h.svc.assist.End(AssistEndAdmin); err != nil {
+		t.Fatal(err)
+	}
+	if !waitUntil(5*time.Second, func() bool { return !h.fakeTerminalAlive(sid) }) {
+		t.Fatal("end must close the assist terminal")
+	}
+	endFrame, ok := probe.endFrame()
+	if !ok {
+		t.Fatalf("view sink must receive assist.end, got %v", probe.frames)
+	}
+	if endFrame["reason"] != string(AssistEndAdmin) || endFrame["session_id"] != sid {
+		t.Fatalf("assist.end frame = %v, want reason=%s session=%s", endFrame, AssistEndAdmin, sid)
+	}
+	// 注册表已清:后续扇出无接收者(内部态断言)。
+	h.svc.assist.viewsMu.Lock()
+	_, hasViews := h.svc.assist.views[sid]
+	h.svc.assist.viewsMu.Unlock()
+	if hasViews {
+		t.Fatal("end must clear the view sink registry for the session")
+	}
+}
+
+// TestAssistTerminalCreationIsAsyncOffReadLoop 钉激活钩子不阻塞投递方:
+// approved 帧处理(含钩子 drain)必须同步返回,create 在后台落地——钩子跑在
+// WS 读循环与懒扫路径上,内联阻塞=卡死读循环(任务铁律)。
+func TestAssistTerminalCreationIsAsyncOffReadLoop(t *testing.T) {
+	h := newTestAssistManagerWithFakeTerminal(t)
+	sid, _ := h.svc.assist.RequestAndSignal("")
+	start := time.Now()
+	if _, err := h.svc.assist.OnRemoteFrame(map[string]interface{}{
+		"type": models.AgentEventAssistApproved, "session_id": sid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("approved frame handling blocked %v (create must be off the hook body)", d)
+	}
+	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+		t.Fatal("terminal must still land asynchronously")
+	}
+}
+
+// TestAssistTerminalRapidApproveEndRace 钉快批快收竞态:approve 后立刻 End,
+// 关闭路径必须兜住在途 create(等待落地再杀),最终 PTY 必死、不得存活悬挂。
+func TestAssistTerminalRapidApproveEndRace(t *testing.T) {
+	h := newTestAssistManagerWithFakeTerminal(t)
+	sid, _ := h.svc.assist.RequestAndSignal("")
+	if _, err := h.svc.assist.OnRemoteFrame(map[string]interface{}{
+		"type": models.AgentEventAssistApproved, "session_id": sid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 立刻终态——create 大概率仍在途(几毫秒内)。
+	if err := h.svc.assist.End(AssistEndClient); err != nil {
+		t.Fatal(err)
+	}
+	if !waitUntil(8*time.Second, func() bool { return !h.fakeTerminalAlive(sid) }) {
+		t.Fatal("rapid approve→end must still close the terminal (in-flight create awaited)")
+	}
+}
+
+// TestAssistTerminalEndBeforeApproveIsNoOp 终态先于激活:pending 撤销不建
+// PTY(激活钩子只在 approved 迁移触发,requested→ended 无激活)。
+func TestAssistTerminalEndBeforeApproveIsNoOp(t *testing.T) {
+	h := newTestAssistManagerWithFakeTerminal(t)
+	if _, err := h.svc.assist.RequestAndSignal(""); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.svc.assist.End(AssistEndClient); err != nil {
+		t.Fatal(err)
+	}
+	h.spawner.mu.Lock()
+	spawned := h.spawner.spawned
+	h.spawner.mu.Unlock()
+	if spawned != 0 {
+		t.Fatalf("ending a pending (never approved) session must not spawn a terminal, spawned=%d", spawned)
+	}
+}
+
+func TestAssistTerminalPrefixRouting(t *testing.T) {
+	h := newTestAssistManagerWithFakeTerminal(t)
+	s := h.svc
+	// 无 assist- 前缀帧:门控返回 false(调用点继续走手机腿 Dispatch
+	// TerminalFrame,既有行为零改动)。
+	if s.handleAssistTerminalFrame(map[string]interface{}{
+		"type":       models.AgentEventTerminalCreate,
+		"session_id": "plain-mobile-session",
+	}, func(interface{}) error { return nil }) {
+		t.Fatal("non-assist-prefixed frames must fall through to the mobile leg")
+	}
+
+	// assist- 前缀帧在无 active 会话时一律拒(防会话结束后残留输入)。
+	rejected := false
+	var gotErr string
+	errWrite := func(v interface{}) error {
+		if m, ok := v.(map[string]interface{}); ok {
+			if t, _ := m["type"].(string); t == models.AgentEventTerminalError {
+				rejected = true
+				gotErr = fmt.Sprint(m["error"])
+			}
+		}
+		return nil
+	}
+	if !s.handleAssistTerminalFrame(map[string]interface{}{
+		"type":       models.AgentEventTerminalInput,
+		"session_id": "assist-ghost",
+		"data":       "x",
+	}, errWrite) {
+		t.Fatal("assist-prefixed frame must be handled by the assist leg")
+	}
+	if !rejected || !strings.Contains(gotErr, "not active") {
+		t.Fatalf("assist-prefixed input without an active session must be rejected with a not-active error, got rejected=%t err=%q", rejected, gotErr)
+	}
+
+	// assist- 前缀的 create/close/replay 在无 active 会话时同样走 not-active
+	// 拒(active 门先于帧型分派;active 态的「仅 input/resize」拒面在下文)。
+	for _, typ := range []string{
+		models.AgentEventTerminalCreate,
+		models.AgentEventTerminalClose,
+		models.AgentEventTerminalReplay,
+	} {
+		rejected = false
+		gotErr = ""
+		if !s.handleAssistTerminalFrame(map[string]interface{}{
+			"type":       typ,
+			"session_id": "assist-ghost",
+		}, errWrite) {
+			t.Fatalf("assist-prefixed %s must be handled (rejected) by the assist leg", typ)
+		}
+		if !rejected || !strings.Contains(gotErr, "not active") {
+			t.Fatalf("assist-prefixed %s without an active session must be rejected with a not-active error, got rejected=%t err=%q", typ, rejected, gotErr)
+		}
+	}
+
+	// active 会话时:input 放行落到引擎(mobile 腿分派口),无拒绝帧;
+	// stdin buffer 收到字节即路由穿透实证。
+	sid, _ := s.assist.RequestAndSignal("")
+	if _, err := s.assist.OnRemoteFrame(map[string]interface{}{
+		"type": models.AgentEventAssistApproved, "session_id": sid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+		t.Fatal("terminal must be live before routing input")
+	}
+	collActive, writeActive := newPayloadCollector()
+	if !s.handleAssistTerminalFrame(map[string]interface{}{
+		"type":       models.AgentEventTerminalInput,
+		"session_id": sid,
+		"data":       "echo routed\r",
+	}, writeActive) {
+		t.Fatal("active-session input must be handled by the assist leg")
+	}
+	if errs := collActive.ofTypes(models.AgentEventTerminalError); len(errs) != 0 {
+		t.Fatalf("active-session input must dispatch into the engine, got errors %v", errs)
+	}
+	if !waitUntil(5*time.Second, func() bool {
+		h.spawner.mu.Lock()
+		defer h.spawner.mu.Unlock()
+		return strings.Contains(h.spawner.inputBufs[sid].String(), "echo routed")
+	}) {
+		t.Fatal("input must reach the assist PTY stdin")
+	}
+
+	// active 态下 create/close/replay 一律拒(P1 帧契约:创建在批准时由设备
+	// 完成,云端永不创建;关闭来自状态机 End 而非云端 close 帧)。
+	for _, typ := range []string{
+		models.AgentEventTerminalCreate,
+		models.AgentEventTerminalClose,
+		models.AgentEventTerminalReplay,
+	} {
+		collRej, writeRej := newPayloadCollector()
+		if !s.handleAssistTerminalFrame(map[string]interface{}{
+			"type": typ, "session_id": sid,
+		}, writeRej) {
+			t.Fatalf("active-session assist-prefixed %s must be handled by the assist leg", typ)
+		}
+		errs := collRej.ofTypes(models.AgentEventTerminalError)
+		if len(errs) != 1 || !strings.Contains(fmt.Sprint(errs[0]["error"]), "input/resize") {
+			t.Fatalf("active-session assist-prefixed %s must be rejected once with the input/resize copy, got %v", typ, errs)
+		}
+	}
+}
+
+func TestAssistTerminalPoolHeadroom(t *testing.T) {
+	h := newTestAssistManagerWithFakeTerminal(t)
+	s := h.svc
+
+	// 占满 4 坑(手机腿会话,非 assist 前缀)。killer 记录被杀者,断言
+	// 「一个不少」用 exit 后计数复核。
+	killed := make(chan string, agentMaxTerminalSessions)
+	s.terminal.mu.Lock()
+	for i := 0; i < agentMaxTerminalSessions; i++ {
+		id := fmt.Sprintf("mobile-%d", i)
+		s.terminal.sessions[id] = &agentTerminalSession{
+			id:        id,
+			killer:    func() error { killed <- id; return nil },
+			token:     new(struct{}),
+			startedAt: time.Now(),
+		}
+	}
+	s.terminal.mu.Unlock()
+
+	sid, _ := s.assist.RequestAndSignal("")
+	if _, err := s.assist.OnRemoteFrame(map[string]interface{}{
+		"type": models.AgentEventAssistApproved, "session_id": sid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// approved 撞满池 → EndAndSignal(AssistEndTerminalLimit):状态终态、
+	// 上行 assist.end{reason=terminal_limit}、无 PTY 被挤掉。
+	if !waitUntil(5*time.Second, func() bool {
+		snap := s.assist.Snapshot()
+		return snap.State == assistStateEnded && snap.EndReason == AssistEndTerminalLimit
+	}) {
+		snap := s.assist.Snapshot()
+		t.Fatalf("full pool must end the approval with terminal_limit, got %+v", snap)
+	}
+	ends := h.upOfTypes(models.AgentEventAssistEnd)
+	if len(ends) == 0 {
+		t.Fatal("terminal_limit end must uplink assist.end")
+	}
+	last := ends[len(ends)-1]
+	if last["reason"] != string(AssistEndTerminalLimit) || last["session_id"] != sid {
+		t.Fatalf("terminal_limit uplink frame = %v", last)
+	}
+	// 手机会话一个都不少(kill 零发生 + live 表仍满 4)。
+	select {
+	case id := <-killed:
+		t.Fatalf("mobile session %s must never be evicted by an assist approval", id)
+	default:
+	}
+	s.terminal.mu.Lock()
+	mobileCount := 0
+	for id := range s.terminal.sessions {
+		if strings.HasPrefix(id, "mobile-") {
+			mobileCount++
+		}
+	}
+	s.terminal.mu.Unlock()
+	if mobileCount != agentMaxTerminalSessions {
+		t.Fatalf("mobile sessions must never be evicted by an assist approval, alive=%d", mobileCount)
+	}
+	if h.fakeTerminalCWD(sid) != "" {
+		t.Fatal("no assist terminal may be created when the pool is full")
+	}
+}
+
+// TestAssistTerminalCompositeWriterUplinkDropViewsLive 钉不对称性:上行 writer
+// 断连(admin 掉线,frameWriter 失败)时观看端仍收全量输出(P1 刻意接受:
+// 围观优先,admin 重连由 ring 回放补齐)。
+func TestAssistTerminalCompositeWriterUplinkDropViewsLive(t *testing.T) {
+	h := newTestAssistManagerWithFakeTerminal(t)
+	s := h.svc
+	sid, _ := s.assist.RequestAndSignal("")
+	if _, err := s.assist.OnRemoteFrame(map[string]interface{}{
+		"type": models.AgentEventAssistApproved, "session_id": sid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+		t.Fatal("terminal must be live")
+	}
+	// 换掉上行 sink 为失败 writer(admin 掉线等价)。还原挂 Cleanup 于换帧
+	// 之后立即注册——断言中途失败时失败缝不会跨测试泄漏;收尾静默
+	// (quiesceFakeTerminals)依赖 exit 帧落上行缝,失败缝会让该等待不满足。
+	AssistSetFrameSink(func(map[string]interface{}) error { return errors.New("uplink offline") })
+	t.Cleanup(func() { AssistSetFrameSink(h.collectFrame) })
+	probe := &assistViewProbe{}
+	s.assist.RegisterViewSink(sid, "view1", probe.fan)
+	h.fakeTerminalEmit(sid, "still-visible")
+	if !waitUntil(5*time.Second, func() bool { return probe.Got("still-visible") }) {
+		t.Fatal("view sinks must keep receiving output while the uplink leg is down")
+	}
+}
+
+// TestAssistViewSinkRegistrySemantics 钉注册表 API 语义:幂等覆盖同 viewID、
+// 注销最后一个 sink 清会话桶、多 sink 并存扇出。
+func TestAssistViewSinkRegistrySemantics(t *testing.T) {
+	h := newTestAssistManagerWithFakeTerminal(t)
+	s := h.svc
+	sid, _ := s.assist.RequestAndSignal("")
+	if _, err := s.assist.OnRemoteFrame(map[string]interface{}{
+		"type": models.AgentEventAssistApproved, "session_id": sid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+		t.Fatal("terminal must be live")
+	}
+	p1, p2 := &assistViewProbe{}, &assistViewProbe{}
+	s.assist.RegisterViewSink(sid, "v1", p1.fan)
+	s.assist.RegisterViewSink(sid, "v2", p2.fan)
+	h.fakeTerminalEmit(sid, "multi")
+	if !waitUntil(5*time.Second, func() bool { return p1.Got("multi") && p2.Got("multi") }) {
+		t.Fatal("all registered view sinks must receive output")
+	}
+	// 幂等覆盖:同 viewID 重注册换函数,旧函数不再收。
+	p1b := &assistViewProbe{}
+	s.assist.RegisterViewSink(sid, "v1", p1b.fan)
+	s.assist.UnregisterViewSink(sid, "v2")
+	h.fakeTerminalEmit(sid, "after-swap")
+	if !waitUntil(5*time.Second, func() bool { return p1b.Got("after-swap") }) {
+		t.Fatal("re-registered sink must receive output")
+	}
+	if p1.Got("after-swap") {
+		t.Fatal("overwritten sink must no longer receive output")
+	}
+	if p2.Got("after-swap") {
+		t.Fatal("unregistered sink must no longer receive output")
+	}
+	// 注销最后一个 sink → 会话桶清空。
+	s.assist.UnregisterViewSink(sid, "v1")
+	s.assist.viewsMu.Lock()
+	_, has := s.assist.views[sid]
+	s.assist.viewsMu.Unlock()
+	if has {
+		t.Fatal("session bucket must be dropped with its last sink")
+	}
+}
+
+// TestAssistViewSinkPanicDoesNotKillFanLoop 钉评审 Fix 3:扇出的 sink 是外部
+// 代码,单 sink panic 必须被 recover 成单路失败(其余 sink 照常收帧,测试进程
+// 活着——fan 跑在 PTY 复制循环 goroutine 上,panic 不 recover 即杀全进程)。
+func TestAssistViewSinkPanicDoesNotKillFanLoop(t *testing.T) {
+	h := newTestAssistManagerWithFakeTerminal(t)
+	s := h.svc
+	sid, _ := s.assist.RequestAndSignal("")
+	if _, err := s.assist.OnRemoteFrame(map[string]interface{}{
+		"type": models.AgentEventAssistApproved, "session_id": sid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+		t.Fatal("terminal must be live")
+	}
+	healthy := &assistViewProbe{}
+	s.assist.RegisterViewSink(sid, "v-boom", func(map[string]interface{}) error {
+		panic("view sink exploded")
+	})
+	s.assist.RegisterViewSink(sid, "v-ok", healthy.fan)
+	// 多轮投递:panic 路径反复走,健康 sink 每轮都收到(循环没被第一爆带走)。
+	for i := 0; i < 3; i++ {
+		h.fakeTerminalEmit(sid, "round")
+	}
+	if !waitUntil(5*time.Second, func() bool {
+		healthy.mu.Lock()
+		defer healthy.mu.Unlock()
+		return len(healthy.frames) >= 3
+	}) {
+		t.Fatalf("healthy sink must keep receiving frames across a panicking sibling, got %d", len(healthy.frames))
+	}
+	// 终态路径的 panic 同样被吞:notifyAndClearViews 收摊收住爆掉的 sink。
+	s.assist.RegisterViewSink(sid, "v-boom-end", func(map[string]interface{}) error {
+		panic("end notify exploded")
+	})
+	if err := s.assist.End(AssistEndAdmin); err != nil {
+		t.Fatal(err) // 走到这里 = panic 被 recover,进程与断言都活着
+	}
+	if endFrame, ok := healthy.endFrame(); !ok || endFrame["reason"] != string(AssistEndAdmin) {
+		t.Fatalf("healthy sink must still get assist.end alongside a panicking sibling, got %+v", healthy.frames)
+	}
+}
+
+// TestAssistHasHeadroom 钥匙面:空 manager 有余量,占满即无。
+func TestAssistHasHeadroom(t *testing.T) {
+	m := newAgentTerminalManager()
+	if !m.hasHeadroom() {
+		t.Fatal("fresh manager must report headroom")
+	}
+	m.mu.Lock()
+	for i := 0; i < agentMaxTerminalSessions; i++ {
+		m.sessions[fmt.Sprintf("h-%d", i)] = &agentTerminalSession{id: fmt.Sprintf("h-%d", i)}
+	}
+	m.mu.Unlock()
+	if m.hasHeadroom() {
+		t.Fatal("full manager must report no headroom")
+	}
+}
+
+// TestAssistTerminalCloseGiveUpOnBlockedCreate 钉放弃分支(评审 Fix 2):
+// startProcess 卡死的在途 create,缩短总窗后后台关闭 goroutine 必须放弃
+// (warn 日志)且不挂死;spawner 放行后延迟落地的会话仍被收——两条真身路径:
+//  1. closeAll(remote 循环终态/forceDisconnect 的生产收摊面,Task 4 已接线);
+//  2. assistCloseTerminal 直调(任何后续 end 迁移会再走它,含未来 dup 收口)。
+//
+// 放弃后不入 closeAll 面的孤儿由闲置回收兜底(24h attached),不在本测试面。
+func TestAssistTerminalCloseGiveUpOnBlockedCreate(t *testing.T) {
+	// 缩窗:总窗 200ms + 单轮 50ms(agentTerminalCreateWaitTimeout 是全局
+	// var,restore 走 defer)。
+	oldCap := assistTerminalCloseWaitCap
+	assistTerminalCloseWaitCap = 200 * time.Millisecond
+	defer func() { assistTerminalCloseWaitCap = oldCap }()
+	oldWait := agentTerminalCreateWaitTimeout
+	agentTerminalCreateWaitTimeout = 50 * time.Millisecond
+	defer func() { agentTerminalCreateWaitTimeout = oldWait }()
+
+	h := newTestAssistManagerWithFakeTerminal(t)
+	s := h.svc
+
+	// 卡死的 startProcess:批准前换上,create 永不落地直到放行。
+	blocked := make(chan struct{})
+	spawnEntered := make(chan struct{}, 1)
+	s.terminal.startProcess = func(sessionID string, shell string, cwd string, rows int, cols int) (*agentTerminalSession, []io.Reader, error) {
+		spawnEntered <- struct{}{}
+		<-blocked
+		return h.spawner.start(sessionID, shell, cwd, rows, cols)
+	}
+	t.Cleanup(func() {
+		select {
+		case <-blocked:
+		default:
+			close(blocked)
+		}
+	})
+
+	sid, _ := s.assist.RequestAndSignal("")
+	if _, err := s.assist.OnRemoteFrame(map[string]interface{}{
+		"type": models.AgentEventAssistApproved, "session_id": sid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-spawnEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fake create must enter the blocked spawner")
+	}
+
+	// approve→end:短窗内 create 仍卡死 → 转后台续等 → 200ms 总窗放弃。
+	// End 同步返回(不挂)即证明读循环不被长等拖死;放弃分支只留 warn。
+	// (warn 文本断言不可行:logger 无注入缝,行为断言替代——放弃后烧窗期间
+	// 会话不落地、后台 goroutine 不挂死,放行后由追杀路径收。)
+	done := make(chan error, 1)
+	go func() { done <- s.assist.End(AssistEndAdmin) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("end: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("end must not hang while the create is blocked (background wait is bounded)")
+	}
+	// 放弃窗口烧完:creating 条目仍在(spawner 卡死),后台 goroutine 已放弃——
+	// 直接证据:此刻 end 早已终态而 PTY 未被杀(spawner 未放行、create 未落地)。
+	time.Sleep(300 * time.Millisecond)
+	if got := s.terminal.get(sid); got != nil {
+		t.Fatal("no terminal may exist while the spawner is still blocked")
+	}
+	if !s.assistCreateInFlight(sid) {
+		t.Log("create already settled before give-up (timing); continuing with the landed session")
+	}
+
+	// 放行 spawner:延迟 create 落地(会话注册进 live 表)。
+	close(blocked)
+	if !waitUntil(5*time.Second, func() bool { return s.terminal.get(sid) != nil }) {
+		t.Fatal("delayed terminal must land after the spawner unblocks")
+	}
+
+	// 追杀路径 1:closeAll(remote 循环终态的生产收摊面)。
+	s.terminal.closeAll()
+	if s.terminal.get(sid) != nil {
+		t.Fatal("closeAll must reclaim the delayed terminal (loop-teardown path)")
+	}
+
+	// 追杀路径 2(独立会话再验):再起一个卡死 create 走到放弃,放行落地后
+	// 直调 assistCloseTerminal(后续 end 迁移的真身),迟到的会话照样被杀。
+	blocked2 := make(chan struct{})
+	spawnEntered2 := make(chan struct{}, 1)
+	s.terminal.startProcess = func(sessionID string, shell string, cwd string, rows int, cols int) (*agentTerminalSession, []io.Reader, error) {
+		spawnEntered2 <- struct{}{}
+		<-blocked2
+		return h.spawner.start(sessionID, shell, cwd, rows, cols)
+	}
+	t.Cleanup(func() {
+		select {
+		case <-blocked2:
+		default:
+			close(blocked2)
+		}
+	})
+	// 场景 1 的 End 已落 60s 冷却锚(时钟可注入,推进跳出)。
+	s.assist.AdvanceClock(61 * time.Second)
+	sid2, _ := s.assist.RequestAndSignal("")
+	if _, err := s.assist.OnRemoteFrame(map[string]interface{}{
+		"type": models.AgentEventAssistApproved, "session_id": sid2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-spawnEntered2:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second fake create must enter the blocked spawner")
+	}
+	if err := s.assist.End(AssistEndClient); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond) // 烧完缩短的放弃窗
+	close(blocked2)
+	if !waitUntil(5*time.Second, func() bool { return s.terminal.get(sid2) != nil }) {
+		t.Fatal("second delayed terminal must land")
+	}
+	s.assistCloseTerminal(sid2) // 已无在途 create:立即杀
+	if !waitUntil(5*time.Second, func() bool { return !h.fakeTerminalAlive(sid2) }) {
+		t.Fatal("assistCloseTerminal must kill the delayed terminal once it has landed")
 	}
 }
