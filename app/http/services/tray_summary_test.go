@@ -356,6 +356,51 @@ func TestTrayEndpointCooldownExpiryLazyRecover(t *testing.T) {
 	}
 }
 
+// TestTrayEndpointRateLimitedRowShowsCooldown 429 限流行(HealthStatus 恒 ok,
+// endpoint_service 刻意「429 不改健康状态」)在限流窗口内必须按 cooldown 展示
+// ——selectAuto 本尊会跳过它,面板若显示 ok 并选为 current 即失真。
+func TestTrayEndpointRateLimitedRowShowsCooldown(t *testing.T) {
+	now := time.Now().Unix()
+	list := []*config.LLMEndpoint{
+		// 健康位 ok 但 RateLimitedUntil 在未来:面板态应 cooldown+剩余秒>0,
+		// 且不进 current(selectAuto 同窗口内会跳过它)。
+		{ID: "rl", Name: "rate-limited", Enabled: true, ProtocolAnthropic: true,
+			AutoGroup: true, Priority: 10, HealthStatus: "ok", RateLimitedUntil: now + 90},
+		{ID: "ok1", Name: "healthy", Enabled: true, ProtocolAnthropic: true,
+			AutoGroup: true, Priority: 20, HealthStatus: "ok"},
+	}
+	summary := trayEndpointSummary(list, nil, now)
+	group := summary.Groups[0]
+	item := group.Items[0]
+	if item.State != "cooldown" || item.CooldownRemainingSec <= 0 {
+		t.Fatalf("429 限流行 = %+v, want state=cooldown 且剩余秒>0", item)
+	}
+	if group.Current != "healthy" {
+		t.Fatalf("current = %q, want healthy(限流行不可被选为当前激活)", group.Current)
+	}
+}
+
+// TestTrayAgentKernelProviderTrimmed 内核键 trim 对齐:Provider 带首尾空格的
+// 会话与干净键归并同一内核,卡名不留空格(map 键若用原始值会劈成两张卡)。
+func TestTrayAgentKernelProviderTrimmed(t *testing.T) {
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	rfc := func(d time.Duration) string { return now.Add(d).UTC().Format(time.RFC3339) }
+	sessions := []models.AgentVibeSession{
+		{ID: "a", Provider: " claude ", Title: "带空格", Status: "idle", UpdatedAt: rfc(-time.Minute)},
+		{ID: "b", Provider: "claude", Title: "干净键", Status: "idle", UpdatedAt: rfc(-2 * time.Minute)},
+	}
+	kernels := aggregateTrayAgentKernels(sessions, now)
+	if len(kernels) != 1 {
+		t.Fatalf("kernels = %d 张卡, want 1(带空格 Provider 应与干净键归并)", len(kernels))
+	}
+	if kernels[0].Name != "claude" {
+		t.Fatalf("内核名 = %q, want claude(无首尾空格)", kernels[0].Name)
+	}
+	if kernels[0].Total24h != 2 {
+		t.Fatalf("total_24h = %d, want 2(两会话同卡)", kernels[0].Total24h)
+	}
+}
+
 // TestTrayEndpointSummaryUnavailable registry 不可用(单例 nil / 读库失败 /
 // 空表)→ available=false,面板整区不渲染(spec §4.4 降级)。
 func TestTrayEndpointSummaryUnavailable(t *testing.T) {

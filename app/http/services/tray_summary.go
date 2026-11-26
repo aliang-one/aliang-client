@@ -266,7 +266,7 @@ func aggregateTrayAgentKernels(sessions []models.AgentVibeSession, now time.Time
 		acc := byKernel[provider]
 		if acc == nil {
 			acc = &kernelAcc{}
-			byKernel[s.Provider] = acc
+			byKernel[provider] = acc
 		}
 		if active {
 			acc.active++
@@ -330,6 +330,12 @@ func trayEndpointState(e *config.LLMEndpoint, now int64) (string, int64) {
 		}
 		return trayEndpointStateCooldown, remaining
 	default:
+		// 429 限流刻意不改健康状态(endpoint_service「429 不改健康状态」),
+		// 限流窗口内的 ok 行在此按 cooldown 展示——与 selectAuto 的
+		// 「RateLimitedUntil>now 跳过」同口径,否则面板会把它当 current。
+		if e.RateLimitedUntil > now {
+			return trayEndpointStateCooldown, e.RateLimitedUntil - now
+		}
 		return trayEndpointStateOK, 0
 	}
 }
