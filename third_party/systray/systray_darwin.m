@@ -241,18 +241,22 @@ NSMenuItem *find_menu_item(NSMenu *ourMenu, NSNumber *menuId) {
 }
 
 // 本仓补丁:把托盘按钮窗口 frame 装箱回传给 C 入口 tray_rect(主线程执行)。
-// macOS 的 NSScreen 全局坐标系是左下原点;换算成与 Windows 侧 TrayRect 同基准
-// 的全局左上原点:主屏 = [NSScreen screens] 首个(带菜单栏的那块,全局坐标
-// 零点在其左下角),y_top = 主屏高 - (frame.origin.y + frame 高)。
+// macOS 的 NSScreen 全局坐标系是左下原点;换算成全局左上原点(AppKit 点(逻辑)
+// 坐标,macOS 面板窗口 API 同单位直通,物理像素仅 Windows 侧):主屏 =
+// [NSScreen screens] 首个(带菜单栏的那块,全局坐标零点在其左下角),
+// y_top = 主屏高 - (frame.origin.y + frame 高)。screens 为空时 firstObject
+// 返回 nil、高度取 0,兜底 ok=false(objectAtIndex:0 会抛 NSRangeException
+// 带走主线程,故不用)。
 - (void)fillTrayRect:(NSMutableArray *)box {
   NSWindow *win = statusItem.button.window;
   NSRect frame = win.frame;
-  CGFloat primaryScreenHeight = [[[NSScreen screens] objectAtIndex:0] frame].size.height;
+  NSScreen *primaryScreen = [[NSScreen screens] firstObject];
+  CGFloat primaryScreenHeight = primaryScreen.frame.size.height;
   [box addObject:[NSNumber numberWithDouble:frame.origin.x]];
   [box addObject:[NSNumber numberWithDouble:primaryScreenHeight - frame.origin.y - frame.size.height]];
   [box addObject:[NSNumber numberWithDouble:frame.size.width]];
   [box addObject:[NSNumber numberWithDouble:frame.size.height]];
-  [box addObject:[NSNumber numberWithBool:(win != nil && frame.size.width > 0 && frame.size.height > 0)]];
+  [box addObject:[NSNumber numberWithBool:(win != nil && frame.size.width > 0 && frame.size.height > 0 && primaryScreenHeight > 0)]];
 }
 
 @end
@@ -382,10 +386,11 @@ void set_panel_mode(bool panel) {
   }
 }
 
-// 本仓补丁:托盘图标屏幕矩形(全局左上原点、物理像素,与 Windows 侧 TrayRect
-// 同基准),面板窗口锚定用。macOS 的 NSScreen 全局坐标系是左下原点,换算(经
-// 主屏高度)在 AppDelegate fillTrayRect: 里做;窗口 frame 只能主线程读,经
-// runInMainThread 同步封送,结果装箱进 NSArray 回传。
+// 本仓补丁:托盘图标屏幕矩形——AppKit 点(逻辑)坐标、全局左上原点;macOS
+// 面板窗口 API 同单位直通,物理像素仅 Windows 侧(两侧 TrayRect 语义对应、
+// 单位随平台),面板窗口锚定用。macOS 的 NSScreen 全局坐标系是左下原点,换算
+// (经主屏高度)在 AppDelegate fillTrayRect: 里做;窗口 frame 只能主线程读,
+// 经 runInMainThread 同步封送,结果装箱进 NSArray 回传。
 void tray_rect(int* x, int* y, int* w, int* h, bool* ok) {
   @autoreleasepool { // 本仓补丁
   NSMutableArray *box = [NSMutableArray arrayWithCapacity:5];

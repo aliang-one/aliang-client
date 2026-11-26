@@ -21,10 +21,11 @@ func SetPanelMode(panel bool) {
 	C.set_panel_mode(C.bool(panel))
 }
 
-// 本仓补丁:托盘图标的屏幕矩形(全局左上原点、物理像素,与 Windows 侧 TrayRect
-// 同基准),面板窗口锚定用。ok=false = 托盘尚未初始化或拿不到窗口矩形(溢出区
-// 之类的两态判废归接线层,同 Windows 侧约定)。darwin 侧是整数四元组、Windows
-// 侧是导出 Rect 类型——两种形态并存是既定设计(见 systray_windows.go 的 TrayRect)。
+// 本仓补丁:托盘图标的屏幕矩形——AppKit 点(逻辑)坐标、全局左上原点;macOS
+// 面板窗口 API 同单位直通,物理像素仅 Windows 侧(两侧 TrayRect 语义对应、
+// 单位随平台),面板窗口锚定用。ok=false = 托盘尚未初始化或拿不到窗口矩形
+// (溢出区之类的两态判废归接线层,同 Windows 侧约定)。darwin 侧是整数四元组、
+// Windows 侧是导出 Rect 类型——两种形态并存是既定设计(见 systray_windows.go 的 TrayRect)。
 func TrayRect() (x, y, w, h int, ok bool) {
 	var cx, cy, cw, ch C.int
 	var cok C.bool

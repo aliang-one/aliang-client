@@ -206,6 +206,9 @@ func TestVendoredSystrayDarwinPanelPatch(t *testing.T) {
 			"sendActionOn:",             // 按下即触发(而非默认抬起)
 			"NSEventMaskLeftMouseDown",  // 左键
 			"NSEventMaskRightMouseDown", // 右键:左右键都触发,→ panelClickFn
+			// false 分支必须把掩码恢复成按钮默认的抬起触发:上游同步重放时漏
+			// 这行,兜底模式下按钮仍按下即发 action(与 menu 接管相冲)。
+			"sendActionOn:NSEventMaskLeftMouseUp",
 		} {
 			if !strings.Contains(mSrc, want) {
 				t.Errorf("systray_darwin.m 缺少 %q(面板模式切换形态不完整)", want)
