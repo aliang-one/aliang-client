@@ -39,11 +39,25 @@ export function quickSetupLanguageExtension(format, defaultPath) {
 
 // 组合模板渲染：单次正则替换（与 findUnresolvedPlaceholders/后端校验同一空白容忍
 // 语义）；替换回调的返回值不会被再次扫描——变量值含 {{...}} 也不会二次展开。
+//
+// 哨兵 key：写入客户端配置文件的 `api_key`/`ANTHROPIC_AUTH_TOKEN` 永远填
+// `SENTINEL_API_KEY`（sk-aliang-local），而非用户选的真实平台 key。真实鉴权靠
+// 56432 路由层来源闸+内置 endpoint relay 注入（spec §9）——客户端 key 值本身
+// 对路由层不透明，哨兵/旧真实 key/任意非空串均放行。
+// 注意：快渲染只替换 api_key 占位符，base_url/model 不变；Go 侧常量
+// QuickSetupSentinelAPIKey（quick_setup_support.go）与本值必须保持一致。
+export const SENTINEL_API_KEY = 'sk-aliang-local';
+
 export function renderComboContent(content, variables) {
   const vars = variables || {};
   return String(content ?? '').replace(
     /\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}/g,
-    (m, key) => (Object.prototype.hasOwnProperty.call(vars, key) ? String(vars[key] ?? '') : m),
+    (m, key) => {
+      if (!Object.prototype.hasOwnProperty.call(vars, key)) return m;
+      // api_key 永远写入哨兵，不透明接受；其它变量原样替换且不再二次扫描
+      if (key === 'api_key') return SENTINEL_API_KEY;
+      return String(vars[key] ?? '');
+    },
   );
 }
 

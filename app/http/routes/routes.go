@@ -45,6 +45,7 @@ type Handlers struct {
 	MeshDiag         *handlers.MeshDiagHandler
 	MeshProbe        *handlers.MeshStunProbeHandler
 	Memory           *handlers.AgentMemoryHandler
+	Endpoint         *handlers.EndpointHandler
 
 	statsCollector     *statistic.StatsCollector
 	httpStatsCollector *statistic.HTTPStatsCollector
@@ -107,6 +108,7 @@ func newHandlers(runService *services.RunService) *Handlers {
 		MeshDiag:           handlers.NewMeshDiagHandler(),
 		MeshProbe:          handlers.NewMeshStunProbeHandler(),
 		Memory:             handlers.NewAgentMemoryHandler(),
+		Endpoint:           handlers.NewEndpointHandler(services.GetEndpointService()),
 		statsCollector:     statsCollector,
 		httpStatsCollector: httpStatsCollector,
 	}
@@ -432,6 +434,21 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	// 包级 TryLock busy 不排队,预算截断单点在 punch.ClassifyWithBudget。双注册
 	// 另一处 agentruntime server.go(缺任一侧=404 透传,2026-10-21 教训)。
 	register("/api/mesh/stun_probe", h.MeshProbe.HandleStunProbe, http.MethodPost)
+
+	// LLM endpoint registry 管理面(spec 2026-11-25 §11,Task 4)。core-only
+	// 单注册:registry service/健康态/信号量都活在 core 进程(§12),agentruntime
+	// 侧不注册(与 proxy/known-hosts 的跨进程双注册特例不同,见本文件:133 注释)。
+	// {id} 路由用方法前缀模式(同 quick-setup combos 约定,防 ServeMux 双注册
+	// panic);鉴权=handler 内 RequireDashboardSession(与 quick-setup CRUD 同族)。
+	register("GET /api/endpoints", h.Endpoint.HandleList, http.MethodGet)
+	register("POST /api/endpoints", h.Endpoint.HandleCreate, http.MethodPost)
+	register("GET /api/endpoints/{id}", h.Endpoint.HandleGet, http.MethodGet)
+	register("PUT /api/endpoints/{id}", h.Endpoint.HandleUpdate, http.MethodPut)
+	register("DELETE /api/endpoints/{id}", h.Endpoint.HandleDelete, http.MethodDelete)
+	register("POST /api/endpoints/{id}/test", h.Endpoint.HandleTest, http.MethodPost)
+	register("POST /api/endpoints/{id}/fetch-models", h.Endpoint.HandleFetchModels, http.MethodPost)
+	register("POST /api/endpoints/{id}/reset-health", h.Endpoint.HandleResetHealth, http.MethodPost)
+	register("/api/endpoint-groups/auto/policy", h.Endpoint.HandlePolicy, http.MethodGet, http.MethodPut)
 
 	registerDocsRoutes(mux, catalog)
 }

@@ -14,6 +14,12 @@ import (
 	"aliang.one/nursorgate/processor/config"
 )
 
+// QuickSetupSentinelAPIKey 写入客户端配置文件的 api_key/ANTHROPIC_AUTH_TOKEN 字段值，
+// 替代用户选的真实平台 key。56432 路由层对客户端 Authorization 不透明接受（spec §9）：
+// 哨兵、旧真实 key、任意非空串均放行，真实鉴权靠来源闸+relay 注入。
+// 前端 JS 常量 SENTINEL_API_KEY（app/website/src/utils/quickSetupState.js）与此值必须一致。
+const QuickSetupSentinelAPIKey = "sk-aliang-local"
+
 // quickSetupBaseURLPresets 返回该 software 的 base_url 预设（local/public）。
 // codex/opencode 的 base_url 变量值带 /v1（模板裸 {{base_url}}，/v1 属变量值）；
 // claude-code/pi 不带（Claude Code/pi 自行追加 /v1/messages）。
