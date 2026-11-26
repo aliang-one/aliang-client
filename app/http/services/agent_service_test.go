@@ -3822,18 +3822,21 @@ func TestAgentHelloPayloadIncludesProjectsAndVibeSessionSummaries(t *testing.T) 
 		t.Fatalf("write HEAD: %v", err)
 	}
 
+	// 2026-11-26 时间窗后清单只收近期会话,fixture 日期必须相对新鲜(固定
+	// 老日期会随窗口语义准时出局,与测试意图——三路合并——无关)。
+	freshTS := time.Now().UTC().Add(-time.Hour)
 	codexDir := filepath.Join(home, ".codex", "sessions", "2026", "06", "13")
 	if err := os.MkdirAll(codexDir, 0o700); err != nil {
 		t.Fatalf("mkdir codex sessions: %v", err)
 	}
 	codexID := "codex-session-1"
-	indexLine := `{"id":"` + codexID + `","thread_name":"Codex history title","updated_at":"2026-06-13T01:00:00Z"}` + "\n"
+	indexLine := `{"id":"` + codexID + `","thread_name":"Codex history title","updated_at":"` + freshTS.Format(time.RFC3339) + `"}` + "\n"
 	if err := os.WriteFile(filepath.Join(home, ".codex", "session_index.jsonl"), []byte(indexLine), 0o600); err != nil {
 		t.Fatalf("write codex index: %v", err)
 	}
-	metaLine := `{"timestamp":"2026-06-13T00:59:00Z","type":"session_meta","payload":{"id":"` + codexID + `","cwd":"` + codexProject + `","model":"gpt-5-codex","model_provider":"OpenAI","git":{"branch":"main"}}}` + "\n"
-	userLine := `{"timestamp":"2026-06-13T01:00:00Z","type":"message","payload":{"role":"user","content":[{"type":"input_text","text":"Codex user prompt"}]}}` + "\n"
-	assistantLine := `{"timestamp":"2026-06-13T01:01:00Z","type":"message","payload":{"role":"assistant","content":[{"type":"output_text","text":"Codex assistant reply"}]}}` + "\n"
+	metaLine := `{"timestamp":"` + freshTS.Add(-time.Minute).Format(time.RFC3339) + `","type":"session_meta","payload":{"id":"` + codexID + `","cwd":"` + codexProject + `","model":"gpt-5-codex","model_provider":"OpenAI","git":{"branch":"main"}}}` + "\n"
+	userLine := `{"timestamp":"` + freshTS.Format(time.RFC3339) + `","type":"message","payload":{"role":"user","content":[{"type":"input_text","text":"Codex user prompt"}]}}` + "\n"
+	assistantLine := `{"timestamp":"` + freshTS.Add(time.Minute).Format(time.RFC3339) + `","type":"message","payload":{"role":"assistant","content":[{"type":"output_text","text":"Codex assistant reply"}]}}` + "\n"
 	if err := os.WriteFile(filepath.Join(codexDir, "session.jsonl"), []byte(metaLine+userLine+assistantLine), 0o600); err != nil {
 		t.Fatalf("write codex session: %v", err)
 	}
@@ -3842,7 +3845,7 @@ func TestAgentHelloPayloadIncludesProjectsAndVibeSessionSummaries(t *testing.T) 
 	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
 		t.Fatalf("mkdir claude sessions: %v", err)
 	}
-	claudeIndex := `{"version":1,"originalPath":"` + claudeProject + `","entries":[{"sessionId":"claude-session-1","firstPrompt":"Claude prompt","summary":"Claude summary","messageCount":7,"created":"2026-06-13T02:00:00Z","modified":"2026-06-13T02:05:00Z","gitBranch":"feature","projectPath":"` + claudeProject + `","isSidechain":false}]}`
+	claudeIndex := `{"version":1,"originalPath":"` + claudeProject + `","entries":[{"sessionId":"claude-session-1","firstPrompt":"Claude prompt","summary":"Claude summary","messageCount":7,"created":"` + freshTS.Add(-2*time.Minute).Format(time.RFC3339) + `","modified":"` + freshTS.Add(time.Minute).Format(time.RFC3339) + `","gitBranch":"feature","projectPath":"` + claudeProject + `","isSidechain":false}]}`
 	if err := os.WriteFile(filepath.Join(claudeDir, "sessions-index.json"), []byte(claudeIndex), 0o600); err != nil {
 		t.Fatalf("write claude index: %v", err)
 	}
@@ -4316,9 +4319,11 @@ func TestAgentHelloPayloadSanitizesReportedVibeSessions(t *testing.T) {
 		t.Fatalf("mkdir claude dir: %v", err)
 	}
 	longTitle := strings.Repeat("题", 260)
+	// 2026-11-26 时间窗后 fixture 日期须相对新鲜(见 IncludesProjects 同注)。
+	freshTS := time.Now().UTC().Add(-time.Hour)
 	claudeIndex := `{"version":1,"originalPath":"` + projectPath + `","entries":[` +
-		`{"sessionId":"claude-long","firstPrompt":"` + longTitle + `","summary":"` + strings.Repeat("摘", 620) + `","messageCount":2,"created":"2026-06-13T02:00:00Z","modified":"2026-06-13T02:05:00Z","projectPath":"` + projectPath + `","isSidechain":false},` +
-		`{"sessionId":"claude-root","firstPrompt":"root","messageCount":1,"created":"2026-06-13T03:00:00Z","modified":"2026-06-13T03:05:00Z","projectPath":"/","isSidechain":false}` +
+		`{"sessionId":"claude-long","firstPrompt":"` + longTitle + `","summary":"` + strings.Repeat("摘", 620) + `","messageCount":2,"created":"` + freshTS.Add(-2*time.Minute).Format(time.RFC3339) + `","modified":"` + freshTS.Format(time.RFC3339) + `","projectPath":"` + projectPath + `","isSidechain":false},` +
+		`{"sessionId":"claude-root","firstPrompt":"root","messageCount":1,"created":"` + freshTS.Add(-time.Minute).Format(time.RFC3339) + `","modified":"` + freshTS.Add(-time.Minute).Format(time.RFC3339) + `","projectPath":"/","isSidechain":false}` +
 		`]}`
 	if err := os.WriteFile(filepath.Join(claudeDir, "sessions-index.json"), []byte(claudeIndex), 0o600); err != nil {
 		t.Fatalf("write claude index: %v", err)

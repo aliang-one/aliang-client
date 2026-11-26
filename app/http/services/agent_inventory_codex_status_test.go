@@ -344,3 +344,78 @@ func TestOverlayActiveTruncatesFair(t *testing.T) {
 	}
 	assert.True(t, codexSeen, "overlay 再截断不得破坏公平采样,codex 必须保有代表")
 }
+
+// —— 15 天时间窗(2026-11-26 拍板:时间窗是产品语义,cap 降级为兜底)——
+
+// 窗口过滤:超窗条目(含无时间/解析失败)从清单出局;窗内照常。过滤挂在
+// collect 唯一咽喉,且必须在 codex :754 时间戳修正之后跑——resumed 老会话
+// (索引钟陈旧、rollout mtime 新鲜)靠修正后的时间回窗,不需要特判。
+func TestCollectAgentVibeSessionsRecentWindowOnly(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	cache.ResetCacheDirForTest()
+
+	fresh := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
+	stale := time.Now().Add(-20 * 24 * time.Hour)
+
+	// codex: 新鲜(rollout mtime 新)+ 陈旧(索引行,rollout mtime 也旧)+ 无时间索引行
+	freshID := "01awin000-0000-4000-8000-000000000010"
+	staleID := "01aoldwin-0000-4000-8000-000000000011"
+	writeCodexIndexFixture(t, home, map[string]string{
+		freshID: stale.Format(time.RFC3339), // 索引钟陈旧,靠 :754 修正回窗
+		staleID: stale.Format(time.RFC3339),
+	})
+	freshPath := writeCodexRolloutFixture(t, home, "2026-11-26T09-00-00", freshID, freshID, 1)
+	require.NoError(t, os.Chtimes(freshPath, fresh, fresh))
+	stalePath := writeCodexRolloutFixture(t, home, "2026-11-01T09-00-00", staleID, staleID, 1)
+	require.NoError(t, os.Chtimes(stalePath, stale, stale))
+
+	// claude: 一新一旧
+	projectPath := filepath.Join(home, "work", "winproj")
+	require.NoError(t, os.MkdirAll(projectPath, 0o700))
+	encodedCwd := "-" + strings.ReplaceAll(strings.Trim(projectPath, string(filepath.Separator)), string(filepath.Separator), "-")
+	claudeDir := filepath.Join(home, ".claude", "projects", encodedCwd)
+	require.NoError(t, os.MkdirAll(claudeDir, 0o700))
+	claudeFresh := "claude-win-fresh"
+	claudeStale := "claude-win-stale"
+	for _, tc := range []struct {
+		id   string
+		mod  time.Time
+		body string
+	}{{claudeFresh, fresh, `{"timestamp":"` + fresh.Format(time.RFC3339) + `","type":"user","cwd":"` + projectPath + `","sessionId":"` + claudeFresh + `","gitBranch":"main","message":{"role":"user","content":[{"type":"text","text":"window fresh"}]}}` + "\n"},
+		{claudeStale, stale, `{"timestamp":"` + stale.Format(time.RFC3339) + `","type":"user","cwd":"` + projectPath + `","sessionId":"` + claudeStale + `","gitBranch":"main","message":{"role":"user","content":[{"type":"text","text":"window stale"}]}}` + "\n"}} {
+		require.NoError(t, os.WriteFile(filepath.Join(claudeDir, tc.id+".jsonl"), []byte(tc.body), 0o600))
+		require.NoError(t, os.Chtimes(filepath.Join(claudeDir, tc.id+".jsonl"), tc.mod, tc.mod))
+	}
+
+	sessions := collectAgentVibeSessions(nil)
+	assert.NotNil(t, findCodexSession(sessions, freshID), "索引钟陈旧但 rollout 新鲜的会话必须回窗")
+	assert.Nil(t, findCodexSession(sessions, staleID), "全钟皆陈旧的 codex 会话必须出窗")
+	byID := map[string]bool{}
+	for _, s := range sessions {
+		byID[s.ID] = true
+	}
+	assert.True(t, byID["claude_"+claudeFresh], "claude 新会话必须在窗内")
+	assert.False(t, byID["claude_"+claudeStale], "claude 陈旧会话必须出窗")
+}
+
+// 活跃豁免:窗口外的老会话今天续跑,活跃 overlay 必须让它可见(「正在发生」
+// 压倒窗口)。
+func TestOverlayActiveBypassesRecentWindow(t *testing.T) {
+	old := time.Now().Add(-20 * 24 * time.Hour).Format(time.RFC3339)
+	active := []models.AgentVibeSession{{
+		ID:        "claude_resumed_old",
+		Provider:  "claude",
+		Status:    "running",
+		UpdatedAt: old,
+	}}
+	out := overlayActiveAgentVibeSessions(agentSyncSnapshot{VibeSessions: nil}, active, nil)
+	found := false
+	for _, s := range out.VibeSessions {
+		if s.ID == "claude_resumed_old" && s.Status == "running" {
+			found = true
+		}
+	}
+	assert.True(t, found, "活跃 run 不得被时间窗误杀")
+}

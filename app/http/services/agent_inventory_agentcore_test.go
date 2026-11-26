@@ -334,11 +334,17 @@ func TestCollectAgentCoreVibeSessionsMergeAndCache(t *testing.T) {
 
 func TestCollectAgentVibeSessionsIncludesAgentCore(t *testing.T) {
 	setTestAgentHome(t)
-	writeAgentCoreJournalFixture(t, agentCoreJournalDir(), "conv-merge", "/tmp/pm")
+	// 2026-11-26 时间窗(agentVibeRecentWindow=15d)后,清单只收近期有活动的
+	// 会话——固定老日期 fixture 会准时出局,这里用相对新鲜时间证明三路合并。
+	freshTS := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+	writeCoreJournalRawFixture(t, "conv-fresh-window",
+		`{"kind":"session","session_id":"conv-fresh-window","project_path":"/tmp/pf","model":"m","created_at":"`+freshTS+`"}`,
+		`{"kind":"msg","role":"user","message_id":"u1","text":"窗口内活动","ts":"`+freshTS+`"}`,
+		`{"kind":"msg","role":"assistant","message_id":"a1","text":"窗口内答复","ts":"`+freshTS+`"}`)
 	sessions := collectAgentVibeSessions(nil)
 	found := false
 	for _, s := range sessions {
-		if s.ID == "conv-merge" && s.Provider == "agentcore" {
+		if s.ID == "conv-fresh-window" && s.Provider == "agentcore" {
 			found = true
 		}
 	}

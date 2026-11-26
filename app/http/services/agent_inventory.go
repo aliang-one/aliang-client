@@ -43,6 +43,16 @@ const (
 	// 全量并留余量;流量代价实测每条约 800B,WS hello 60s 周期下 600 条 ≈
 	// +40MB/h(活跃机),远低于 8MiB 帧上限。两处截断(collect/overlay)共用
 	// truncateAgentVibeSessionsFair,禁止绕开它直切前缀。
+	// 时间窗(2026-11-26 拍板):清单只收最近窗口内有活动的会话——时间窗是
+	// 产品语义(太老的历史对话不必同步到网上),agentVibeSummaryMaxSessions 由此
+	// 降级为窗口内洪峰的兜底。窗口过滤挂在 collectAgentVibeSessions 唯一咽喉,
+	// 跑在各源时间戳修正之后(claude=转录消息钟,codex=:754 修正后的 rollout
+	// mtime),resumed 老会话靠修正自动回窗;活跃 run 由 overlay 豁免(正在发生
+	// 压倒窗口)。解析不出时间=不能证明近期,按窗口语义出局。
+	// 实测收益(2026-11-26 本机):推送 600→~145 条/hello(-75% 出向流量),
+	// codex 0.172.0 死索引的 283 行陈旧+31 条无时间幽灵自然出清,服务端
+	// ai_sessions 单设备增长被「窗口内活跃量」封顶(此前逼近磁盘全量 5000+)。
+	agentVibeRecentWindow             = 15 * 24 * time.Hour
 	agentVibeSummaryMaxSessions       = 600
 	agentVibeSessionFileScanLimit     = 300
 	agentVibeDetailCandidateFileLimit = 24
@@ -685,6 +695,20 @@ func collectAgentVibeSessions(scanDirs []string) []models.AgentVibeSession {
 	claudeSessions, claudeDropped := collectClaudeVibeSessionsWithStats(scanDirs)
 	sessions := append(collectCodexVibeSessions(scanDirs), claudeSessions...)
 	sessions = append(sessions, collectAgentCoreVibeSessions(scanDirs)...)
+	// 时间窗过滤(唯一咽喉,见 agentVibeRecentWindow 注释):在排序与截断之前。
+	cutoff := time.Now().Add(-agentVibeRecentWindow)
+	kept := sessions[:0]
+	for _, session := range sessions {
+		updatedAt, err := time.Parse(time.RFC3339, session.UpdatedAt)
+		if err != nil || updatedAt.Before(cutoff) {
+			continue
+		}
+		kept = append(kept, session)
+	}
+	if droppedOld := len(sessions) - len(kept); droppedOld > 0 {
+		logger.Debug(fmt.Sprintf("[AGENT-INVENTORY] vibe_sessions_window_dropped dropped=%d window_days=%d", droppedOld, int(agentVibeRecentWindow/(24*time.Hour))))
+	}
+	sessions = kept
 	sort.Slice(sessions, func(i, j int) bool {
 		return sessions[i].UpdatedAt > sessions[j].UpdatedAt
 	})
