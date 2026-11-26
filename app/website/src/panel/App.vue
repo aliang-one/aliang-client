@@ -1,8 +1,12 @@
 <!-- App.vue — 托盘面板根壳:
      theme + 340px 容器 + Toast 挂载 + 数据层接线(useSummary 轮询 +
      derivePanelState 七态派生,provide 给区块组件)。
-     区块组件:①状态头/②传输行(Task 8)/③AI 加速(Task 9)已落地;
-     ④ENDPOINT/⑤AI AGENT/⑥底部动作行仍是占位(Task 10-11),绝不提前实现。 -->
+     区块组件:①状态头/②传输行(Task 8)/③AI 加速(Task 9)/④ENDPOINT
+     (Task 10)已落地;⑤AI AGENT/⑥底部动作行仍是占位(Task 11),
+     绝不提前实现。
+     ④ENDPOINT 的分隔线随区走(spec mockup endpoints() 自带前置 sep):
+     available=false 整区不渲染时连 sep 一起消失,故本文件不为④放静态 sep
+     ——③ 后的 sep 就是 ③/⑤ 之间的那条线。 -->
 <script setup>
 import { computed, provide, ref } from 'vue';
 import { useSummary } from './summary';
@@ -11,6 +15,7 @@ import Toast, { useToast } from './components/Toast.vue';
 import StatusHeader from './components/StatusHeader.vue';
 import TransportRow from './components/TransportRow.vue';
 import AISection from './components/AISection.vue';
+import EndpointZone from './components/EndpointZone.vue';
 
 // 数据层:启动即拉一次 + 2s 轮询;connLost 连续 2 次失败置位(§3 错误态)。
 // 仅本根壳调用一次;区块组件一律经 inject('panelData') 取同一份数据。
@@ -47,9 +52,9 @@ provide('panelToast', toast);
     <AISection />
     <div class="sep"></div>
 
-    <!-- ④ ENDPOINT:Anthropic 组 / OpenAI 组;available=false 整区不渲染(Task 10/11) -->
-    <div class="panel-block" data-block="endpoints">ENDPOINT(Task 10-11 占位)</div>
-    <div class="sep"></div>
+    <!-- ④ ENDPOINT:Anthropic 组 / OpenAI 组;available=false 整区不渲染
+         (spec §4.4 硬性降级);自带前置 sep,故此处无静态 sep(Task 10) -->
+    <EndpointZone />
 
     <!-- ⑤ AI AGENT:每内核一张卡片(24h 统计)(Task 11) -->
     <div class="panel-block" data-block="agents">AI AGENT · 24H(Task 11 占位)</div>
@@ -64,7 +69,7 @@ provide('panelToast', toast);
 </template>
 
 <style scoped>
-/* 占位块最小可读样式:仅剩 Task 10-11 的三个占位在用,落一删一,全落整段删。 */
+/* 占位块最小可读样式:仅剩 Task 11 的两个占位在用,落一删一,全落整段删。 */
 .panel-block {
   padding: 12px 14px;
   font-size: 11.5px;
