@@ -939,6 +939,92 @@ export function consumeSubagentFrame(store, e, activeSessionId, hooks = {}) {
   return true;
 }
 
+// --- 会话诊断 WS 消费链（spec 2026-11-26-chat-info-drawer-design，导出供单测）---
+//
+// ai.run.progress 心跳自诊断面板批（2026-10-28）起携带逐回合诊断快照
+// （turns/context_tokens/守卫连击/耗时，宿主 diag.payload()）+ files_touched/
+// git_changed 计数；网页端此前无消费者（帧只计入重连预算）。拆成模块级纯函数
+// （蛇形归一 + 按会话键存快照），composable 内 case 只做薄壳装配——同
+// subagentFrameToReducerMsg/consumeSubagentFrame 惯用法。
+
+// WS 蛇形帧 → 驼峰快照条目。键名与宿主 diag.payload()/models.AgentVibeDiagnostics
+// 的 json tag 同源（两路同一套字段：实时心跳 / 详情回放）。diagnostics 缺席
+// （尚无回合的空心跳）返回 null 由调用方丢弃；数值字段统一归一，未知键不透传。
+export function diagnosticsFrameToState(e) {
+  if (!e || typeof e !== 'object') return null;
+  const d = e.diagnostics;
+  if (!d || typeof d !== 'object') return null;
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+  const str = (v) => (typeof v === 'string' && v ? v : null);
+  const out = {
+    turns: num(d.turns) ?? 0,
+    contextTokens: num(d.context_tokens),
+    contextWindow: num(d.context_window),
+    dupStreak: num(d.dup_streak) ?? 0,
+    errStreak: num(d.err_streak) ?? 0,
+    truncStreak: num(d.trunc_streak) ?? 0,
+    elapsedMs: num(d.elapsed_ms),
+    stopReason: str(d.stop_reason),
+    terminal: d.terminal === true,
+    reason: str(d.reason),
+    status: str(d.status),
+    error: str(d.error),
+  };
+  const files = num(e.files_touched_count);
+  const git = num(e.git_changed_count);
+  if (files !== null) out.filesTouchedCount = files;
+  if (git !== null) out.gitChangedCount = git;
+  return out;
+}
+
+// ai.run.progress 帧消费主链：按帧 session_id 键整条覆盖快照（最新心跳即权威
+// 快照，无聚合），读写都按键取，无跨会话污染面——不设归属守卫（与 ai.subagent
+// 的 M2 守卫不同源：诊断快照挂在键上，展示层只读当前会话的键）。导出供单测。
+export function consumeProgressFrame(store, e) {
+  if (!e || typeof e !== 'object' || e.type !== 'ai.run.progress') return false;
+  const sid = typeof e.session_id === 'string' ? e.session_id : '';
+  if (!sid) return false;
+  const entry = diagnosticsFrameToState(e);
+  if (!entry) return false; // 尚无回合：宿主 diag.payload()=nil，无数据可存
+  store[sid] = entry;
+  return true;
+}
+
+// 详情回填（journal end 行的终态诊断，含 status/error/reason 终态字段）：
+// detail.diagnostics 与实时通道同一套键，走同一归一化。导出供单测。
+export function ingestDetailDiagnostics(store, sessionId, detail) {
+  const sid = String(sessionId || '');
+  if (!sid) return false;
+  const entry = diagnosticsFrameToState({
+    type: 'ai.run.progress',
+    session_id: sid,
+    diagnostics: detail && typeof detail === 'object' ? detail.diagnostics : null,
+    files_touched_count: detail && typeof detail === 'object' ? detail.files_touched_count : undefined,
+    git_changed_count: detail && typeof detail === 'object' ? detail.git_changed_count : undefined,
+  });
+  if (!entry) return false;
+  store[sid] = entry;
+  return true;
+}
+
+// 诊断详情静默重拉（真实实现，经 vi.mock 的 getAgentSessionDetail 可测）：
+// 打开抽屉时拉一次 journal end 终态快照，补齐 progress 心跳不带终态字段的
+// 缺口；失败静默——实时心跳仍在。同会话 in-flight 去重同 refreshSubagentsFromDetail。
+const diagnosticsRefreshInflight = new Set();
+export async function refreshDiagnosticsFromDetail(store, sessionId) {
+  const sid = String(sessionId || '');
+  if (!sid || diagnosticsRefreshInflight.has(sid)) return;
+  diagnosticsRefreshInflight.add(sid);
+  try {
+    const detail = await getAgentSessionDetail(sid);
+    ingestDetailDiagnostics(store, sid, detail);
+  } catch (_) {
+    // 静默：详情缺席不阻断（实时心跳通道仍在）
+  } finally {
+    diagnosticsRefreshInflight.delete(sid);
+  }
+}
+
 
 // 详情 API（AgentVibeSubagent，models/agent.go 蛇形键 + status 词表）→ reducer
 // 条目形状（驼峰键 + phase 词表）。评审钉死的契约分歧收口：详情发 status
@@ -1511,6 +1597,21 @@ export function useAliangChat() {
   // M1 重拉入口（composable 侧薄壳）：绑定本会话存储交给模块级真实实现。
   function refetchSubagentsForSession(sessionId) {
     return refreshSubagentsFromDetail(subagentsBySession, sessionId);
+  }
+
+  // 会话诊断快照（spec 2026-11-26-chat-info-drawer）：key=aiSessionId、
+  // value=consumeProgressFrame/ingestDetailDiagnostics 的整条快照。瞬态展示
+  // 数据不进 localStorage（同 subagentsBySession 口径）；抽屉打开时经
+  // refetchDiagnosticsForSession 拉 journal end 终态补全。
+  const diagnosticsBySession = reactive({});
+  // getter：当前打开会话的诊断快照（无打开会话/无 aiSessionId/无快照时为 null）。
+  const activeDiagnostics = computed(() => {
+    const sid = activeConversation.value?.aiSessionId || '';
+    return (sid && diagnosticsBySession[sid]) ? diagnosticsBySession[sid] : null;
+  });
+  // 诊断详情重拉入口（composable 侧薄壳）：绑定本会话存储交给模块级真实实现。
+  function refetchDiagnosticsForSession(sessionId) {
+    return refreshDiagnosticsFromDetail(diagnosticsBySession, sessionId);
   }
 
 
@@ -4138,6 +4239,14 @@ export function useAliangChat() {
         }
         break;
       }
+      case 'ai.run.progress': {
+        // 运行心跳（诊断面板实时通道，spec 2026-11-26-chat-info-drawer）：
+        // 宿主 ticker 携带逐回合诊断快照+文件/Git 计数，蛇形归一+按会话键存
+        // 都在 consumeProgressFrame 纯链（模块级导出供单测）。尚无回合的空
+        // 心跳（diagnostics=nil）安全丢弃。
+        consumeProgressFrame(diagnosticsBySession, e);
+        return; // 心跳是瞬态展示数据：不落 localStorage（同 ai.subagent 口径）
+      }
       case 'ai.subagent': {
         // 子agent生命周期帧（spec 2026-11-07-subagent-panel §三）：归属守卫
         // +蛇形归一+reducer 聚合+M1 详情重拉都在 consumeSubagentFrame 纯链
@@ -4621,5 +4730,9 @@ export function useAliangChat() {
     activeHasRunningSubagents,
     subagentWatchingTaskId,
     refetchSubagentsForSession,
+    // 会话诊断（spec 2026-11-26-chat-info-drawer）：信息抽屉实时（progress
+    // 心跳）+ 详情（journal end 终态）双通道；activeDiagnostics 供抽屉组件。
+    activeDiagnostics,
+    refetchDiagnosticsForSession,
   };
 }

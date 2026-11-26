@@ -40,6 +40,18 @@
     >
       <span class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-primary"></span>{{ t('chat_statusRunning') }}
     </span>
+    <!-- 会话信息抽屉入口（spec 2026-11-26-chat-info-drawer-design）：有活跃
+         会话即可开，桌面/移动端一致（抽屉自身负责响应式形态）。 -->
+    <button
+      v-if="activeId"
+      type="button"
+      data-testid="chat-info-entry"
+      class="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 dark:hover:bg-slate-800"
+      :aria-label="t('chat_infoEntry')"
+      @click="emit('open-info')"
+    >
+      <span class="material-symbols-outlined text-lg">info</span>
+    </button>
     <button
       v-if="activeId && !activeIsDevice"
       type="button"
@@ -79,6 +91,7 @@ const props = defineProps({
 
 const emit = defineEmits([
   'open-sidebar',
+  'open-info',
   'rename-start',
   'rename-commit',
   'rename-cancel',

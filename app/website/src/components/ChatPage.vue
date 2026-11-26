@@ -31,6 +31,7 @@
         :rename-draft="renameDraft"
         :set-rename-input="setRenameInput"
         @open-sidebar="showMobileSidebar = true"
+        @open-info="infoDrawerOpen = true"
         @rename-start="startRename"
         @rename-commit="commitRename"
         @rename-cancel="cancelRename"
@@ -86,6 +87,19 @@
         v-if="activeIsAgentcore && activeSubagents.length > 0"
         :subagents="activeSubagents"
         @open="openSubagentPanel"
+      />
+
+      <!-- 会话信息抽屉（spec 2026-11-26-chat-info-drawer-design）：贴右滑出，
+           常驻挂载（滑出范式镜像 ChatSidebar）；数据=activeSubagents +
+           activeDiagnostics（实时心跳+详情终态双通道）。点「查看详情」上抛
+           开子agent面板（z 序在其之下，面板盖在上面）。 -->
+      <ChatInfoDrawer
+        :open="infoDrawerOpen"
+        :subagents="activeSubagents"
+        :diagnostics="activeDiagnostics"
+        :running="activeRunning"
+        @close="infoDrawerOpen = false"
+        @open-subagent-panel="openSubagentPanel"
       />
 
       <!-- 子agent面板（Task 8, spec 2026-11-07-subagent-panel §三）：入口条
@@ -156,10 +170,12 @@ import ChatComposer from './chat/ChatComposer.vue';
 import ChatComposerTools from './chat/ChatComposerTools.vue';
 import SubagentStatusBar from './chat/SubagentStatusBar.vue';
 import SubagentPanel from './chat/SubagentPanel.vue';
+import ChatInfoDrawer from './chat/ChatInfoDrawer.vue';
 
 const {
   activeApprovals,
   activeConversation,
+  activeDiagnostics,
   activeId,
   activeIsDevice,
   activeMessages,
@@ -197,6 +213,7 @@ const {
   onSidebarItemClick,
   onSlashInput,
   recallActive,
+  refetchDiagnosticsForSession,
   refetchSubagentsForSession,
   renameDraft,
   renamingId,
@@ -258,11 +275,23 @@ function closeSubagentPanel() {
 function onSubagentPanelSelect(taskId) {
   subagentWatchingTaskId.value = taskId || null;
 }
+
+// 会话信息抽屉（spec 2026-11-26-chat-info-drawer-design）：常驻挂载的滑出
+// 面板。打开瞬间以当前会话 aiSessionId 拉一次详情（journal end 终态快照补全
+// status/reason/error——实时心跳不带终态字段）；失败静默（refresh 纯链自带）。
+const infoDrawerOpen = ref(false);
+watch(infoDrawerOpen, (open) => {
+  if (!open) return;
+  const sid = activeConversation.value?.aiSessionId || '';
+  if (sid) refetchDiagnosticsForSession(sid);
+});
 // D2（2026-11-21 审计四批拍板修）：面板开着切会话——面板展示旧会话的子代理
 // 内容、watchingTaskId 跨会话泄漏。切会话即收面板（open watch 的 else 分支
-// 顺带清 watching，复用同一收口）。
+// 顺带清 watching，复用同一收口）。信息抽屉同口径：切会话即收，防旧会话
+// 诊断快照（activeDiagnostics 键随会话切换本就换挡）与子agent列表错位呈现。
 watch(activeId, () => {
   if (subagentPanelOpen.value) closeSubagentPanel();
+  if (infoDrawerOpen.value) infoDrawerOpen.value = false;
 });
 watch(subagentPanelOpen, (open) => {
   if (open) {
@@ -322,5 +351,8 @@ useEscLayer('chat-recall-edit', cancelRecall, () => recallActive.value);
 // 子代理面板全屏抽屉（2026-11-20 审计二批 B9）：面板开着时 Esc 先关面板——
 // 未注册层的漏网面板，Esc 直接命中 page-return 整页退出聊天，浏览上下文
 // 全丢。层序=后激活在顶：面板层晚于 page-return 压栈，先收面板再回页面。
+// 会话信息抽屉层更早压栈（在其之下）：抽屉+面板同开时 Esc 先收面板、再收
+// 抽屉、最后才退页面——与 z 序（940/950 > 930）一致。
+useEscLayer('chat-info-drawer', () => { infoDrawerOpen.value = false; }, () => infoDrawerOpen.value);
 useEscLayer('chat-subagent-panel', closeSubagentPanel, () => subagentPanelOpen.value);
 </script>
