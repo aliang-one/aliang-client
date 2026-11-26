@@ -108,6 +108,33 @@ const (
 	agentCoreTokenFailCacheTTL = time.Minute
 )
 
+// agentCoreGetEndpointServiceFn 是内核三个解析点取 endpoint registry 单例的
+// 入口（测试可替换）。生产恒 GetEndpointService；单例 sync.Once 构造失败会
+// 缓存 nil，测试无法重置，故经此 var 注入独立 service（形状对齐
+// agentCoreGetUserAPIKeysFn）。
+var agentCoreGetEndpointServiceFn = GetEndpointService
+
+// agentCoreSelectEndpoint 为内核解析出网形态选一个 anthropic endpoint：
+// registry service 缺失（未构造/构造失败）或选择失败（无候选且内置行不健康）
+// 返回 nil——调用方走原逻辑降级，不允许 panic。每次调用独立 Select：内核
+// BaseURL/AuthToken/EnsureUpstream 三处必须看到同一选择，不缓存（缓存会漂移）。
+//
+// 返回的 builtin 行（Select 的空候选兜底）代表「平台隧道」——与继承链落到
+// agentCoreDefaultBaseURL 等价，因此三个解析点对 builtin 一律走原逻辑，不
+// 因 registry 的存在改变现状（§13「升级后开箱即用等价今天的行为」）。只有
+// BYO 行才代表「registry 有新东西要说」，由调用方各自接住。
+func agentCoreSelectEndpoint() *config.LLMEndpoint {
+	svc := agentCoreGetEndpointServiceFn()
+	if svc == nil {
+		return nil
+	}
+	ep, err := svc.Select("anthropic", "", "")
+	if err != nil {
+		return nil
+	}
+	return ep
+}
+
 // agentCoreAuthToken 解析内核出网要带的用户 API key。
 //
 // 为什么必须带：网关 /v1/messages 的 key 解析有两条路——请求自带用户的 key 就
@@ -122,6 +149,7 @@ const (
 //
 // 取值顺序：
 //  0. 显式 agentcore_llm（仪表盘配置）——命中且非空直接返回，不进缓存；
+//  0.5 endpoint registry 选中的 BYO 行 api_key（spec §8，旧字段未配置时生效）；
 //  1. ANTHROPIC_AUTH_TOKEN（子进程 env → ~/.claude/settings.json）——零网络，
 //     与 CLI 用的是同一个值，quick-setup 用户恒命中；
 //  2. user-center 的 key 列表（带缓存）——没跑过 quick-setup 的新装用户兜底。
@@ -135,6 +163,16 @@ func agentCoreAuthToken() string {
 			return custom.APIKey
 		}
 		// 回环+空 key 是合法形态:key 落继承链(URL 已显式)。
+	}
+	// endpoint registry(spec §8,不变量 9:仅旧字段未配置时生效):选中 BYO
+	// 行的 api_key 优先于继承链;builtin(空 key = 平台隧道走登录态)与
+	// registry 不可用落回现有链,现状不变。
+	if ep := agentCoreSelectEndpoint(); ep != nil && !ep.Builtin {
+		if key := strings.TrimSpace(ep.APIKey); key != "" {
+			return key
+		}
+		// 回环 BYO 行允许空 key(Validate 口径):凭据落继承链,与显式配置的
+		// 「回环+空 key」同款语义。
 	}
 	if v := agentCoreEnvOrSettings("ANTHROPIC_AUTH_TOKEN"); v != "" {
 		return v
@@ -219,6 +257,17 @@ func agentCoreBaseURL() string {
 	if custom := config.GetGlobalConfig().EffectiveAgentCoreLLM(); custom != nil {
 		return custom.BaseURL
 	}
+	// endpoint registry(spec §8,不变量 9:仅旧字段未配置时生效):BYO 行用
+	// 其 base_url,优先于继承链;builtin 行(base_url 空 = 平台隧道)与
+	// registry 不可用/无候选不改变现状——落继承链原逻辑(env 回环放行 →
+	// 远端被闸拒 → agentCoreDefaultBaseURL),存量行为零漂移。只有 BYO 行
+	// 才把出网地址从 56432 改写出去。
+	if ep := agentCoreSelectEndpoint(); ep != nil && !ep.Builtin {
+		if base := strings.TrimSpace(ep.BaseURL); base != "" {
+			return base
+		}
+		// 空 base_url 的 BYO 行(Validate 允许,非内置不强制):当没配过,落继承链。
+	}
 	if v := agentCoreEnvOrSettings("ANTHROPIC_BASE_URL"); v != "" {
 		if agentCoreIsLoopbackBase(v) {
 			return v
@@ -295,8 +344,9 @@ func agentCoreDialHost(u *url.URL) string {
 // 配时才生效）。用 ...ForRun 会在「什么都没配」这个最常见的场景下探测空地址、
 // 直接放行，于是 56432 没起时用户看到的仍是裸的 Connection refused。
 func agentCoreEnsureUpstream(ctx context.Context) error {
-	// 显式端点:没有「自愈」概念(不是我们的进程,POST /api/run/start 拉不活
-	// 它),只做同款 2s TCP 拨测,失败给可自查的文案。
+	// 显式端点(customer.agentcore_llm)最优先(不变量 9):没有「自愈」概念
+	// (不是我们的进程,POST /api/run/start 拉不活它),只做同款 2s TCP 拨测,
+	// 失败给可自查的文案。registry 在其未配置时才生效(下方分支)。
 	if custom := config.GetGlobalConfig().EffectiveAgentCoreLLM(); custom != nil {
 		logger.Info("agentcore: 使用自定义 LLM 端点 " + custom.BaseURL)
 		u, err := url.Parse(custom.BaseURL)
@@ -310,6 +360,50 @@ func agentCoreEnsureUpstream(ctx context.Context) error {
 		}
 		conn.Close()
 		return nil
+	}
+	// endpoint registry(spec §8,不变量 9:仅旧字段未配置时生效):BYO 行做
+	// HTTP 探测(GET /v1/models,2s;200/401/403 都算可达——链路通,key 问题
+	// 留给请求本身报),没有「自愈」概念(不是我们的进程,POST /api/run/start
+	// 拉不活它),失败给可自查的文案;builtin 行(空 base_url = 平台隧道)与
+	// registry 不可用/无候选落下方 MeshDelegateActive 跳过 + 自愈链(原样不动)。
+	if ep := agentCoreSelectEndpoint(); ep != nil && !ep.Builtin {
+		base := strings.TrimSpace(ep.BaseURL)
+		logger.Info("agentcore: 使用 endpoint registry 自定义端点 " + ep.ID + " " + base)
+		if base == "" {
+			return nil // 形态已被 Validate 挡住;探测逻辑自身不挂 run
+		}
+		u, err := url.Parse(base)
+		if err != nil || u.Host == "" {
+			return nil // 同上:非法形态不在探测层报
+		}
+		// 同款 host:port 解析(agentCoreDialHost):URL 无显式端口时补 scheme 默认值。
+		d := net.Dialer{Timeout: 2 * time.Second}
+		conn, err := d.DialContext(ctx, "tcp", agentCoreDialHost(u))
+		if err != nil {
+			return fmt.Errorf("自定义 LLM 端点不可达(%s: %v)——请检查地址与服务状态后重试", base, err)
+		}
+		conn.Close()
+		// HTTP smoke:GET /v1/models(带 Bearer key),2s 封顶。200/401/403 都算
+		// 可达(401/403 = 链路通、key 被拒,口径同 EndpointService.Test)。
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/v1/models", nil)
+		if err != nil {
+			return nil // 构造失败不挂 run(形态已被上面 url.Parse 卡过)
+		}
+		if key := strings.TrimSpace(ep.APIKey); key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
+		client := &http.Client{Timeout: 2 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("自定义 LLM 端点不可达(%s: %v)——请检查地址与服务状态后重试", base, err)
+		}
+		resp.Body.Close()
+		switch resp.StatusCode {
+		case http.StatusOK, http.StatusUnauthorized, http.StatusForbidden:
+			return nil
+		default:
+			return fmt.Errorf("自定义 LLM 端点探测失败(%s: /v1/models 返回 %d)——请检查地址与服务状态后重试", base, resp.StatusCode)
+		}
 	}
 	// 探针降级:出口链路委托激活时跳过上游可达性探针。该探针拨回环
 	// 56432 并在失败时自愈拉起本机 run service——委托激活时 AI 流量的真实
