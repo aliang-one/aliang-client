@@ -327,7 +327,7 @@ describe('B3 看门狗按会话隔离（并发挂死回合自愈通道恢复）'
     return sock;
   }
 
-  it('B 持续出帧抢不走 A 的看门狗：A 挂死 90s 被判 error，B 不受累', async () => {
+  it('B 持续出帧抢不走 A 的看门狗：A 挂死被探测+兜底判 error，B 不受累', async () => {
     vi.useFakeTimers();
     const chat = useAliangChat();
     const a = makeConv({ id: 'cA', aiSessionId: 'sess-a', model: 'glm-x', messages: [] });
@@ -346,12 +346,27 @@ describe('B3 看门狗按会话隔离（并发挂死回合自愈通道恢复）'
     const sock = await sendIntoA(chat, a);
     // B 的帧持续到达。旧实现：单槽看门狗被 B 帧抢靶（gate=已有狗即武装）→
     // A 挂死永不触发；新实现：B 的帧只武装 B（此形态下 gate 关着，B 无狗），
-    // A 的狗按自己的 90s 走时。
+    // A 的狗按自己的节奏走时。
     for (let i = 0; i < 5; i++) {
       vi.advanceTimersByTime(30000);
       frame(sock, { type: 'ai.delta', session_id: 'sess-b', delta: 'y' });
       await flushMicrotasks();
     }
+    // 症状1修复（2026-11-26）：90s 首窗不再盲染红——先发快照探测问权威
+    // （长静默工具是合法运行态，快照 running 回包会喂狗续命）。
+    expect(a.messages[1].status).toBe('running');
+    const probes = sock.sent.filter((raw) => {
+      try {
+        const p = JSON.parse(raw);
+        return p.type === 'ai.session.subscribe' && p.session_id === 'sess-a';
+      } catch (_) {
+        return false;
+      }
+    });
+    expect(probes).toHaveLength(1);
+    // 连续 2 窗无快照回包（socket 半死黑洞）→ 第 3 窗兜底染红，挂死自愈保留
+    vi.advanceTimersByTime(200000);
+    await flushMicrotasks();
     expect(a.messages[1].status).toBe('error');
     expect(b.messages[1].status).toBe('running');
   });
@@ -371,8 +386,9 @@ describe('B3 看门狗按会话隔离（并发挂死回合自愈通道恢复）'
     await flushMicrotasks();
     frame(sock, { type: 'ai.done', session_id: 'sess-b' });
     await flushMicrotasks();
-    // A 的占位泡还在 running；A 的狗必须存活
-    vi.advanceTimersByTime(91000);
+    // A 的占位泡还在 running；A 的狗必须存活。90s 首窗改探测后，兜底染红
+    // 在连续 3 窗无响应处收敛（探测上限 2，症状1修复 2026-11-26）。
+    vi.advanceTimersByTime(280000);
     await flushMicrotasks();
     expect(a.messages[1].status).toBe('error');
   });

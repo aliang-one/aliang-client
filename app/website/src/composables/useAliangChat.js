@@ -17,6 +17,10 @@ import { uploadChatAttachment } from '../services/agentApi';
 const DEVICE_DETAIL_PAGE_LIMIT = 100;
 const DEVICE_DETAIL_MAX_PAGES = 5;
 
+// 帧级/事件级跟踪开关（模块加载时一次性求值）：ai.delta 是逐 token 热路径，
+// 默认静默；定位流问题设 globalThis.__CHAT_DEBUG__ = true 后重载页面。
+const CHAT_FRAME_TRACE = typeof globalThis !== 'undefined' && !!globalThis.__CHAT_DEBUG__;
+
 // 详情分页拉全（导出纯函数）：openDeviceSession 与草稿↔journal 对账
 // （reconcileDraftWithJournal）同源实现——翻页方向「向更早」（before = 上一页
 // 最旧行的 message_id），每页新行前插保持时间正序；中途页失败降级为已取到
@@ -86,6 +90,7 @@ import {
   sliceMessagesBefore,
 } from '../utils/chatRecall';
 import { applySubagentEvent, hasActiveSubagents } from '../utils/subagentPanel';
+import { chatTurnBareId } from '../utils/chatTimeline';
 
 const STORAGE_KEY = 'aliang-chat-data';
 
@@ -355,10 +360,14 @@ export function ensureAssistantBubble(conv, ts) {
 // 泡，可能已含先于 run.started 到达的 delta 内容），绝不关账、按复用认领；
 // false（外来回合/后台会话/设备壳）则关账全部 running 后产本回合新泡。
 // 置 runActive/running，返回本回合 ensured 气泡。
-export function beginRunWindow(conv, ts, { ownPending = false } = {}) {
+// turnMessageId（2026-11-26 症状1归属守卫）：run.started 帧携带的 assistant
+// 回合 id（assistant_<mid>），记进 runningTurnMessageId——ai.error/终态帧据
+// 此精确归属：不属于当前回合的迟到/外来错误帧不得染红当前泡、不得关当前窗。
+export function beginRunWindow(conv, ts, { ownPending = false, turnMessageId = '' } = {}) {
   if (!conv) return null;
   conv.runActive = true;
   conv.running = true;
+  conv.runningTurnMessageId = turnMessageId || '';
   if (!ownPending) {
     const msgs = Array.isArray(conv.messages) ? conv.messages : [];
     for (const m of msgs) {
@@ -396,6 +405,9 @@ export function endRunWindow(conv) {
   }
   conv.runActive = false;
   conv.running = false;
+  // 回合归属跟踪随窗口关闭清零（与 beginRunWindow 置位对称）——残留的旧
+  // turn id 会让下一回合的 ai.error 归属守卫误判成 mismatch。
+  conv.runningTurnMessageId = '';
   return had;
 }
 
@@ -432,6 +444,9 @@ export function conversationForStorage(conv) {
   // 在 agent（journal/快照），localStorage 只是视图缓存——落盘前剥掉。
   delete copy.running;
   delete copy.runActive;
+  // 回合归属 id 同族瞬态（症状1修复 2026-11-26）：跨页残留旧 turn id 会让
+  // ai.error 归属守卫把外来回合失败帧整体吞掉——权威在 agent，落盘前剥。
+  delete copy.runningTurnMessageId;
   return copy;
 }
 
@@ -448,9 +463,12 @@ export function normalizeConversation(conv) {
   conv.optionCards = [];
   conv.toolAsks = [];
   // 僵尸 flag 恢复清洗（同上）：旧版本落盘（或异常写入）留下的 running 态
-  // 在恢复时一律压平，输入框解锁交给真实的 run 生命周期帧/快照重建。
+  // 在恢复时一律压平，输入框解锁交给真实的 run 生命周期帧/快照重建。回合
+  // 归属 id 同律复位（症状1修复 2026-11-26）：reload 后 stale id 会让归属
+  // 守卫误判，复位后自然回落「缺席=旧近因语义」。
   conv.running = false;
   conv.runActive = false;
+  conv.runningTurnMessageId = '';
   return conv;
 }
 
@@ -631,7 +649,20 @@ export function reconcileLocalSnapshotMessages(localMessages, rows, opts = {}) {
         answer.content = text;
         result.changed = true;
       }
-      if (answer.status !== 'error') answer.status = streaming ? 'running' : 'done';
+      if (answer.status !== 'error') {
+        answer.status = streaming ? 'running' : 'done';
+      } else if (settled && !r.notes.length && typeof answer.content === 'string' && answer.content) {
+        // error 洗白律（症状1修复 2026-11-26）：journal 定谳（settled）且该
+        // 回合没有 end(error) 折出的系统条（r.notes=journal 权威失败信号）且
+        // 有正文 → 误染红洗白。误染源（看门狗假红/断线画法/外来帧误染）
+        // journal 无 end(error) 行，自动翻绿；真失败（notes 非空）永不清。
+        // 流中末回合（journal 已有部分行而回合未终——recoveredRun 增量落行
+        // 形态）翻 running 恢复活体接流，不定谳成 done。失败条补条段有
+        // failedMessageId 去重，降级不会重复补条。
+        answer.status = streaming ? 'running' : 'done';
+        if (answer.status === 'running' && isLast && snapshotRunning) result.createdRunning = true;
+        result.changed = true;
+      }
       // seq 同步：只在真的变了时改写并记 changed（幂等契约：零改动必须
       // changed=false，否则调用方每轮都重赋值+落盘，渲染抖动）。
       if (r.lastSeq > 0 && answer.seq !== r.lastSeq) {
@@ -748,10 +779,26 @@ export function reconcileLocalSnapshotMessages(localMessages, rows, opts = {}) {
             candidate.content = anchorTexts;
             result.changed = true;
           }
+          // error 洗白律·锚回合（症状1修复 2026-11-26）：「红壳+成功正文」形态
+          // 根治点——journal 全文刚修进红壳，但 journal 读侧行不带 error 语义、
+          // 唯一权威失败信号是 end(error) 折出的 anchorRound.notes。误染（无
+          // notes）定谳即翻绿；真失败（notes 非空）保留红。洗白后不会重复补
+          // 失败条（补条段 failedMessageId 去重兜底）。
+          if (candidate.status === 'error' && anchorRound.notes.length === 0
+            && typeof candidate.content === 'string' && candidate.content) {
+            candidate.status = 'done';
+            result.changed = true;
+          }
         } else if (anchorTexts && anchorTexts !== candidate.content
           && anchorTexts.startsWith(candidate.content || '')) {
           // 流中：journal 增长式对齐（canAlign 原语义），绝不收缩
           candidate.content = anchorTexts;
+          // 流中洗白（症状1修复）：settled=false 蕴含 notes 空（journal 无失败
+          // 行且 run 还在跑）——误染红泡翻回 running 恢复活体形态接流。
+          if (candidate.status === 'error') {
+            candidate.status = 'running';
+            result.changed = true;
+          }
           result.alignedLive = true;
           result.changed = true;
         }
@@ -798,9 +845,12 @@ export function reconcileLocalSnapshotMessages(localMessages, rows, opts = {}) {
     emitRound(k, null, null, (k === rounds.length - 1) ? anchorLive : null);
   }
   // 快照也要补本地已有提问的失败说明。按 user ID 定位，保留已经实时展示的原因。
+  // 建键走 chatTurnBareId 归一（症状1修复 2026-11-26）：journal user 行本是裸
+  // id，但 WS 通道的失败条 failedMessageId 可能带 .option 后缀（续跑回合），
+  // 去重比对同样归一后跨通道才不重复补条。
   const notesByMessageId = new Map(rounds
     .filter(r => r.notes.length && r.userRow.message_id)
-    .map(r => [String(r.userRow.message_id), r.notes]));
+    .map(r => [chatTurnBareId(r.userRow.message_id), r.notes]));
   let messages = out;
   if (notesByMessageId.size) {
     messages = [];
@@ -812,7 +862,7 @@ export function reconcileLocalSnapshotMessages(localMessages, rows, opts = {}) {
       const existing = messages.slice(roundStart);
       for (const n of notes) {
         if (existing.some(m => (m?.note === 'turn_failed'
-          && (m.failedMessageId === failedMessageId || (n.seq && m.seq === n.seq) || m.content === n.text))
+          && (chatTurnBareId(m.failedMessageId) === chatTurnBareId(failedMessageId) || (n.seq && m.seq === n.seq) || m.content === n.text))
           || (m?.status === 'error' && m.content && n.text.endsWith(`：${m.content}`)))) continue;
         messages.push({
           ...deviceSystemNoteBubble(n.text, n.ts, n.seq),
@@ -888,6 +938,7 @@ export function consumeSubagentFrame(store, e, activeSessionId, hooks = {}) {
   }
   return true;
 }
+
 
 // 详情 API（AgentVibeSubagent，models/agent.go 蛇形键 + status 词表）→ reducer
 // 条目形状（驼峰键 + phase 词表）。评审钉死的契约分歧收口：详情发 status
@@ -1312,6 +1363,11 @@ export function useAliangChat() {
   // 回合的自愈通道丢失（rescue 恰在最需要并发的场景失效）。Map 按会话建狗：
   // 谁挂死谁超时，别人的帧只武装别人的狗，别人的终态只拆别人的狗。
   const idleWatchdogTimers = new Map(); // conv.id -> timer
+  // 探测计数（症状1修复，2026-11-26）：狗到期先发快照探测而非盲染红；计数
+  // 只在「任何真帧/运行中快照」到达时归零——完全无响应（socket 黑洞）连续
+  // 两个窗口才落原判兜底。
+  const idleWatchdogProbes = new Map(); // conv.id -> 已探测次数
+  const IDLE_PROBE_LIMIT = 2;
 
   function armIdleWatchdog(conv) {
     if (!conv) return;
@@ -1321,9 +1377,34 @@ export function useAliangChat() {
       idleWatchdogTimers.delete(conv.id);
       const asst = findRunningAssistant(conv);
       if (!asst) return;
+      // 症状1修复（2026-11-26）：90s 盲染红与后端 watchdog 语义矛盾——
+      // agent_ai_watchdog.go 对工具/子代理等待态不按 stale 阈值判死，只服
+      // 各自天花板；长静默工具（慢下载/慢克隆）期间 run 完全合法，盲杀把
+      // 活跃 run 画成红色错误泡（用户截图实锤：红泡正文停在「分批跑完:」
+      // 的静默下载叙述处），且原实现漏 endRunWindow 留僵尸 running/runActive
+      // （后续消息全被 steer 分流、输入框假锁）。改探测优先：快照订阅是
+      // 权威且对在途流无副作用——running 回包经 reconcileLocalSnapshot 再
+      // 武装本狗并清探测计数（无条件，含 inFlight——inFlight 只该挡收敛，
+      // 不该挡喂狗）；idle 回包走既有收敛链关窗+补 journal 终态系统条。
+      // 连续 IDLE_PROBE_LIMIT 个窗口连快照都没有（socket 半死黑洞）才落
+      // 原判兜底，并补收窗修 flag 僵尸。
+      const probes = idleWatchdogProbes.get(conv.id) || 0;
+      if (!conv.deviceSession
+        && probes < IDLE_PROBE_LIMIT
+        && sendAI({ type: 'ai.session.subscribe', session_id: conv.aiSessionId })) {
+        idleWatchdogProbes.set(conv.id, probes + 1);
+        armIdleWatchdog(conv); // 探测宽限：再等一个窗口，帧/快照到即喂狗归零
+        return;
+      }
+      idleWatchdogProbes.delete(conv.id);
       asst.status = 'error';
       if (!asst.content) asst.content = t('chat_idleTimeout');
+      // 兜底染红可能误判（run 实际仍活、只是传输停摆）：置 recoveredRun 放行
+      // ai.done 的终态定谳复订阅——快照回来经 reconcile 的 error 洗白律翻绿并
+      // 补 journal 全文（与洗白律强耦合同批：无洗白律时这里只会造红壳+全文）。
+      conv.recoveredRun = true;
       clearApprovalsForSession(conv, conv.aiSessionId); // 与 ai.done/ai.error 同口径
+      endRunWindow(conv); // 原缺陷漏收窗：running/runActive 僵尸化（2026-11-18 家族②同型）
       finishRun(conv);
       saveToStorage();
     }, CHAT_IDLE_TIMEOUT_MS);
@@ -1338,10 +1419,12 @@ export function useAliangChat() {
         clearTimeout(timer);
         idleWatchdogTimers.delete(conv.id);
       }
+      idleWatchdogProbes.delete(conv.id);
       return;
     }
     for (const timer of idleWatchdogTimers.values()) clearTimeout(timer);
     idleWatchdogTimers.clear();
+    idleWatchdogProbes.clear();
   }
 
   // Local agent AI WebSocket: streams the local Claude Code / Codex headless run
@@ -1429,6 +1512,7 @@ export function useAliangChat() {
   function refetchSubagentsForSession(sessionId) {
     return refreshSubagentsFromDetail(subagentsBySession, sessionId);
   }
+
 
   // True while the active conversation's latest assistant message is still streaming.
   const activeRunning = computed(() => {
@@ -2311,8 +2395,12 @@ export function useAliangChat() {
     }
     // running 快照证实 run 活着 → 看门狗再武装（onclose 的 disarm-all 清了
     // 计时器）。该会话自己的狗直接重武装——按会话隔离后不存在「抢别人靶」
-    // 的问题（2026-11-20 审计二批 B3）。
-    if (snapshotRunning && !inFlight) {
+    // 的问题（2026-11-20 审计二批 B3）。症状1修复联动（2026-11-26）：再武装
+    // 与探测计数归零改为无条件——运行中快照是权威活证，inFlight 只该挡收敛
+    // 分支（快照非权威时不动消息列表），不该挡喂狗：run 进行中 sending 恒
+    // 真，旧条件会让看门狗探测发出的回包再武装永远落空、探测循环断链。
+    if (snapshotRunning) {
+      idleWatchdogProbes.delete(local.id);
       armIdleWatchdog(local);
     }
     // pending_approvals 恢复与状态分支解耦（审批等待中关窗重进：running
@@ -2457,7 +2545,12 @@ export function useAliangChat() {
           // ignore malformed frames
         }
         if (parsed && parsed.type) {
-          console.log('[aliang-chat] frame', parsed.type, parsed.type === 'ai.delta' ? `len=${(parsed.delta || '').length}` : '');
+          // 帧级跟踪默认关闭：ai.delta 高频逐帧打日志在 DevTools 打开时显著
+          // 拖慢流式渲染（2026-11-26 审计）。需要定位流问题时设
+          // globalThis.__CHAT_DEBUG__ = true 后重载页面再开。
+          if (CHAT_FRAME_TRACE) {
+            console.log('[aliang-chat] frame', parsed.type, parsed.type === 'ai.delta' ? `len=${(parsed.delta || '').length}` : '');
+          }
         }
         handleAIEvent(parsed);
       };
@@ -2587,6 +2680,13 @@ export function useAliangChat() {
         if (!asst.content) {
           asst.content = closeCode === 1011 ? t('chat_agentOffline') : t('chat_connInterrupted');
         }
+        // 收窗纪律补漏（症状1修复 2026-11-26）：染红不收窗会留 running/runActive
+        // 僵尸——后续用户消息全被 steer 分流静默吞掉（与看门狗兜底同族缺陷，
+        // 唯一复位点漏网位）。置 recoveredRun 同款：重连后快照/终态按 journal
+        // 定谳（误判经洗白律翻绿）。
+        conv.recoveredRun = true;
+        disarmIdleWatchdog(conv);
+        endRunWindow(conv);
       }
       conv.aiSessionCreated = false; // 下条消息经确认门重发 create 重试
       // 离线语义下同步压住设置条的 serviceUnavailable（先设 createError，
@@ -2734,6 +2834,8 @@ export function useAliangChat() {
       expiresAt: event.expires_at || existing?.expiresAt || '',
       availableDecisions: normalizeApprovalDecisions(event.available_decisions || event.availableDecisions || existing?.availableDecisions),
       error: '',
+      // 首建时刻（症状2锚点，同 upsertOptionCard 口径）：时间线内联依据。
+      createdAt: existing?.createdAt || now(),
       updatedAt: now()
     };
     if (existing) {
@@ -2781,6 +2883,29 @@ export function useAliangChat() {
       });
       if (!ok) throw new Error('socket-closed');
       markApprovalHandled(conv, key);
+      // 作答反馈（症状2修复 2026-11-26）：审批族作答成功即删卡、零「已选择」
+      // 终态——与 option/tool_ask 折叠绿卡语义不对称，用户无从确认作答是否
+      // 生效。不建持久 answered 卡（对抗 ai.done/ai.error/看门狗/快照收敛
+      // 四处清除链，carve-out 面太宽直接对抗卡滞留家族设计），改推系统条进
+      // messages：持久化、跟随作答时刻、天然随时间线内联渲染。decision 人话
+      // 复用审批按钮既有 i18n 文案。
+      const decisionLabelKeys = {
+        accept: 'chat_approvalAccept',
+        accept_for_session: 'chat_approvalAcceptSession',
+        decline: 'chat_approvalDecline',
+        cancel: 'chat_approvalCancel',
+      };
+      const decisionText = decisionLabelKeys[normalized]
+        ? t(decisionLabelKeys[normalized])
+        : normalized;
+      conv.messages.push({
+        ...deviceSystemNoteBubble(
+          t('chat_approvalSelected', { decision: decisionText }),
+          now(),
+        ),
+        note: 'approval_decided',
+      });
+      if (conv.id === activeId.value) scrollToBottom();
       saveToStorage();
     } catch (_) {
       if (!handledApprovalIds.has(key)) {
@@ -2858,6 +2983,9 @@ export function useAliangChat() {
       interactionId,
       sessionId,
       messageId: e.message_id || existing?.messageId || '',
+      // 回合归属留据（症状2锚定族）：协议帧可选 run_id；后端补锚定字段后的
+      // 精确内联与调试都靠它。缺席落空串不参与锚定。
+      runId: e.run_id || existing?.runId || '',
       provider: 'tool_ask',
       toolName: String(e.tool_name || existing?.toolName || ''),
       title: String(input.title || existing?.title || ''),
@@ -2876,6 +3004,8 @@ export function useAliangChat() {
       error: '',
       // ③活跃兜底来源标（镜像审批族，渲染层经 chat_approvalFromSession 翻译）
       sourceId: e.sourceId || existing?.sourceId || '',
+      // 首建时刻（症状2锚点，同 upsertOptionCard 口径）。
+      createdAt: existing?.createdAt || now(),
       updatedAt: now(),
     };
     if (existing) Object.assign(existing, next);
@@ -2952,6 +3082,10 @@ export function useAliangChat() {
       error: '',
       // ③活跃兜底来源标（镜像审批族，渲染层经 chat_approvalFromSession 翻译）
       sourceId: e.sourceId || existing?.sourceId || '',
+      // 首建时刻（症状2锚点）：mergeTimeline 按 createdAt 把卡内联到所属
+      // 回合之后——发起请求时请求泡必是末条消息，首建落点即泡后。同 key
+      // 重投/作答复用既有卡不刷新（锚定位置不漂移）。
+      createdAt: existing?.createdAt || now(),
       updatedAt: now(),
     };
     if (existing) Object.assign(existing, next);
@@ -3708,15 +3842,24 @@ export function useAliangChat() {
 
     // Lightweight trace so a streaming/render issue can be localized from the
     // browser console (event type + session match). Delta text is intentionally
-    // omitted to keep the log readable.
-    console.log('[aliang-chat] ai event', e.type, 'session=', e.session_id, 'conv=', conv.id);
+    // omitted to keep the log readable. 默认关闭：ai.delta 也走这里，逐事件
+    // 打日志在流式期间等价逐 token 打点，DevTools 打开时显著拖慢（2026-11-26
+    // 审计）。需要时设 globalThis.__CHAT_DEBUG__ = true 后重载页面。
+    if (CHAT_FRAME_TRACE) {
+      console.log('[aliang-chat] ai event', e.type, 'session=', e.session_id, 'conv=', conv.id);
+    }
 
     // 喂狗：任何到达会话归属判定之后的帧都算 AI 活动，重置无活动计时。审批族
     // 帧路由到设备壳时例外——看门狗目标是活跃 run 的会话，不能被无关帧换靶。
     // 断线自愈路径的再武装口：onclose 曾无条件 disarm（计时器为 null，旧门
     // `if (idleWatchdogTimer && ...)` 从此永远假——重连治愈的 run 僵死即永
     // running），活跃会话发送在途时允许从零重新武装。
-    if ((idleWatchdogTimers.has(conv.id) || (conv.id === activeId.value && sending.value)) && !routedToShell) armIdleWatchdog(conv);
+    if ((idleWatchdogTimers.has(conv.id) || (conv.id === activeId.value && sending.value)) && !routedToShell) {
+      // 真帧喂狗（症状1修复联动）：任何到达帧都是活性证据，探测计数归零——
+      // 真在跑的会话不会累积到探测上限，兜底染红只打完全无响应的会话。
+      idleWatchdogProbes.delete(conv.id);
+      armIdleWatchdog(conv);
+    }
 
     let persist = false;
     switch (e.type) {
@@ -3759,7 +3902,7 @@ export function useAliangChat() {
         // matchedById 门控：未命中帧（fallback 兜底挂活跃会话）绝不凭空造泡
         // /置 runActive——他会话的 run 不得污染活跃会话（旧实现只抬不造）。
         if (matchedById) {
-          beginRunWindow(conv, now(), { ownPending: conv.id === activeId.value && sending.value });
+          beginRunWindow(conv, now(), { ownPending: conv.id === activeId.value && sending.value, turnMessageId: e.message_id || '' });
           // 外来回合快照拉取：run.started 不携带提问行，订阅握手回包（快照）
           // 是网页拿到外来 user 行的唯一载体——本端命中即补订阅（inFlight 守卫
           // 下对本端在途流无副作用）。旧泡关账随 persist 落盘。
@@ -3802,7 +3945,6 @@ export function useAliangChat() {
         }
         conv.snapshotCatchupAt = 0;
         asst.content += delta;
-        console.log('[aliang-chat] rendered delta, contentLen=', asst.content.length, 'conv=', conv.id);
         scrollToBottom();
         break;
       }
@@ -4056,10 +4198,29 @@ export function useAliangChat() {
           return;
         }
         const messages = conv.messages;
+        // 回合归属守卫（症状1修复，2026-11-26）：run window 记着当前回合的
+        // assistant id（beginRunWindow 自 run.started 帧落 runningTurnMessageId）。
+        // 不属于当前回合的 ai.error（迟到重投/跨端外来回合的终态）在此整体
+        // 退场——绝不染红当前正在流的泡、绝不清当前 run 的审批卡、绝不关当前
+        // 窗（旧实现 findRunningAssistant 近因认领，是「错误蔓延到后续对话」
+        // 的染红源之一）。比对前双侧剥壳归一（chatTurnBareId）：option 续跑
+        // 回合的帧 id 带 .option 后缀（后端 pending.MessageID+".option"），
+        // 不归一会把续跑回合自己的错误误判成外来帧整体丢弃。runningTurnMessageId
+        // 缺席（旧 agent 不带 message_id 的 run.started）维持旧近因语义不收窄。
+        if (conv.runningTurnMessageId && e.message_id
+          && chatTurnBareId(conv.runningTurnMessageId) !== chatTurnBareId(e.message_id)) {
+          console.debug('[aliang-chat] drop misattributed ai.error', e.message_id,
+            'current=', conv.runningTurnMessageId);
+          return;
+        }
         const alreadyShown = messages.some(m => m?.note === 'turn_failed' && m.failedMessageId === e.message_id);
         // 迟到的错误留在原回合，避免结束同一会话已经开始的下一轮。
+        // 归一比对（症状1修复 2026-11-26）：.option 续跑回合的 e.message_id
+        // 带 .option 后缀，原样比对恒失配 → 迟到判定死路（错误误染当前泡）。
+        // alreadyShown 键保持原始全串：同回合的正常形错误与 .option 形错误
+        // 是两次不同失败，不去重是正确行为。
         const userIndex = matchedById ? messages.findIndex(m => m?.role === 'user'
-          && m.messageId && `assistant_${m.messageId}` === e.message_id) : -1;
+          && m.messageId && chatTurnBareId(e.message_id) === m.messageId) : -1;
         const nextUser = userIndex < 0 ? -1 : messages.findIndex((m, i) => i > userIndex && m?.role === 'user');
         if (alreadyShown && (userIndex < 0 || nextUser >= 0)) return;
         const late = nextUser >= 0;
@@ -4074,7 +4235,12 @@ export function useAliangChat() {
             failedMessageId: e.message_id,
           };
           if (late) {
-            note.ts = messages[nextUser - 1].ts;
+            // ts 借位守卫（症状1修复 2026-11-26）：借前一条目 ts 让条排进原
+            // 回合（ts=now() 会沉到下一条 user 泡之后，破坏「留在原回合」）；
+            // 前一条目 ts 缺失/非有限数时不覆写（deviceSystemNoteBubble 已带
+            // now() 合法 ts，undefined 覆写会让条沉底）。
+            const borrowed = messages[nextUser - 1]?.ts;
+            if (Number.isFinite(borrowed)) note.ts = borrowed;
             messages.splice(nextUser, 0, note);
           } else {
             messages.push(note);
@@ -4095,6 +4261,26 @@ export function useAliangChat() {
         clearApprovalsForSession(conv, e.session_id);
         finishRun(conv);
         return;
+      }
+      case 'ai.session.closed': {
+        // 跨端 session.close / 56433 本地端点关闭本端开着且回合在跑的会话
+        // （症状1修复 2026-11-26）：该终态帧此前落 default 被静默丢弃 →
+        // running 泡悬挂 90s 被自家看门狗画红。终态口径同 ai.done：关窗+清
+        // 审批+系统条（后端 close 前已 emitApprovalCancelled/emitOptionCancelled，
+        // 这里只兜残留）。matchedById 门控同族；会话已删时自然兜住。
+        if (matchedById) {
+          disarmIdleWatchdog(conv);
+          endRunWindow(conv);
+          clearApprovalsForSession(conv, e.session_id);
+          conv.messages.push(deviceSystemNoteBubble(t('chat_sessionClosed'), now()));
+          finishRun(conv);
+          if (conv.id === activeId.value) scrollToBottom();
+          persist = true;
+        }
+        // break 走统一落盘出口（收口评审钉正：return 让 persist=true 成死
+        // 旗标，落盘纯靠 finishRun 内部副作用侥幸达成）；matchedById=false
+        // 时 persist 保持 false 自然跳过。
+        break;
       }
       default:
         return;

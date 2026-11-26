@@ -38,7 +38,14 @@
                仍不写 messages、不进持久化。key：messageId 分支已随 Task 13 落地
                （本地发送/撤回重发/设备壳转录行均带 id），'m-'+idx 仅兜底无 id 的
                存量旧消息。 -->
-          <template v-for="(item, idx) in timeline" :key="item.messageId || 'm-' + idx">
+          <!-- key 稳定化（症状1修复 2026-11-26）：卡有稳定 key；泡优先
+               messageId，其次 seq（跨端合并唯一稳定序真值，补建泡/系统条均
+               带）；失败系统条用 failedMessageId+seq/ts（reconcile 中段插入
+               时其后无 id 泡不再整体重挂——旧 'm-'+idx 数组序键会连坐重挂，
+               代码块折叠态丢失、滚动锚跳动）。 -->
+          <template v-for="(item, idx) in timeline" :key="item.key || item.messageId
+            || (item.note && item.failedMessageId ? item.failedMessageId + ':note:' + (item.seq || item.ts)
+              : (item.seq ? 'm-seq-' + item.seq : 'm-' + idx))">
             <ChatMessageBubble
               v-if="item.type === 'message'"
               :msg="item"
@@ -68,31 +75,21 @@
               <p class="mt-1 whitespace-pre-wrap break-all text-slate-600 dark:text-slate-300">{{ item.content }}</p>
               <p v-if="item.status === 'failed' && item.detail" class="mt-1 text-rose-500">{{ item.detail }}</p>
             </div>
+            <!-- 交互卡内联（2026-11-26 症状2修复）：审批/方案/tool_ask 卡
+                 归并进时间线跟随所属回合；prop 走 item.ref 引用（作答状态
+                 突变必须落回 conv 上的原对象，见 timeline computed 注释）。 -->
+            <ChatApprovalCard
+              v-else-if="item.type === 'card' && item.cardKind === 'approval'"
+              :approval="item.ref"
+              :now-tick="nowTick"
+              @respond="(decision) => emit('approval-respond', item.ref, decision)"
+            />
+            <ChatOptionCard
+              v-else-if="item.type === 'card'"
+              :card="item.ref"
+              @respond="(payload) => emit(item.cardKind === 'toolAsk' ? 'tool-ask-respond' : 'option-respond', item.ref, payload)"
+            />
           </template>
-          <ChatApprovalCard
-            v-for="approval in approvals"
-            :key="approval.key"
-            :approval="approval"
-            :now-tick="nowTick"
-            @respond="(decision) => emit('approval-respond', approval, decision)"
-          />
-          <!-- 方案交互卡（Task 14）：与审批卡同区（消息时间线之后），两步
-               作答的 respond 事件上抛给 ChatPage → useAliangChat.respondOption。 -->
-          <ChatOptionCard
-            v-for="card in optionCards"
-            :key="card.key"
-            :card="card"
-            @respond="(payload) => emit('option-respond', card, payload)"
-          />
-          <!-- tool_ask 提问卡（2026-11-08 dashboard 渲染接入）：与方案卡同构
-               同区，数据形状兼容 ChatOptionCard（title/options/allowCustom/
-               multi/status），作答上抛 ChatPage → respondToolAsk。 -->
-          <ChatOptionCard
-            v-for="card in toolAsks"
-            :key="card.key"
-            :card="card"
-            @respond="(payload) => emit('tool-ask-respond', card, payload)"
-          />
         </template>
       </div>
     </div>
@@ -155,8 +152,33 @@ const emit = defineEmits(['approval-respond', 'option-respond', 'tool-ask-respon
 const { t } = useI18n();
 
 // 统一渲染时间线（Task 11）：messages + steerItems 按 ts 归并、打 type 标。
-// 归并函数单测已覆盖（chatTimeline.test.js），组件层不加重复单测。
-const timeline = computed(() => mergeTimeline(props.activeMessages, props.steerItems));
+// 2026-11-26 症状2：三族交互卡并入归并，按 createdAt/messageId 锚内联到所属
+// 回合之后——已选「已选择」折叠卡从此跟随对应气泡，不再钉列表底。
+// 卡条目用 wrapper 引用传递（ref 字段持原对象）：respondOption/respondApproval
+// 靠对象引用突变 pending→sending→answered/responding 驱动终态渲染，spread
+// 副本会让全部状态突变落在副本上（作答终态永不显示、防重复提交失效）——
+// 消息泡是纯渲染可安全副本，卡不行。锚定字段（key/messageId/createdAt）提
+// 升到 wrapper 层供 mergeTimeline 使用。无 createdAt/messageId 的存量卡退化
+// 列表尾（旧钉底兜底）。归并/锚定单测在 chatTimeline.test.js，组件层只钉
+// 「卡渲染在时间线内」的接线。
+const timeline = computed(() => mergeTimeline(
+  props.activeMessages,
+  props.steerItems,
+  [
+    ...props.approvals.map(a => ({
+      type: 'card', cardKind: 'approval', key: a.key,
+      messageId: a.messageId, createdAt: a.createdAt, ref: a,
+    })),
+    ...props.optionCards.map(c => ({
+      type: 'card', cardKind: 'option', key: c.key,
+      messageId: c.messageId, createdAt: c.createdAt, ref: c,
+    })),
+    ...props.toolAsks.map(k => ({
+      type: 'card', cardKind: 'toolAsk', key: k.key,
+      messageId: k.messageId, createdAt: k.createdAt, ref: k,
+    })),
+  ],
+));
 
 // 撤回可用门（spec §6 定案）：设备壳会话整体禁用撤回——壳续聊 create 落在
 // 新建的 local-* journal，而壳气泡锚点 id 来自原 entry.id journal，truncate

@@ -251,6 +251,7 @@ export default {
   chat_approvalDecline: '拒绝',
   chat_approvalCancel: '取消',
   chat_approvalSendFailed: '授权响应发送失败，请重试。',
+  chat_approvalSelected: '已选择：{decision}',
   chat_settingsDirectory: '工作目录',
   chat_settingsModel: '模型',
   chat_settingsEffort: '推理力度',
@@ -317,7 +318,11 @@ export default {
   chat_approvalBlockHint: '有待审批请求，请先处理后再发送',
   chat_noticeResumeMissing: '原生会话不存在，已按新会话继续',
   chat_noticeHistoryRestoreFailed: '历史恢复失败，已按空会话继续',
-  chat_noticeToolTimeout: '工具执行超时已终止（命令可能扫到了受保护目录或范围过大），请缩小范围后重试',
+  // 文案修正（症状1同批 2026-11-26）：事实=命令已中止、run 不终止、模型自
+  // 重试——旧文案「已终止」+「扫到受保护目录」让用户把继续运行的回合误读为
+  // 失败（截图红泡误读的直接诱因之一），且目录归因是无因果依据的猜测。
+  chat_noticeToolTimeout: '工具执行超时（该命令已中止），AI 将自行重试；若反复超时，可让它缩小范围',
+  chat_sessionClosed: '会话已在另一端关闭',
   chat_approvalCancelled: '审批已被取消',
   chat_approvalCancelledReason: '审批已被取消（{reason}）',
   chat_md_copy: '复制',

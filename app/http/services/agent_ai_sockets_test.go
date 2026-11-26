@@ -825,3 +825,27 @@ func TestSubscribeAndEnqueueSnapshotBehavior(t *testing.T) {
 		t.Fatalf("缺席 socket 应回落直写一次, got %d", direct)
 	}
 }
+
+// 审批族广播白名单（2026-11-26 症状2同批）：tool_ask.cancel 此前缺席——
+// 非订阅/非发起端（仪表盘/另一台设备）对 run 终结时发出的作废帧永收不到，
+// 卡滞留 pending。前端路由链（isApprovalFamily）与重连预算词表均已含
+// tool_ask.cancel，后端单侧缺席即单点失明。
+func TestAgentAIEventIsApprovalFamilyToolAskCancel(t *testing.T) {
+	cases := []struct {
+		typ  string
+		want bool
+	}{
+		{models.AgentEventToolAskCancel, true},
+		{models.AgentEventToolAskRequest, true},
+		{models.AgentEventAIOptionCancelled, true},
+		{models.AgentEventAIApprovalCancelled, true},
+		{models.AgentEventAIDelta, false},
+		{models.AgentEventAIRunProgress, false},
+	}
+	for _, tc := range cases {
+		payload := map[string]interface{}{"type": tc.typ}
+		if got := agentAIEventIsApprovalFamily(payload); got != tc.want {
+			t.Fatalf("type=%s got=%v want=%v", tc.typ, got, tc.want)
+		}
+	}
+}

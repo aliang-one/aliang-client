@@ -565,6 +565,7 @@ func agentAIEventIsApprovalFamily(payload map[string]interface{}) bool {
 		models.AgentEventAIApprovalCancelled,
 		models.AgentEventAIOptionRequest,
 		models.AgentEventToolAskRequest,
+		models.AgentEventToolAskCancel,
 		models.AgentEventAIOptionCancelled:
 		return true
 	default:

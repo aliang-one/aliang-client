@@ -122,9 +122,13 @@ function aliangBalancedJSONObject(s) {
 // + options 非空校验把关,闭合行不是真闸门。标签后没有任何闭合行时不存在
 // 后续闭合围栏,扫描随之终止;截不出 JSON(纯垃圾)不产跨度:不产卡、原文保留
 // (维持旧行为,半截代码块由 ChatMarkdown enhance 兜底隐藏)。
+// 返回 { spans, halfStart }：spans 同旧语义；halfStart = 流式半截围栏的
+// 开栏 marker 偏移（扫描器在「独占行开栏但截不出配平 JSON」处 break 的位置，
+// -1=无）。stripAliangOptionsForPlainText 用它做纯文本侧截尾兜底。
 function scanAliangOptionSpans(src) {
   const spans = [];
-  if (typeof src !== 'string') return spans;
+  let halfStart = -1;
+  if (typeof src !== 'string') return { spans, halfStart };
   const lines = src.split('\n');
   let fence = null; // 普通围栏态（与 normalizeCjkMarkdown 同一跟踪器）
   let offset = 0;   // 当前行在 src 中的起始偏移
@@ -166,9 +170,14 @@ function scanAliangOptionSpans(src) {
         continue;
       }
       // 退化形态（独占行但闭合缺失）：括号配平兜底，其后不再扫（旧终止语义）。
+      // 截不出 JSON = 流式半截围栏：记下 marker 偏移供纯文本截尾（2026-11-26
+      // 症状1），markdown 管线侧仍由 ChatMarkdown enhance 隐藏半截代码块。
       const rest = lines.slice(i + 1).join('\n');
       const json = aliangBalancedJSONObject(rest);
-      if (json === null) break;
+      if (json === null) {
+        halfStart = start;
+        break;
+      }
       spans.push({ start, end: bodyStart + json.length, body: json });
       break;
     }
@@ -185,14 +194,14 @@ function scanAliangOptionSpans(src) {
     offset += line.length + 1;
     i++;
   }
-  return spans;
+  return { spans, halfStart };
 }
 
 // 提取 ```aliang-options 围栏(供静态卡渲染/防双份对账);坏 JSON 块跳过。
 export function extractAliangOptions(src) {
   const out = [];
   if (typeof src !== 'string') return out;
-  for (const span of scanAliangOptionSpans(src)) {
+  for (const span of scanAliangOptionSpans(src).spans) {
     try {
       const parsed = JSON.parse(span.body);
       if (parsed && typeof parsed === 'object' && Array.isArray(parsed.options) && parsed.options.length) {
@@ -213,7 +222,7 @@ export function stripAliangOptions(src) {
   if (typeof src !== 'string') return '';
   let out = '';
   let last = 0;
-  for (const span of scanAliangOptionSpans(src)) {
+  for (const span of scanAliangOptionSpans(src).spans) {
     // body JSON 闸门（评审 should：退化形态闭栏探测放宽后，提前收口的坏
     // body——JSON 后跟 prose/别的围栏——截出的 span 不参与剔除，杜绝吞正文；
     // 与 extract 的丢弃口径对齐）。JSON.parse 每气泡仅 AliangOptions 块数量级,
@@ -228,6 +237,34 @@ export function stripAliangOptions(src) {
     last = span.end;
   }
   out += src.slice(last);
+  return out.trim();
+}
+
+// 错误气泡纯文本路径的围栏处置（2026-11-26 症状1：红泡正文裸漏 aliang-options
+// 原始 JSON，用户截图实锤）。防注入铁律要求 error 泡不走 markdown 管线
+// （纯文本插值），剥离只能做成纯字符串过滤——本函数与 stripAliangOptions
+// 同源剔块（同一扫描器、同一合法 JSON 闸门、同一「坏 body 保留原文」口径），
+// 另补 done/running 泡在 markdown 管线里由 ChatMarkdown enhance 兜底隐藏、
+// 而纯文本侧无人兜底的形态：流式半截围栏（开栏后截不出配平 JSON，扫描器在
+// 此 break）从 marker 起截到文末——半截 JSON 是流式尸体不是内容，保留即
+// 复现用户投诉的泄漏形态。≥4 缩进/嵌套示例开栏 openOk=false 不触发 break，
+// 文档示例不受影响。返回值仍走 Vue 转义插值，绝不进 markdown/HTML 管线。
+export function stripAliangOptionsForPlainText(src) {
+  if (typeof src !== 'string') return '';
+  const { spans, halfStart } = scanAliangOptionSpans(src);
+  let out = '';
+  let last = 0;
+  for (const span of spans) {
+    let bodyOk = false;
+    try {
+      JSON.parse(span.body);
+      bodyOk = true;
+    } catch (_) { /* 坏 body：不剔除（与 done 泡「原文保留」口径一致） */ }
+    if (!bodyOk) continue;
+    out += src.slice(last, span.start);
+    last = span.end;
+  }
+  out += src.slice(last, halfStart >= 0 ? halfStart : undefined);
   return out.trim();
 }
 

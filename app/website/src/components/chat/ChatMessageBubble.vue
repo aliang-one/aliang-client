@@ -80,7 +80,7 @@
         <div
           class="min-w-0 max-w-[85%] rounded-2xl border px-4 py-2.5 text-sm shadow-sm"
           :class="msg.status === 'error'
-            ? 'border-rose-200 bg-rose-50 text-rose-600 dark:border-rose-800 dark:bg-rose-900/30 dark:text-rose-300'
+            ? 'whitespace-pre-wrap break-words border-rose-200 bg-rose-50 text-rose-600 dark:border-rose-800 dark:bg-rose-900/30 dark:text-rose-300'
             : 'border-slate-200 bg-white text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100'"
         >
           <span
@@ -126,7 +126,13 @@
               aria-hidden="true"
             ></span>
           </template>
-          <template v-else>{{ msg.content }}</template>
+          <!-- error/遗留无状态 assistant 泡：保持纯文本插值铁律（不进
+               markdown 管线），但走 stripAliangOptionsForPlainText 纯字符串
+               过滤剔除 aliang-options 围栏（2026-11-26 症状1：错误回合的
+               方案块 JSON 此前整段裸漏在红泡正文里；done 泡同块在 markdown
+               管线里被剥成静态卡，红泡独不剥）。纯过滤后仍是转义插值，
+               防注入语义不变。 -->
+          <template v-else>{{ plainContent }}</template>
         </div>
       </div>
     </template>
@@ -134,9 +140,11 @@
 </template>
 
 <script setup>
+import { computed } from 'vue';
 import { useI18n } from '../../i18n';
 import { canRecall } from '../../utils/chatRecall';
 import { copyText } from '../../utils/clipboard';
+import { stripAliangOptionsForPlainText } from '../../utils/chatMarkdown';
 import ChatMarkdown from './ChatMarkdown.vue';
 import ChatAttachmentStrip from './ChatAttachmentStrip.vue';
 
@@ -155,6 +163,11 @@ const props = defineProps({
 const emit = defineEmits(['recall']);
 
 const { t } = useI18n();
+
+// 纯文本插值分支（本组件唯一到达面 = assistant 非 markdown 泡：status=error
+// 或遗留无状态）的展示文本：剥 aliang-options 围栏，正文原样保留。done/running
+// 泡走 ChatMarkdown（其 render() 内已无条件 strip），此处是纯文本侧的对偶。
+const plainContent = computed(() => stripAliangOptionsForPlainText(props.msg?.content));
 
 // 系统条 testid 按 note 种类分流（Task 14 新增 option_cancelled；未知种类
 // 退审批取消条形态，与既有 run_notice/approval_cancelled 同族）。
@@ -179,8 +192,17 @@ function copyMessage() {
 
 // 相对时间：<60s「刚刚」/<60m「X 分钟前」/<24h「X 小时前」/否则「M-D HH:mm」。
 // 绝对时间走 toLocaleString 挂 hover title（不加 i18n 键——数值格式无文案）。
+// ts 双形态（2026-11-26 渲染族审计）：store 里消息 ts 一律是 epoch 毫秒数
+// （now()=Date.now() / Date.parse(journal ts) 回填），Date.parse(数字) 会先
+// ToString 再按日期格式解析 → NaN → 相对时间恒为空串（eyebrow 时间戳生产
+// 环境从不显示、hover 无 title 的根因）。数字直接用，字符串才走 Date.parse。
+function parseMsgTs(ts) {
+  if (typeof ts === 'number') return Number.isFinite(ts) ? ts : NaN;
+  return Date.parse(ts);
+}
+
 function relativeTime(ts) {
-  const ms = Date.parse(ts);
+  const ms = parseMsgTs(ts);
   if (!Number.isFinite(ms)) return '';
   const diff = Math.max(0, (props.nowTick || Date.now()) - ms);
   if (diff < 60 * 1000) return t('chat_justNow');
@@ -197,7 +219,7 @@ function relativeTime(ts) {
 }
 
 function absoluteTime(ts) {
-  const ms = Date.parse(ts);
+  const ms = parseMsgTs(ts);
   if (!Number.isFinite(ms)) return '';
   return new Date(ms).toLocaleString();
 }
