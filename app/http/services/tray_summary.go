@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"aliang.one/nursorgate/app/http/common"
@@ -33,6 +34,7 @@ import (
 	"aliang.one/nursorgate/common/version"
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/statistic"
+	"golang.org/x/sync/singleflight"
 )
 
 // ---- 出参结构(字段名即面板契约,改名=面板渲染崩)--------------------------
@@ -173,8 +175,13 @@ func ServeTraySummary(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// serveTraySummaryWith 注入式 handler 本体:来源闸 + 聚合 + 信封。
+// serveTraySummaryWith 注入式 handler 本体:方法闸 + 来源闸 + 聚合 + 信封。
 func serveTraySummaryWith(w http.ResponseWriter, r *http.Request, g traySummaryGatherers) {
+	// 只读通道:非 GET 拒绝(对齐 agent_handler 的 405 惯例),白耗鉴权前先拒。
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	// 回环 ∥ cookie 双闸:面板(浏览器开 127.0.0.1:56431)免 cookie 直读;
 	// LAN/远端来源没有会话不得读——会话标题与 endpoint 名是本机隐私面。
 	if !middleware.IsLoopbackRequest(r) && !middleware.ValidateDashboardSession(r) {
@@ -500,14 +507,74 @@ func gatherTrayAI() *TrayAISummary {
 	return &TrayAISummary{Enabled: len(providers) > 0, Providers: providers}
 }
 
-// gatherTrayAgents agents 子源:复用仪表盘 agent 会话查询(AgentService.
-// VibeSessions——磁盘清单+活跃覆盖层的同一份数据),聚合层做 24h 过滤。
-func gatherTrayAgents() *TrayAgentsSummary {
+// trayAgentsSnapshotTTL agents 子源备忘快照窗口:面板 2s 轮询 × 2s TTL ≈ 每两
+// 次轮询最多一次真实扫描。VibeSessions 冷扫描可能远超 12s(agent_handler.go
+// 同款教训),且 vibeSessionsSnapshot(true) 持 agentAIManager.mu 与聊天写路径
+// 共享——不设快照,2s 轮询在慢机器上会堆叠扫描并把锁压力外溢到聊天。
+const trayAgentsSnapshotTTL = 2 * time.Second
+
+// trayAgentsSnapshotCache agents 子源共享快照:TTL 内直返上次结果,过期后经
+// singleflight 合并——同 key 并发只跑一次采集,等待者共享同一结果。快照结构
+// mutex 保护存值/时间戳;collect 在锁外执行(慢扫描不持锁)。
+type trayAgentsSnapshotCache struct {
+	ttl     time.Duration
+	collect func() *TrayAgentsSummary
+
+	mu      sync.Mutex
+	value   *TrayAgentsSummary
+	fetched time.Time
+	flight  singleflight.Group
+}
+
+// newTrayAgentsSnapshotCache ttl/采集函数均可注入(测试用计数 fake 直打语义,
+// 生产用 trayAgentsSnapshotTTL + VibeSessions)。
+func newTrayAgentsSnapshotCache(ttl time.Duration, collect func() *TrayAgentsSummary) *trayAgentsSnapshotCache {
+	if ttl <= 0 {
+		ttl = trayAgentsSnapshotTTL
+	}
+	return &trayAgentsSnapshotCache{ttl: ttl, collect: collect}
+}
+
+// get 取快照:TTL 内复用;过期走 singleflight(先查后合,冷缓存并发全落同一
+// 航班)。collect panic 会被 singleflight 原样抛给所有等待者,由调用方各自的
+// recoverTraySubSource 兜住降级为 null——单源 panic 语义不因合并而变化。
+func (c *trayAgentsSnapshotCache) get() *TrayAgentsSummary {
+	c.mu.Lock()
+	if c.value != nil && time.Since(c.fetched) < c.ttl {
+		v := c.value
+		c.mu.Unlock()
+		return v
+	}
+	c.mu.Unlock()
+
+	v, _, _ := c.flight.Do("agents", func() (interface{}, error) {
+		collected := c.collect()
+		c.mu.Lock()
+		c.value = collected
+		c.fetched = time.Now()
+		c.mu.Unlock()
+		return collected, nil
+	})
+	if typed, ok := v.(*TrayAgentsSummary); ok {
+		return typed
+	}
+	return nil
+}
+
+// trayAgentsSharedSnapshot 进程级共享快照:生产采集闭包(复用仪表盘 agent
+// 会话查询,聚合层做 24h 过滤)。面板所有轮询共享这一个实例。
+var trayAgentsSharedSnapshot = newTrayAgentsSnapshotCache(trayAgentsSnapshotTTL, func() *TrayAgentsSummary {
 	svc := GetSharedAgentService()
 	if svc == nil {
 		return nil
 	}
 	return &TrayAgentsSummary{Kernels: aggregateTrayAgentKernels(svc.VibeSessions(), time.Now())}
+})
+
+// gatherTrayAgents agents 子源:经共享快照读(TTL+singleflight),不再每调用
+// 同步全量扫描。
+func gatherTrayAgents() *TrayAgentsSummary {
+	return trayAgentsSharedSnapshot.get()
 }
 
 // gatherTrayEndpoints endpoints 子源:registry 单例(降级=nil)→ ListEndpoints。

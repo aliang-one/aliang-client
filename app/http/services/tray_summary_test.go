@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -475,6 +477,80 @@ func TestTrayRunSummaryFromStatus(t *testing.T) {
 	}
 	if s.Blocked.Code != "session_recovering" || s.Blocked.Msg != "登录恢复中" {
 		t.Fatalf("blocked = %+v, want 透传", s.Blocked)
+	}
+}
+
+// TestServeTraySummaryMethodNotAllowed 非 GET 拒绝(对齐 agent_handler.go
+// 的 405 惯例):面板只读通道,写方法不应漏过来源闸白耗鉴权。
+func TestServeTraySummaryMethodNotAllowed(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/tray/summary", nil)
+	req.RemoteAddr = "127.0.0.1:54321"
+	rec := httptest.NewRecorder()
+	serveTraySummaryWith(rec, req, traySummaryTestGatherers())
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST: code = %d, want 405", rec.Code)
+	}
+}
+
+// TestTrayAgentsSnapshotCacheTTL TTL 备忘:窗口内重复调用不再触发底层采集
+// (面板 2s 轮询 × 2s TTL ≈ 每两次轮询最多一次真实扫描),过期后重扫。
+func TestTrayAgentsSnapshotCacheTTL(t *testing.T) {
+	var calls atomic.Int64
+	collect := func() *TrayAgentsSummary {
+		calls.Add(1)
+		return &TrayAgentsSummary{Kernels: []TrayAgentKernel{{Name: "claude", Total24h: 1}}}
+	}
+	cache := newTrayAgentsSnapshotCache(50*time.Millisecond, collect)
+
+	first := cache.get()
+	if first == nil || len(first.Kernels) != 1 || first.Kernels[0].Name != "claude" {
+		t.Fatalf("首采结果 = %+v, want claude 内核", first)
+	}
+	second := cache.get()
+	if calls.Load() != 1 {
+		t.Fatalf("TTL 内第二次调用采集次数 = %d, want 1(备忘快照生效)", calls.Load())
+	}
+	if second != first {
+		t.Fatalf("TTL 内应返回同一份快照(零拷贝复用)")
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	cache.get()
+	if calls.Load() != 2 {
+		t.Fatalf("TTL 过期后采集次数 = %d, want 2(应重扫)", calls.Load())
+	}
+}
+
+// TestTrayAgentsSnapshotCacheSingleflight 冷缓存并发 N 调用只触发一次采集
+// (singleflight 合并,等待者共享结果)——慢机器上 2s 轮询堆叠不叠加全量扫描。
+func TestTrayAgentsSnapshotCacheSingleflight(t *testing.T) {
+	var calls atomic.Int64
+	collect := func() *TrayAgentsSummary {
+		calls.Add(1)
+		time.Sleep(30 * time.Millisecond) // 拉长采集窗,让并发调用全部落进同一航班
+		return &TrayAgentsSummary{Kernels: []TrayAgentKernel{{Name: "codex"}}}
+	}
+	cache := newTrayAgentsSnapshotCache(time.Second, collect)
+
+	const n = 10
+	results := make([]*TrayAgentsSummary, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = cache.get()
+		}(i)
+	}
+	wg.Wait()
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("并发 %d 调用采集次数 = %d, want 1(singleflight 合并)", n, got)
+	}
+	for i, v := range results {
+		if v == nil || len(v.Kernels) != 1 || v.Kernels[0].Name != "codex" {
+			t.Fatalf("等待者 %d 未共享采集结果: %+v", i, v)
+		}
 	}
 }
 
