@@ -1571,6 +1571,10 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		registry.Register(tool)
 	}
 
+	mainToolEnv := *kernelEnv
+	if progressTool != nil {
+		mainToolEnv.OnShellStart = progressTool.shellObserver()
+	}
 	cfg := &agentcore.Config{
 		Client: kernelClient,
 		Model:  model,
@@ -1592,7 +1596,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		// 打转守卫阈值（仪表盘 customer.agentcore.max_identical_tool_turns）；
 		// 0 时内核用默认值。子 agent 同参（见 agentCoreSubagentRunner）。
 		MaxIdenticalToolTurns: config.GetGlobalConfig().EffectiveAgentCoreMaxIdenticalToolTurns(),
-		Env:                   kernelEnv,
+		Env:                   &mainToolEnv,
 		Approve: func(ctx context.Context, req agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error) {
 			if progressTool != nil && req.ToolName == progressTool.Name() {
 				return agentcore.ApprovalResponse{Approved: true}, nil

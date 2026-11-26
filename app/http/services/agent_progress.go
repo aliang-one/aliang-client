@@ -18,6 +18,8 @@ var progressAgentInstance = uuid.NewString()
 
 const progressToolDescription = "Publish progress for a long task the user would benefit from following on another device. Use start once, then update when the phase or measured progress changes, and finish when the task ends. Omit totals you cannot measure. Skip short work and tasks already tracked by Aliang, such as device file transfers. Use short plain-text summaries without paths, commands, or secrets."
 
+const shellProgressDelay = 500 * time.Millisecond
+
 func (run agentAIRun) allowsOperationProgress() bool {
 	return !run.readOnly && run.approvalMode != agentAIApprovalModeReadOnly
 }
@@ -30,14 +32,19 @@ type agentProgressTransport struct {
 }
 
 type pendingOperationFinish struct {
-	account string
-	frame   map[string]interface{}
+	account    string
+	frame      map[string]interface{}
+	startFrame map[string]interface{}
 }
 
 func (s *AgentService) queueOperationFinish(account string, frame map[string]interface{}) {
+	s.queuePendingOperationFinish(pendingOperationFinish{account: account, frame: frame})
+}
+
+func (s *AgentService) queuePendingOperationFinish(entry pendingOperationFinish) {
 	s.progress.mu.Lock()
 	defer s.progress.mu.Unlock()
-	s.progress.terminal = append(s.progress.terminal, pendingOperationFinish{account, frame})
+	s.progress.terminal = append(s.progress.terminal, entry)
 	if len(s.progress.terminal) > 128 {
 		s.progress.terminal = s.progress.terminal[len(s.progress.terminal)-128:]
 	}
@@ -55,12 +62,31 @@ func (s *AgentService) flushOperationFinishes(ctx context.Context) {
 			continue
 		}
 		attempt, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_, err := s.reportOperation(attempt, entry.account, entry.frame)
+		err := s.reportPendingOperationFinish(attempt, &entry)
 		cancel()
 		if err != nil && entry.account == s.operationAccount() {
-			s.queueOperationFinish(entry.account, entry.frame)
+			s.queuePendingOperationFinish(entry)
 		}
 	}
+}
+
+func (s *AgentService) reportPendingOperationFinish(ctx context.Context, entry *pendingOperationFinish) error {
+	if entry.startFrame != nil {
+		// The original start may have been accepted before the connection was
+		// lost. Reuse its idempotency key to recover the same operation ID.
+		ack, err := s.reportOperation(ctx, entry.account, entry.startFrame)
+		if err != nil {
+			return err
+		}
+		id := remoteString(ack, "operation_id")
+		if remoteString(ack, "status") != "accepted" || id == "" {
+			return nil
+		}
+		entry.frame["operation_id"] = id
+		entry.startFrame = nil
+	}
+	_, err := s.reportOperation(ctx, entry.account, entry.frame)
+	return err
 }
 
 func (p *agentProgressTransport) acceptAck(frame map[string]interface{}) {
@@ -115,7 +141,7 @@ type agentProgressTool struct {
 	instance  string
 	runID     string
 	mu        sync.Mutex
-	sequence  int64
+	sequence  atomic.Int64
 	active    map[string]struct{}
 	closed    bool
 }
@@ -208,14 +234,13 @@ func (p *agentProgressTool) Execute(ctx context.Context, input map[string]interf
 }
 
 func (p *agentProgressTool) frame(fields map[string]interface{}) map[string]interface{} {
-	p.sequence++
 	id := uuid.NewString()
 	fields["type"] = "operation.progress"
 	fields["session_id"] = p.sessionID
 	fields["run_id"] = p.runID
 	fields["agent_instance_id"] = p.instance
 	fields["request_id"] = id
-	fields["source_sequence"] = p.sequence
+	fields["source_sequence"] = p.sequence.Add(1)
 	if fields["action"] == "start" {
 		fields["idempotency_key"] = id
 	}
@@ -223,10 +248,13 @@ func (p *agentProgressTool) frame(fields map[string]interface{}) map[string]inte
 }
 
 func (p *agentProgressTool) send(ctx context.Context, fields map[string]interface{}) (map[string]interface{}, error) {
+	return p.sendFrame(ctx, p.frame(fields))
+}
+
+func (p *agentProgressTool) sendFrame(ctx context.Context, frame map[string]interface{}) (map[string]interface{}, error) {
 	if p.account != p.service.operationAccount() {
 		return nil, errors.New("run account changed")
 	}
-	frame := p.frame(fields)
 	timeout, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	result, err := p.service.reportOperation(timeout, p.account, frame)
@@ -256,4 +284,68 @@ func (p *agentProgressTool) close() {
 	}
 	p.active = nil
 	go p.service.flushOperationFinishes(context.Background())
+}
+
+func (p *agentProgressTool) shellObserver() func(string) func(agentcore.ShellOutcome) {
+	// At most one shell report is in flight per run. Network acknowledgements
+	// stay off the tool execution path.
+	busy := make(chan struct{}, 1)
+	return func(tool string) func(agentcore.ShellOutcome) {
+		done := make(chan agentcore.ShellOutcome, 1)
+		go func() {
+			timer := time.NewTimer(shellProgressDelay)
+			defer timer.Stop()
+			select {
+			case <-done:
+				return
+			case <-timer.C:
+			}
+			select {
+			case <-done:
+				return
+			case busy <- struct{}{}:
+				defer func() { <-busy }()
+			default:
+				return
+			}
+
+			ctx := context.Background()
+			if !p.service.progress.supported.Load() || p.service.currentRemoteWriter() == nil {
+				return
+			}
+			startFrame := p.frame(map[string]interface{}{
+				"action": "start", "title": tool, "kind": "shell",
+			})
+			ack, err := p.sendFrame(ctx, startFrame)
+			operationID := remoteString(ack, "operation_id")
+			if err == nil && (remoteString(ack, "status") != "accepted" || operationID == "") {
+				return
+			}
+
+			outcome := <-done
+			fields := map[string]interface{}{"action": "finish", "operation_id": operationID, "outcome": string(outcome)}
+			switch outcome {
+			case agentcore.ShellTimedOut:
+				fields["outcome"] = "failed"
+				fields["error_code"] = "tool_timeout"
+				fields["message"] = "Shell command timed out."
+			case agentcore.ShellFailed:
+				fields["error_code"] = "tool_failed"
+				fields["message"] = "Shell command failed. See the conversation for details."
+			}
+			frame := p.frame(fields)
+			if err != nil {
+				if p.account == p.service.operationAccount() {
+					p.service.queuePendingOperationFinish(pendingOperationFinish{
+						account: p.account, frame: frame, startFrame: startFrame,
+					})
+				}
+				return
+			}
+			if _, err := p.sendFrame(ctx, frame); err != nil {
+				p.service.queueOperationFinish(p.account, frame)
+			}
+		}()
+		return func(outcome agentcore.ShellOutcome) { done <- outcome }
+	}
 }

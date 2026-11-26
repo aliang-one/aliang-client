@@ -6,10 +6,96 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"aliang.one/nursorgate/app/agentcore"
 )
+
+func TestAutomaticShellProgressReportsOnlyLongCommands(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		service := AgentService{state: agentState{RegisteredUser: "test-account"}}
+		service.progress.supported.Store(true)
+		var reports []map[string]interface{}
+		service.setCurrentRemoteWriter(func(payload interface{}) error {
+			frame := payload.(map[string]interface{})
+			reports = append(reports, frame)
+			service.progress.acceptAck(map[string]interface{}{
+				"request_id": frame["request_id"], "status": "accepted", "operation_id": "op_shell",
+			})
+			return nil
+		})
+		progress := newAgentProgressTool(&service, "session-shell", "run-shell")
+		start := progress.shellObserver()
+
+		start("PowerShell")(agentcore.ShellOutcome("completed"))
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if len(reports) != 0 {
+			t.Fatalf("short command wrote %d progress reports", len(reports))
+		}
+
+		finish := start("Bash")
+		time.Sleep(750 * time.Millisecond)
+		synctest.Wait()
+		if len(reports) != 1 || reports[0]["action"] != "start" ||
+			reports[0]["title"] != "Bash" || reports[0]["session_id"] != "session-shell" ||
+			reports[0]["run_id"] != "run-shell" || reports[0]["command"] != nil {
+			t.Fatalf("running command progress: %#v", reports)
+		}
+
+		finish(agentcore.ShellOutcome("timed_out"))
+		synctest.Wait()
+		if len(reports) != 2 || reports[1]["action"] != "finish" ||
+			reports[1]["operation_id"] != "op_shell" || reports[1]["outcome"] != "failed" ||
+			reports[1]["error_code"] != "tool_timeout" {
+			t.Fatalf("terminal command progress: %#v", reports)
+		}
+	})
+}
+
+func TestAutomaticShellProgressRestoresFinishAfterLostStartAck(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		service := AgentService{state: agentState{RegisteredUser: "test-account"}}
+		service.progress.supported.Store(true)
+		var requestIDs []string
+		var terminal map[string]interface{}
+		acknowledge := false
+		service.setCurrentRemoteWriter(func(payload interface{}) error {
+			frame := payload.(map[string]interface{})
+			if frame["action"] == "start" {
+				requestIDs = append(requestIDs, remoteString(frame, "request_id"))
+			} else {
+				terminal = frame
+			}
+			if acknowledge {
+				service.progress.acceptAck(map[string]interface{}{
+					"request_id": frame["request_id"], "status": "accepted", "operation_id": "op_shell",
+				})
+			}
+			return nil
+		})
+
+		progress := newAgentProgressTool(&service, "session-shell", "run-shell")
+		finish := progress.shellObserver()("Bash")
+		time.Sleep(time.Second)
+		finish(agentcore.ShellCancelled)
+		time.Sleep(8 * time.Second)
+		synctest.Wait()
+		if len(requestIDs) != 2 || requestIDs[0] == "" || requestIDs[0] != requestIDs[1] {
+			t.Fatalf("start retries must share the original request: %v", requestIDs)
+		}
+
+		acknowledge = true
+		service.flushOperationFinishes(context.Background())
+		if len(requestIDs) != 3 || requestIDs[2] != requestIDs[0] ||
+			terminal["operation_id"] != "op_shell" || terminal["outcome"] != "cancelled" {
+			t.Fatalf("registration did not recover the original task and finish it: starts=%v finish=%v", requestIDs, terminal)
+		}
+	})
+}
 
 func TestProgressToolDropsEventsFromPreviousAccount(t *testing.T) {
 	service := AgentService{state: agentState{RegisteredUser: "account-b"}}
