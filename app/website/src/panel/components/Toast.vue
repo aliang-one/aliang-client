@@ -7,6 +7,9 @@ import { ref } from 'vue';
 
 // 单条 toast 存活时长(spec §5「不要长时动画」口径下的轻提示预算)。
 const TOAST_TTL_MS = 3000;
+// 队列容量上限(M-2):340px 窄面板堆不下无限条,超限挤掉最旧一条并回收
+// 其超时句柄,防连发场景(如 restart 的 stop/start 两次反馈)叠穿屏幕。
+const MAX_TOASTS = 4;
 // 语义色只认两档:警告归 warn,其余一律归 success(容错,不炸未知输入)。
 const KIND_WARN = 'warn';
 
@@ -33,6 +36,10 @@ export function useToast() {
       msg: String(msg),
       kind: kind === KIND_WARN ? KIND_WARN : 'success',
     });
+    // 超限挤旧(先挤再排超时,被挤那条的句柄经 dismiss 回收,不留残计时)。
+    while (toasts.value.length > MAX_TOASTS) {
+      dismiss(toasts.value[0].id);
+    }
     timers.set(
       id,
       setTimeout(() => dismiss(id), TOAST_TTL_MS)

@@ -45,8 +45,10 @@
   box-sizing: border-box;
 }
 
-/* 页面底:宿主模式下面板贴系统材质,页面本体透明;浏览器直开时给一层
-   中性渐变垫底(mockup 背景的简化版),让 340px 面板可直观看。 */
+/* 页面底(M1 无宿主模式专用):浏览器直开 panel.html 时给一层中性渐变垫底
+   (mockup 背景的简化版),让 340px 面板可直观看。
+   M2 宿主态由下方 html.hosted body 规则切成透明——原生壳 drawsBackground
+   =false,页面不透明渐变会盖住系统材质。 */
 body {
   font-family: 'Inter', -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
   background: linear-gradient(160deg, #e8ece9 0%, #d3dad5 45%, #b9c4bd 100%);
@@ -55,6 +57,14 @@ body {
   body {
     background: linear-gradient(160deg, #1a2320 0%, #121a16 50%, #0b1210 100%);
   }
+}
+
+/* 宿主态(I-1):<html> 带 hosted 类(main.js 经 isHosted() 探测后添加)
+   时页面本体必须透明,背景交系统材质层;!important 压过上方浅深两段渐变。
+   .panel 的 backdrop-filter 刻意保留:无宿主时它是唯一模糊来源,有宿主
+   材质时叠加一次无副作用。 */
+html.hosted body {
+  background: transparent !important;
 }
 
 /* ---- 面板容器(mockup .panel 原值) ---- */

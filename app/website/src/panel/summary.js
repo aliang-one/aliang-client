@@ -71,6 +71,9 @@ export function parseSummary(raw) {
 // useSummary() — 轮询 composable:启动即拉一次,此后每 2s 一次;
 // 连续 SUMMARY_FAIL_THRESHOLD 次失败 → connLost=true;任何一次成功即恢复
 // 清零。组件卸载自动停轮询;非组件环境(Test/外壳)用返回的 stop() 手动停。
+// 调用纪律(M-4):仅 App.vue 根壳调用一次(全局唯一数据源);Task 8-11
+// 的区块组件一律经 inject('panelData') 取同一份数据,严禁各自再开轮询
+// ——2s×N 份轮询会把服务端 agents 快照/磁盘扫放大 N 倍。
 export function useSummary({ pollMs = SUMMARY_POLL_MS } = {}) {
   const summary = ref(null);
   const connLost = ref(false);

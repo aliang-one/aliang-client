@@ -1,18 +1,20 @@
-// api.test.js — postMessageHost 双宿主/无宿主专测(Task 7 计划加粗项:
-// 「两后端皆缺 → 返回 false(无宿主模式判据)」必须有专测)。
-//
-// 三个分支:
-//   ① 无宿主(jsdom 默认 window.chrome/window.webkit 皆缺)→ false 且不抛错
-//      ——M1 浏览器直开 panel.html 的无宿主模式靠这个返回值判定;
-//   ② WebView2(Windows):window.chrome.webview.postMessage;
-//   ③ WKWebView(macOS):window.webkit.messageHandlers.panel.postMessage。
-// 宿主对象用 vi.stubGlobal 打桩(jsdom 下 globalThis 即 window),测完恢复。
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { postMessageHost } from './api';
+// api.test.js — api 层三面专测:
+// A. postMessageHost 双宿主/无宿主(Task 7 计划加粗项:两后端皆缺 → 返回
+//    false=无宿主模式判据,必须有专测);
+// B. isHosted() 宿主探测(I-1:theme.css hosted 门控的数据源,M2 原生壳
+//    drawsBackground=false 时页面底色必须让位给系统材质);
+// C. 动作链路(I-2:getSummary 信封/启停业务失败容忍白名单/restart 顺序与
+//    400ms 间隔/超时转译——评审收口批补的回归网)。
+// 宿主对象用 vi.stubGlobal 打桩(jsdom 下 globalThis 即 window),fetch 用
+// stubGlobal + fake timers,测完恢复。
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { getSummary, isHosted, postMessageHost, restartProxy, startProxy, stopProxy, SUMMARY_TIMEOUT_MS } from './api';
 
 afterEach(() => {
   vi.unstubAllGlobals();
 });
+
+// ---- A. postMessageHost ----------------------------------------------------
 
 describe('postMessageHost', () => {
   it('① 无宿主环境:两后端皆缺 → 返回 false 且不抛错', () => {
@@ -63,5 +65,147 @@ describe('postMessageHost', () => {
     vi.stubGlobal('chrome', { webview: { postMessage: 42 } });
     vi.stubGlobal('webkit', undefined);
     expect(postMessageHost({ type: 'x' })).toBe(false);
+  });
+});
+
+// ---- B. isHosted -----------------------------------------------------------
+
+describe('isHosted', () => {
+  it('无宿主(chrome/webkit 皆缺)→ false', () => {
+    vi.stubGlobal('chrome', undefined);
+    vi.stubGlobal('webkit', undefined);
+    expect(isHosted()).toBe(false);
+  });
+
+  it('WebView2(chrome.webview)→ true', () => {
+    vi.stubGlobal('chrome', { webview: {} });
+    vi.stubGlobal('webkit', undefined);
+    expect(isHosted()).toBe(true);
+  });
+
+  it('WKWebView(webkit.messageHandlers.panel)→ true', () => {
+    vi.stubGlobal('chrome', undefined);
+    vi.stubGlobal('webkit', { messageHandlers: { panel: {} } });
+    expect(isHosted()).toBe(true);
+  });
+});
+
+// ---- C. 动作链路 ------------------------------------------------------------
+
+// stubFetch 打桩 global fetch 并返回 mock 便于断言调用序列。
+function stubFetch(impl) {
+  const fetchMock = vi.fn(impl);
+  vi.stubGlobal('fetch', fetchMock);
+  return fetchMock;
+}
+
+// flushQueue:把 mock fetch 的 promise 链冲到落定(fake timers 下用
+// advanceTimersByTimeAsync 冲微任务,不混真实定时器)。
+async function flushQueue() {
+  await vi.advanceTimersByTimeAsync(0);
+}
+
+describe('动作链路(信封/启停/超时)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('① getSummary 信封 code≠0 → 抛错且带服务端 msg', async () => {
+    stubFetch(() =>
+      Promise.resolve({ ok: true, json: () => Promise.resolve({ code: 401001, msg: 'unauthorized' }) })
+    );
+    await expect(getSummary()).rejects.toThrow('unauthorized');
+  });
+
+  it('② start 业务失败(status=failed)→ 抛错且错误信息带服务端 msg', async () => {
+    stubFetch(() =>
+      Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            code: 0,
+            data: { status: 'failed', error: 'activation_required', msg: '请先完成登录或配置恢复' },
+          }),
+      })
+    );
+    await expect(startProxy()).rejects.toThrow('请先完成登录或配置恢复');
+  });
+
+  it('③ stop 撞 not_running → 容忍不抛(白名单,与托盘同口径)', async () => {
+    const fetchMock = stubFetch(() =>
+      Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            code: 0,
+            data: { status: 'failed', error: 'not_running', msg: 'No service is currently running' },
+          }),
+      })
+    );
+    await expect(stopProxy()).resolves.toBeDefined();
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/run/stop');
+  });
+
+  it('④ stop 返回白名单外的 failed error → 照抛', async () => {
+    stubFetch(() =>
+      Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve({ code: 0, data: { status: 'failed', error: 'boom', msg: '服务端炸了' } }),
+      })
+    );
+    await expect(stopProxy()).rejects.toThrow('服务端炸了');
+  });
+
+  it('⑤ restartProxy 顺序与间隔:先 POST stop,400ms 内不 start,满 400ms 才 start', async () => {
+    const fetchMock = stubFetch(() =>
+      Promise.resolve({ ok: true, json: () => Promise.resolve({ code: 0, data: { status: 'success' } }) })
+    );
+    const done = restartProxy();
+    await flushQueue();
+    // stop 已发出,start 还没有
+    expect(fetchMock.mock.calls.map((c) => c[0])).toEqual(['/api/run/stop']);
+    vi.advanceTimersByTime(399);
+    await flushQueue();
+    // 399ms:间隔未满,start 仍未发出
+    expect(fetchMock.mock.calls.map((c) => c[0])).toEqual(['/api/run/stop']);
+    vi.advanceTimersByTime(1); // 满 400ms
+    await flushQueue();
+    expect(fetchMock.mock.calls.map((c) => c[0])).toEqual(['/api/run/stop', '/api/run/start']);
+    await done;
+  });
+
+  it('⑥ fetch 超时 → 转译为带毫秒数的超时错误', async () => {
+    // mock fetch 不自动响应 abort,手动监听 signal 模拟真实 fetch 行为。
+    stubFetch(
+      (_path, opts) =>
+        new Promise((_resolve, reject) => {
+          opts.signal.addEventListener('abort', () => {
+            const err = new Error('The operation was aborted');
+            err.name = 'AbortError';
+            reject(err);
+          });
+        })
+    );
+    const pending = getSummary();
+    await vi.advanceTimersByTimeAsync(SUMMARY_TIMEOUT_MS);
+    await expect(pending).rejects.toThrow(`超时(${SUMMARY_TIMEOUT_MS}ms)`);
+  });
+
+  it('restart 中途 stop 失败(非白名单)→ 整条 restart 抛错且不发 start', async () => {
+    const fetchMock = stubFetch(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ code: 0, data: { status: 'failed', error: 'boom', msg: 'stop 炸了' } }),
+      })
+    );
+    const done = restartProxy();
+    await flushQueue();
+    await expect(done).rejects.toThrow('stop 炸了');
+    expect(fetchMock.mock.calls.map((c) => c[0])).toEqual(['/api/run/stop']);
   });
 });

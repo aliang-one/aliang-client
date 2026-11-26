@@ -5,12 +5,12 @@
      Task 8-11 的活,此处只放占位注释,绝不提前实现。 -->
 <script setup>
 import { computed, provide } from 'vue';
-import { postMessageHost } from './api';
 import { useSummary } from './summary';
 import { derivePanelState } from './state';
 import Toast, { useToast } from './components/Toast.vue';
 
 // 数据层:启动即拉一次 + 2s 轮询;connLost 连续 2 次失败置位(§3 错误态)。
+// 仅本根壳调用一次;区块组件一律经 inject('panelData') 取同一份数据。
 const { summary, connLost } = useSummary();
 const panelState = computed(() => derivePanelState(summary.value, connLost.value, null));
 
@@ -19,9 +19,6 @@ provide('panelData', { summary, connLost, panelState });
 // toast 队列单例(接口 toast.show(msg, kind))也一并注入。
 const toast = useToast();
 provide('panelToast', toast);
-
-// 宿主就绪通知:面板加载完成即告知宿主(无宿主模式返回 false,静默忽略)。
-postMessageHost({ type: 'panel_ready' });
 </script>
 
 <template>

@@ -103,6 +103,19 @@ export async function restartProxy() {
   return startProxy();
 }
 
+// isHosted() — 宿主探测:WebView2 / WKWebView 任一在即为原生壳宿主态。
+// 消费方:main.js 启动时据此给 <html> 加 hosted 类(theme.css 据此关掉页面
+// 渐变底色,把底让给系统材质层——M2 壳 drawsBackground=false 时页面不透明
+// 底色会盖住材质);与 postMessageHost 同文件同族(都在认宿主通道)。
+export function isHosted() {
+  if (typeof window === 'undefined') return false;
+  if (window.chrome && window.chrome.webview) return true;
+  if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.panel) {
+    return true;
+  }
+  return false;
+}
+
 // postMessageHost(msg) — 把消息投给原生宿主:
 //   Windows WebView2: window.chrome.webview.postMessage
 //   macOS WKWebView:  window.webkit.messageHandlers.panel.postMessage

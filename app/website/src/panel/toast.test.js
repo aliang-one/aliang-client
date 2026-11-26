@@ -71,4 +71,21 @@ describe('useToast', () => {
     vi.advanceTimersByTime(5000);
     expect(toast.toasts.value.length).toBe(0);
   });
+
+  it('超限挤旧:上限 4 条,第 5 条入队时最旧一条被挤出且其超时被回收', () => {
+    const toast = useToast();
+    toast.show('旧1');
+    toast.show('旧2');
+    toast.show('旧3');
+    toast.show('旧4');
+    toast.show('新5');
+    expect(toast.toasts.value.length).toBe(4);
+    expect(toast.toasts.value.map((t) => t.msg)).toEqual(['旧2', '旧3', '旧4', '新5']);
+    // 被挤出的「旧1」句柄已回收:推到其原超时点不会引发异常或队列抖动,
+    // 剩余 4 条按各自计划消失(2s 后旧2/旧3/旧4 还在,新5 也在)。
+    vi.advanceTimersByTime(2000);
+    expect(toast.toasts.value.length).toBe(4);
+    vi.advanceTimersByTime(1000); // 满 3s:旧2-新5 全部到期消失
+    expect(toast.toasts.value.length).toBe(0);
+  });
 });
