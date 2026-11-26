@@ -113,7 +113,7 @@ func TestAssistDurationCap(t *testing.T) {
 func TestAssistGuardMatrix(t *testing.T) {
 	// 守卫面矩阵:setup 到目标态 → act 触发动作 → 断言错误哨兵与状态快照。
 	// 错误哨兵按当前契约钉死(含 CloudRejected 错 id 走合并守卫归并到
-	// errAssistNotPending);失败须显式改测试,防止守卫面静默漂移。
+	// ErrAssistNotPending);失败须显式改测试,防止守卫面静默漂移。
 	cases := []struct {
 		name      string
 		setup     func(m *remoteAssistManager) string
@@ -138,14 +138,14 @@ func TestAssistGuardMatrix(t *testing.T) {
 				return sid
 			},
 			act:       func(m *remoteAssistManager, _ string) error { return m.Cancel() },
-			wantErr:   errAssistNotPending,
+			wantErr:   ErrAssistNotPending,
 			wantState: assistStateActive,
 		},
 		{
 			name:      "CloudRejected 错 id 报错且仍 requested",
 			setup:     func(m *remoteAssistManager) string { sid, _ := m.Request(""); return sid },
 			act:       func(m *remoteAssistManager, sid string) error { return m.CloudRejected(sid + "-x") },
-			wantErr:   errAssistNotPending,
+			wantErr:   ErrAssistNotPending,
 			wantState: assistStateRequested,
 		},
 		{
@@ -324,7 +324,7 @@ func TestAssistUplinkFrameShapes(t *testing.T) {
 	}
 
 	// active 态 CancelAndSignal 走守卫拒绝且不上行
-	if err := m.CancelAndSignal(); !errors.Is(err, errAssistNotPending) {
+	if err := m.CancelAndSignal(); !errors.Is(err, ErrAssistNotPending) {
 		t.Fatalf("cancel in active must be rejected, got %v", err)
 	}
 	if len(up) != 6 {
@@ -336,7 +336,7 @@ func TestAssistEndAndSignalIdleIsIdempotent(t *testing.T) {
 	m := newTestAssistManagerWithSink(t)
 	var up []map[string]interface{}
 	m.SetFrameSink(func(f map[string]interface{}) error { up = append(up, f); return nil })
-	if _, err := m.EndAndSignal(AssistEndClient); !errors.Is(err, errAssistNothingToEnd) {
+	if _, err := m.EndAndSignal(AssistEndClient); !errors.Is(err, ErrAssistNothingToEnd) {
 		t.Fatalf("idle EndAndSignal must be a no-op, got %v", err)
 	}
 	if len(up) != 0 {

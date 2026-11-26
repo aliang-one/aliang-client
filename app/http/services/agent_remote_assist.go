@@ -46,7 +46,7 @@ const (
 	AssistEndTerminalLimit assistEndReason = "terminal_limit"
 )
 
-type remoteAssistSnapshot struct {
+type RemoteAssistSnapshot struct {
 	SessionID   string          `json:"session_id"`
 	State       assistState     `json:"state"`
 	Message     string          `json:"message"`
@@ -139,14 +139,17 @@ func (m *remoteAssistManager) runPendingHooks() {
 	}
 }
 
+// 四哨兵导出(Task 6):HTTP 面的 handler 层要 errors.Is 做错误→HTTP 语义
+// 映射(ErrAgentFS 家族同款先例);errAssistNotActive/errAssistIDMismatch 仅
+// 服务内部(WS 分派/终端腿)使用,保持 unexported。
 var (
-	errAssistCooldown   = errors.New("assist: request cooldown")
-	errAssistBusy       = errors.New("assist: session already active or pending")
-	errAssistNotPending = errors.New("assist: no pending session")
+	ErrAssistCooldown   = errors.New("assist: request cooldown")
+	ErrAssistBusy       = errors.New("assist: session already active or pending")
+	ErrAssistNotPending = errors.New("assist: no pending session")
 	// errAssistNotActive 供 Task 4/5 网络接线使用(信令仅在 active 态合法)。
 	errAssistNotActive    = errors.New("assist: no active session")
 	errAssistIDMismatch   = errors.New("assist: session id mismatch")
-	errAssistNothingToEnd = errors.New("assist: nothing to end")
+	ErrAssistNothingToEnd = errors.New("assist: nothing to end")
 )
 
 // ---------------------------------------------------------------------------
@@ -222,7 +225,7 @@ func (m *remoteAssistManager) requestLocked(message string) (string, bool, error
 	// pending 过期豁免锚点(见 finishLocked)——过期已含 5 分钟自然等待,
 	// 立即重申是合法路径。
 	if m.session == nil && !m.lastEnded.IsZero() && now.Sub(m.lastEnded) < assistRequestCooldown {
-		return "", false, errAssistCooldown
+		return "", false, ErrAssistCooldown
 	}
 	if m.session != nil {
 		switch m.stateLocked() {
@@ -230,7 +233,7 @@ func (m *remoteAssistManager) requestLocked(message string) (string, bool, error
 			m.session.message = strings.TrimSpace(message) // 同态更新留言
 			return m.session.id, false, nil
 		case assistStateActive:
-			return "", false, errAssistBusy
+			return "", false, ErrAssistBusy
 		}
 	}
 	id := fmt.Sprintf("%s%d", assistIDPrefix, now.UnixNano())
@@ -267,10 +270,14 @@ func (m *remoteAssistManager) RequestAndSignal(message string) (string, error) {
 // session id 未变才回滚(解锁到写失败的窗口里云端帧可能已改状态,那种情况
 // 以现状为准不回滚,白盒守卫见 TestAssistRollbackGuardKeepsApprovedSession)。
 //
-// 单调用方假设:RequestAndSignal 的入口自 Task 6 起是唯一 HTTP 端点(每请求
-// 串行),不存在「A 新建+信令失败」与「B 同态更新+信令成功」并发交错——
-// 若未来出现双调用方,A 的回滚可抹掉 B 已上行的会话(云端按 pending_expired
-// 自愈、本地无脏态,但体验断档),届时须加 signaled-since-creation 标记。
+// 并发口径(评审 Fix 3 勘误):「唯一 HTTP 端点=单调用方」的前提不成立——
+// Go http server 并发处理请求,两个 POST /assist/request 即双调用方(A 新建+
+// 信令失败 / B 同态更新+信令成功),A 的回滚可抹掉 B 已上行的会话:窗口窄
+// (A 的解锁→写失败 vs B 的同态更新,同为信令抖动期的连点),云端按
+// pending_expired 自愈、本地无脏态,但体验断档(用户刚发的申请从 admin
+// 队列消失)。P1 接受此窄窗不加 signaled-since-creation 标记(YAGNI:标记
+// 要在 requestLocked/rollbackCreated 双点维护创建代次,收益仅覆盖连点抖动
+// 场景);出现实际投诉再补,补法即该标记。
 func (m *remoteAssistManager) rollbackCreated(sid string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -291,7 +298,7 @@ func (m *remoteAssistManager) Cancel() error {
 // cancelLocked 前提:持锁。
 func (m *remoteAssistManager) cancelLocked() error {
 	if m.stateLocked() != assistStateRequested {
-		return errAssistNotPending
+		return ErrAssistNotPending
 	}
 	m.finishLocked(AssistEndClient)
 	return nil
@@ -320,7 +327,7 @@ func (m *remoteAssistManager) CloudApproved(sessionID string) error {
 	m.mu.Lock()
 	if m.stateLocked() != assistStateRequested {
 		m.mu.Unlock()
-		return errAssistNotPending
+		return ErrAssistNotPending
 	}
 	if m.session.id != sessionID {
 		m.mu.Unlock()
@@ -340,7 +347,7 @@ func (m *remoteAssistManager) CloudRejected(sessionID string) error {
 	m.mu.Lock()
 	if m.stateLocked() != assistStateRequested || m.session.id != sessionID {
 		m.mu.Unlock()
-		return errAssistNotPending
+		return ErrAssistNotPending
 	}
 	m.finishLocked(AssistEndAdmin) // 拒绝按 admin 侧终态计,审计同源
 	m.mu.Unlock()
@@ -359,7 +366,7 @@ func (m *remoteAssistManager) End(reason assistEndReason) error {
 // endLocked 前提:持锁。
 func (m *remoteAssistManager) endLocked(reason assistEndReason) error {
 	if m.stateLocked() == assistStateIdle {
-		return errAssistNothingToEnd
+		return ErrAssistNothingToEnd
 	}
 	m.finishLocked(reason)
 	return nil
@@ -369,7 +376,7 @@ func (m *remoteAssistManager) endLocked(reason assistEndReason) error {
 // 发起的收口(client_end,撤销申请/结束会话/总开关关闸)恒 assist.cancel;
 // 设备侧原因(device_restart 等)走 assist.end 带 reason(帧族注释:该帧
 // 双向)。信令失败不回滚终态(本地已终态,云侧自愈语义见 CancelAndSignal),
-// 错误照实上抛。idle 时返回 errAssistNothingToEnd 且不上行——禁用路径的
+// 错误照实上抛。idle 时返回 ErrAssistNothingToEnd 且不上行——禁用路径的
 // 常态幂等分支。
 func (m *remoteAssistManager) EndAndSignal(reason assistEndReason) (string, error) {
 	m.mu.Lock()
@@ -480,12 +487,12 @@ func (m *remoteAssistManager) finishLocked(reason assistEndReason) {
 // Snapshot 当前状态快照。读路径懒扫一次,过期/时长上限在读取时即收敛,
 // 无需独立定时器。终态后会话槽位已释放,按粘性终态字段回填 SessionID。
 // 懒扫可能落终态,钩子在解锁后投递(锁纪律见 runPendingHooks)。
-func (m *remoteAssistManager) Snapshot() remoteAssistSnapshot {
+func (m *remoteAssistManager) Snapshot() RemoteAssistSnapshot {
 	m.mu.Lock()
 	m.sweepLocked()
-	var snap remoteAssistSnapshot
+	var snap RemoteAssistSnapshot
 	if m.session != nil {
-		snap = remoteAssistSnapshot{
+		snap = RemoteAssistSnapshot{
 			SessionID:   m.session.id,
 			State:       m.stateLocked(),
 			Message:     m.session.message,
@@ -495,7 +502,7 @@ func (m *remoteAssistManager) Snapshot() remoteAssistSnapshot {
 			snap.ApprovedAt = m.session.approvedAt.Format(time.RFC3339)
 		}
 	} else if m.endReason != "" {
-		snap = remoteAssistSnapshot{
+		snap = RemoteAssistSnapshot{
 			SessionID: m.lastSessionID,
 			State:     assistStateEnded,
 			EndReason: m.endReason,

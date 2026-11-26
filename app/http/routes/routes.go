@@ -324,8 +324,18 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	// 远程协助总开关 gates(spec 2026-11-26-remote-assist-design §7.1):GET 读 /
 	// POST 写 remote_assist_enabled。真身在 user agent runtime,core 侧
 	// proxyIfNeeded 透传;双注册另一处 agentruntime/server.go(缺任一侧=404
-	// 透传,route_parity_test 兜底)。request/session/end 三端点是 Task 6。
+	// 透传,route_parity_test 兜底)。
 	register("/api/agent/assist/gates", h.Agent.HandleAssistGates, http.MethodGet, http.MethodPost)
+	// 远程协助客户端会话面(Task 6):request(申请,POST)/session(会话态
+	// 轮询,GET)/end(主动结束,POST)/cancel(撤销待审批申请,POST)。core
+	// 侧闸门①(双闸)+同源闸+真源标记+proxy 透传且**零 body 解析**
+	// (PROXY-FIRST);runtime 腿总开关 403 门+状态机+审计。方法前缀模式防
+	// 同路径互相覆盖(同 /api/agent/fs/* 先例)。双注册另一处
+	// agentruntime/server.go(缺任一侧=404 透传,route_parity_test 兜底)。
+	register("POST /api/agent/assist/request", h.Agent.HandleAssistRequest, http.MethodPost)
+	register("GET /api/agent/assist/session", h.Agent.HandleAssistSession, http.MethodGet)
+	register("POST /api/agent/assist/end", h.Agent.HandleAssistEnd, http.MethodPost)
+	register("POST /api/agent/assist/cancel", h.Agent.HandleAssistCancel, http.MethodPost)
 	register("/api/agent/operations/events", h.Agent.HandleOperationEvents, http.MethodGet)
 	register("/api/agent/ai/stream", h.Agent.HandleAIStream, http.MethodGet)
 	register("/api/agent/ai/approval-hook", h.Agent.HandleAIApprovalHook, http.MethodPost)
