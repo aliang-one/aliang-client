@@ -2,12 +2,13 @@
      theme + 340px 容器 + Toast 挂载 + 数据层接线(useSummary 轮询 +
      derivePanelState 七态派生,provide 给区块组件)。
      区块组件:①状态头/②传输行(Task 8)/③AI 加速(Task 9)/④ENDPOINT
-     (Task 10)已落地;⑤AI AGENT/⑥底部动作行仍是占位(Task 11),
-     绝不提前实现。
-     ④ENDPOINT 的分隔线放区尾并随整区显隐:available=false 整区不渲染时
-     连 trailing sep 一起消失,避免可用性切换出现孤线/双线,故本文件不为④
-     放静态 sep——③ 后的 sep 就是 ③/⑤ 之间的那条线(mockup 的 sep 不随
-     zone 走,随区显隐是实现层决定)。 -->
+     (Task 10)/⑤AI AGENT + ⑥底部动作行(Task 11)全部落地,无占位。
+     ④⑤的分隔线放区尾并随整区显隐:整区不渲染(数据缺失硬性降级)时
+     连 trailing sep 一起消失,避免可用性切换出现孤线/双线,故本文件不为
+     ④⑤放静态 sep——③ 后的 sep 是 ③ 与「下一个可见区块」之间的那条线,
+     ⑥底部行的分隔由其上方最近一个可见区块的区尾 sep 承担(mockup 的 sep
+     不随 zone 走,随区显隐是实现层决定;⑥的 mockup border-top 因同因不抄,
+     见 FooterBar 文件头)。 -->
 <script setup>
 import { computed, provide, ref } from 'vue';
 import { useSummary } from './summary';
@@ -17,6 +18,8 @@ import StatusHeader from './components/StatusHeader.vue';
 import TransportRow from './components/TransportRow.vue';
 import AISection from './components/AISection.vue';
 import EndpointZone from './components/EndpointZone.vue';
+import AgentZone from './components/AgentZone.vue';
+import FooterBar from './components/FooterBar.vue';
 
 // 数据层:启动即拉一次 + 2s 轮询;connLost 连续 2 次失败置位(§3 错误态)。
 // 仅本根壳调用一次;区块组件一律经 inject('panelData') 取同一份数据。
@@ -57,23 +60,15 @@ provide('panelToast', toast);
          (spec §4.4 硬性降级);sep 随区尾显隐,故此处无静态 sep(Task 10) -->
     <EndpointZone />
 
-    <!-- ⑤ AI AGENT:每内核一张卡片(24h 统计)(Task 11) -->
-    <div class="panel-block" data-block="agents">AI AGENT · 24H(Task 11 占位)</div>
-    <div class="sep"></div>
+    <!-- ⑤ AI AGENT:每内核一张卡片(24h 统计);kernels 缺失整区不渲染
+         (硬性降级),sep 放区尾随整区显隐,故此处无静态 sep(Task 11) -->
+    <AgentZone />
 
-    <!-- ⑥ 底部动作行:版本 · 仪表盘 · 设备互访 · 退出(Task 8) -->
-    <div class="panel-block" data-block="footer">底部动作行(Task 8 占位)</div>
+    <!-- ⑥ 底部动作行:版本 · 仪表盘 · 设备互访 · 退出;恒渲染(无降级),
+         其上方分隔由最近可见区块的区尾 sep 承担(Task 11) -->
+    <FooterBar />
 
     <!-- 轻提示挂载点(全局单例队列,Task 8-11 组件经 useToast 注入使用) -->
     <Toast />
   </div>
 </template>
-
-<style scoped>
-/* 占位块最小可读样式:仅剩 Task 11 的两个占位在用,落一删一,全落整段删。 */
-.panel-block {
-  padding: 12px 14px;
-  font-size: 11.5px;
-  color: var(--text-muted);
-}
-</style>
