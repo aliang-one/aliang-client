@@ -191,6 +191,11 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/run/tun/status", h.Run.HandleRunTUNStatus, http.MethodGet)
 	register("/api/run/tun/conflicts", h.Run.HandleRunTUNConflictStatus, http.MethodGet)
 	register("/api/run/swift", h.Run.HandleRunSwift, http.MethodPost)
+	// 托盘面板唯一读通道(托盘面板 plan Task 5):一次聚合 run/ai/agents/
+	// endpoints 四子源,子源缺失/panic → 字段 null 不拖死整体。来源闸在
+	// services.ServeTraySummary 内(回环免 cookie ∥ dashboard 会话),与既有
+	// /api 家族同监听面,仅本机面板消费,不在 agentruntime 侧双注册。
+	register("/api/tray/summary", services.ServeTraySummary, http.MethodGet)
 	register("/api/software-update/status", h.SoftwareUpdate.HandleStatus, http.MethodGet)
 	register("/api/software-update/dismiss", h.SoftwareUpdate.HandleDismiss, http.MethodPost)
 
