@@ -436,6 +436,8 @@ type agentAIRunEmitter struct {
 	mu         sync.Mutex
 	runID      string
 	nextSeq    int64
+	startedAt  time.Time
+	firstText  bool
 	terminal   bool
 	write      agentTerminalWriter
 	onTerminal func(map[string]interface{}) error
@@ -517,8 +519,24 @@ func (e *agentAIRunEmitter) emit(value interface{}) error {
 	for key, identityValue := range e.goalIdentity {
 		payload[key] = identityValue
 	}
-	if payload["type"] == models.AgentEventAIDelta {
-		e.appendGoalOutput(remoteString(payload, "delta"))
+	switch payload["type"] {
+	case models.AgentEventAIRunStarted:
+		if e.startedAt.IsZero() {
+			e.startedAt = time.Now()
+			payload["agent_emitted_at_ms"] = e.startedAt.UnixMilli()
+		}
+	case models.AgentEventAIDelta:
+		delta := remoteString(payload, "delta")
+		e.appendGoalOutput(delta)
+		channel := remoteString(payload, "channel")
+		if !e.firstText && (channel == "" || channel == "assistant" || channel == "stdout") && strings.TrimSpace(delta) != "" {
+			e.firstText = true
+			emittedAt := time.Now()
+			payload["agent_emitted_at_ms"] = emittedAt.UnixMilli()
+			if !e.startedAt.IsZero() {
+				payload["agent_started_to_first_text_ms"] = emittedAt.Sub(e.startedAt).Milliseconds()
+			}
+		}
 	}
 	if payload["type"] == models.AgentEventAIError {
 		e.appendGoalOutput(remoteString(payload, "error"))

@@ -78,6 +78,40 @@ func TestAgentAIRunEmitterOrdersAndFencesTerminal(t *testing.T) {
 	}
 }
 
+func TestAgentAIRunEmitterMeasuresStartAndFirstAssistantText(t *testing.T) {
+	var frames []map[string]interface{}
+	emitter := newAgentAIRunEmitter(agentAIRun{runID: "run-timing"}, func(value interface{}) error {
+		frames = append(frames, value.(map[string]interface{}))
+		return nil
+	})
+
+	for _, frame := range []map[string]interface{}{
+		{"type": models.AgentEventAIRunStarted},
+		{"type": models.AgentEventAIDelta, "channel": "stderr", "delta": "diagnostics"},
+		{"type": models.AgentEventAIDelta, "delta": " "},
+		{"type": models.AgentEventAIDelta, "channel": "assistant", "delta": "hello"},
+		{"type": models.AgentEventAIDelta, "channel": "assistant", "delta": " world"},
+	} {
+		if err := emitter.emit(frame); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, index := range []int{0, 3} {
+		if stamp, ok := frames[index]["agent_emitted_at_ms"].(int64); !ok || stamp <= 0 {
+			t.Fatalf("frame %d missing emission timestamp: %v", index, frames[index])
+		}
+	}
+	if elapsed, ok := frames[3]["agent_started_to_first_text_ms"].(int64); !ok || elapsed < 0 {
+		t.Fatalf("first assistant frame missing monotonic duration: %v", frames[3])
+	}
+	for _, index := range []int{1, 2, 4} {
+		if _, ok := frames[index]["agent_emitted_at_ms"]; ok {
+			t.Fatalf("unexpected timing sample on frame %d", index)
+		}
+	}
+}
+
 func TestAgentAIRunEmitterTreatsSessionCloseAsTerminal(t *testing.T) {
 	var mu sync.Mutex
 	events := make([]map[string]interface{}, 0)

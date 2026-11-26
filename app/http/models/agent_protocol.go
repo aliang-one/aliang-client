@@ -270,9 +270,9 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				// truncate_applied：撤回重发回显（create 带 truncate_before_message_id 时）。
 				{Type: AgentEventAISessionCreated, Required: []string{"type", "session_id", "mode", "project_path", "provider", "state"}, Optional: []string{"state=idle", "truncate_applied"}},
 				{Type: AgentEventAIMessageReceived, Required: []string{"type", "session_id", "message_id", "run_id", "event_seq"}, Optional: []string{"received_at"}},
-				{Type: AgentEventAIRunStarted, Required: []string{"type", "session_id", "message_id", "provider", "mode", "project_path", "run_id", "event_seq"}, Optional: []string{"state=running"}},
+				{Type: AgentEventAIRunStarted, Required: []string{"type", "session_id", "message_id", "provider", "mode", "project_path", "run_id", "event_seq"}, Optional: []string{"state=running", "agent_emitted_at_ms"}},
 				{Type: AgentEventAISteerAck, Required: []string{"type", "session_id", "message_id", "result"}, Optional: []string{"error", "code", "acked_at"}},
-				{Type: AgentEventAIDelta, Required: []string{"type", "session_id", "message_id", "channel", "delta", "run_id", "event_seq"}},
+				{Type: AgentEventAIDelta, Required: []string{"type", "session_id", "message_id", "channel", "delta", "run_id", "event_seq"}, Optional: []string{"agent_emitted_at_ms", "agent_started_to_first_text_ms"}},
 				{Type: AgentEventAIDone, Required: []string{"type", "session_id", "message_id", "run_id", "event_seq"}},
 				{Type: AgentEventAIRunProgress, Required: []string{"type", "session_id", "run_id", "event_seq"}, Optional: []string{"message_id", "files_touched_count", "git_changed_count", "retry_active", "retry_attempt", "retry_max", "retry_delay_ms", "error_status", "error_type"}},
 				{Type: AgentEventAICommand, Required: []string{"type", "session_id", "message_id", "item_id", "status", "run_id", "event_seq"}, Optional: []string{"command", "cwd", "exit_code", "output"}},
