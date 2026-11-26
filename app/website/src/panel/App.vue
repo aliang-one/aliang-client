@@ -1,8 +1,8 @@
 <!-- App.vue — 托盘面板根壳:
      theme + 340px 容器 + Toast 挂载 + 数据层接线(useSummary 轮询 +
      derivePanelState 七态派生,provide 给区块组件)。
-     区块组件:①状态头/②传输行已落地(Task 8);③AI 加速/④ENDPOINT/
-     ⑤AI AGENT/⑥底部动作行仍是占位(Task 9-11),绝不提前实现。 -->
+     区块组件:①状态头/②传输行(Task 8)/③AI 加速(Task 9)已落地;
+     ④ENDPOINT/⑤AI AGENT/⑥底部动作行仍是占位(Task 10-11),绝不提前实现。 -->
 <script setup>
 import { computed, provide, ref } from 'vue';
 import { useSummary } from './summary';
@@ -10,6 +10,7 @@ import { derivePanelState } from './state';
 import Toast, { useToast } from './components/Toast.vue';
 import StatusHeader from './components/StatusHeader.vue';
 import TransportRow from './components/TransportRow.vue';
+import AISection from './components/AISection.vue';
 
 // 数据层:启动即拉一次 + 2s 轮询;connLost 连续 2 次失败置位(§3 错误态)。
 // 仅本根壳调用一次;区块组件一律经 inject('panelData') 取同一份数据。
@@ -42,8 +43,8 @@ provide('panelToast', toast);
     <TransportRow />
     <div class="sep"></div>
 
-    <!-- ③ AI 加速:总开关行 + provider 图标行(Task 10) -->
-    <div class="panel-block" data-block="ai">AI 加速(Task 10 占位)</div>
+    <!-- ③ AI 加速:总开关行 + provider 图标行,检测驱动点亮(Task 9) -->
+    <AISection />
     <div class="sep"></div>
 
     <!-- ④ ENDPOINT:Anthropic 组 / OpenAI 组;available=false 整区不渲染(Task 10/11) -->
@@ -63,7 +64,7 @@ provide('panelToast', toast);
 </template>
 
 <style scoped>
-/* 占位块最小可读样式:仅剩 Task 9-11 的四个占位在用,落一删一,全落整段删。 */
+/* 占位块最小可读样式:仅剩 Task 10-11 的三个占位在用,落一删一,全落整段删。 */
 .panel-block {
   padding: 12px 14px;
   font-size: 11.5px;
