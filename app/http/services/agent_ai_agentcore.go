@@ -151,7 +151,7 @@ func agentCoreSelectEndpoint() *config.LLMEndpoint {
 //
 // 取值顺序：
 //  0. 显式 agentcore_llm（仪表盘配置）——命中且非空直接返回，不进缓存；
-//  0.5 endpoint registry 选中的 BYO 行 api_key（spec §8，旧字段未配置时生效）；
+//     0.5 endpoint registry 选中的 BYO 行 api_key（spec §8，旧字段未配置时生效）；
 //  1. ANTHROPIC_AUTH_TOKEN（子进程 env → ~/.claude/settings.json）——零网络，
 //     与 CLI 用的是同一个值，quick-setup 用户恒命中；
 //  2. user-center 的 key 列表（带缓存）——没跑过 quick-setup 的新装用户兜底。

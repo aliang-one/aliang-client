@@ -17,8 +17,8 @@ import (
 
 	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
-	"aliang.one/nursorgate/processor/tcp"
 	"aliang.one/nursorgate/processor/storage"
+	"aliang.one/nursorgate/processor/tcp"
 )
 
 // stubAgentCoreEndpointService 把内核的 registry 入口替换为独立 :memory:
