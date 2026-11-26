@@ -107,7 +107,10 @@ export function endpointZoneModel(endpoints, ai) {
       });
     }
   }
-  return { available, aiOn, groups };
+  // available 收窄到过滤后(I-1):组数组全坏(groups:[null,42])或组内条目
+  // 全坏时 groups 为空 → 整区不渲染,不留零子元素空壳+尾随 sep(组件头注释
+  // 自述契约)。groups 只在本函数 available 分支内填充,收窄语义安全。
+  return { available: available && groups.length > 0, aiOn, groups };
 }
 
 // 组件本体:渲染派生结果 + 递延降级交互(toast),不发任何请求(api 层

@@ -147,6 +147,15 @@ describe('endpointZoneModel 纯派生(spec §4.4 + 数据防御)', () => {
     expect(endpointZoneModel(demoEndpoints(), makeAI(true)).available).toBe(true);
   });
 
+  it('组数组全坏(groups 条目全坏对象)→ available=false 整区不渲染(I-1:available 收窄到过滤后,不留零子元素空壳)', () => {
+    // groups 数组条目全坏(null/数字):available 开关开着,但过滤后一个组都不剩
+    for (const groups of [[null], [42], [null, 42], ['bad', null]]) {
+      expect(endpointZoneModel(makeEndpoints({ groups }), makeAI(true)).available).toBe(false);
+    }
+    // 注:有效组但组内 items 全坏(组头照渲染)是 M-1,评审记打磨清单刻意不修,
+    // 不在本用例钉死
+  });
+
   it('aiOn 判定:仅 ai.enabled 真值 true 为开;ai 缺失/坏类型/enabled=false → 关(§6-4 联动降透明)', () => {
     expect(endpointZoneModel(demoEndpoints(), makeAI(true)).aiOn).toBe(true);
     for (const ai of [null, undefined, 'bad', 42, makeAI(false)]) {
@@ -214,6 +223,7 @@ describe('endpointZoneModel 纯派生(spec §4.4 + 数据防御)', () => {
       [0, '冷却 1m'],
       [30, '冷却 1m'],
       [60, '冷却 1m'],
+      ['90', '冷却 1m'], // 字符串兜底 0 → ceil(0/60)=0 → max(1,·)=1m(M-4:坏类型已定义行为)
       [61, '冷却 2m'],
       [90, '冷却 2m'],
       [119, '冷却 2m'],
@@ -288,6 +298,16 @@ describe('EndpointZone 挂载 DOM 契约', () => {
   it('groups 缺失但 available=true → 同样整区不渲染(契约第 8 条数据防御)', () => {
     const { el } = mountZone({ endpoints: makeEndpoints({ available: true, groups: undefined }), ai: makeAI(true) });
     expect(q(el, '.ep-zone')).toBeNull();
+  });
+
+  it('groups:[null] 全坏数组 → 整区不渲染无空壳(I-1 挂载层:available 过滤后收窄,连尾随 sep 一起消失)', () => {
+    const { el } = mountZone({
+      endpoints: makeEndpoints({ available: true, groups: [null] }),
+      ai: makeAI(true),
+    });
+    expect(q(el, '.ep-zone')).toBeNull();
+    expect(q(el, '.ep-group')).toBeNull();
+    expect(el.textContent.trim()).toBe('');
   });
 
   it('正常渲染:两组组头(协议图标+组名+当前名+chevron);列表默认收起(max-height 0 由 CSS 承载,open 类缺席)', () => {
