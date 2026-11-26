@@ -204,18 +204,3 @@ GDI/托盘行为无法在 darwin 上运行时验证,分四层:
    不创建对象)。
 4. 实机层:装机重启 companion 后 `footprint <pid>` 观测,24h 内 MALLOC_SMALL
    应平坦(旧版 3 天涨到 5.8GB)。
-2. 运行层(2026-11-26 实测,macOS 26.2):探针程序经 replace 引用本目录,
-   在 onReady 里建与 companion 相同的菜单,再按 companion 每 tick 的调用
-   序列以 20Hz 批量调用,`footprint <pid>` 看 MALLOC_SMALL 脏内存——补丁前
-   6.4KB/tick(去图标化后的序列)/ 51KB/tick(含 4 个 provider 菜单项图标的
-   序列),补丁后 1000 轮累计 +0.2MB,平坦。同一探针同时比对
-   statusItem.button 的图标内容哈希与 tooltip、每个菜单项的
-   title/enabled/state/hidden/图标哈希,补丁前后逐字节一致。
-   覆盖范围:逐 tick 序列在运行期实际走到 6 个入口
-   (`add_or_update_menu_item`、`setTooltip`、`setIcon`、`setMenuItemIcon`、
-   `hide_menu_item`、`show_menu_item`);`add_separator` 只在初始化时调用;
-   `setTitle` 与 `quit` 只有结构测试和人工审读覆盖——两者形态安全
-   (`setTitle` 与已覆盖的 `setTooltip` 同构,且 companion 不调用它;`quit`
-   不创建对象)。
-3. 实机层:装机重启 companion 后 `footprint <pid>` 观测,24h 内 MALLOC_SMALL
-   应平坦(旧版 3 天涨到 5.8GB)。
