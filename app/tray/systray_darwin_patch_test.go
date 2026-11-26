@@ -35,6 +35,10 @@ var goroutineCallableDarwinEntries = []string{
 	"hide_menu_item",
 	"show_menu_item",
 	"quit",
+	// 本仓补丁:面板模式胶水(2026-11-26 托盘面板 M1 Task 4)——同样会被
+	// goroutine 直接调用,包 pool 纪律自动生效(上面的排空测试逐个校验)。
+	"set_panel_mode",
+	"tray_rect",
 }
 
 // noOwnPoolNeededDarwinFunctions 是不需要自己那层 pool 的 C 函数:只在主线程上
@@ -163,4 +167,165 @@ func matchingBrace(s string, open int) int {
 		}
 	}
 	return -1
+}
+
+// TestVendoredSystrayDarwinPanelPatch 钉住 macOS 托盘底座面板胶水的补丁形态
+// (2026-11-26 托盘面板 M1 Task 4,对齐调研 §6.5):panelMode=true 时 AppDelegate
+// 摘掉原生菜单、给按钮挂 trayClicked:(sendActionOn 掩码含左右键按下,点击 →
+// systray_tray_clicked → Go 侧 panelClickFn);panelMode=false 时摘掉 action、
+// 接回原生菜单(原生菜单兜底)。菜单对象与刷新循环完全不动,切换无损。
+// third_party/systray 以「逐字节忠实于上游 + 仅功能补丁」为纪律,补丁只靠
+// PATCH_NOTES 里 grep「本仓补丁」的人工流程重放——这里钉成测试,同步上游漏
+// 重放即红。新 C 入口的 @autoreleasepool 纪律由上面的清单类测试自动覆盖。
+//
+// export 三处分工按仓内惯例(与既有 systray_menu_item_selected 同款):
+//   - Go 侧 systray_nonwindows.go 持 //export systray_tray_clicked(实现体);
+//   - systray.h 持 extern 声明;
+//   - systray_darwin.m 持调用点(trayClicked: → systray_tray_clicked())。
+//
+// darwin 侧 TrayRect 是整数四元组、Windows 侧是导出 Rect 类型——两种形态
+// 并存是既定设计(systray_windows.go 的 TrayRect 见 systray_windows_patch_test.go)。
+func TestVendoredSystrayDarwinPanelPatch(t *testing.T) {
+	mSrc := vendoredSystrayDarwinSource(t)
+	goSrc := vendoredSystrayDarwinGoSource(t)
+	nonwindowsSrc := vendoredSystrayNonwindowsSource(t)
+	headerSrc := vendoredSystrayHeaderSource(t)
+
+	t.Run("面板模式开关", func(t *testing.T) {
+		// C 入口照 setIcon 等既有入口写法,经 runInMainThread 封送主线程。
+		body := cFunctionBody(t, mSrc, "set_panel_mode")
+		if !strings.Contains(body, "runInMainThread(@selector(setPanelMode:)") {
+			t.Fatalf("set_panel_mode 必须经 runInMainThread 封送主线程(窗口/状态项只能在主线程动):\n%s", body)
+		}
+
+		// AppDelegate 方法:摘菜单挂 action(左/右键按下都触发)与摘 action 接回菜单。
+		for _, want := range []string{
+			"statusItem.menu = nil",  // detach:摘菜单,面板模式
+			"statusItem.menu = menu", // attach:接回原生菜单(兜底)
+			"statusItem.button.action = @selector(trayClicked:)",
+			"sendActionOn:",             // 按下即触发(而非默认抬起)
+			"NSEventMaskLeftMouseDown",  // 左键
+			"NSEventMaskRightMouseDown", // 右键:左右键都触发,→ panelClickFn
+		} {
+			if !strings.Contains(mSrc, want) {
+				t.Errorf("systray_darwin.m 缺少 %q(面板模式切换形态不完整)", want)
+			}
+		}
+		assertAnchorAbove(t, mSrc, "- (void)setPanelMode:(NSNumber *)panel {", 8)
+	})
+
+	t.Run("点击转发链路", func(t *testing.T) {
+		if !strings.Contains(mSrc, "systray_tray_clicked();") {
+			t.Error("systray_darwin.m 缺少对 systray_tray_clicked 的调用(AppDelegate trayClicked: 应转发到 Go 侧出口)")
+		}
+
+		// Go 侧出口与 Windows 侧 wndProc 点击分支对齐:非阻塞丢 goroutine,
+		// 绝不在 AppKit 主线程做耗时工作;hook 为 nil 则忽略。
+		body := goFuncBody(t, nonwindowsSrc, "systray_tray_clicked")
+		for _, want := range []string{
+			"if panelClickFn != nil {",
+			"go panelClickFn()",
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("systray_tray_clicked 实现缺少 %q(必须与 Windows 侧同款:非阻塞起 goroutine):\n%s", want, body)
+			}
+		}
+		assertAnchorAbove(t, nonwindowsSrc, "//export systray_tray_clicked", 8)
+	})
+
+	t.Run("托盘图标矩形", func(t *testing.T) {
+		body := cFunctionBody(t, mSrc, "tray_rect")
+		if !strings.Contains(body, "runInMainThread(@selector(fillTrayRect:)") {
+			t.Fatalf("tray_rect 必须经 runInMainThread 封送主线程(窗口 frame 只能主线程读):\n%s", body)
+		}
+
+		// NSScreen 全局坐标系左下原点 → 全局左上原点(与 Windows 同基准):
+		// 主屏 = [NSScreen screens] 首个(带菜单栏的那块,全局坐标零点在其左下角)。
+		for _, want := range []string{
+			"[NSScreen screens]",
+			"frame.origin.y - frame.size.height", // screenHeight - (bottomY + h) 的换算形态
+		} {
+			if !strings.Contains(mSrc, want) {
+				t.Errorf("systray_darwin.m 缺少 %q(缺左下原点→全局左上原点换算,面板锚定会偏一个屏高)", want)
+			}
+		}
+		assertAnchorAbove(t, mSrc, "- (void)fillTrayRect:(NSMutableArray *)box {", 8)
+
+		// Go 包装在 systray_darwin.go(TrayRect 签名是整数四元组,与 Windows 侧
+		// 返回导出 Rect 的形态并存是既定设计)。
+		for _, want := range []string{
+			"func SetPanelMode(panel bool) {",
+			"func TrayRect() (x, y, w, h int, ok bool) {",
+		} {
+			if !strings.Contains(goSrc, want) {
+				t.Errorf("systray_darwin.go 缺少包装 %q", want)
+			}
+			assertAnchorAbove(t, goSrc, want, 8)
+		}
+	})
+
+	t.Run("export三处分工", func(t *testing.T) {
+		// 与既有 systray_menu_item_selected 的三处分工同款:Go 持 //export 实现,
+		// systray.h 持 extern 声明,.m 持调用点。
+		if !strings.Contains(nonwindowsSrc, "//export systray_tray_clicked") {
+			t.Error("systray_nonwindows.go 缺少 //export systray_tray_clicked(既有 systray_menu_item_selected 的 //export 就在此文件,同款位置)")
+		}
+		if !strings.Contains(headerSrc, "extern void systray_tray_clicked") {
+			t.Error("systray.h 缺少 systray_tray_clicked 的 extern 声明")
+		}
+		for _, want := range []string{
+			"void set_panel_mode(bool panel)",
+			"void tray_rect(int* x, int* y, int* w, int* h, bool* ok)",
+		} {
+			if !strings.Contains(headerSrc, want) {
+				t.Errorf("systray.h 缺少声明 %q", want)
+			}
+		}
+	})
+}
+
+// vendoredSystrayDarwinGoSource 读取内嵌 systray 的 darwin Go 包装层。
+func vendoredSystrayDarwinGoSource(t *testing.T) string {
+	t.Helper()
+
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller: 无法定位测试文件")
+	}
+	src, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "third_party", "systray", "systray_darwin.go"))
+	if err != nil {
+		t.Fatalf("读取内嵌 systray 的 darwin Go 包装层: %v", err)
+	}
+	return string(src)
+}
+
+// vendoredSystrayNonwindowsSource 读取内嵌 systray 的非 Windows cgo 桥接层
+// (既有 systray_menu_item_selected 的 //export 在此文件)。
+func vendoredSystrayNonwindowsSource(t *testing.T) string {
+	t.Helper()
+
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller: 无法定位测试文件")
+	}
+	src, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "third_party", "systray", "systray_nonwindows.go"))
+	if err != nil {
+		t.Fatalf("读取内嵌 systray 的非 Windows 桥接层: %v", err)
+	}
+	return string(src)
+}
+
+// vendoredSystrayHeaderSource 读取内嵌 systray 的 C 头文件。
+func vendoredSystrayHeaderSource(t *testing.T) string {
+	t.Helper()
+
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller: 无法定位测试文件")
+	}
+	src, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "third_party", "systray", "systray.h"))
+	if err != nil {
+		t.Fatalf("读取内嵌 systray 的 C 头文件: %v", err)
+	}
+	return string(src)
 }

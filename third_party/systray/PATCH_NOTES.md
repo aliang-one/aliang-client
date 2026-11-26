@@ -26,11 +26,12 @@ Apache-2.0(LICENSE 原样保留)。本目录的 go.mod 保持上游 module path 
 ### systray.go(1 处,2026-11-26)
 
 1. `panelClickFn` + `SetPanelClickHook(fn func())`:面板模式点击回调。设置后
-   Windows 后端把托盘图标的左/右键点击交给回调(每次点击起新 goroutine
-   异步执行),不再弹原生菜单;nil(默认)= 上游行为,原生菜单兜底。只有
-   Windows 的 wndProc 读取此回调,其余平台后端不接线。回调契约已写进
-   注释:应快速返回(否则 goroutine 按连点次数无上限堆积)、可能并发执行
-   (串行化归接线层)、panic 会终止整个进程(无 recover 的 goroutine)。
+   后端把托盘图标的左/右键点击交给回调(每次点击起新 goroutine
+   异步执行),不再弹原生菜单;nil(默认)= 上游行为,原生菜单兜底。读取此
+   回调的是 Windows 的 wndProc 与 macOS 的 `systray_tray_clicked`(见下方
+   面板胶水小节)。回调契约已写进注释:应快速返回(否则 goroutine 按连点
+   次数无上限堆积)、可能并发执行(串行化归接线层)、panic 会终止整个进程
+   (无 recover 的 goroutine)。
 
 ### systray_windows.go(12 处;1~3=2026-11-20 GDI 修复,4~12=2026-11-26 面板胶水)
 
@@ -87,6 +88,47 @@ Apache-2.0(LICENSE 原样保留)。本目录的 go.mod 保持上游 module path 
   `footprint` 的 MALLOC_SMALL,看 RSS 发现不了。
 - `quit` 不创建对象,包进 pool 只为 9 个入口形态统一。
 
+### systray_darwin.m / systray_darwin.go / systray_nonwindows.go / systray.h(6 处,2026-11-26 面板胶水 Task 4)
+
+macOS 底座补上与 Windows 侧同构的面板胶水(托盘面板调研 §6.5 的机制):
+`SetPanelMode(true)` → `statusItem.menu = nil`(摘菜单)+ `button.target/action
+= @selector(trayClicked:)` + `sendActionOn`(左/右键按下都触发)→ 点击经
+`systray_tray_clicked()` 交给 Go 侧 `panelClickFn`(自绘面板);`SetPanelMode(false)`
+→ 摘 action + `[statusItem setMenu:menu]` 接回(原生菜单兜底)。**菜单项对象与
+companion 的刷新循环完全不动**——面板模式期间菜单对象照常被更新(不可见而已),
+随时无损接回。
+
+1. AppDelegate 新增三个方法(接口声明带注释锚点,四处锚点):`setPanelMode:`
+   (主线程执行,两态切换如上;false 侧另把按钮掩码恢复为默认的抬起触发)、
+   `trayClicked:`(转发 `systray_tray_clicked()`,Go 侧起新 goroutine 异步执行,
+   不在 AppKit 主线程做耗时工作)、`fillTrayRect:`(窗口 frame 装箱回传;
+   macOS 的 NSScreen 全局坐标系是左下原点,经主屏高度换算成与 Windows 同基准
+   的全局左上原点——主屏 = `[NSScreen screens]` 首个,带菜单栏的那块,全局
+   坐标零点在其左下角)。
+2. 新增 C 入口 `set_panel_mode(bool)`:经既有 `runInMainThread` 模式封送
+   `setPanelMode:`(照 `setIcon` 等入口写法);会被 goroutine 直接调用,函数体
+   整体包 `@autoreleasepool` 同其余 9 入口的纪律。(两处锚点)
+3. 新增 C 入口 `tray_rect(int* x, int* y, int* w, int* h, bool* ok)`:取
+   `statusItem.button.window.frame`,经主屏高度换算为全局左上原点,装箱进
+   `NSArray` 回传;窗口 frame 只能主线程读,同样经 `runInMainThread` 同步封送;
+   包 pool 同上。(两处锚点)
+4. `systray_nonwindows.go` 新增 `//export systray_tray_clicked`:与 Windows 侧
+   wndProc 点击分支对齐——非阻塞地 `go panelClickFn()`,hook 为 nil 则忽略。
+   (一处锚点)
+5. `systray.h` 新增三处声明:`extern void systray_tray_clicked()`、
+   `set_panel_mode`、`tray_rect`。export 三处分工按仓内惯例(与既有
+   `systray_menu_item_selected` 同款):Go 侧持 `//export` 实现、systray.h 持
+   extern 声明、.m 持调用点。(两处锚点)
+6. `systray_darwin.go` 新增 `SetPanelMode(bool)` 与 `TrayRect() (x, y, w, h int,
+   ok bool)` 包装;darwin 侧是整数四元组、Windows 侧是导出 `Rect` 类型,两种
+   形态并存是既定设计(见 `systray_windows.go` 的 TrayRect)。(两处锚点)
+
+结构测试:`app/tray/systray_darwin_patch_test.go` 的
+`TestVendoredSystrayDarwinPanelPatch` 钉住形态(两态切换/摘菜单接回/左右键
+掩码/点击转发链路/坐标换算/export 三处分工/Go 包装签名),
+`goroutineCallableDarwinEntries` 增补 `set_panel_mode`、`tray_rect`(pool 纪律
+由既有清单测试自动生效);同步上游漏重放即红。
+
 ### 删除的文件
 
 - `example/`、`webview_example/`:演示目录,含 package main,保留会拖累
@@ -105,9 +147,11 @@ gofmt 现代化——本目录以「逐字节忠实于上游 + 仅功能补丁�
 ## 升级流程
 
 上游若发新版:替换本目录为新版源码 → `grep -n 本仓补丁 systray_windows.go`
-按上文 12 处、`grep -n 本仓补丁 systray_darwin.m` 按上文 9 处、
-`grep -n 本仓补丁 systray.go` 按上文 1 处重放补丁 →
-重新评估是否恢复被删文件 → 主仓按下一节双平台验证。
+按上文 12 处、`grep -n 本仓补丁 systray_darwin.m` 按上文 9+6=15 处
+(锚点注释共 18 行)、`grep -n 本仓补丁 systray.go` 按上文 1 处、面板胶水
+另三个文件(`grep -n 本仓补丁 systray_darwin.go` 2 处 /
+`grep -n 本仓补丁 systray_nonwindows.go` 1 处 / `grep -n 本仓补丁 systray.h`
+2 处)重放补丁 → 重新评估是否恢复被删文件 → 主仓按下一节双平台验证。
 
 ## 验证方式
 
@@ -128,12 +172,38 @@ GDI/托盘行为无法在 darwin 上运行时验证,分四层:
    AI 状态翻转下应保持平坦(不再线性增长);面板接线任务落地后另验
    TrayRect 矩形与点击回调(溢出区两态判废在接线层)。
 
-### macOS(autorelease)
+### macOS(autorelease 与面板胶水)
 
 1. 结构层:`go test ./app/tray/ -run TestVendoredSystrayDarwin`(用例在
-   `app/tray/systray_darwin_patch_test.go`)钉住三件事——9 个入口的函数体
+   `app/tray/systray_darwin_patch_test.go`)钉住四件事——9 个入口的函数体
    整体在 `@autoreleasepool` 内、每处带 `本仓补丁` 锚点、文件里新增的 C
-   入口必须归类(会被 goroutine 直接调用的要包 pool)。同步上游漏重放即红。
+   入口必须归类(会被 goroutine 直接调用的要包 pool,面板胶水的
+   `set_panel_mode` / `tray_rect` 已入清单)、面板胶水形态
+   (`TestVendoredSystrayDarwinPanelPatch`:两态切换/摘菜单接回/左右键
+   sendActionOn 掩码/点击转发链路/tray_rect 的左下原点→全局左上原点换算/
+   export 三处分工/Go 侧包装签名)。同步上游漏重放即红。
+2. 面板胶水探针层(2026-11-26 实测,macOS 26.2):探针程序
+   (/tmp/tray-probe-mac,LSUIElement .app,经 replace 引用本目录,全透明
+   128×128 PNG 图标)程序化验证三条——`SetPanelMode(true)` 后经
+   `performClick:` 程序化点击托盘按钮,`panelClickFn` 回调被触发;
+   `SetPanelMode(false)` 后 `statusItem.menu` 接回、按钮 action/target 摘除;
+   `TrayRect()` 返回值在主屏范围内(与 `[NSScreen screens]` 首个的 frame
+   对照)。
+3. 运行层(autorelease,2026-11-26 实测):探针程序经 replace 引用本目录,
+   在 onReady 里建与 companion 相同的菜单,再按 companion 每 tick 的调用
+   序列以 20Hz 批量调用,`footprint <pid>` 看 MALLOC_SMALL 脏内存——补丁前
+   6.4KB/tick(去图标化后的序列)/ 51KB/tick(含 4 个 provider 菜单项图标的
+   序列),补丁后 1000 轮累计 +0.2MB,平坦。同一探针同时比对
+   statusItem.button 的图标内容哈希与 tooltip、每个菜单项的
+   title/enabled/state/hidden/图标哈希,补丁前后逐字节一致。
+   覆盖范围:逐 tick 序列在运行期实际走到 6 个入口
+   (`add_or_update_menu_item`、`setTooltip`、`setIcon`、`setMenuItemIcon`、
+   `hide_menu_item`、`show_menu_item`);`add_separator` 只在初始化时调用;
+   `setTitle` 与 `quit` 只有结构测试和人工审读覆盖——两者形态安全
+   (`setTitle` 与已覆盖的 `setTooltip` 同构,且 companion 不调用它;`quit`
+   不创建对象)。
+4. 实机层:装机重启 companion 后 `footprint <pid>` 观测,24h 内 MALLOC_SMALL
+   应平坦(旧版 3 天涨到 5.8GB)。
 2. 运行层(2026-11-26 实测,macOS 26.2):探针程序经 replace 引用本目录,
    在 onReady 里建与 companion 相同的菜单,再按 companion 每 tick 的调用
    序列以 20Hz 批量调用,`footprint <pid>` 看 MALLOC_SMALL 脏内存——补丁前

@@ -111,11 +111,11 @@ func Quit() {
 	quitOnce.Do(quit)
 }
 
-// 本仓补丁:面板模式点击回调。设置后,Windows 后端把托盘图标的左/右键点击
-// 都交给回调(每次点击起新 goroutine 异步执行),不再弹原生菜单;nil(默认)
-// 保持上游行为 = 点击弹原生菜单(原生菜单兜底模式)。其余平台后端不接线,
-// 读取此回调的只有 Windows 的 wndProc。应在 Run/Register 之前设置;运行期
-// 切换的时序责任由面板接线层自担。
+// 本仓补丁:面板模式点击回调。设置后,后端把托盘图标的左/右键点击都交给
+// 回调(每次点击起新 goroutine 异步执行),不再弹原生菜单;nil(默认)保持
+// 上游行为 = 点击弹原生菜单(原生菜单兜底模式)。读取此回调的是 Windows 的
+// wndProc 与 macOS 的 systray_tray_clicked(2026-11-26 面板胶水接入 darwin)。
+// 应在 Run/Register 之前设置;运行期切换的时序责任由面板接线层自担。
 var panelClickFn func()
 
 // SetPanelClickHook 注册托盘图标点击回调(面板模式)。
