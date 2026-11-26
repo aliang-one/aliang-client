@@ -235,59 +235,87 @@ void runInMainThread(SEL method, id object) {
                   waitUntilDone: YES];
 }
 
+// 本仓补丁(2026-11-26 macOS companion 内存泄漏):下面的入口在调用者 goroutine
+// 所在的线程上创建 ObjC 对象(NSData/NSImage/NSString/NSNumber 及图片解码的
+// 中间对象,大量是 autoreleased),之后 runInMainThread 才切到主线程。Go 运行时
+// 的线程上没有 autorelease pool,这些对象永不释放:每次图标类调用漏约 6~11KB
+// (随图片内容与尺寸而异)。macOS companion 以 2s 一轮同步,去图标化之前每轮
+// 5 次图标解码,线上实测约 2GB/天;之后每轮 1 次,仍在漏。RSS 很小是因为泄漏页
+// 全被系统压缩,要看 footprint。上游 #135 自 2020 年开着至今。
+// 修法:每个入口的函数体整体包一层 @autoreleasepool,在调用线程上就地排空
+// (quit 不创建对象,包进去只为 9 个入口形态统一)。重放与验证见 PATCH_NOTES.md。
+
 void setIcon(const char* iconBytes, int length, bool template) {
+  @autoreleasepool { // 本仓补丁
   NSData* buffer = [NSData dataWithBytes: iconBytes length:length];
   NSImage *image = [[NSImage alloc] initWithData:buffer];
   [image setSize:NSMakeSize(16, 16)];
   image.template = template;
   runInMainThread(@selector(setIcon:), (id)image);
+  }
 }
 
 void setMenuItemIcon(const char* iconBytes, int length, int menuId, bool template) {
+  @autoreleasepool { // 本仓补丁
   NSData* buffer = [NSData dataWithBytes: iconBytes length:length];
   NSImage *image = [[NSImage alloc] initWithData:buffer];
   [image setSize:NSMakeSize(16, 16)];
   image.template = template;
   NSNumber *mId = [NSNumber numberWithInt:menuId];
   runInMainThread(@selector(setMenuItemIcon:), @[image, (id)mId]);
+  }
 }
 
 void setTitle(char* ctitle) {
+  @autoreleasepool { // 本仓补丁
   NSString* title = [[NSString alloc] initWithCString:ctitle
                                              encoding:NSUTF8StringEncoding];
   free(ctitle);
   runInMainThread(@selector(setTitle:), (id)title);
+  }
 }
 
 void setTooltip(char* ctooltip) {
+  @autoreleasepool { // 本仓补丁
   NSString* tooltip = [[NSString alloc] initWithCString:ctooltip
                                                encoding:NSUTF8StringEncoding];
   free(ctooltip);
   runInMainThread(@selector(setTooltip:), (id)tooltip);
+  }
 }
 
 void add_or_update_menu_item(int menuId, int parentMenuId, char* title, char* tooltip, short disabled, short checked, short isCheckable) {
+  @autoreleasepool { // 本仓补丁
   MenuItem* item = [[MenuItem alloc] initWithId: menuId withParentMenuId: parentMenuId withTitle: title withTooltip: tooltip withDisabled: disabled withChecked: checked];
   free(title);
   free(tooltip);
   runInMainThread(@selector(add_or_update_menu_item:), (id)item);
+  }
 }
 
 void add_separator(int menuId) {
+  @autoreleasepool { // 本仓补丁
   NSNumber *mId = [NSNumber numberWithInt:menuId];
   runInMainThread(@selector(add_separator:), (id)mId);
+  }
 }
 
 void hide_menu_item(int menuId) {
+  @autoreleasepool { // 本仓补丁
   NSNumber *mId = [NSNumber numberWithInt:menuId];
   runInMainThread(@selector(hide_menu_item:), (id)mId);
+  }
 }
 
 void show_menu_item(int menuId) {
+  @autoreleasepool { // 本仓补丁
   NSNumber *mId = [NSNumber numberWithInt:menuId];
   runInMainThread(@selector(show_menu_item:), (id)mId);
+  }
 }
 
 void quit() {
+  @autoreleasepool { // 本仓补丁
   runInMainThread(@selector(quit), nil);
+  }
 }

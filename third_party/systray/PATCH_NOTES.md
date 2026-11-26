@@ -14,6 +14,9 @@ Apache-2.0(LICENSE 原样保留)。本目录的 go.mod 保持上游 module path 
 - 事故现场:2026-11-20 0.196,companion 托盘 AI 菜单每 2s×4 providers 调
   MenuItem.SetIcon,HBITMAP 泄漏 ~83min 耗尽 10k GDI 配额,托盘图标消失
   (WER GDIObjectLeak ×3 实锤)。
+- macOS 侧同病(2026-11-26 定位):`systray_darwin.m` 没有 autorelease pool,
+  每次 UI 调用都泄漏 ObjC 对象,上游 #135 自 2020 年开着至今;fyne-io 只给
+  两条图片路径加了 pool,其余 7 个入口没有,换分支同样不能全修。
 
 ## 相对上游的改动
 
@@ -27,6 +30,23 @@ Apache-2.0(LICENSE 原样保留)。本目录的 go.mod 保持上游 module path 
    hMemBmp 无人接管 = 泄漏;补丁在返回前销毁。
 3. `MenuItem.SetIcon`:上游覆盖 `wt.menuItemIcons[id]` 前不销毁旧句柄,
    每次调用泄漏一个 HBITMAP(主泄漏点);补丁在覆盖前 `DeleteObject` 旧值。
+
+### systray_darwin.m(9 处,2026-11-26)
+
+9 个 C 入口(`setIcon`、`setMenuItemIcon`、`setTitle`、`setTooltip`、
+`add_or_update_menu_item`、`add_separator`、`hide_menu_item`、`show_menu_item`、
+`quit`)的函数体各包一层 `@autoreleasepool`,原有行不动,每处 +2 行。
+
+- 根因:这些入口都在调用者 goroutine 所在的线程上创建 ObjC 对象
+  (NSData/NSImage/NSString/NSNumber 及图片解码的中间对象,大量是
+  autoreleased),之后 `runInMainThread` 才切到主线程。Go 运行时的线程上
+  没有 autorelease pool,这些对象永不释放。
+- 事故现场:macOS companion 每 2s 一轮同步,且该路径没有变更门控。每次图标类
+  调用漏约 6~11KB(随图片内容与尺寸而异):去图标化之前每轮 5 次图标解码,
+  线上实测约 2GB/天;去掉 provider 菜单项图标后每轮 1 次,按探针数据折算约
+  280~380MB/天,仍在漏。RSS 只有 ~32MB——泄漏页全被系统压缩,要看
+  `footprint` 的 MALLOC_SMALL,看 RSS 发现不了。
+- `quit` 不创建对象,包进 pool 只为 9 个入口形态统一。
 
 ### 删除的文件
 
@@ -46,14 +66,40 @@ gofmt 现代化——本目录以「逐字节忠实于上游 + 仅功能补丁�
 ## 升级流程
 
 上游若发新版:替换本目录为新版源码 → `grep -n 本仓补丁 systray_windows.go`
-按上文 3 处重放补丁 → 重新评估是否恢复被删文件 → 主仓
-`GOOS=windows go build ./third_party/systray/` + darwin `go build ./app/tray/`
-双验证。
+按上文 3 处、`grep -n 本仓补丁 systray_darwin.m` 按上文 9 处重放补丁 →
+重新评估是否恢复被删文件 → 主仓按下一节双平台验证。
 
 ## 验证方式
 
+本目录是嵌套模块,主模块不认 `./third_party/systray/` 这种路径写法;编译
+验证要写 import 路径 `github.com/getlantern/systray`,由主仓的 replace 解析。
+
+### Windows(GDI)
+
 GDI 行为无法在 darwin 上运行时验证,分三层:
-1. 编译层:`GOOS=windows GOARCH=amd64 go build ./third_party/systray/`。
+1. 编译层:`GOOS=windows GOARCH=amd64 go build github.com/getlantern/systray`。
 2. 审阅层:补丁 diff 仅 3 处、语义直白(销毁即将被覆盖/丢弃的句柄)。
 3. 实机层:部署后在真机用 GetGuiResources 观测 companion 的 GDI 对象数,
    AI 状态翻转下应保持平坦(不再线性增长)。
+
+### macOS(autorelease)
+
+1. 结构层:`go test ./app/tray/ -run TestVendoredSystrayDarwin`(用例在
+   `app/tray/systray_darwin_patch_test.go`)钉住三件事——9 个入口的函数体
+   整体在 `@autoreleasepool` 内、每处带 `本仓补丁` 锚点、文件里新增的 C
+   入口必须归类(会被 goroutine 直接调用的要包 pool)。同步上游漏重放即红。
+2. 运行层(2026-11-26 实测,macOS 26.2):探针程序经 replace 引用本目录,
+   在 onReady 里建与 companion 相同的菜单,再按 companion 每 tick 的调用
+   序列以 20Hz 批量调用,`footprint <pid>` 看 MALLOC_SMALL 脏内存——补丁前
+   6.4KB/tick(去图标化后的序列)/ 51KB/tick(含 4 个 provider 菜单项图标的
+   序列),补丁后 1000 轮累计 +0.2MB,平坦。同一探针同时比对
+   statusItem.button 的图标内容哈希与 tooltip、每个菜单项的
+   title/enabled/state/hidden/图标哈希,补丁前后逐字节一致。
+   覆盖范围:逐 tick 序列在运行期实际走到 6 个入口
+   (`add_or_update_menu_item`、`setTooltip`、`setIcon`、`setMenuItemIcon`、
+   `hide_menu_item`、`show_menu_item`);`add_separator` 只在初始化时调用;
+   `setTitle` 与 `quit` 只有结构测试和人工审读覆盖——两者形态安全
+   (`setTitle` 与已覆盖的 `setTooltip` 同构,且 companion 不调用它;`quit`
+   不创建对象)。
+3. 实机层:装机重启 companion 后 `footprint <pid>` 观测,24h 内 MALLOC_SMALL
+   应平坦(旧版 3 天涨到 5.8GB)。
