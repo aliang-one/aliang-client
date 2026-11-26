@@ -120,6 +120,10 @@ var panelClickFn func()
 
 // SetPanelClickHook 注册托盘图标点击回调(面板模式)。
 // fn 为 nil 时恢复原生菜单兜底模式。
+// 回调契约:应快速返回——每次点击都会起新 goroutine,耗时回调会按连点
+// 次数无上限堆积 goroutine;回调可能并发执行(双击 = 两个并发回调),
+// 串行化由接线层负责;回调 panic 发生在无 recover 的 goroutine 上,
+// 会终止整个进程。
 func SetPanelClickHook(fn func()) {
 	panelClickFn = fn
 }

@@ -26,7 +26,7 @@ import (
 //     且 NOTIFYICONIDENTIFIER 与库内 notifyIconData(NOTIFYICONDATAW)是
 //     两个不同结构体,不得混用。
 //   - 成功只认 ret==0(S_OK);S_FALSE(1)表示图标在溢出区(Win10 给溢出
-//     箭头矩形 / Win11 给屏外坐标),连同 rect 原样透传给调用方判废。
+//     箭头矩形 / Win11 给屏外坐标),连同 Rect 原样透传给调用方判废。
 //
 // 本机是 macOS 跑不了 Windows GUI,验证手段只有编译 + 本结构测试。
 func TestSystrayWindowsPanelPatch(t *testing.T) {
@@ -124,7 +124,7 @@ func TestSystrayWindowsPanelPatch(t *testing.T) {
 		if regexp.MustCompile(`cbSize:\s*[0-9]`).MatchString(body) {
 			t.Fatalf("TrayRect 的 cbSize 不允许写字面常量:\n%s", body)
 		}
-		assertAnchorAbove(t, winSrc, "func TrayRect() (rect, error) {", 6)
+		assertAnchorAbove(t, winSrc, "func TrayRect() (Rect, error) {", 6)
 	})
 
 	t.Run("TrayRect_两参Call且只认S_OK", func(t *testing.T) {

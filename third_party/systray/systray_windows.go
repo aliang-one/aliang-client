@@ -5,6 +5,7 @@ package systray
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -188,9 +189,10 @@ type point struct {
 }
 
 // 本仓补丁:RECT 结构——新版 golang.org/x/sys 已不再提供,库内自备
-// (风格同上游的 point),TrayRect 用。
+// (风格同上游的 point),TrayRect 用。导出(而非 rect)是因为 TrayRect
+// 返回它,Go 惯例反对 exported func 返回未导出类型——接线层无法命名。
 // https://msdn.microsoft.com/en-us/library/windows/desktop/dd162897(v=vs.85).aspx
-type rect struct {
+type Rect struct {
 	Left, Top, Right, Bottom int32
 }
 
@@ -709,17 +711,21 @@ func (h HRESULT) Error() string {
 	return fmt.Sprintf("Shell_NotifyIconGetRect: HRESULT=0x%08X", uint32(h))
 }
 
+// 本仓补丁:errTrayNotInitialized——TrayRect 的「托盘未初始化」前置错误
+// 哨兵,与 HRESULT 的类型化错误对称,接线层可 errors.Is 判定。
+var errTrayNotInitialized = errors.New("TrayRect: tray not initialized")
+
 // 本仓补丁:TrayRect 返回托盘图标的屏幕矩形(物理像素),面板窗口锚定用。
 // 真实 Win32 签名第二参是 RECT*(调用方分配好的矩形指针;MSDN 语法块里的
 // LPRECT* 是文档笔误,照抄会传 RECT** 导致脏写)。成功只认 ret==0(S_OK);
-// 其余 HRESULT 连同已填充的 rect 原样透传——S_FALSE(1)表示图标在溢出区,
+// 其余 HRESULT 连同已填充的 Rect 原样透传——S_FALSE(1)表示图标在溢出区,
 // 此时 Win10 给溢出箭头的矩形、Win11 给屏外坐标,是否可用由调用方判废。
-func TrayRect() (rect, error) {
+func TrayRect() (Rect, error) {
 	const S_OK = 0
 	wt.muNID.RLock()
 	if wt.nid == nil {
 		wt.muNID.RUnlock()
-		return rect{}, fmt.Errorf("TrayRect: tray not initialized")
+		return Rect{}, errTrayNotInitialized
 	}
 	idf := notifyIconIdentifier{
 		cbSize: uint32(unsafe.Sizeof(notifyIconIdentifier{})),
@@ -727,7 +733,7 @@ func TrayRect() (rect, error) {
 		uID:    wt.nid.ID,
 	}
 	wt.muNID.RUnlock()
-	var r rect
+	var r Rect
 	ret, _, _ := pShell_NotifyIconGetRect.Call(
 		uintptr(unsafe.Pointer(&idf)),
 		uintptr(unsafe.Pointer(&r)),

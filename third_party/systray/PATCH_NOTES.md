@@ -28,9 +28,11 @@ Apache-2.0(LICENSE 原样保留)。本目录的 go.mod 保持上游 module path 
 1. `panelClickFn` + `SetPanelClickHook(fn func())`:面板模式点击回调。设置后
    Windows 后端把托盘图标的左/右键点击交给回调(每次点击起新 goroutine
    异步执行),不再弹原生菜单;nil(默认)= 上游行为,原生菜单兜底。只有
-   Windows 的 wndProc 读取此回调,其余平台后端不接线。
+   Windows 的 wndProc 读取此回调,其余平台后端不接线。回调契约已写进
+   注释:应快速返回(否则 goroutine 按连点次数无上限堆积)、可能并发执行
+   (串行化归接线层)、panic 会终止整个进程(无 recover 的 goroutine)。
 
-### systray_windows.go(11 处;1~3=2026-11-20 GDI 修复,4~11=2026-11-26 面板胶水)
+### systray_windows.go(12 处;1~3=2026-11-20 GDI 修复,4~12=2026-11-26 面板胶水)
 
 1. proc 表新增 `pDeleteObject = g32.NewProc("DeleteObject")`。
 2. `iconToBitmap`:`pDrawIconEx` 失败路径上游直接 `return 0`,已创建的
@@ -41,18 +43,21 @@ Apache-2.0(LICENSE 原样保留)。本目录的 go.mod 保持上游 module path 
    + 新增 `notifyIconIdentifier` 结构体(NOTIFYICONIDENTIFIER):与库内
    `notifyIconData`(NOTIFYICONDATAW)是两个不同结构体,不得混用;字段名
    保持 Win32 原名(cbSize/hWnd/uID/guidItem)防转录错位。(两处锚点)
-5. 新增 `rect` 结构体:新版 golang.org/x/sys 已不再提供 RECT,库内自备,
-   风格同上游的 `point`。
-6. 新增 `HRESULT` 类型 + 包级 `TrayRect()`:拿托盘图标屏幕矩形(面板窗口
-   锚定用)。要点:①cbSize 必须用 `uint32(unsafe.Sizeof(notifyIconIdentifier{}))`
-   表达式——该结构 x64 sizeof=40(已用编译期断言实编译验证),照抄上游
-   字面常量风格写 24 会让 API 恒 E_INVALIDARG 且被兜底静默掩盖;②Call 是
-   两参形态 `Call(uintptr(unsafe.Pointer(&idf)), uintptr(unsafe.Pointer(&r)))`
+5. 新增 `Rect` 结构体:新版 golang.org/x/sys 已不再提供 RECT,库内自备,
+   风格同上游的 `point`;导出(而非 `rect`)是因为 TrayRect 返回它——Go
+   惯例反对 exported func 返回未导出类型,接线层无法命名。
+6. 新增 `HRESULT` 类型 + 哨兵 `errTrayNotInitialized` + 包级 `TrayRect()`:
+   拿托盘图标屏幕矩形(面板窗口锚定用)。要点:①cbSize 必须用
+   `uint32(unsafe.Sizeof(notifyIconIdentifier{}))` 表达式——该结构 x64
+   sizeof=40(已用编译期断言实编译验证),照抄上游字面常量风格写 24 会让
+   API 恒 E_INVALIDARG 且被兜底静默掩盖;②Call 是两参形态
+   `Call(uintptr(unsafe.Pointer(&idf)), uintptr(unsafe.Pointer(&r)))`
    ——真实 Win32 签名第二参是 `RECT *`(调用方分配好的矩形指针),MSDN
    语法块的 `LPRECT *` 是文档笔误,照抄会传 RECT** 导致脏写;③成功只认
    `ret == 0`(S_OK),S_FALSE(1)= 图标在溢出区(Win10 给溢出箭头矩形 /
-   Win11 给屏外坐标),连同已填充的 rect 原样透传,由调用方判废。
-   (两处锚点)
+   Win11 给屏外坐标),连同已填充的 Rect 原样透传,由调用方判废;④托盘
+   未初始化的前置错误用包级哨兵 `errTrayNotInitialized`(可 errors.Is
+   判定),与 HRESULT 的类型化错误对称。(三处锚点)
 7. `wndProc` 的 WM_LBUTTONUP/WM_RBUTTONUP 分支:`panelClickFn != nil` 时
    `go panelClickFn()`(面板模式),否则落回 `showMenu()` 原生菜单兜底。
 8. `showMenu` 两处:①TrackPopupMenu flags 加 `TPM_RIGHTBUTTON`(右键路径
@@ -100,7 +105,7 @@ gofmt 现代化——本目录以「逐字节忠实于上游 + 仅功能补丁�
 ## 升级流程
 
 上游若发新版:替换本目录为新版源码 → `grep -n 本仓补丁 systray_windows.go`
-按上文 11 处、`grep -n 本仓补丁 systray_darwin.m` 按上文 9 处、
+按上文 12 处、`grep -n 本仓补丁 systray_darwin.m` 按上文 9 处、
 `grep -n 本仓补丁 systray.go` 按上文 1 处重放补丁 →
 重新评估是否恢复被删文件 → 主仓按下一节双平台验证。
 
