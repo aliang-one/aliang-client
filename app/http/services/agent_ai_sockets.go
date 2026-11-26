@@ -65,6 +65,9 @@ type agentAISocket struct {
 	// subOrder 是 subs 的插入序（最旧在前）：cap 逐出按它取最旧。
 	// 只在 s.mu 内读写；不含已删键（subscribe/unsubscribe 同步维护）。
 	subOrder []string
+	// A cloud unsubscribe can expire independently of a local run. Keep the
+	// delivery subscription until that run settles or the viewer renews it.
+	pendingUnsubscribes map[string]struct{}
 	// onDead 由 registerAISocket 注入：溢出/写失败断开时把自身从注册表摘除。
 	// 经 closeOnce 保证只触发一次。
 	onDead func(id string)
@@ -324,6 +327,7 @@ func (m *agentAIManager) subscribeAISocket(socketID, sessionID string) {
 func (m *agentAIManager) subscribeAISocketLocked(s *agentAISocket, sessionID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	delete(s.pendingUnsubscribes, sessionID)
 	if _, exists := s.subs[sessionID]; !exists && len(s.subs) >= agentAISocketSubCap {
 		// 逐出最旧且非活跃 run 的订阅；活跃 run 的订阅绝不全清连坐
 		// （审计 2026-11-17：started/delta 无重放通道）。活跃项轮转保到队尾，
@@ -342,6 +346,7 @@ func (m *agentAIManager) subscribeAISocketLocked(s *agentAISocket, sessionID str
 					continue
 				}
 				delete(s.subs, oldest)
+				delete(s.pendingUnsubscribes, oldest)
 				evicted++
 			}
 		}
@@ -351,6 +356,7 @@ func (m *agentAIManager) subscribeAISocketLocked(s *agentAISocket, sessionID str
 			s.subOrder = s.subOrder[1:]
 			if _, ok := s.subs[oldest]; ok {
 				delete(s.subs, oldest)
+				delete(s.pendingUnsubscribes, oldest)
 				evicted++
 			}
 		}
@@ -400,21 +406,50 @@ func (m *agentAIManager) sessionHasActiveRunLocked(sessionID string) bool {
 	return s != nil && s.activeRunID != ""
 }
 
+func (s *agentAISocket) removeSubscriptionLocked(sessionID string) {
+	delete(s.pendingUnsubscribes, sessionID)
+	if _, subscribed := s.subs[sessionID]; !subscribed {
+		return
+	}
+	delete(s.subs, sessionID)
+	for i, id := range s.subOrder {
+		if id == sessionID {
+			s.subOrder = append(s.subOrder[:i], s.subOrder[i+1:]...)
+			break
+		}
+	}
+}
+
 func (m *agentAIManager) unsubscribeAISocket(socketID, sessionID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if s := m.aiSockets[socketID]; s != nil {
-		s.mu.Lock()
-		if _, ok := s.subs[sessionID]; ok {
-			delete(s.subs, sessionID)
-			for i, k := range s.subOrder {
-				if k == sessionID {
-					s.subOrder = append(s.subOrder[:i], s.subOrder[i+1:]...)
-					break
-				}
+	s := m.aiSockets[socketID]
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if socketID == agentAIRemoteSocketID && m.sessionHasActiveRunLocked(sessionID) {
+		if _, subscribed := s.subs[sessionID]; subscribed {
+			if s.pendingUnsubscribes == nil {
+				s.pendingUnsubscribes = make(map[string]struct{})
 			}
+			s.pendingUnsubscribes[sessionID] = struct{}{}
 		}
-		s.mu.Unlock()
+		return
+	}
+	s.removeSubscriptionLocked(sessionID)
+}
+
+func (m *agentAIManager) finishRemoteUnsubscribeLocked(sessionID string) {
+	s := m.aiSockets[agentAIRemoteSocketID]
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, pending := s.pendingUnsubscribes[sessionID]; pending {
+		s.removeSubscriptionLocked(sessionID)
 	}
 }
 

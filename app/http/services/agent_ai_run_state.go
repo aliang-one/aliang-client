@@ -43,6 +43,7 @@ func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON ag
 		subagentControl = session.subagentControl
 		session.subagentControl = nil
 		session.activeRunID = ""
+		m.finishRemoteUnsubscribeLocked(sessionID)
 		session.goalIdentity = nil
 		session.history = trimAgentAIHistoryForSession(session, session.history)
 	}

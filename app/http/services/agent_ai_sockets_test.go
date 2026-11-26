@@ -43,6 +43,37 @@ func TestAISocketRegisterUnsubscribeLifecycle(t *testing.T) {
 	}
 }
 
+func TestAISocketDefersRemoteUnsubscribeUntilRunEnds(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	remote := m.registerAISocket("remote", func(interface{}) error { return nil })
+	local := m.registerAISocket("local", func(interface{}) error { return nil })
+	defer m.unregisterAISocket(remote.id)
+	defer m.unregisterAISocket(local.id)
+	m.sessions["s1"] = &agentAISession{id: "s1", activeRunID: "run-1", runSeq: 1}
+
+	m.subscribeAISocket(remote.id, "s1")
+	m.subscribeAISocket(local.id, "s1")
+	m.unsubscribeAISocket(remote.id, "s1")
+	m.unsubscribeAISocket(local.id, "s1")
+	if !remote.subscribed("s1") || local.subscribed("s1") {
+		t.Fatal("remote subscription should survive the run while local unsubscribe applies immediately")
+	}
+
+	m.subscribeAISocket(remote.id, "s1")
+	m.clearRunning("s1", 1, nil)
+	if !remote.subscribed("s1") {
+		t.Fatal("renewal should keep the subscription after the run ends")
+	}
+
+	m.sessions["s1"].activeRunID = "run-2"
+	m.sessions["s1"].runSeq = 2
+	m.unsubscribeAISocket(remote.id, "s1")
+	m.clearRunning("s1", 2, nil)
+	if remote.subscribed("s1") {
+		t.Fatal("deferred unsubscribe should apply when the run ends")
+	}
+}
+
 func TestAISocketSlowConsumerDropped(t *testing.T) {
 	m := newTestAISocketsManager(t)
 	block := make(chan struct{})
