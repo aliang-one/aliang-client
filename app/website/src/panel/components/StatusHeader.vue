@@ -50,9 +50,9 @@ export function statusHeaderContent(kind, run) {
     return { title: '代理运行中', subtitle: parts.join(' · '), busy: false, dotClass: 'green pulse', logoOff: false };
   }
   if (kind === 'stopped') {
-    // 「下次启动 · ××模式」读 summary.run.mode——面板侧模式 segmented 无
-    // 落盘通道(拍板 2 仅停止态本地乐观选中),下次启动真正生效的仍是
-    // 服务端配置的这份值,状态头以服务端为准不说谎。
+    // 「下次启动 · ××模式」读 summary.run.mode——segmented 点击已落盘到
+    // 服务端(setMode),轮询回读后本值即反映真实下次启动模式;回读滞后
+    // 的瞬间以服务端为准不说谎。
     return { title: '代理已停止', subtitle: label ? `下次启动 · ${label}模式` : '下次启动', busy: false, dotClass: 'gray', logoOff: true };
   }
   if (kind === 'logged_out') {

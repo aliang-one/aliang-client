@@ -8,7 +8,7 @@
 // 宿主对象用 vi.stubGlobal 打桩(jsdom 下 globalThis 即 window),fetch 用
 // stubGlobal + fake timers,测完恢复。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { getSummary, isHosted, postMessageHost, restartProxy, startProxy, stopProxy, SUMMARY_TIMEOUT_MS } from './api';
+import { getSummary, isHosted, postMessageHost, PROXY_ACTION_TIMEOUT_MS, restartProxy, setMode, startProxy, stopProxy, SUMMARY_TIMEOUT_MS } from './api';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -192,8 +192,12 @@ describe('动作链路(信封/启停/超时)', () => {
         })
     );
     const pending = getSummary();
+    // 拒绝断言先于推进时钟挂上:abort 在 advanceTimersByTimeAsync 期间落地,
+    // 若此刻 pending 还没有任何 handler,Node 会记 unhandledRejection
+    // (vitest 汇总报 Unhandled Errors)——先挂断言再触发即可消除。
+    const assertion = expect(pending).rejects.toThrow(`超时(${SUMMARY_TIMEOUT_MS}ms)`);
     await vi.advanceTimersByTimeAsync(SUMMARY_TIMEOUT_MS);
-    await expect(pending).rejects.toThrow(`超时(${SUMMARY_TIMEOUT_MS}ms)`);
+    await assertion;
   });
 
   it('restart 中途 stop 失败(非白名单)→ 整条 restart 抛错且不发 start', async () => {
@@ -204,8 +208,54 @@ describe('动作链路(信封/启停/超时)', () => {
       })
     );
     const done = restartProxy();
+    // 同⑥:拒绝断言先于冲队列挂上,消除 rejection 落地时无 handler 的窗口。
+    const assertion = expect(done).rejects.toThrow('stop 炸了');
     await flushQueue();
-    await expect(done).rejects.toThrow('stop 炸了');
+    await assertion;
     expect(fetchMock.mock.calls.map((c) => c[0])).toEqual(['/api/run/stop']);
+  });
+
+  it('⑦ setMode POST /api/run/swift,body {"mode":...},成功透传 data', async () => {
+    const fetchMock = stubFetch(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ code: 0, data: { status: 'switched', current_mode: 'tun' } }),
+      })
+    );
+    const out = await setMode('tun');
+    expect(out).toEqual({ status: 'switched', current_mode: 'tun' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/run/swift');
+    expect(fetchMock.mock.calls[0][1].method).toBe('POST');
+    expect(fetchMock.mock.calls[0][1].body).toBe(JSON.stringify({ mode: 'tun' }));
+    // 超时走启停同一条 proxyAction(10s 档,fetchJson 内部消费 timeoutMs,
+    // 不出现在 fetch 入参;超时转译机制本身由⑥用例覆盖)——这里断言
+    // abort 信号已挂,证明确有超时闸。
+    expect(fetchMock.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal);
+    expect(PROXY_ACTION_TIMEOUT_MS).toBe(10000); // 与启停同档的静态锚
+  });
+
+  it('⑧ setMode 非法 mode(status=failed)→ 抛错且带服务端 msg', async () => {
+    stubFetch(() =>
+      Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            code: 0,
+            data: { status: 'failed', error: 'invalid_mode', msg: "Invalid target mode: bad. Must be 'http' or 'tun'" },
+          }),
+      })
+    );
+    await expect(setMode('bad')).rejects.toThrow('Invalid target mode');
+  });
+
+  it('⑨ setMode 同值幂等(status=unchanged)→ 视为成功不抛', async () => {
+    stubFetch(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ code: 0, data: { status: 'unchanged', current_mode: 'http' } }),
+      })
+    );
+    await expect(setMode('http')).resolves.toEqual({ status: 'unchanged', current_mode: 'http' });
   });
 });

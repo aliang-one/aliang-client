@@ -19,6 +19,14 @@
 const SUMMARY_PATH = '/api/tray/summary';
 const RUN_START_PATH = '/api/run/start';
 const RUN_STOP_PATH = '/api/run/stop';
+// 模式切换:POST /api/run/swift(body {"mode":"http"|"tun"}),契约 2026-11-27
+// 读码核实(routes.go:193 → HandleRunSwift → RunService.SwitchMode):
+//   失败恒藏 200 信封 data:{status:'failed', error, msg}(invalid_mode /
+//   wintun_required|wintun_installing / switch_failed);成功 data.status=
+//   'switched',同值幂等 'unchanged'。⚠️ 运行中调用会同步停掉当前代理且
+//   不拉起(SwitchMode 既有语义)——调用方必须只在停止态调用(面板拍板 2:
+//   segmented 仅 stopped 可点)。
+const RUN_MODE_PATH = '/api/run/swift';
 
 // getSummary 的超时预算:面板 2s 轮询一次,超时 1.5s 保证不堆叠
 // (实现计划 Task 7 指定值)。
@@ -33,11 +41,17 @@ export const PROXY_ACTION_TIMEOUT_MS = 10000;
 export const RESTART_GAP_MS = 400;
 
 // 底层请求:同源 fetch + AbortController 超时,HTTP 非 2xx 抛错。
-async function fetchJson(path, { method = 'GET', timeoutMs } = {}) {
+// body(JSON 字符串)可选:仅 POST 动作使用,带上标准 Content-Type
+// (服务端 DecodeRequest 只认 body 本身,头是规范习惯非硬依赖)。
+async function fetchJson(path, { method = 'GET', timeoutMs, body } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(path, { method, signal: controller.signal });
+    const res = await fetch(path, {
+      method,
+      signal: controller.signal,
+      ...(body !== undefined ? { body, headers: { 'Content-Type': 'application/json' } } : {}),
+    });
     if (!res.ok) {
       throw new Error(`${method} ${path} 失败: HTTP ${res.status}`);
     }
@@ -70,10 +84,10 @@ export function getSummary() {
 
 // 启停动作:除信封外,还要看 data.status==='failed'(业务失败恒 200 信封,
 // 见文件头契约注释)。失败抛 Error(带服务端 msg),成功返回 data。
-async function proxyAction(path, { tolerateErrors = [] } = {}) {
-  const body = await fetchJson(path, { method: 'POST', timeoutMs: PROXY_ACTION_TIMEOUT_MS });
-  unwrapEnvelopeOrThrow(body, path);
-  const data = body && typeof body === 'object' ? body.data : undefined;
+async function proxyAction(path, { tolerateErrors = [], body } = {}) {
+  const payload = await fetchJson(path, { method: 'POST', timeoutMs: PROXY_ACTION_TIMEOUT_MS, body });
+  unwrapEnvelopeOrThrow(payload, path);
+  const data = payload && typeof payload === 'object' ? payload.data : undefined;
   if (data && typeof data === 'object' && data.status === 'failed') {
     // tolerateErrors:重启流程里 stop 撞 not_running 属正常(companion 同款
     // 容忍,app/tray/companion.go stopProxy),不算失败。
@@ -93,6 +107,13 @@ export function startProxy() {
 // 停止代理:POST /api/run/stop。not_running 容忍(幂等,与托盘同口径)。
 export function stopProxy() {
   return proxyAction(RUN_STOP_PATH, { tolerateErrors: ['not_running'] });
+}
+
+// 切换运行模式:POST /api/run/swift(契约见 RUN_MODE_PATH 注释)。失败
+// (非法 mode/wintun 依赖/落盘失败)抛错带服务端 msg;'unchanged' 幂等属
+// 成功。超时沿用启停 10s 档(SwitchMode 内含 wintun 刷新与配置落盘)。
+export function setMode(mode) {
+  return proxyAction(RUN_MODE_PATH, { body: JSON.stringify({ mode }) });
 }
 
 // 重启代理:stop → 间隔 RESTART_GAP_MS → start(服务端无 restart 路由,

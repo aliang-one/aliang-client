@@ -5,12 +5,13 @@
      翻转目标态才撤过渡(§6-1);api 失败立即撤过渡 + warn toast;
      api 成功但轮询迟迟不翻转由 6s 看门狗强撤,控件绝不永久锁死。
      模式 segmented(拍板 2):running/过渡一律禁用,消除 SwitchMode
-     「停而不起」陷阱;仅 stopped 可点——本地乐观选中 + toast,面板侧无
-     模式落盘通道,运行态回正以服务端 summary 为准。 -->
+     「停而不起」陷阱(运行中调用 SwitchMode 会同步停代理且不拉起);
+     仅 stopped 可点——乐观选中 + setMode 落盘(POST /api/run/swift),
+     成功保留选中、失败回滚,summary 回读后一律以服务端为准。 -->
 <script setup>
 import { computed, inject, onUnmounted, ref, watch } from 'vue';
 import { allControlsDisabled, derivePanelState } from '../state';
-import { restartProxy, startProxy, stopProxy } from '../api';
+import { restartProxy, setMode, startProxy, stopProxy } from '../api';
 
 // 数据层(纪律 M-4):经 App.vue 根壳 inject,绝不开第二条轮询。
 const { summary, connLost, panelState, localTransition } = inject('panelData');
@@ -47,8 +48,8 @@ function confirm(what) {
 
 watch(remoteKind, (kind, prevKind) => {
   // 进入 running 稳态(本次启停或外部启动):模式选中以服务端为准回正。
-  // 面板侧模式 segmented 无落盘通道,停止态的乐观选中从未被服务端确认,
-  // 运行态再显示它就与状态头副标题(读 summary.run.mode)打架了。
+  // running 态 segmented 本就禁用,显示值必须与实际运行模式(状态头副标题
+  // 读 summary.run.mode)一致,否则两处打架。
   if (kind === 'running' && prevKind !== 'running') adoptServerMode();
   const t = localTransition.value;
   if (!t) return;
@@ -135,12 +136,30 @@ watch(
   { immediate: true }
 );
 
-function onMode(mode) {
+// 模式落盘在途闸:上一次 setMode 未返回前再点直接忽略(防连点双发)。
+let modePending = false;
+
+// onMode — 停止态点击:乐观选中 → setMode 落盘(拍板 2「下次启动生效」的
+// 服务端真身)→ 成功保留选中,summary 回读以服务端为准;失败回滚 + warn
+// toast 带服务端 msg。running/过渡态被 segDisabled + 本闸双重挡住
+// (SwitchMode 运行中调用会同步停代理且不拉起——拍板 2 禁用的原因)。
+async function onMode(mode) {
   if (panelState.value !== 'stopped') return; // 拍板 2:仅停止态可点
+  if (modePending) return;
   if (selectedMode.value === mode) return;
-  selectedMode.value = mode;
-  const label = modeLabel(mode);
-  toast.show(label ? `下次启动 · ${label}模式` : '已切换模式');
+  const previous = selectedMode.value;
+  selectedMode.value = mode; // 乐观选中,失败回滚
+  modePending = true;
+  try {
+    await setMode(mode);
+    const label = modeLabel(mode);
+    toast.show(label ? `已切换为${label}模式（下次启动生效）` : '已切换模式（下次启动生效）');
+  } catch (err) {
+    selectedMode.value = previous;
+    toast.show(err && err.message ? err.message : '模式切换失败', 'warn');
+  } finally {
+    modePending = false;
+  }
 }
 
 // ---- 派生给模板 ----

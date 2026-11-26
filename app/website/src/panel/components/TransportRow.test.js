@@ -8,13 +8,14 @@ import { computed, createApp, h, nextTick, ref } from 'vue';
 import TransportRow from './TransportRow.vue';
 import { derivePanelState } from '../state';
 import { useToast } from './Toast.vue';
-import { restartProxy, startProxy, stopProxy } from '../api';
+import { restartProxy, setMode, startProxy, stopProxy } from '../api';
 
-// api 层全部 mock:组件动作链路(启停/重启)不真发请求。
+// api 层全部 mock:组件动作链路(启停/重启/模式落盘)不真发请求。
 vi.mock('../api', () => ({
   startProxy: vi.fn(),
   stopProxy: vi.fn(),
   restartProxy: vi.fn(),
+  setMode: vi.fn(),
   getSummary: vi.fn(),
   isHosted: vi.fn(() => false),
   postMessageHost: vi.fn(() => false),
@@ -69,6 +70,7 @@ function q(el, sel) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  setMode.mockResolvedValue({}); // 默认模式落盘成功,失败路径用例内覆盖
   useToast().clear();
 });
 
@@ -100,8 +102,8 @@ describe('TransportRow 静态形态', () => {
   });
 });
 
-describe('TransportRow 模式 segmented(拍板 2:运行/过渡禁用,仅停止可点)', () => {
-  it('running 时 seg 禁用且点击无效(不切选中、不弹 toast)', async () => {
+describe('TransportRow 模式 segmented(拍板 2:运行/过渡禁用,仅停止可点;落盘走 setMode)', () => {
+  it('running 时 seg 禁用且点击无效(不切选中、不弹 toast、不落盘)', async () => {
     const { el } = mountRow({ summaryInit: { isRunning: true, mode: 'http' } });
     const seg = q(el, '.seg');
     expect(seg.className).toContain('seg-disabled');
@@ -114,23 +116,54 @@ describe('TransportRow 模式 segmented(拍板 2:运行/过渡禁用,仅停止�
     expect(deep.className).not.toContain('on'); // 选中未移动
     expect(regular.className).toContain('on');
     expect(useToast().toasts.value.length).toBe(0); // 无 toast
+    expect(setMode).not.toHaveBeenCalled(); // 不发落盘请求
   });
 
-  it('stopped 点击深度:即时选中 + toast;summary 同值回读不弹回', async () => {
-    const { el, summary } = mountRow({ summaryInit: { isRunning: false, mode: 'http' } });
+  it('stopped 点击深度:调 setMode("tun") 落盘 + 即时选中 + 成功 toast', async () => {
+    setMode.mockResolvedValue({ status: 'switched' });
+    const { el } = mountRow({ summaryInit: { isRunning: false, mode: 'http' } });
     const seg = q(el, '.seg');
     expect(seg.className).not.toContain('seg-disabled');
     const regular = seg.querySelectorAll('.opt')[0];
     const deep = seg.querySelectorAll('.opt')[1];
     deep.click();
     await flush();
+    expect(setMode).toHaveBeenCalledTimes(1);
+    expect(setMode).toHaveBeenCalledWith('tun'); // 参数正确(wire 值,非中文)
     expect(deep.className).toContain('on');
     expect(regular.className).not.toContain('on');
-    expect(useToast().toasts.value.some((t) => t.msg.includes('深度'))).toBe(true);
-    // 「等 summary 回读确认」:轮询回读同值(服务器模式未变)→ 乐观选中保留。
+    const t = useToast().toasts.value.at(-1);
+    expect(t.kind).toBe('success');
+    expect(t.msg).toContain('深度');
+    expect(t.msg).toContain('下次启动生效');
+  });
+
+  it('stopped 点击后轮询滞后回读旧值(http)不弹回选中', async () => {
+    setMode.mockResolvedValue({ status: 'switched' });
+    const { el, summary } = mountRow({ summaryInit: { isRunning: false, mode: 'http' } });
+    const deep = q(el, '.seg').querySelectorAll('.opt')[1];
+    deep.click();
+    await flush();
+    expect(deep.className).toContain('on');
+    // 回读滞后:轮询仍报旧值 http(lastServerMode 未变)→ 乐观选中保留。
     summary.value = makeSummary({ isRunning: false, mode: 'http' });
     await flush();
     expect(deep.className).toContain('on');
+  });
+
+  it('setMode 失败:选中回滚 + warn toast 带服务端 msg', async () => {
+    setMode.mockRejectedValue(new Error('Invalid target mode: tun. Must be \'http\' or \'tun\''));
+    const { el } = mountRow({ summaryInit: { isRunning: false, mode: 'http' } });
+    const regular = q(el, '.seg').querySelectorAll('.opt')[0];
+    const deep = q(el, '.seg').querySelectorAll('.opt')[1];
+    deep.click();
+    await flush();
+    expect(setMode).toHaveBeenCalledWith('tun');
+    expect(deep.className).not.toContain('on'); // 回滚:深度落选
+    expect(regular.className).toContain('on'); // 常规回到选中
+    const t = useToast().toasts.value.at(-1);
+    expect(t.kind).toBe('warn');
+    expect(t.msg).toContain('http');
   });
 
   it('服务端模式值变化(如仪表盘改的)→ segmented 跟随回读值', async () => {
