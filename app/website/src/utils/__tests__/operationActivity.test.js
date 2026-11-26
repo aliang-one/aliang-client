@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseOperation, mergeOperation, operationPercent } from '../operationActivity';
+import { parseOperation, mergeOperation, operationElapsedLabel, operationPercent } from '../operationActivity';
 
 // 合法 wire 帧工厂:测试逐字段改坏,其余字段保持合法
 const frame = extra => ({
@@ -263,6 +263,21 @@ describe('mergeOperation(revision 单调 + 终态钉死,原 Map 永不被改)', 
     const out2 = mergeOperation(junkState, frame({ revision: 1 }));
     expect(out2.get('op-1')).not.toBe('垃圾行');
     expect(out2.get('op-1').operation_id).toBe('op-1');
+  });
+});
+
+describe('operationElapsedLabel', () => {
+  const started_at = '2026-11-25T10:00:00Z';
+  const now = Date.parse('2026-11-25T11:02:03Z');
+
+  it('shows hours for long-running work', () => {
+    expect(operationElapsedLabel(frame({ started_at, phase: 'waiting' }), now)).toBe('1:02:03');
+  });
+
+  it('omits elapsed time when work is queued or timestamps are unavailable', () => {
+    expect(operationElapsedLabel(frame({ started_at, phase: 'queued' }), now)).toBeNull();
+    expect(operationElapsedLabel(frame({ started_at: '' }), now)).toBeNull();
+    expect(operationElapsedLabel(frame({ started_at, phase: 'completed' }), now)).toBeNull();
   });
 });
 

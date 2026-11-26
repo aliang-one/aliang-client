@@ -51,6 +51,9 @@
                 {{ sourceLabel(item.source_kind) }} · {{ t('operation_phase_' + item.phase) }}
                 <template v-if="item.source_device_id"> · {{ deviceLabel(item.source_device_id) }}</template>
               </span>
+              <span v-if="elapsedById.has(item.operation_id)" class="block text-xs tabular-nums text-slate-600 dark:text-slate-400">
+                {{ t('operation_elapsed', { value: elapsedById.get(item.operation_id) }) }}
+              </span>
               <span v-if="item.step" class="block truncate text-xs text-slate-600 dark:text-slate-400">{{ item.step }}</span>
               <progress v-if="operationPercent(item) !== null" :value="operationPercent(item)" max="100" :aria-label="item.title"
                 class="mt-2 block h-1 w-full accent-primary"></progress>
@@ -62,6 +65,9 @@
             @click="selectedId = ''">{{ t('operation_back') }}</button>
           <h3 class="break-words text-lg font-semibold">{{ selected.title }}</h3>
           <p class="mt-1 text-sm font-medium text-primary">{{ t('operation_phase_' + selected.phase) }}</p>
+          <p v-if="elapsedById.has(selected.operation_id)" class="mt-1 text-sm tabular-nums text-slate-600 dark:text-slate-400">
+            {{ t('operation_elapsed', { value: elapsedById.get(selected.operation_id) }) }}
+          </p>
           <div v-if="operationPercent(selected) !== null" class="mt-4 space-y-1">
             <progress :value="operationPercent(selected)" max="100" :aria-label="selected.title" class="block h-2 w-full accent-primary"></progress>
             <p class="text-sm tabular-nums">{{ numberLabel(operationPercent(selected)) }}% · {{ progressLabel(selected.progress) }}</p>
@@ -100,9 +106,9 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onBeforeUnmount, ref } from 'vue';
+import { computed, onMounted, onBeforeUnmount, ref, watchEffect } from 'vue';
 import { useI18n } from '../../i18n';
-import { isActiveOperation, operationPercent } from '../../utils/operationActivity';
+import { isActiveOperation, operationElapsedLabel, operationPercent } from '../../utils/operationActivity';
 
 const props = defineProps({
   operations: { type: Array, required: true },
@@ -129,6 +135,23 @@ const visible = computed(() => props.operations.filter(row =>
   (!source.value || source.value === row.source_kind) &&
   (!device.value || device.value === row.source_device_id)));
 const selected = computed(() => visible.value.find(row => row.operation_id === selectedId.value));
+const now = ref(Date.now());
+const showLiveElapsed = computed(() => visible.value.some(row =>
+  (row.phase === 'running' || row.phase === 'waiting') && Number.isFinite(Date.parse(row.started_at))));
+watchEffect(onCleanup => {
+  if (!showLiveElapsed.value) return;
+  now.value = Date.now();
+  const timer = setInterval(() => { now.value = Date.now(); }, 1000);
+  onCleanup(() => clearInterval(timer));
+});
+const elapsedById = computed(() => {
+  const labels = new Map();
+  for (const row of visible.value) {
+    const label = operationElapsedLabel(row, now.value);
+    if (label !== null) labels.set(row.operation_id, label);
+  }
+  return labels;
+});
 const sourceLabel = kind => t('operation_type_' + kind);
 const deviceLabel = id => props.operations.find(row => row.source_device_id === id && row.source_device_name)?.source_device_name ?? id;
 const durationLabel = seconds => {
