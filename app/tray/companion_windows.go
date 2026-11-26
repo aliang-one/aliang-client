@@ -104,6 +104,11 @@ func (a *CompanionApp) onReady() {
 		goWithCompanionTrace("syncStateLoop", a.syncStateLoop)
 		goWithCompanionTrace("agentWatchdogLoop", a.agentWatchdogLoop)
 	})
+
+	// M1 托盘面板接线(收尾动作):左右键点击 → panel.html。Windows 侧
+	// panelClickFn 非 nil 即接管左右键(wndProc 分支),无摘菜单动作;挂接
+	// 仍放在菜单构建完成之后,与 macOS 侧时序语义保持一致。
+	a.installPanelBridge()
 }
 
 func (a *CompanionApp) onExit() {

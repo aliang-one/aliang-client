@@ -107,6 +107,10 @@ func (a *CompanionApp) onReady() {
 		go a.syncStateLoop()
 		go a.agentWatchdogLoop()
 	}()
+
+	// M1 托盘面板接线(收尾动作):左右键点击 → panel.html。必须位于菜单
+	// 构建完成之后——面板模式会摘掉原生菜单,提前摘会把空菜单钉上状态项。
+	a.installPanelBridge()
 }
 
 func (a *CompanionApp) onExit() {
