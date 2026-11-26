@@ -2,6 +2,7 @@ export default {
   operation_stage_save_failed: '保存失败，可重试',
   operation_rate: '{value} {unit}/秒',
   operation_eta: '预计剩余 {value}',
+  operation_elapsed: '已用时 {value}',
   operation_timeline: '阶段记录',
   operation_title: "任务活动",
   operation_activeCount: "{count} 项进行中",

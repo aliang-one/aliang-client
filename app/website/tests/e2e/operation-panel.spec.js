@@ -46,3 +46,23 @@ test('narrow task drawer shows detail and returns to the list', async ({ page })
   await drawer.getByRole('button', { name: 'Back to tasks' }).click();
   await expect(drawer.getByRole('button', { name: /Build assets/ })).toBeVisible();
 });
+
+test('task drawer advances elapsed time until the task finishes', async ({ page }) => {
+  await page.clock.install({ time: new Date('2026-11-25T10:00:00Z') });
+  await page.clock.pauseAt(new Date('2026-11-25T10:00:05Z'));
+  const running = { ...task, started_at: timestamp, progress: undefined };
+  await push(page, running);
+  await page.getByTestId('chat-operation-entry').last().click();
+  const drawer = page.getByTestId('chat-operation-panel');
+  const taskRow = drawer.getByRole('button', { name: /Build assets/ });
+  await expect(taskRow).toContainText('Elapsed 00:05');
+  await taskRow.click();
+  await expect(drawer.getByText('Elapsed 00:05', { exact: true }).last()).toBeVisible();
+
+  await page.clock.fastForward(2000);
+  await expect(taskRow).toContainText('Elapsed 00:07');
+  await push(page, { ...running, phase: 'completed', revision: 2, finished_at: '2026-11-25T10:00:06Z' });
+  await page.clock.fastForward(2000);
+  await expect(taskRow).toContainText('Elapsed 00:06');
+  await expect(drawer.getByText('Elapsed 00:06', { exact: true }).last()).toBeVisible();
+});

@@ -2,6 +2,7 @@ export default {
   operation_stage_save_failed: 'Save failed · retry available',
   operation_rate: '{value} {unit}/s',
   operation_eta: 'About {value} remaining',
+  operation_elapsed: 'Elapsed {value}',
   operation_timeline: 'Phase history',
   operation_title: "Task activity",
   operation_activeCount: "{count} active",

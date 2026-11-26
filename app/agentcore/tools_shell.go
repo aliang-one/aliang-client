@@ -28,6 +28,16 @@ const defaultShellTimeout = 30 * time.Second
 // maxShellTimeout 是 timeout 参数的上限。
 const maxShellTimeout = 10 * time.Minute
 
+// ShellOutcome describes how a started shell command ended.
+type ShellOutcome string
+
+const (
+	ShellCompleted ShellOutcome = "completed"
+	ShellFailed    ShellOutcome = "failed"
+	ShellCancelled ShellOutcome = "cancelled"
+	ShellTimedOut  ShellOutcome = "timed_out"
+)
+
 // ---------------------------------------------------------------------------
 // Bash
 // ---------------------------------------------------------------------------
@@ -82,7 +92,7 @@ func (t *powershellTool) Execute(ctx context.Context, input map[string]interface
 // ---------------------------------------------------------------------------
 
 // runShell 是 Bash / PowerShell 的共用实现。
-func runShell(ctx context.Context, kind string, input map[string]interface{}, env *ToolEnv) ToolResult {
+func runShell(ctx context.Context, kind string, input map[string]interface{}, env *ToolEnv) (result ToolResult) {
 	command := strings.TrimSpace(inputString(input, "command"))
 	if command == "" {
 		return ErrorResult("缺少 command 参数")
@@ -152,7 +162,30 @@ func runShell(ctx context.Context, kind string, input map[string]interface{}, en
 	cmd.Stdout = &cappedWriter{buf: &stdout, limit: maxToolOutputBytes}
 	cmd.Stderr = &cappedWriter{buf: &stderr, limit: maxToolOutputBytes}
 
-	runErr := cmd.Run()
+	runErr := cmd.Start()
+	if runErr == nil {
+		if env.OnShellStart != nil {
+			tool := "Bash"
+			if kind == "powershell" {
+				tool = "PowerShell"
+			}
+			if finish := env.OnShellStart(tool); finish != nil {
+				defer func() {
+					switch {
+					case result.TimedOut:
+						finish(ShellTimedOut)
+					case result.IsError && ctx.Err() != nil:
+						finish(ShellCancelled)
+					case result.IsError:
+						finish(ShellFailed)
+					default:
+						finish(ShellCompleted)
+					}
+				}()
+			}
+		}
+		runErr = cmd.Wait()
+	}
 
 	var sb strings.Builder
 	if s := stdout.String(); s != "" {
