@@ -1,6 +1,7 @@
 package services
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -638,4 +639,47 @@ func TestAgentCoreSessionSubagentZombieDowngradeScopedToOwnTurn(t *testing.T) {
 	if len(sess2.Subagents) != 1 || sess2.Subagents[0].Status != "started" {
 		t.Fatalf("重启后按最新 start 行判定, 不得降级: %+v", sess2.Subagents)
 	}
+}
+
+// 传输限幅的围栏保活（读侧集成，2026-11-25 local-mwl6wqyvv5ysrg 手机端
+// 选项卡消失事故）：turn 行文本超 4000 rune 且 aliang-options 围栏骑跨
+// 截断点时，清单转录必须携带完整围栏——手机端静态选项卡解析（正则要闭合
+// ```、裸 JSON 兜底要配平 {}）对半截围栏双双失效。
+func TestReadAgentCoreTurnTextTruncationPreservesOptionFence(t *testing.T) {
+	setTestAgentHome(t)
+	optionJSON := `{"v":2,"title":"构建策略","options":[{"id":"nodeps-triton","label":"最小绕过"},{"id":"wait-upstream","label":"等上游"}]}`
+	text := strings.Repeat("析", 3900) + "```aliang-options\n" + optionJSON + "\n```"
+	if n := len([]rune(text)); n <= agentVibeTranscriptMaxContentRunes {
+		t.Fatalf("测试向量必须超限: %d runes", n)
+	}
+	row, err := json.Marshal(map[string]interface{}{
+		"kind": "turn", "turn": 1, "role": "assistant", "message_id": "assistant_m1#1",
+		"stop_reason": "end_turn", "ts": "2026-11-25T08:36:45Z", "text": text,
+	})
+	if err != nil {
+		t.Fatalf("marshal turn 行失败: %v", err)
+	}
+	path := writeCoreJournalRawFixture(t, "sess-fence",
+		`{"kind":"session","session_id":"sess-fence","project_path":"/tmp/p","model":"m","created_at":"2026-11-25T08:36:00Z"}`,
+		`{"kind":"msg","role":"user","message_id":"m1","text":"尝试给我修复","ts":"2026-11-25T08:36:21Z"}`,
+		string(row),
+	)
+	session := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: 24})
+	if len(session.Transcript) != 2 {
+		t.Fatalf("Transcript = %d 行, want 2: %+v", len(session.Transcript), session.Transcript)
+	}
+	got := session.Transcript[1].Content
+	if got != text {
+		t.Fatalf("围栏骑跨截断点:转录应保活完整围栏\ngot  %d runes\ntail %q",
+			len([]rune(got)), tailRunesForTest(got, 60))
+	}
+}
+
+// tailRunesForTest 取尾段 rune 供断言信息展示。
+func tailRunesForTest(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[len(runes)-n:])
 }

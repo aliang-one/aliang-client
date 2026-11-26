@@ -208,7 +208,7 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 			// spec 2026-11-05-chat-image-pipeline §3.3）,这里防损坏行：两者
 			// 皆空的行不计数的语义与 codex reader 的 msg.Content != "" 守卫
 			// 一致。
-			content := truncateAgentText(row.Text, agentVibeTranscriptMaxContentRunes)
+			content := truncateAgentTextOptionFenceAware(row.Text, agentVibeTranscriptMaxContentRunes)
 			if content == "" && len(row.Attachments) == 0 {
 				return true
 			}
@@ -251,7 +251,7 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 			if session.ID == "" {
 				return true
 			}
-			content := truncateAgentText(row.Text, agentVibeTranscriptMaxContentRunes)
+			content := truncateAgentTextOptionFenceAware(row.Text, agentVibeTranscriptMaxContentRunes)
 			if content == "" {
 				return true
 			}

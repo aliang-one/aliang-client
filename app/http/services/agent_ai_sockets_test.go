@@ -849,3 +849,43 @@ func TestAgentAIEventIsApprovalFamilyToolAskCancel(t *testing.T) {
 		}
 	}
 }
+
+// TestDispatchLocalAISnapshotTranscriptPreservesOptionFence 快照传输限幅的
+// 围栏保活（2026-11-25 local-mwl6wqyvv5ysrg 手机端选项卡消失事故）：单条
+// 文本超 4000 rune 且 aliang-options 围栏骑跨截断点时，快照文本必须携带
+// 完整围栏——接收端静态选项卡解析（正则要闭合 ```、裸 JSON 兜底要配平 {}）
+// 对半截围栏双双失效。
+func TestDispatchLocalAISnapshotTranscriptPreservesOptionFence(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	svc := &AgentService{ai: m}
+	dir := t.TempDir()
+	m.coreJournal = newAgentCoreJournal(dir)
+	ts := time.Now().UTC().Format(time.RFC3339)
+	m.coreJournal.ensureSessionHeader("s-fence", "/proj", "glm-5.3", "", ts, "phone", nil, nil, "")
+	optionJSON := `{"v":2,"title":"构建策略","options":[{"id":"nodeps-triton","label":"最小绕过"},{"id":"wait-upstream","label":"等上游"}]}`
+	text := strings.Repeat("析", 3900) + "```aliang-options\n" + optionJSON + "\n```"
+	if n := len([]rune(text)); n <= agentVibeTranscriptMaxContentRunes {
+		t.Fatalf("测试向量必须超限: %d runes", n)
+	}
+	m.coreJournal.appendUser("s-fence", "m-fence", text, ts)
+
+	replies := make(chan map[string]interface{}, 8)
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":       models.AgentEventAISessionSubscribe,
+		"session_id": "s-fence",
+	}, func(p interface{}) error { replies <- p.(map[string]interface{}); return nil })
+	select {
+	case p := <-replies:
+		tr, _ := p["transcript"].([]map[string]interface{})
+		if len(tr) != 1 {
+			t.Fatalf("快照转录应 1 条,实际 %d: %v", len(tr), p["transcript"])
+		}
+		got, _ := tr[0]["text"].(string)
+		if got != text {
+			t.Fatalf("快照文本应保活完整围栏: got %d runes, tail %q",
+				len([]rune(got)), tailRunesForTest(got, 60))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("未收到快照")
+	}
+}

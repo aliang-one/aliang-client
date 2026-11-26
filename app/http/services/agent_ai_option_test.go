@@ -523,3 +523,54 @@ func TestOptionCancelledEmittedOnClose(t *testing.T) {
 	// close() deletes the session entry, so pendingOption can no longer be read;
 	// the cancelled event + option_ids above are the contract under test.
 }
+
+// truncateAgentTextOptionFenceAware 的围栏保活契约表（2026-11-25
+// local-mwl6wqyvv5ysrg 手机端选项卡消失事故）：传输限幅切进 aliang-options
+// 围栏（开标签在窗内、闭合被切掉）时必须保住完整围栏——手机/网页的静态
+// 选项卡解析（正则要闭合 ```、裸 JSON 兜底要配平 {}）对半截围栏双双失效。
+// 其余形态（无围栏/围栏在窗内/原文未闭合/病态巨围栏）与普通截断逐字节一致。
+func TestTruncateAgentTextOptionFenceAware(t *testing.T) {
+	const optionJSON = `{"v":2,"title":"构建策略","options":[{"id":"nodeps-triton","label":"最小绕过"},{"id":"wait-upstream","label":"等上游"}]}`
+	fence := "```aliang-options\n" + optionJSON + "\n```"
+	straddle := strings.Repeat("析", 3900) + fence // 开标签在窗内、闭合在窗外（事故形态）
+	if n := len([]rune(straddle)); n <= agentVibeTranscriptMaxContentRunes {
+		t.Fatalf("骑跨向量必须超限: %d runes", n)
+	}
+	beyondWindow := strings.Repeat("析", 4200) + fence // 围栏整体在截断点之后
+	giant := strings.Repeat("析", 3900) + "```aliang-options\n" + strings.Repeat("巨", 20000) + "\n```"
+	unclosed := strings.Repeat("析", 3900) + "```aliang-options\n" + optionJSON // 原文自身未闭合
+
+	// 对抗评审坐实(minor):LastIndex 只锚最后一个 tag 样文本——尾部跟一段
+	// 未闭合 tag/巨围栏时,真正骑跨截断点的更早完整围栏仍被普通截断切断。
+	straddledThenDegenerate := strings.Repeat("析", 3960) + fence + strings.Repeat("尾", 100) + "```aliang-options\n" + optionJSON
+	straddledThenGiant := strings.Repeat("析", 3960) + fence + "```aliang-options\n" + strings.Repeat("巨", 20000) + "\n```"
+	fence1End := strings.Repeat("析", 3960) + fence // 骑跨围栏的闭合处即保活终点,其后尾文让位于传输上限
+	// 对抗评审坐实(major 同族):散文内联提及 tag(同行还有正文)+ 其后出现
+	// 无关代码块闭合行——不是围栏,不得触发保活延长。
+	proseMentionThenCodeBlock := strings.Repeat("析", 3990) + "提及```aliang-options 围栏写法\n```\n" + strings.Repeat("后", 300)
+
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"无围栏:与普通截断一致", strings.Repeat("析", 5000), truncateAgentText(strings.Repeat("析", 5000), agentVibeTranscriptMaxContentRunes)},
+		{"围栏整体在窗内:不改写不缩短", "前" + fence + strings.Repeat("尾", 5000), truncateAgentText("前"+fence+strings.Repeat("尾", 5000), agentVibeTranscriptMaxContentRunes)},
+		{"围栏骑跨截断点:保活到闭合", straddle, straddle},
+		{"围栏整体在窗外:延长带上围栏", beyondWindow, beyondWindow},
+		{"原文未闭合:回落普通截断", unclosed, truncateAgentText(unclosed, agentVibeTranscriptMaxContentRunes)},
+		{"病态巨围栏超预算:回落普通截断", giant, truncateAgentText(giant, agentVibeTranscriptMaxContentRunes)},
+		{"骑跨围栏后跟未闭合 tag:保活骑跨者,不被尾部退化拖累", straddledThenDegenerate, fence1End},
+		{"骑跨围栏后跟巨围栏:保活骑跨者", straddledThenGiant, fence1End},
+		{"散文内联提及 tag+无关代码块:不触发保活", proseMentionThenCodeBlock, truncateAgentText(proseMentionThenCodeBlock, agentVibeTranscriptMaxContentRunes)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := truncateAgentTextOptionFenceAware(tc.in, agentVibeTranscriptMaxContentRunes)
+			if got != tc.want {
+				t.Fatalf("got %d runes, want %d runes\ngot 尾: %.60q\nwant尾: %.60q",
+					len([]rune(got)), len([]rune(tc.want)), got, tc.want)
+			}
+		})
+	}
+}
