@@ -631,6 +631,21 @@ func (s *EndpointService) FetchModels(id string) ([]string, error) {
 	return ids, nil
 }
 
+// FetchModelsByBaseURL 按裸 base_url+key 探测模型列表(新建表单「自动获取」
+// 用,行尚未落库没有 id 可走 FetchModels)。同款不写库语义;base_url 形态由
+// 调用方(handler)先经 Validate 同源规则校验,这里只拒绝空值与探测失败。
+func (s *EndpointService) FetchModelsByBaseURL(baseURL, apiKey string) ([]string, error) {
+	base := strings.TrimSpace(baseURL)
+	if base == "" {
+		return nil, fmt.Errorf("endpoint: base_url 为空,无法探测")
+	}
+	_, ids, err := s.probeModels(base, strings.TrimSpace(apiKey))
+	if err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
 // Test 连接测试(spec §11):TCP 拨测 + GET /v1/models smoke,返回可达/模型数/
 // 错误摘要。401 算可达(链路通、key 问题留给请求本身报,口径同 §8 内核探针)。
 func (s *EndpointService) Test(id string) (bool, int, string) {

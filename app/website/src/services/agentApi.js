@@ -266,6 +266,16 @@ export async function fetchEndpointModels(id) {
   return Array.isArray(data?.models) ? data.models : [];
 }
 
+// 按裸 base_url+key 探测模型列表(新建表单自动获取:行未落库没有 id)。
+// 同款不写库语义,结果回填表单由用户确认后保存。
+export async function probeEndpointModels(baseUrl, apiKey) {
+  const data = await request('/api/endpoints/probe-models', {
+    method: 'POST',
+    body: JSON.stringify({ base_url: baseUrl || '', api_key: apiKey || '' }),
+  });
+  return Array.isArray(data?.models) ? data.models : [];
+}
+
 export async function resetEndpointHealth(id) {
   return request(`/api/endpoints/${encodeURIComponent(id)}/reset-health`, { method: 'POST' });
 }

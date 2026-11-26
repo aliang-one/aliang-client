@@ -17,6 +17,7 @@ package handlers
 import (
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/google/uuid"
@@ -401,6 +402,51 @@ func (h *EndpointHandler) HandleFetchModels(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	models, err := h.service.FetchModels(id)
+	if err != nil {
+		common.ErrorBadRequest(w, err.Error(), nil)
+		return
+	}
+	common.Success(w, map[string]interface{}{"models": models})
+}
+
+// endpointProbeRequest 是「按裸地址探测」的请求体:新建表单里行还没落库,
+// 没有 id 可走 {id}/fetch-models,先用用户正在填的 base_url+key 试拉。
+type endpointProbeRequest struct {
+	BaseURL string `json:"base_url"`
+	APIKey  string `json:"api_key"`
+}
+
+// HandleProbeModels POST /api/endpoints/probe-models — 按裸 base_url+key 拉
+// 模型列表(不落库,形态校验同源 Create 的 Validate)。新建/编辑表单的
+// 「自动获取」按钮走这里;已保存行仍走 {id}/fetch-models。
+func (h *EndpointHandler) HandleProbeModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !endpointRequireSession(w, r) {
+		return
+	}
+	if h.service == nil {
+		endpointServiceUnavailable(w)
+		return
+	}
+	var req endpointProbeRequest
+	if !endpointDecodeBody(w, r, &req) {
+		return
+	}
+	// 形态闸同源 Create:base_url 必须是合法 http(s) URL(带 host);空/畸形 400。
+	base := strings.TrimSpace(req.BaseURL)
+	if base != "" {
+		if u, err := url.Parse(base); err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			common.ErrorBadRequest(w, "base_url 必须是合法的 http/https URL(含主机名)", nil)
+			return
+		}
+	} else {
+		common.ErrorBadRequest(w, "base_url 为空,无法探测", nil)
+		return
+	}
+	models, err := h.service.FetchModelsByBaseURL(base, req.APIKey)
 	if err != nil {
 		common.ErrorBadRequest(w, err.Error(), nil)
 		return

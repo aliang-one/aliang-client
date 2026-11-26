@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -89,6 +90,8 @@ func endpointDo(t *testing.T, h *EndpointHandler, cookie *http.Cookie, method, p
 		h.HandleTest(rec, r)
 	case strings.HasSuffix(path, "/fetch-models"):
 		h.HandleFetchModels(rec, r)
+	case strings.HasSuffix(path, "/probe-models"):
+		h.HandleProbeModels(rec, r)
 	case strings.HasSuffix(path, "/reset-health"):
 		h.HandleResetHealth(rec, r)
 	case method == http.MethodGet && strings.HasSuffix(path, "/api/endpoints"):
@@ -304,14 +307,15 @@ func TestEndpointHandlerDeleteBuiltinConflict(t *testing.T) {
 func TestEndpointHandlerActionEndpoints(t *testing.T) {
 	h, cookie := newEndpointHandlerHarness(t)
 
-	// test:内置行无独立探测目标 → 200 + ok=false + 摘要(不是 5xx)。
+	// test:内置行拨平台代理入口(本机 56432 常驻 → ok=true + 语义摘要)。
+	// 不可达路径由 TestEndpointService_TestProbe 的死址注入单测覆盖。
 	rec := endpointDo(t, h, cookie, http.MethodPost, "/api/endpoints/"+storage.BuiltinEndpointID+"/test", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("builtin test code=%d body=%s", rec.Code, rec.Body.String())
 	}
 	_, data := endpointDecode(t, rec)
-	if ok, _ := data["ok"].(bool); ok {
-		t.Fatalf("内置行 test 应 ok=false: %#v", data)
+	if ok, _ := data["ok"].(bool); !ok {
+		t.Fatalf("内置行 test 应 ok=true(平台入口可达): %#v", data)
 	}
 
 	// fetch-models:fake 上游返回 OpenAI 形态列表,不落库。
@@ -542,5 +546,57 @@ func TestEndpointHandlerPolicyNegativeAndIdempotentDelete(t *testing.T) {
 	rec = endpointDo(t, h, cookie, http.MethodDelete, "/api/endpoints/ep-never-existed", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("删除不存在 id code=%d, want 200 幂等; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// probe-models:按裸 base_url 探测(新建表单「自动获取」,行未落库)。
+// 契约:合法 URL+fake 上游 → 模型列表;空/畸形 base_url → 400;上游 5xx → 400。
+func TestEndpointHandlerProbeModels(t *testing.T) {
+	h, cookie := newEndpointHandlerHarness(t)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		if auth := r.Header.Get("Authorization"); auth != "Bearer sk-probe-key-123" {
+			http.Error(w, `{"error":"bad key"}`, http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"glm-4.6"},{"id":"kimi-k2"}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	// 合法请求:返回模型列表。
+	body := fmt.Sprintf(`{"base_url":%q,"api_key":"sk-probe-key-123"}`, upstream.URL)
+	rec := endpointDo(t, h, cookie, http.MethodPost, "/api/endpoints/probe-models", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("probe-models code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	_, data := endpointDecode(t, rec)
+	models, _ := data["models"].([]interface{})
+	if len(models) != 2 || models[0] != "glm-4.6" {
+		t.Fatalf("probe-models 结果 = %#v", data)
+	}
+
+	// 空 base_url → 400。
+	rec = endpointDo(t, h, cookie, http.MethodPost, "/api/endpoints/probe-models", `{"base_url":""}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("空 base_url 应 400, got %d", rec.Code)
+	}
+
+	// 畸形 base_url(非 http/https)→ 400。
+	rec = endpointDo(t, h, cookie, http.MethodPost, "/api/endpoints/probe-models", `{"base_url":"ftp://x.example.com"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("畸形 base_url 应 400, got %d", rec.Code)
+	}
+
+	// 上游 401(链路通 key 拒)→ 400 带错误摘要(裸探测没有「算可达」语义,
+	// 用户拿到摘要先修 key)。
+	rec = endpointDo(t, h, cookie, http.MethodPost, "/api/endpoints/probe-models",
+		fmt.Sprintf(`{"base_url":%q,"api_key":"sk-wrong"}`, upstream.URL))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("key 被拒应 400, got %d", rec.Code)
 	}
 }

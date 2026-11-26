@@ -447,6 +447,8 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("DELETE /api/endpoints/{id}", h.Endpoint.HandleDelete, http.MethodDelete)
 	register("POST /api/endpoints/{id}/test", h.Endpoint.HandleTest, http.MethodPost)
 	register("POST /api/endpoints/{id}/fetch-models", h.Endpoint.HandleFetchModels, http.MethodPost)
+	// 按裸 base_url 探测模型(新建表单自动获取;行未落库没有 id)。
+	register("POST /api/endpoints/probe-models", h.Endpoint.HandleProbeModels, http.MethodPost)
 	register("POST /api/endpoints/{id}/reset-health", h.Endpoint.HandleResetHealth, http.MethodPost)
 	register("/api/endpoint-groups/auto/policy", h.Endpoint.HandlePolicy, http.MethodGet, http.MethodPut)
 

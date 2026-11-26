@@ -311,13 +311,22 @@
           </div>
 
           <label class="block">
-            <span class="text-xs font-semibold text-slate-600 dark:text-slate-300">{{ t('endpointManager_models') }}</span>
+            <span class="flex items-center justify-between">
+              <span class="text-xs font-semibold text-slate-600 dark:text-slate-300">{{ t('endpointManager_models') }}</span>
+              <button
+                type="button"
+                class="inline-flex h-7 items-center rounded-md border border-primary/30 px-2.5 text-[11px] font-bold text-primary transition-colors hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 disabled:opacity-50"
+                :disabled="form.busy || formBusy || probingModels"
+                :title="t('endpointManager_modelsAutoHint')"
+                @click="runAutoFetchModels"
+              >{{ probingModels ? t('endpointManager_modelsAutoRunning') : t('endpointManager_modelsAuto') }}</button>
+            </span>
             <textarea
               v-model="form.modelsText"
               rows="4"
               data-field="models"
               :placeholder="t('endpointManager_modelsPlaceholder')"
-              class="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono text-xs text-slate-800 focus:border-primary/50 focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+              class="mt-1.5 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono text-xs text-slate-800 focus:border-primary/50 focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
             ></textarea>
             <span class="mt-1 block text-[10px] leading-4 text-slate-400">{{ t('endpointManager_modelsHint') }}</span>
           </label>
@@ -397,6 +406,7 @@ import {
   fetchEndpointModels,
   getEndpointPolicy,
   getEndpoints,
+  probeEndpointModels,
   resetEndpointHealth,
   setEndpointPolicy,
   testEndpoint,
@@ -455,6 +465,15 @@ function emptyForm() {
   };
 }
 
+// 编辑态的 key:表单留空 = 沿用存储值;自动获取探测仍要带真 key 上行,
+// 所以优先显式输入,否则回退编辑对象的存储 key(行上带的是掩码,不可用;
+// 此时探测不带 key,上游 401 由摘要提示用户先填 key)。
+function effectiveApiKeyForProbe(form) {
+  const typed = String(form.apiKey || '').trim();
+  if (typed) return typed;
+  return '';
+}
+
 function emptyPolicy() {
   return {
     failureDisable: true,
@@ -488,6 +507,7 @@ export default {
       fetchModelsOpen: false,
       fetchedModels: [],
       fetchedTargetRow: null,
+      probingModels: false,
       policy: emptyPolicy(),
       policyError: '',
       policySaving: false,
@@ -702,6 +722,31 @@ export default {
       this.fetchModelsOpen = false;
       this.fetchedModels = [];
       this.fetchedTargetRow = null;
+    },
+    // 表单内「自动获取」:按当前填写的 base_url+key 裸探测(行未落库场景)。
+    // 结果直接回填 modelsText(值可见可改),不自动保存——落库仍走表单「保存」。
+    async runAutoFetchModels() {
+      if (this.probingModels) return;
+      const base = String(this.form.baseUrl || '').trim();
+      if (!base) {
+        this.setNotice(this.t('endpointManager_modelsAutoNeedUrl'), false);
+        return;
+      }
+      this.probingModels = true;
+      try {
+        const models = await probeEndpointModels(base, effectiveApiKeyForProbe(this.form));
+        const ids = models.filter((m) => typeof m === 'string' && m.trim());
+        if (!ids.length) {
+          this.setNotice(this.t('endpointManager_modelsAutoEmpty'), false);
+          return;
+        }
+        this.form.modelsText = ids.join('\n');
+        this.setNotice(this.t('endpointManager_modelsAutoDone', { count: ids.length }), true);
+      } catch (error) {
+        this.setNotice(this.t('endpointManager_fetchFailed', { error: error?.message || '' }), false);
+      } finally {
+        this.probingModels = false;
+      }
     },
     // 确认后把 models 写进编辑表单(不自动 PUT);用户点保存才落库(spec §10)。
     confirmFetchedModels() {
