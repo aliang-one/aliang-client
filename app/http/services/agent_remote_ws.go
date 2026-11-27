@@ -1246,6 +1246,22 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 				return
 			}
 		}
+	case models.AgentEventAssistRrEvent, models.AgentEventAssistRrSnapshot, models.AgentEventAssistNav:
+		// 远程协助 P2(Task 1):rrweb 页面镜像帧族下行纯中继。帧自云端
+		// (admin 观看页采集侧)来,经设备原样扇给观看端注册表——不改写载荷、
+		// 不进状态机、零回帧;sid 与当前/粘性终态会话不符静默丢弃(判定与
+		// 限频日志见 RelayRrFrame:纯中继不做 error 帧风暴)。enabled 门已在
+		// remoteAgentMessageRequiresEnabledDevice;协助总闸关时静默丢——镜像
+		// 面是协助面的一部分,总闸关=面收摊,观看注册表本就随 assist.end 清空。
+		// 高频中继臂:活性触达不落盘(活性由心跳承载;全量落盘成本见
+		// touchRemoteConnectionOnline/2026-11-22 锁史)。序刻意:总闸/串会话
+		// 先判,被丢帧零状态触达——仅在帧真被中继后才 touch(内存态,零 IO)。
+		if !s.RemoteAssistEnabled() || s.assist == nil {
+			return
+		}
+		if s.assist.RelayRrFrame(msg, msgType) {
+			s.touchRemoteConnectionOnline()
+		}
 	case models.AgentEventError:
 		// Server rejected something. With the registration gate, business
 		// messages should never be sent before registration, but surface the
@@ -1313,10 +1329,15 @@ func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 		models.AgentEventPeerPunchCandidates,
 		// 远程协助 P1(Task 4):云端协助信令(approved/rejected/end/state)是
 		// 控制面能力,与 terminal/AI 同族——禁用设备不接受协助。
+		// 远程协助 P2(Task 1):rrweb 页面镜像帧族同族——镜像下行同为控制面
+		// 能力(观看端页面由 admin 侧采集注入),禁用设备不接受。
 		models.AgentEventAssistApproved,
 		models.AgentEventAssistRejected,
 		models.AgentEventAssistEnd,
-		models.AgentEventAssistState:
+		models.AgentEventAssistState,
+		models.AgentEventAssistRrEvent,
+		models.AgentEventAssistRrSnapshot,
+		models.AgentEventAssistNav:
 		return true
 	default:
 		// tools.list 是元 RPC（非注册表工具项），显式门控；注册表命中的工具事件
@@ -1438,6 +1459,18 @@ func (s *AgentService) setRemoteConnectionState(connected bool, status string, m
 	defer s.mu.Unlock()
 	s.setRemoteConnectionStateLocked(connected, status, message)
 	_ = s.saveStateLocked()
+}
+
+// touchRemoteConnectionOnline 活性触达的免落盘变体(高频臂专用,rrweb 页面
+// 镜像中继臂首个使用方):状态迁移语义与 setRemoteConnectionState 一致,但
+// 跳过 saveStateLocked。理由:setRemoteConnectionState 每次调用都全量重写
+// agent_state.json(实测 ~188µs @~1KB 状态,APFS;Windows NTFS 突发下 s.mu
+// 占比更高,且 s.mu 正是 2026-11-22 锁死史之锁)——每秒几十帧的中继臂上这
+// 是纯浪费,连接活性由 heartbeat.ack 臂承载,LastSeenAt 内存戳足以保鲜。
+func (s *AgentService) touchRemoteConnectionOnline() {
+	s.mu.Lock()
+	s.setRemoteConnectionStateLocked(true, "online", "")
+	s.mu.Unlock()
 }
 
 func (s *AgentService) setRemoteConnectionStateLocked(connected bool, status string, message string) {
