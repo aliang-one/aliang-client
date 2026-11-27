@@ -45,14 +45,48 @@ async function openChat(page, { detail404 = false, sessions = SESSIONS, detailPa
   await expect(page.getByTestId('session-source-badge')).toHaveCount(expectedSourceBadgeCount(sessions));
 }
 
-test('侧栏三源清单：来源角标、running 状态点、设备条目不可删除/重命名', async ({ page }) => {
+test('侧栏三源清单显示来源与运行状态，AliangCode 设备会话可改名', async ({ page }) => {
   await openChat(page);
   const badges = page.getByTestId('session-source-badge');
   // i18n 后角标渲染 chat_source_* 文案（无头 Chrome=en-US → 英文），双语文本匹配
   await expect(badges).toHaveText([/Running|进行中/, /Terminal|终端/]); // running > origin > id 前缀
   await expect(page.getByTestId('device-session-running-dot')).toHaveCount(1); // 仅 agentcore running 条目
-  // 无本地草稿时不应有任何重命名入口（设备会话不可本端改名/删除）
-  await expect(page.getByRole('button', { name: /重命名|Rename/ })).toHaveCount(0);
+  await expect(page.locator('button[aria-label]').filter({ has: page.locator('span', { hasText: /^edit$/ }) }))
+    .toHaveCount(1);
+});
+
+test('等待改名回执，另一个浏览器更新标题且刷新后保持', async ({ page, browser }) => {
+  const observer = await browser.newContext();
+  try {
+    const other = await observer.newPage();
+    const entry = { ...SESSIONS[0] };
+    await Promise.all([openChat(page, { sessions: [entry] }), openChat(other, { sessions: [entry] })]);
+    await page.getByRole('button', { name: /^(?:重命名|Rename) 手机发起的会话$/ }).click();
+    const title = '跨端同步标题';
+    const input = page.getByPlaceholder(/输入对话名称|Enter a conversation name/);
+    await input.fill(title);
+    await input.press('Enter');
+    const getRename = () => page.evaluate(() => window.__aiFrames.find(f => f.type === 'ai.session.rename'));
+    await expect.poll(getRename).toBeTruthy();
+    const rename = await getRename();
+    expect(rename).toMatchObject({ session_id: entry.id, title, request_id: expect.any(String) });
+    await expect(page.getByText('手机发起的会话', { exact: true })).toBeVisible();
+    const stamp = new Date().toISOString();
+    entry.title = title;
+    entry.title_updated_at = stamp;
+    await Promise.all([
+      pushFrame(page, { ...rename, type: 'ai.session.rename.ack', accepted: true, title_updated_at: stamp }),
+      pushFrame(other, { type: 'ai.session.title.updated', session_id: entry.id, title, title_updated_at: stamp }),
+    ]);
+    for (const viewer of [page, other]) {
+      await expect(viewer.getByText(title, { exact: true })).toBeVisible({ timeout: 5000 });
+    }
+    await other.reload();
+    await other.getByTestId('aliang-chat-entry-sidebar').click();
+    await expect(other.getByText(title, { exact: true })).toBeVisible();
+  } finally {
+    await observer.close();
+  }
 });
 
 test('点开 agentcore 会话：详情转录渲染 + subscribe 帧发出 + 切走退订 + claude_ 不订阅', async ({ page }) => {

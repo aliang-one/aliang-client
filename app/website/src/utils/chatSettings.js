@@ -205,6 +205,7 @@ export function deviceSessionToConversation(entry) {
   return {
     id: 'dev-' + id,
     title: entry.title || id,
+    titleUpdatedAt: entry.title_updated_at,
     provider: normalizeDeviceProvider(entry.provider),
     projectPath: entry.project_path || '',
     // model/effort 必须回填：服务端清单/详情已带 model（agent_inventory_*），

@@ -659,13 +659,21 @@ func (m *agentAIManager) fanOutFrom(originID, sessionID string, payload map[stri
 // payload 冻结契约同 fanOutWrite:同一 map 实例投给 N 个 pump,返回后调用
 // 方不得原地改写。
 func (m *agentAIManager) BroadcastListenerEvent(payload map[string]interface{}) {
+	m.broadcastChatEvent(payload, false)
+}
+
+func (m *agentAIManager) broadcastLocalTitle(payload map[string]interface{}) {
+	m.broadcastChatEvent(payload, true)
+}
+
+func (m *agentAIManager) broadcastChatEvent(payload map[string]interface{}, localOnly bool) {
 	if payload == nil {
 		return
 	}
 	m.mu.Lock()
 	targets := make([]*agentAISocket, 0, len(m.aiSockets))
 	for _, s := range m.aiSockets {
-		if s == nil || !s.alive() {
+		if s == nil || !s.alive() || (localOnly && s.role != "local") {
 			continue
 		}
 		targets = append(targets, s)

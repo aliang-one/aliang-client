@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { toRaw } from 'vue';
 
 // agentApi（连带 stores/auth 的 localStorage 副作用）整体 mock 掉
 vi.mock('../services/agentApi', () => ({
@@ -77,7 +78,7 @@ describe('useDeviceSessions', () => {
     expect(shell.updatedAt).toBe(Date.parse('2026-10-29T10:00:00Z')); // 归一 epoch ms
     expect(shell.messages).toEqual([]);
     expect(shell.provider).toBe('agentcore');
-    expect(shell.deviceSession).toBe(AGENTCORE_ENTRY);
+    expect(toRaw(shell.deviceSession)).toBe(AGENTCORE_ENTRY);
 
     // 同一条目重复派生返回同一对象（缓存防重建）
     expect(ds.shellForEntry(AGENTCORE_ENTRY)).toBe(shell);
@@ -112,7 +113,7 @@ describe('useDeviceSessions', () => {
     expect(again.running).toBe(false);
     expect(again.updatedAt).toBe(Date.parse('2026-10-29T11:00:00Z'));
     expect(again.messages).toEqual([{ role: 'user', content: '已打开' }]);
-    expect(again.deviceSession).toBe(refreshed);
+    expect(toRaw(again.deviceSession)).toBe(refreshed);
   });
 
   it('shellForEntry 刷新回填 approval_mode：别端换挡不被已开壳的旧值回滚', async () => {

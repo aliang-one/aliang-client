@@ -74,9 +74,8 @@
                 class="inline-block h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-primary"
                 :title="t('chat_statusRunning')"
               ></span>
-              <!-- 设备会话不可在本端重命名/删除（后端无端点，title 由清单权威） -->
               <button
-                v-if="!c.deviceSession"
+                v-if="canRenameConversation(c)"
                 type="button"
                 class="relative shrink-0 rounded p-1 text-slate-400 opacity-100 transition-opacity hover:bg-slate-200 hover:text-slate-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100 dark:hover:bg-slate-700 before:absolute before:-inset-2 before:content-['']"
                 :aria-label="`${t('chat_rename')} ${c.title || t('chat_emptyTitle')}`"
@@ -102,6 +101,7 @@ import { computed } from 'vue';
 import { useI18n } from '../../i18n';
 import { isComposingEvent } from '../../composables/useAliangChat';
 import { sessionSourceBadge } from '../../utils/chatSettings';
+import { canRenameConversation } from '../../utils/chatTitle';
 
 const props = defineProps({
   groups: { type: Array, default: () => [] },

@@ -51,6 +51,7 @@ const (
 	AgentEventGoalRunEventAck         = "goal.run.event.ack"
 	AgentEventAIRename                = "ai.session.rename"     // server→agent: user renamed a conversation on the phone; the agent persists it into its durable rename cache
 	AgentEventAIRenameAck             = "ai.session.rename.ack" // agent→server: rename accepted/rejected; carries the agent-clock title_updated_at PhoneServer's latestOf guard compares against
+	AgentEventAISessionTitleUpdated   = "ai.session.title.updated"
 	AgentEventAIStop                  = "ai.stop"
 	AgentEventAITuiSync               = "ai.tui.sync" // server→agent: best-effort "phone turn landed" digest for an imported session; agent gates + injects into the live TUI's messaging UDS, no reply by design
 	AgentEventAIStatus                = "ai.status"
@@ -320,6 +321,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventFileWriteResult, Required: []string{"type", "request_id", "ok"}, Optional: []string{"path", "size_bytes", "sha256"}},
 				{Type: AgentEventError, Required: []string{"type", "error"}},
 				{Type: AgentEventAIRenameAck, Required: []string{"type", "session_id", "accepted"}, Optional: []string{"title_updated_at", "error"}},
+				{Type: AgentEventAISessionTitleUpdated, Required: []string{"type", "session_id", "title", "title_updated_at"}},
 				{Type: AgentEventAIOptionRequest, Required: []string{"type", "session_id", "option_id", "options", "run_id", "event_seq"}, Optional: []string{"message_id", "title", "header", "summary", "v", "allow_custom", "multi", "provider", "status", "selected", "custom_text"}},
 				{Type: AgentEventToolAskRequest, Required: []string{"type", "session_id", "interaction_id"}, Optional: []string{"tool_name", "tool_input", "expires_at", "status", "answer", "reason", "message_id", "title", "options", "allow_custom", "multi", "provider", "device_id"}},
 				{Type: AgentEventGoalPlanAIRequest, Required: []string{"type", "request_id", "goal_id", "planning_attempt_id", "ai_session_id", "turn", "messages"}},

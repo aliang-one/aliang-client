@@ -264,6 +264,7 @@ export default {
   chat_title: 'AI 对话',
   chat_emptyTitle: '新对话',
   chat_rename: '重命名',
+  chat_renameFailed: '未能确认会话改名，请重试。',
   chat_renamePlaceholder: '输入对话名称',
   chat_placeholder: '输入消息…',
   chat_send: '发送',

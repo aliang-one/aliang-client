@@ -411,6 +411,12 @@ func (s *AgentService) handleRemoteAIRename(msg map[string]interface{}, writeJSO
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	mirrorsClaude := agentRenameMirrorsClaude(remoteString(msg, "provider"), remoteString(msg, "tool"))
+	dashboardSession := s != nil && s.ai != nil && strings.EqualFold(remoteString(msg, "provider"), "agentcore")
+	if dashboardSession {
+		if stamp := renameTimestamp(remoteString(msg, "title_updated_at")); !stamp.IsZero() {
+			now = stamp.UTC().Format(time.RFC3339Nano)
+		}
+	}
 	// 键面扩展（G4 改名断链）:agentcore 清单卡是裸会话 id 卡（journal 文件名
 	// 键,inventoryNativeSessionID 对无前缀 id 返回空）,native 键条目对清单
 	// 不可达。非 claude 家族（= SkipMirror 家族）额外以「会话 id」为别名键落
@@ -426,6 +432,7 @@ func (s *AgentService) handleRemoteAIRename(msg map[string]interface{}, writeJSO
 	// One serialized read-modify-write: the inventory ticker and HTTP handlers
 	// merge observed renames on other goroutines, and an interleaved whole-file
 	// save here used to drop this phone entry permanently (no local re-source).
+	var dashboardTitleChanged bool
 	persistErr := updateAgentRenameCache(func(entries map[string]agentRenameCacheEntry) bool {
 		entry := agentRenameCacheEntry{
 			Name:        title,
@@ -438,17 +445,21 @@ func (s *AgentService) handleRemoteAIRename(msg map[string]interface{}, writeJSO
 		before, existed := entries[nativeID]
 		mergeAgentRenameEntry(entries, nativeID, entry)
 		changed := !existed || entries[nativeID] != before
+		dashboardTitleChanged = dashboardSession && sessionID == nativeID && changed
 		for _, alias := range aliasKeys {
 			aliasBefore, aliasExisted := entries[alias]
 			mergeAgentRenameEntry(entries, alias, entry)
 			if !aliasExisted || entries[alias] != aliasBefore {
 				changed = true
+				dashboardTitleChanged = dashboardSession
 			}
 		}
 		return changed
 	})
 	if persistErr != nil {
 		logger.Warn("[AGENT-RENAME] phone_rename_persist_failed sid=" + nativeID + " error=" + persistErr.Error())
+	} else if dashboardTitleChanged {
+		s.ai.broadcastLocalTitle(dashboardSessionTitleEvent(sessionID, title, now))
 	}
 	// Mirror the rename into Claude Code's own transcript so the desktop TUI
 	// /resume list shows the phone-chosen name too (its list builder takes the

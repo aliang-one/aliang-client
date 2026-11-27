@@ -24,9 +24,8 @@
     <h3 v-else class="flex-1 truncate text-sm font-semibold text-slate-900 dark:text-white">
       {{ conversation?.title || t('chat_emptyTitle') }}
     </h3>
-    <!-- 设备会话不可在本端重命名/删除（后端无端点，title 由清单权威） -->
     <button
-      v-if="activeId && renamingId !== activeId && !activeIsDevice"
+      v-if="activeId && renamingId !== activeId && canRenameConversation(conversation)"
       type="button"
       class="relative rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 dark:hover:bg-slate-800 before:absolute before:-inset-2 before:content-['']"
       :aria-label="t('chat_rename')"
@@ -75,6 +74,7 @@
 import { computed } from 'vue';
 import { useI18n } from '../../i18n';
 import { isComposingEvent } from '../../composables/useAliangChat';
+import { canRenameConversation } from '../../utils/chatTitle';
 
 const props = defineProps({
   conversation: { type: Object, default: null },

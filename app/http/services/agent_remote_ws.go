@@ -1313,6 +1313,8 @@ func (s *AgentService) DispatchLocalAI(msg map[string]interface{}, writeJSON fun
 		s.ai.subagentControl(msg, writeJSON)
 	case models.AgentEventAISessionClose:
 		s.ai.close(msg, writeJSON)
+	case models.AgentEventAIRename:
+		s.renameDashboardSession(msg, writeJSON)
 	case models.AgentEventAISessionSubscribe, models.AgentEventAISessionUnsubscribe:
 		// 跨端同态（spec §4.1）：本机聊天连接订阅任意会话（手机发起的、终端
 		// 导入的都行）。透传是裸泵，此端点只存在于 agent 进程。

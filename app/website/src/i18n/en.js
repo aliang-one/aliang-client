@@ -264,6 +264,7 @@ export default {
   chat_title: 'AI Chat',
   chat_emptyTitle: 'New Chat',
   chat_rename: 'Rename',
+  chat_renameFailed: 'Could not confirm the conversation rename. Please retry.',
   chat_renamePlaceholder: 'Enter a conversation name',
   chat_placeholder: 'Type a message...',
   chat_send: 'Send',

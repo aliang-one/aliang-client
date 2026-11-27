@@ -2,7 +2,8 @@ import { ref, reactive, computed, nextTick, onMounted, onUnmounted, watch } from
 import { useI18n } from '../i18n';
 import { useNavigation } from './useNavigation';
 import { slashProviderFor } from '../utils/chatProvider';
-import { normalizeConversationTitle } from '../utils/chatTitle';
+import { applyConversationTitle, canRenameConversation, normalizeConversationTitle } from '../utils/chatTitle';
+import { showErrorDialog } from './useErrorDialog';
 import { noteChatFirstText } from '../utils/chatTiming';
 import { useAuthStore } from '../stores/auth';
 import { uploadChatAttachment } from '../services/agentApi';
@@ -1419,6 +1420,16 @@ export function useAliangChat() {
   } = useDeviceSessions();
 
   const conversations = ref([]);
+  watch(deviceSessions, entries => {
+    const bySession = new Map(entries.map(entry => [entry.id, entry]));
+    let changed = false;
+    for (const conversation of conversations.value) {
+      if (conversation.deviceSession) continue;
+      const entry = bySession.get(conversation.aiSessionId);
+      if (entry && applyConversationTitle(conversation, entry.title, entry.title_updated_at)) changed = true;
+    }
+    if (changed) saveToStorage();
+  });
   const activeId = ref(null);
   const inputText = ref('');
   const sending = ref(false);
@@ -2076,20 +2087,19 @@ export function useAliangChat() {
         conversations.value.push(inc);
         byId.set(inc.id, inc);
         changed = true;
-      } else if ((inc.updatedAt || 0) > (local.updatedAt || 0)) {
-        local.title = inc.title;
-        local.messages = inc.messages;
-        local.model = inc.model;
-        local.effort = inc.effort;
-        local.updatedAt = inc.updatedAt;
-        changed = true;
+      } else {
+        if (applyConversationTitle(local, inc.title, inc.titleUpdatedAt)) changed = true;
+        if ((inc.updatedAt || 0) > (local.updatedAt || 0)) {
+          if (!local.titleUpdatedAt) local.title = inc.title;
+          local.messages = inc.messages;
+          local.model = inc.model;
+          local.effort = inc.effort;
+          local.updatedAt = inc.updatedAt;
+          changed = true;
+        }
       }
     }
     if (changed) saveToStorage(); // 合并结果回写，下一 tab 收敛到同一份。
-    // 已知限制（评审 nit，刻意接受）：LWW 以 updatedAt 单键判定，改名刻意
-    // 不抬 updatedAt（commitRename 注释：改名不是内容更新不顶分组首位）——
-    // 纯改名跨 tab 后写会被同 updatedAt 的他端版本回滚标题。两侧二选一为
-    // 已知取舍，不为此引入软时间戳。
   }
 
   function onChatStorageEvent(e) {
@@ -2211,8 +2221,11 @@ export function useAliangChat() {
     nextTick(() => scrollToBottom());
   }
 
-  // --- 会话重命名（仅本地标题，不同步 native / 服务端） ---
+  // --- 会话重命名 ---
   const renamingId = ref('');
+  const pendingRenames = new Map();
+  let failedRename;
+  let renameCommit;
   // 'list' | 'header'：同一会话在列表与顶栏各有一个可编辑位点，
   // 必须靠它保证**同一时刻只渲染一个输入框**，否则键盘焦点会落到 DOM 里靠后的那个。
   const renameSurface = ref('');
@@ -2227,13 +2240,14 @@ export function useAliangChat() {
   }
 
   function startRename(conv, surface = 'list') {
-    if (!conv?.id) return;
+    if (!conv?.id || !canRenameConversation(conv)) return;
     // iOS Safari 点 <button> 不移动焦点，输入框收不到 blur，「失焦提交」不会触发；
     // 进新编辑位点前先主动提交上一个，避免共享的 renameDraft 冲掉在编文字。
     if (renamingId.value) commitRename();
     renamingId.value = conv.id;
     renameSurface.value = surface;
-    renameDraft.value = conv.title || '';
+    renameDraft.value = failedRename?.id === conv.id ? failedRename.title : (conv.title || '');
+    if (failedRename?.id === conv.id) failedRename = undefined;
     nextTick(() => {
       renameInputEl.value?.focus();
       renameInputEl.value?.select();
@@ -2241,13 +2255,66 @@ export function useAliangChat() {
   }
 
   function commitRename() {
-    if (!renamingId.value) return;
-    const conv = conversations.value.find(c => c.id === renamingId.value);
-    if (conv) {
-      conv.title = normalizeConversationTitle(renameDraft.value);
-      saveToStorage(); // 刻意不动 updatedAt：改名不是内容更新，不该把会话顶到分组首位
-    }
+    if (!renamingId.value) return renameCommit;
+    const conv = mergedConversations.value.find(c => c.id === renamingId.value);
+    const title = normalizeConversationTitle(renameDraft.value);
     cancelRename();
+    if (!conv || title === conv.title) return;
+    const id = conv.deviceSession?.id || conv.aiSessionId;
+    if (!id) {
+      conv.title = title;
+      saveToStorage();
+      return;
+    }
+    if (!title) return;
+    const saving = saveConversationTitle(conv.id, id, title);
+    renameCommit = saving;
+    void saving.then(() => {
+      if (renameCommit === saving) renameCommit = undefined;
+    });
+    return saving;
+  }
+
+  async function saveConversationTitle(conversationId, id, title) {
+    try {
+      await ensureAISocket();
+      const requestId = generateId();
+      const accepted = await new Promise(resolve => {
+        const finish = ok => {
+          clearTimeout(timer);
+          pendingRenames.delete(requestId);
+          resolve(ok);
+        };
+        const timer = setTimeout(() => finish(false), 5000);
+        pendingRenames.set(requestId, finish);
+        try {
+          if (!sendAI({ type: 'ai.session.rename', session_id: id, title, request_id: requestId })) finish(false);
+        } catch (_) {
+          finish(false);
+        }
+      });
+      if (!accepted) throw new Error('rename-unconfirmed');
+      return true;
+    } catch (_) {
+      if (chatDisposed) return false;
+      failedRename = { id: conversationId, title };
+      showErrorDialog(t('chat_renameFailed'));
+      return false;
+    }
+  }
+
+  function receiveConversationTitle(event) {
+    const id = event.session_id;
+    if (!id) return;
+    const shell = findDeviceShellBySessionId(id);
+    if (shell) applyConversationTitle(shell, event.title, event.title_updated_at);
+    let changed = false;
+    for (const conv of conversations.value) {
+      if (conv.aiSessionId === id || conv.deviceSession?.id === id) {
+        if (applyConversationTitle(conv, event.title, event.title_updated_at) && !conv.deviceSession) changed = true;
+      }
+    }
+    if (changed) saveToStorage();
   }
 
   function cancelRename() {
@@ -2689,6 +2756,7 @@ export function useAliangChat() {
         // 陈旧 socket 的迟到 close（CLOSING→重连窗口）：aiSocket 已被新连接顶掉，
         // 别解新 run 的看门狗、别给新 run 画错误——让旧 close 静默退场。
         if (stale) return;
+        for (const finish of pendingRenames.values()) finish(false);
         disarmIdleWatchdog();
         // 关窗卸载的主动 close 不是断线：run 在 agent 侧继续跑，重进页经订阅
         // 快照对齐终态（见 resubscribeRestoredRuns / handleDeviceSnapshot 的
@@ -3787,6 +3855,11 @@ export function useAliangChat() {
 
   function handleAIEvent(e, timingReceipt) {
     if (!e || !e.type) return;
+    if (e.type === 'ai.session.rename.ack' || e.type === 'ai.session.title.updated') {
+      if (e.type === 'ai.session.title.updated' || e.accepted === true) receiveConversationTitle(e);
+      if (e.type === 'ai.session.rename.ack') pendingRenames.get(e.request_id)?.(e.accepted === true);
+      return;
+    }
     // run 数据面入站帧证明管道活着：重连预算归零（纯快照握手不算——防
     // 「连上→回一帧→断」假活环境无限洗白预算；长跑 run 的偶发断线在健康
     // 恢复后靠 delta/终态帧重新拿满预算，不会被累计封顶误伤）。
@@ -4534,9 +4607,9 @@ export function useAliangChat() {
     }
   }
 
-  function close() {
+  async function close() {
     // iOS Safari 上点关闭不会触发输入框 blur，先把在编的标题落地再卸载页面。
-    commitRename();
+    if (await commitRename() === false || chatDisposed) return;
     showDashboard();
   }
 
@@ -4588,6 +4661,7 @@ export function useAliangChat() {
     reconnectAttempts = 0;
     ensureAISocket()
       .then(() => {
+        refreshOnEvent();
         // 新 socket 订阅集全灭（服务端订阅挂 socket 键，连接结束整体摘除）：
         // 已打开设备壳补订（评审 P1——resubscribeRestoredRuns 只滤本地会话，
         // 壳订阅唯二入口是 openDeviceSession 与 onclose 自愈，恢复路径必须
@@ -4609,6 +4683,7 @@ export function useAliangChat() {
     console.log('[aliang-chat] ChatPage mounted build=stream-v4 ws=' + aiSocketUrl());
     loadFromStorage();
     loadDeviceSessions(); // 设备会话清单：每次进页拉取（权威在后端，不进 localStorage）
+    ensureAISocket().catch(() => {}); // Idle viewers also receive title updates.
     resubscribeRestoredRuns(); // 后台静默运行对账：恢复的 running 气泡向真值收敛
     // 审批卡 expires_at 倒计时刷新（30s 粒度，见 ChatApprovalCard 的 approvalExpiresLabel）
     nowTickTimer = setInterval(() => { nowTick.value = now(); }, 30000);
@@ -4633,6 +4708,7 @@ export function useAliangChat() {
     aiSocket = null;
     aiSocketSettle = null;
     aiSocketPromise = null;
+    for (const finish of pendingRenames.values()) finish(false);
     disarmIdleWatchdog();
     disposeDeviceSessions(); // B8：尾随刷新定时器随卸载收口
     window.removeEventListener('storage', onChatStorageEvent); // D3：跨 tab 合并监听随卸载拆

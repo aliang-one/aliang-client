@@ -1,5 +1,6 @@
-import { ref } from 'vue';
+import { reactive, ref } from 'vue';
 import { getAgentSessions } from '../services/agentApi';
+import { applyConversationTitle } from '../utils/chatTitle';
 import {
   deviceSessionToConversation,
   isAliangCodeSession,
@@ -106,7 +107,7 @@ export function useDeviceSessions() {
     } else {
       shell.aiSessionId = entry.id;
     }
-    return shell;
+    return reactive(shell);
   }
 
   function shellForEntry(entry) {
@@ -118,7 +119,8 @@ export function useDeviceSessions() {
       return shell;
     }
     // 原位刷新清单驱动字段，保留 messages/approvals/deviceTranscript 等打开态
-    cached.title = entry.title || entry.id;
+    if (!cached.titleUpdatedAt) cached.title = entry.title || entry.id;
+    applyConversationTitle(cached, entry.title, entry.title_updated_at);
     cached.provider = normalizeDeviceProvider(entry.provider);
     cached.projectPath = entry.project_path || '';
     cached.deviceSession = entry;

@@ -108,6 +108,32 @@ function sentTypes(sock) {
   });
 }
 
+it('commits a journal rename only after its receipt and ignores an older title event', async () => {
+  localStorage.clear();
+  FakeWebSocket.instances.length = 0;
+  vi.stubGlobal('WebSocket', FakeWebSocket);
+  const { chat, conv, sock } = await mountRunningSession();
+  conv.title = 'Old title';
+  chat.startRename(conv);
+  chat.renameDraft.value = 'New title';
+  const saving = chat.commitRename();
+  await flushMicrotasks();
+  const rename = sock.sent.map(JSON.parse).find(msg => msg.type === 'ai.session.rename');
+  expect(rename).toMatchObject({ title: 'New title', session_id: 'sess-z' });
+  expect(conv.title).toBe('Old title');
+  frame(sock, {
+    ...rename, type: 'ai.session.rename.ack', accepted: true,
+    title_updated_at: '2026-11-27T01:02:03.123456789Z',
+  });
+  await saving;
+  expect(conv.title).toBe('New title');
+  frame(sock, {
+    type: 'ai.session.title.updated', session_id: 'sess-z', title: 'Older title',
+    title_updated_at: '2026-11-27T01:02:03.123Z',
+  });
+  expect(conv.title).toBe('New title');
+});
+
 describe('① ai.status 终态收窗（词表=agentAIRunEventTerminal）', () => {
   beforeEach(() => {
     localStorage.clear();
