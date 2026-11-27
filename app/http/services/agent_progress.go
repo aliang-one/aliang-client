@@ -428,28 +428,75 @@ func shellFinishFields(operationID string, outcome agentcore.ShellOutcome) map[s
 	return fields
 }
 
+// The automatic shell card carries a bounded, fixed-vocabulary stage summary
+// next to the byte count. Everything on the card is derived from output
+// receipt activity alone: the command line, paths, tokens and the raw
+// stdout/stderr never leave this process, and no output content is inspected
+// to pick a stage.
+const (
+	shellStageStreaming = "receiving command output"
+	shellStageWaiting   = "waiting for command output"
+
+	// Consecutive quiet seconds before the card is demoted to waiting. Three
+	// ticks keep a slow-but-alive producer (a quiet build) on the running
+	// stage instead of flapping.
+	shellWaitingAfterTicks = 3
+)
+
+func shellStageFields(stage string, count int64) map[string]interface{} {
+	phase := "running"
+	if stage == shellStageWaiting {
+		phase = "waiting"
+	}
+	return map[string]interface{}{
+		"action": "update", "current": count, "unit": "bytes",
+		"phase": phase, "step": stage,
+	}
+}
+
 func (p *agentProgressTool) observeShellOutput(ctx context.Context, operationID string, outputBytes func() int64, done <-chan agentcore.ShellOutcome) agentcore.ShellOutcome {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	var reported int64
+	quiet := 0
+	stage := shellStageStreaming
+	send := func(stage string, count int64) bool {
+		// A stalled network must not delay the terminal frame for the full
+		// retry window. The next tick samples the cumulative count again.
+		attempt, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
+		fields := shellStageFields(stage, count)
+		fields["operation_id"] = operationID
+		ack, err := p.service.reportOperation(attempt, p.account, p.frame(fields))
+		cancel()
+		if err == nil && remoteString(ack, "status") == "accepted" {
+			reported = count
+			return true
+		}
+		return false
+	}
 	for {
 		select {
 		case outcome := <-done:
 			return outcome
 		case <-ticker.C:
 			count := outputBytes()
-			if count <= reported {
+			if count > reported {
+				quiet = 0
+				stage = shellStageStreaming
+				send(stage, count)
 				continue
 			}
-			// A stalled network must not delay the terminal frame for the full
-			// retry window. The next tick samples the cumulative count again.
-			attempt, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
-			ack, err := p.service.reportOperation(attempt, p.account, p.frame(map[string]interface{}{
-				"action": "update", "operation_id": operationID, "current": count, "unit": "bytes",
-			}))
-			cancel()
-			if err == nil && remoteString(ack, "status") == "accepted" {
-				reported = count
+			if stage == shellStageWaiting {
+				continue
+			}
+			quiet++
+			if quiet < shellWaitingAfterTicks {
+				continue
+			}
+			// Output stopped arriving: demote the card once, then stay quiet
+			// until output resumes, so a hung command does not tick per second.
+			if send(shellStageWaiting, count) {
+				stage = shellStageWaiting
 			}
 		}
 	}
