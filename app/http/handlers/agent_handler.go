@@ -141,6 +141,9 @@ func (h *AgentHandler) HandleAIStream(w http.ResponseWriter, r *http.Request) {
 	// defer 顺序：注销先于 conn.Close（LIFO）——先停 pump 再关连接。
 	socketID := h.service.RegisterLocalAIChatSocket(writeJSON)
 	defer h.service.UnregisterLocalAIChatSocket(socketID)
+	if err := writeJSON(map[string]interface{}{"type": "presence.ready"}); err != nil {
+		return
+	}
 
 	for {
 		var msg map[string]interface{}
