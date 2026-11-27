@@ -562,6 +562,63 @@ func TestEndpointStore_UpdateProtocolFlipOnEgressRowRejected(t *testing.T) {
 	}
 }
 
+// BumpCounters 窄缝(quality-fix Important 1,spec 二期 §9.1 不变量 6 修订):
+// 池模式下 403 等计数路径要求「计数列与 last_error 照记、只门控动作」——
+// 健康四列必须原样不动。预置健康态+出口标记的非默认值,整行相等断言排除
+// 一切漏守;两连跳证明 SQL 侧累加。
+func TestEndpointStore_BumpCountersNarrowWrite(t *testing.T) {
+	s := newTestStore(t)
+	newAnthropicEndpoint(t, s, "bc1")
+	if err := s.UpdateHealth("bc1", HealthUpdate{Status: "cooldown", Failures: 2,
+		CooldownUntil: 777, RateLimitedUntil: 888, LastErr: "old"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetEgressKernel("bc1", true); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.Get("bc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BumpCounters("bc1", 3, 1, "boom-403"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.Get("bc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 目标列:计数累加 + last_error 覆写。
+	if after.TotalRequests != 3 || after.FailedRequests != 1 {
+		t.Fatalf("counters must accumulate: total=%d failed=%d", after.TotalRequests, after.FailedRequests)
+	}
+	if after.LastError != "boom-403" {
+		t.Fatalf("last_error must be overwritten, got %q", after.LastError)
+	}
+	// 窄写契约:健康四列 + egress + config 列全不动(整行相等,updated_at
+	// 记账列与被写的三列除外)。
+	if after.HealthStatus != "cooldown" || after.ConsecutiveFailures != 2 ||
+		after.CooldownUntil != 777 || after.RateLimitedUntil != 888 {
+		t.Fatalf("health columns must be untouched: %+v", after)
+	}
+	b2, a2 := *before, *after
+	b2.TotalRequests, b2.FailedRequests, b2.LastError, b2.UpdatedAt = 0, 0, "", 0
+	a2.TotalRequests, a2.FailedRequests, a2.LastError, a2.UpdatedAt = 0, 0, "", 0
+	if b2 != a2 {
+		t.Fatalf("BumpCounters must only touch counters+last_error, row changed: %+v -> %+v", b2, a2)
+	}
+	// 二连跳:SQL 侧累加在原值之上。
+	if err := s.BumpCounters("bc1", 1, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	after2, err := s.Get("bc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after2.TotalRequests != 4 || after2.FailedRequests != 1 {
+		t.Fatalf("second bump must accumulate: total=%d failed=%d", after2.TotalRequests, after2.FailedRequests)
+	}
+}
+
 // DDL 实证:四条新列必须以 spec §4 的精确列名落表——gorm 蛇形纪律一期踩过
 // (ProtocolOpenAI → protocol_open_ai),显式 column tag 钉住后用真 DDL 收口,
 // 不赌 NamingStrategy。

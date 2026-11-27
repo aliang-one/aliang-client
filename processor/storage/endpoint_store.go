@@ -10,6 +10,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/processor/config"
 )
 
@@ -295,15 +296,45 @@ func (s *EndpointStore) UpdateHealth(id string, u HealthUpdate) error {
 	return s.db.Model(&config.LLMEndpoint{}).Where("id = ?", id).Updates(cols).Error
 }
 
+// BumpCounters 是「计数列 + last_error」的专用窄缝(quality-fix Important 1,
+// spec 二期 §9.1 不变量 6 修订的落库形态):池模式(failure_disable=0)只门控
+// 「动作」(disabled 迁移/冷却写库),指标照记——Task 2 的 403 计数路径用它
+// (total/failed 增量由调用方按计数语义给,403 按普通失败计即 1/1)。SQL 侧
+// 原子累加两计数、覆写 last_error,健康四列(health_status/consecutive_failures/
+// cooldown_until/rate_limited_until)一概不碰——与 UpdateHealth(健康列宽写)
+// 各守各的列集,谁也不越界。
+func (s *EndpointStore) BumpCounters(id string, totalDelta, failedDelta int64, lastErr string) error {
+	return s.db.Model(&config.LLMEndpoint{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"total_requests":  gorm.Expr("total_requests + ?", totalDelta),
+		"failed_requests": gorm.Expr("failed_requests + ?", failedDelta),
+		"last_error":      lastErr,
+	}).Error
+}
+
 // MarkUsed 是 last_used_at 的专用窄写(spec §5.7):内核选中即打点,只动
 // last_used_at 一列,config 列与健康列原值不动。独立方法而非复用 UpdateHealth:
 // 打点发生在 run 解析命中时,调用方手里没有健康态可带,复用就得读行组装快照,
 // 等于把窄写做成了宽写。(gorm 会顺带刷 updated_at——记账列,与 UpdateHealth
 // 同款行为,不算「其它列」。)
 func (s *EndpointStore) MarkUsed(id string) error {
-	return s.db.Model(&config.LLMEndpoint{}).Where("id = ?", id).
-		Update("last_used_at", time.Now().Unix()).Error
+	res := s.db.Model(&config.LLMEndpoint{}).Where("id = ?", id).
+		Update("last_used_at", time.Now().Unix())
+	if res.Error != nil {
+		return res.Error
+	}
+	// 0 行受影响 = 行在「解析选中」与「打点落库」之间被删:打点丢失不影响
+	// 路由,但 Task 4b 解析器若频繁命中此路径,说明它拿着过期选中快照在打点,
+	// Debug 留痕供诊断(quality-fix Minor 4)。
+	if res.RowsAffected == 0 {
+		logger.Debug(fmt.Sprintf("endpoint: MarkUsed %s 零行受影响(行可能刚被删除),打点丢弃", id))
+	}
+	return nil
 }
+
+// errEgressTargetChanged 是 SetEgressKernel 的内部哨兵:写时条件 WHERE 落 0 行
+// (预检到写之间目标行被并发删除或协议被翻转),事务回滚后按重读结果折算成
+// 对外的两个哨兵(404/ErrNotAnthropic),handler 契约不因竞态变形。
+var errEgressTargetChanged = errors.New("llm_endpoint: 出口目标行并发变更")
 
 // SetEgressKernel 是 egress_kernel 列的唯一写入口(事务换绑,spec §4):set=true
 // 先熄灭全部旧出口行再点亮目标行,「全表至多一行=1」由同一事务保证——中途
@@ -311,20 +342,29 @@ func (s *EndpointStore) MarkUsed(id string) error {
 // 行允许(内置链路本身就是 anthropic);停用行也允许(出口「暂停保留」,
 // enabled 0→1 时恢复生效)。
 //
+// 并发语义(quality-fix Minor 2,评审方案 a):存在性/协议预检在事务外——事务
+// 的第一条语句就是写,不落入「deferred 事务先 SELECT 拿共享锁、再写要升级锁,
+// 升级遇并发写立即 SQLITE_BUSY 且 busy_timeout 救不了」的死角。预检与写之间
+// 是 TOCTOU 窗口,语义为 last-commit-wins:
+//   - 目标行被并发删 → set 的 UPDATE 落 0 行,终态「无出口行」仍满足不变量;
+//   - 协议被并发翻 → 点亮走条件 WHERE(protocol_anthropic=1)写时兜底,
+//     「egress=1⟸anthropic」在写时刻原子成立,0 行受影响回滚后重读折算精确
+//     错误(Validate 双层只守 Update 链,守不住这条竞态窗);
+//   - 「至多一行=1」不受任何并发影响:清旧与点亮在同一事务内。
 // 存在性检查对 set=true/false 一致:不存在的 id 返回包了 gorm.ErrRecordNotFound
 // 的错误,handler 统一映射 404——取消一个拼错的 id 不该被静默吞掉。
 func (s *EndpointStore) SetEgressKernel(id string, set bool) error {
-	return s.db.Transaction(func(tx *gorm.DB) error {
-		var e config.LLMEndpoint
-		if err := tx.First(&e, "id = ?", id).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return fmt.Errorf("endpoint %s 不存在: %w", id, gorm.ErrRecordNotFound)
-			}
-			return err
+	var e config.LLMEndpoint
+	if err := s.db.First(&e, "id = ?", id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("endpoint %s 不存在: %w", id, gorm.ErrRecordNotFound)
 		}
-		if set && !e.ProtocolAnthropic {
-			return fmt.Errorf("%w: %s", ErrNotAnthropic, id)
-		}
+		return err
+	}
+	if set && !e.ProtocolAnthropic {
+		return fmt.Errorf("%w: %s", ErrNotAnthropic, id)
+	}
+	err := s.db.Transaction(func(tx *gorm.DB) error {
 		if set {
 			// 只熄灭当前 =1 的行而非全表置 0:终态完全一致,但不给无关行刷
 			// updated_at;顺带自愈——万一历史状态残留了多行 =1,也一并清掉。
@@ -333,14 +373,34 @@ func (s *EndpointStore) SetEgressKernel(id string, set bool) error {
 				Update("egress_kernel", false).Error; err != nil {
 				return err
 			}
-			return tx.Model(&config.LLMEndpoint{}).
-				Where("id = ?", id).
-				Update("egress_kernel", true).Error
+			// 写时条件兜底(见上方并发语义):预检通过不等于写时刻仍 anthropic。
+			res := tx.Model(&config.LLMEndpoint{}).
+				Where("id = ? AND protocol_anthropic = ?", id, true).
+				Update("egress_kernel", true)
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected == 0 {
+				return errEgressTargetChanged
+			}
+			return nil
 		}
 		return tx.Model(&config.LLMEndpoint{}).
 			Where("id = ?", id).
 			Update("egress_kernel", false).Error
 	})
+	if errors.Is(err, errEgressTargetChanged) {
+		// 事务已回滚,重读折算精确错误:404 或 400,不吞竞态。
+		var cur config.LLMEndpoint
+		if rerr := s.db.First(&cur, "id = ?", id).Error; rerr != nil {
+			if errors.Is(rerr, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("endpoint %s 不存在: %w", id, gorm.ErrRecordNotFound)
+			}
+			return rerr
+		}
+		return fmt.Errorf("%w: %s", ErrNotAnthropic, id)
+	}
+	return err
 }
 
 // Delete 删除端点;内置行恒拒(spec §5.1: builtin=1 的行 DELETE 返回 409)。
