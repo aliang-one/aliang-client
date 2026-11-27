@@ -76,6 +76,8 @@
           <p v-if="selected.step || selected.stage" class="mt-4 break-words text-sm">{{ selected.step || t('operation_stage_' + selected.stage) }}</p>
           <p v-if="selected.message" class="mt-3 whitespace-pre-wrap break-words text-sm">{{ selected.message }}</p>
           <p v-if="selected.error_code" class="mt-3 break-words text-sm text-red-600 dark:text-red-400">{{ selected.error_code }}</p>
+          <p v-if="selected.kind === 'shell' && selected.source_kind === 'ai_progress' && isActiveOperation(selected)"
+            class="mt-3 text-sm text-slate-600 dark:text-slate-400">{{ t('operation_shellStopScope') }}</p>
           <p v-if="selected.rate > 0" class="mt-2 text-sm tabular-nums">
             {{ t('operation_rate', { value: numberLabel(selected.rate), unit: selected.progress?.unit ? t('operation_unit_' + selected.progress.unit) : '' }) }}
             <span v-if="selected.eta_seconds != null"> · {{ t('operation_eta', { value: durationLabel(selected.eta_seconds) }) }}</span>

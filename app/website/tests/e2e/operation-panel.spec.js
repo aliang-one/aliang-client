@@ -66,3 +66,20 @@ test('task drawer advances elapsed time until the task finishes', async ({ page 
   await expect(taskRow).toContainText('Elapsed 00:06');
   await expect(drawer.getByText('Elapsed 00:06', { exact: true }).last()).toBeVisible();
 });
+
+test('shell activity shows the scope of Stop and keeps one terminal record', async ({ page }) => {
+  const running = { ...task, title: 'Bash', kind: 'shell', session_id: 'local-shell-session',
+    started_at: timestamp, progress: undefined };
+  await push(page, running);
+  await page.getByTestId('chat-operation-entry').last().click();
+  const drawer = page.getByTestId('chat-operation-panel');
+  const taskRow = drawer.getByRole('button', { name: /^Bash/ });
+  await taskRow.click();
+  const scope = drawer.getByText('Stop in the conversation ends the entire turn.', { exact: true });
+  await expect(scope).toBeVisible();
+  await expect(drawer.getByRole('progressbar')).toHaveCount(0);
+  await push(page, { ...running, phase: 'cancelled', revision: 2, finished_at: timestamp });
+  await expect(taskRow).toHaveCount(1);
+  await expect(taskRow).toContainText(/Cancelled/i);
+  await expect(scope).toHaveCount(0);
+});

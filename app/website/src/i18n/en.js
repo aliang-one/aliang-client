@@ -23,6 +23,7 @@ export default {
   operation_updated: "Updated",
   operation_ended: "Finished",
   operation_openSession: "Open conversation",
+  operation_shellStopScope: "Stop in the conversation ends the entire turn.",
   operation_phase_queued: "Queued",
   operation_phase_running: "Running",
   operation_phase_waiting: "Waiting",

@@ -23,6 +23,7 @@ export default {
   operation_updated: "更新时间",
   operation_ended: "结束时间",
   operation_openSession: "打开会话",
+  operation_shellStopScope: "会话中的停止按钮会结束整个回合。",
   operation_phase_queued: "排队中",
   operation_phase_running: "运行中",
   operation_phase_waiting: "等待中",
