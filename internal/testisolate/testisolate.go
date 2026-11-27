@@ -16,6 +16,7 @@ package testisolate
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"aliang.one/nursorgate/common/cache"
 	"aliang.one/nursorgate/common/logger"
@@ -53,6 +54,11 @@ func RedirectUserStateDir() func() {
 		return func() {}
 	}
 	_ = os.Setenv("ALIANG_DATA_DIR", dir)
+	// ALIANG_LOG_DIR 一并重定向:EnsureCoreDirs(2026-11 起 core 启动与 IPC
+	// server.Start 都会走)要创建系统日志目录——Linux /var/log/aliang、macOS
+	// /Library/Logs/Aliang,非 root 的 CI 必 permission denied,ipc 包 3 个
+	// 测试因此全挂(2026-11-27 v1.1.127 CI 实证)。指进同一临时目录。
+	_ = os.Setenv("ALIANG_LOG_DIR", filepath.Join(dir, "logs"))
 	cache.ResetCacheDirForTest()
 	// Recompute the default log config against the temp state dir and
 	// propagate it. The main logger opens its file lazily: the path is only
