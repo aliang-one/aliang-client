@@ -2,6 +2,12 @@ module aliang.one/nursorgate
 
 go 1.26.0
 
+// 锁工具链 ≥1.26.11:Go 1.26.0 的 internal/poll RecvFrom 存在 Windows 异步
+// WSARecvFrom 栈缓冲复用缺陷(内核迟到写 *lpFromlen=16 进已回收/复用栈),
+// 表现为 core 随机 fatal error: fault(0.196 实测 7 次同指纹,根因字节级闭环);
+// 1.26.11 已修复。GOTOOLCHAIN 默认 auto,构建会自动切到该版本。
+toolchain go1.26.11
+
 replace github.com/elazarl/goproxy v1.7.2 => ../goproxy
 
 require (
