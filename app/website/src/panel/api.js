@@ -34,8 +34,10 @@ const RUN_MODE_PATH = '/api/run/swift';
 //   成功 200 信封 data 回显 {protocol,id};业务失败走【真 HTTP 错误码】——
 //   目标不存在/protocol 不匹配→404(ErrEndpointNotAvailable)、builtin 兜底行/
 //   auto_group=0/已摘除→400(ErrEndpointNotActivatable)、registry 不可用→
-//   HTTP 500+业务码 201、非 POST→405。信封 body 恒带服务端人话 msg
-//   (app/http/common/response.go Error)。
+//   HTTP 500+业务码 201。这些 common.Error* 路径的信封 body 恒带服务端人话
+//   msg(app/http/common/response.go Error)。例外:非 POST→405 是 handler 直接
+//   http.Error("Method not allowed") 的纯文本、【不是信封】;客户端恒发 POST,
+//   该分支实际不可达,万一读不到 msg 会回落 HTTP 文案。
 const ENDPOINT_ACTIVATE_PATH = '/api/endpoints/activate';
 
 // getSummary 的超时预算:面板 2s 轮询一次,超时 1.5s 保证不堆叠
@@ -75,7 +77,7 @@ async function readErrorEnvelopeMsg(res) {
 // (服务端 DecodeRequest 只认 body 本身,头是规范习惯非硬依赖)。
 // errorBodyMsg(默认关):非 2xx 时尽力捞信封 body 的服务端 msg 作为错误
 // 信息——启用方是 activateEndpoint(它的业务失败走真 HTTP 错误码,msg 是
-// 面板 toast 要直县人话);不启用时保持既有「HTTP 状态码」文案,启停/读
+// 面板 toast 要直吐人话);不启用时保持既有「HTTP 状态码」文案,启停/读
 // 路径行为零变化。
 async function fetchJson(path, { method = 'GET', timeoutMs, body, errorBodyMsg = false } = {}) {
   const controller = new AbortController();
@@ -163,7 +165,7 @@ export async function restartProxy() {
 // /api/endpoints/activate,契约见 ENDPOINT_ACTIVATE_PATH 注释)。判失败与
 // proxyAction 同「三层」但错误形态不同:本路由业务失败走真 HTTP 错误码
 // (404/400/500,信封 body 仍带 code/msg),所以 HTTP 层经 errorBodyMsg 把
-// 信封 msg 捞出来透传(前端 toast 直县人话,如「已摘除的行请先在仪表盘
+// 信封 msg 捞出来透传(前端 toast 直吐人话,如「已摘除的行请先在仪表盘
 // 恢复」),不能只抛状态码;200 信封 code≠0 层防御性保留(惯例对齐
 // getSummary)。成功返回 data(回显 {protocol,id})。
 export async function activateEndpoint(protocol, id) {

@@ -9,8 +9,12 @@
        乐观勾移 + POST /api/endpoints/activate → 成功经既有 summary 刷新
        (data.refresh,同一条轮询管道)回读确认;API 失败/回读不符 → 回滚
        勾移 + warn toast。rank=0(builtin 兜底/auto_group=0/未设优先级)与
-       disabled(摘除)行本地 toast 零请求(与后端 400/404 同义,省一趟网络);
-       拒绝序与后端 ActivateInGroup 同构(builtin/非池行先于摘除)。
+       disabled(摘除)行本地 toast 零请求;已勾选行点击=静默空操作早退。
+       ⚠️ rank 池口径 = auto_group ∧ priority>0(tray_summary.go 授 rank),而
+       selectAuto 的池只看 enabled∧auto_group——priority=0 且 auto_group=1
+       的行后端会接受激活、面板本地 rank 闸却拒绝,属已挂账的计划层缝隙
+       (待产品对齐),【不是】与后端严格同构;只有拒绝序沿用后端
+       ActivateInGroup(builtin/非池行先于摘除)。
      勾选态判定不用 current==item.name 名字匹配(组内重名行撞车全亮)——
      按行自身字段推定(rank 最小的 ok 池行;池全冷却回落 builtin=current
      名字基),见 deriveOnKey 注释;后端 current 仍是名字基,本轮不改后端。
@@ -69,6 +73,9 @@ function normalizeBadge(rank, state, remainingSec) {
 //   3) 都没有 → ''(无行勾选,组头「—」)。
 // 取舍说明:后端 group.current 仍是名字基(本轮不改后端),名字仅在 builtin
 // 回落分支使用;池分支完全走 rank 推定,重名行不互串。
+// 退化限制:行缺 id 且组内同名时,池分支(与 builtin 回落分支)按名字回退
+// 比较可能双亮——主路径自后端 Task 1 起 items 恒带唯一 id,此限制仅针对
+// 防御降级输入,不构成正常数据下的缺陷。
 export function deriveOnKey(items, current) {
   let best = null;
   for (const it of items) {
@@ -247,16 +254,20 @@ export default {
     }
 
     // onItem — 行点击(radio 真激活,plan 2026-11-27 Task 3 语义裁定):
-    //   rank=0/缺 id 行(builtin 兜底/auto_group=0/未设优先级)→ 本地 warn
-    //     toast 零请求(builtin 恒 priority=0→rank0,store 不变量保证,rank
-    //     闸即 builtin 闸;后端对这类行本就 400「激活无效」,零请求省一趟);
+    //   rank=0/缺 id 行 → 本地 warn toast 零请求。rank 池口径如实说明:rank
+    //     只授给 auto_group ∧ priority>0 的行(tray_summary.go:388 的 rankOf),
+    //     selectAuto 的候选池却只看 enabled∧auto_group——priority=0 且
+    //     auto_group=1 的行后端 ActivateInGroup 会接受,面板这里却因 rank=0
+    //     本地拒绝。这是已挂账的计划层缝隙(待产品对齐),本闸【不与后端
+    //     同构】,不能把 rank 闸当成 builtin/非池闸的完整等价物;
     //   disabled 行(rank>=1 池内摘除行)→ 本地 warn toast 零请求(后端 400
     //     同文案「已摘除的行请先在仪表盘恢复」);
+    //   已勾选行(it.on)→ 静默早退(见下方「A」注释:radio 空操作);
     //   其余(ok/cooldown 且 rank>=1)→ 乐观勾移 + activateEndpoint → 成功
     //     经 data.refresh()(既有轮询管道)回读确认;API 失败/回读不符 →
     //     回滚勾移 + warn toast。
-    // 拒绝序与后端 ActivateInGroup 同构(builtin/非池行先于摘除):rank0+
-    // disabled 的行(如 demo kimi-proxy)也归「不在池」,与后端 400 文案一致。
+    // 拒绝序沿用后端 ActivateInGroup 的判定顺序(不存在/协议 → builtin/非池
+    // → 摘除),但如上所述 rank 池定义存在缝隙,别误读为严格同构。
     async function onItem(g, it) {
       if (!model.value.aiOn) return;
       if (it.rank < 1 || !it.id) {
@@ -267,8 +278,18 @@ export default {
         toast.show('已摘除的行请先在仪表盘恢复', 'warn');
         return;
       }
-      // 在途防重:单飞闸(见 pending 注释)。
-      if (pending.value !== null) return;
+      // 「A」已勾选行 = radio 空操作:点当前选中项本不该有任何副作用,但后端
+      // ActivateInGroup 的互斥关停会把同组其余 enabled=1 行(含 cooldown/
+      // health=disabled 行)一并 enabled=0;enabled=0 行失去懒恢复通道=永久
+      // 手动停用。故静默早退(要求无 pending;在途期间点击走下方可见化提示)。
+      if (pending.value === null && it.on) return;
+      // 在途防重:单飞闸(见 pending 注释)。丢弃已可见化——静默吞点击会让
+      // 用户以为面板失灵,统一提示「激活进行中」(pending 期间点任意行,含
+      // 重复点同一行,都走这条)。
+      if (pending.value !== null) {
+        toast.show('激活进行中，请稍候', 'warn');
+        return;
+      }
       const wasCooldown = it.state === 'cooldown';
       pending.value = { protocol: g.protocol, id: it.id };
       try {
@@ -283,12 +304,13 @@ export default {
           toast.show('激活结果未确认，请稍后查看', 'warn');
           return; // finally 释放 pending,勾选回派生值(回滚)
         }
-        // 成功 toast:cooldown 行附冷却恢复预期(分钟向上取整,徽标同口径)。
+        // 成功 toast:带组名上下文(spec §6-6「Anthropic 组 → 名」口径);
+        // cooldown 行附冷却恢复预期(分钟向上取整,徽标同口径)。
         if (wasCooldown) {
           const min = Math.max(1, Math.ceil((it.cooldownSec || 0) / 60));
-          toast.show(`已激活「${it.name}」（冷却中，约 ${min} 分钟后恢复）`);
+          toast.show(`已激活「${g.label} → ${it.name}」（冷却中，约 ${min} 分钟后恢复）`);
         } else {
-          toast.show(`已激活「${it.name}」`);
+          toast.show(`已激活「${g.label} → ${it.name}」`);
         }
       } catch (err) {
         toast.show(humanizeActionError(err), 'warn');

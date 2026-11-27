@@ -270,6 +270,26 @@ describe('动作链路(信封/启停/超时)', () => {
     );
     await expect(setMode('http')).resolves.toEqual({ status: 'unchanged', current_mode: 'http' });
   });
+
+  it('⑩ 非 2xx 默认不透传信封 msg(errorBodyMsg 默认关不变式):getSummary/startProxy/setMode 恒报 HTTP 状态码', async () => {
+    // 信封 body 有人话 msg,但默认关路径必须连 res.json() 都不碰,统一回落
+    // 「HTTP xxx」——防止 errorBodyMsg 默认值被误翻成 true 改变既有三路文案。
+    const body = () => Promise.resolve({ code: 401001, msg: '登录已过期，请重新登录' });
+    const json1 = vi.fn(body);
+    stubFetch(() => Promise.resolve({ ok: false, status: 401, json: json1 }));
+    await expect(getSummary()).rejects.toThrow('GET /api/tray/summary 失败: HTTP 401');
+    expect(json1).not.toHaveBeenCalled();
+
+    const json2 = vi.fn(body);
+    stubFetch(() => Promise.resolve({ ok: false, status: 403, json: json2 }));
+    await expect(startProxy()).rejects.toThrow('POST /api/run/start 失败: HTTP 403');
+    expect(json2).not.toHaveBeenCalled();
+
+    const json3 = vi.fn(body);
+    stubFetch(() => Promise.resolve({ ok: false, status: 503, json: json3 }));
+    await expect(setMode('tun')).rejects.toThrow('POST /api/run/swift 失败: HTTP 503');
+    expect(json3).not.toHaveBeenCalled();
+  });
 });
 
 // ---- D. activateEndpoint(面板 radio 真激活,plan 2026-11-27 Task 3)--------
@@ -344,5 +364,18 @@ describe('activateEndpoint(真实模块:路径/body/三层判失败/超时档)',
     const assertion = expect(pending).rejects.toThrow(`超时(${ENDPOINT_ACTIVATE_TIMEOUT_MS}ms)`);
     await vi.advanceTimersByTimeAsync(ENDPOINT_ACTIVATE_TIMEOUT_MS);
     await assertion;
+  });
+
+  it('⑥ 信封解析自身失败(res.json() reject)→ 回落 HTTP 状态码文案(readErrorEnvelopeMsg catch 分支)', async () => {
+    // 非 JSON 错误页(如网关 502 HTML)会让 res.json() 直接 reject;错误文案
+    // 必须回落状态码,而不是把解析异常漏给用户。
+    stubFetch(() =>
+      Promise.resolve({
+        ok: false,
+        status: 500,
+        json: () => Promise.reject(new SyntaxError('Unexpected token < in JSON')),
+      })
+    );
+    await expect(activateEndpoint('anthropic', 'ep-1')).rejects.toThrow('HTTP 500');
   });
 });

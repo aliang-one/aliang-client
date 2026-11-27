@@ -113,7 +113,10 @@ function q(el, sel) {
 function qa(el, sel) {
   return Array.from(el.querySelectorAll(sel));
 }
-// demoEndpoints — 两组齐全的标准快照(mockup demo 数据同构)。
+// demoEndpoints — 两组齐全的标准快照,刻意对齐 mockup 视觉 demo(§6-6 演示
+// 的 P1/P2/「—」与 builtin 亮勾形态)。注意:mockup 里 builtin 展示为 P1 只是
+// 视觉样板,后端不变量是 builtin priority 恒 0 → rank 恒 0(tray_summary.go
+// 只给 auto_group ∧ priority>0 授 rank);真实语义锚见 realEndpoints。
 function demoEndpoints() {
   return makeEndpoints({
     groups: [
@@ -135,15 +138,41 @@ function demoEndpoints() {
   });
 }
 
+// realEndpoints — builtin rank0 真实形态专项 fixture(评审 item I):后端不变量
+// builtin priority 恒 0 → rank 恒 0;池行 glm rank1 承接勾选,冷却池行 byo
+// rank2 可点击(rank>=1 且非 disabled)。demoEndpoints 保持 mockup 视觉演示
+// 不动(改它牵连 >10 处按索引/文案的断言,且会破坏 mockup 对齐),真实语义
+// 在这里钉死。
+function realEndpoints() {
+  return makeEndpoints({
+    groups: [
+      makeGroup(
+        'anthropic',
+        [
+          makeItem('内置 aliang 隧道', { rank: 0 }),
+          makeItem('glm-coding-plan', { rank: 1 }),
+          makeItem('byo-relay-02', { rank: 2, state: 'cooldown', cd: 90 }),
+        ],
+        'glm-coding-plan'
+      ),
+    ],
+  });
+}
+
 beforeEach(() => {
   useToast().clear();
+  // resetAllMocks(见 afterEach)会把 beforeAll 里 fetch 的「拒网」实现一并
+  // 重置,这里按每个用例重新武装——「零请求」断言之外也绝无真实网络。
+  fetch.mockImplementation(() => Promise.reject(new Error('测试期禁止网络请求')));
 });
 
 afterEach(() => {
   while (mounted.length) mounted.pop().unmount();
   document.body.innerHTML = '';
   useToast().clear();
-  vi.clearAllMocks();
+  // resetAllMocks 而非 clearAllMocks:never-resolve 的 mockImplementation
+  // 会跨用例残留,下个用例「没显式设实现」时会静默返回旧 promise。
+  vi.resetAllMocks();
 });
 
 describe('endpointZoneModel 纯派生(spec §4.4 + 数据防御)', () => {
@@ -468,7 +497,7 @@ describe('EndpointZone 挂载 DOM 契约', () => {
     expect(refresh).toHaveBeenCalledTimes(1);
     // 成功 toast
     const t = useToast().toasts.value.at(-1);
-    expect(t.msg).toBe('已激活「glm-coding-plan」');
+    expect(t.msg).toBe('已激活「Anthropic → glm-coding-plan」');
     expect(t.kind).toBe('success');
     // 勾移:新行亮勾,旧行回空圈
     const items = qa(el, '.ep-item');
@@ -579,7 +608,7 @@ describe('EndpointZone 挂载 DOM 契约', () => {
     expect(api.activateEndpoint).toHaveBeenCalledWith('anthropic', 'id-byo-relay-02');
     expect(refresh).toHaveBeenCalledTimes(1);
     const t = useToast().toasts.value.at(-1);
-    expect(t.msg).toBe('已激活「byo-relay-02」（冷却中，约 2 分钟后恢复）');
+    expect(t.msg).toBe('已激活「Anthropic → byo-relay-02」（冷却中，约 2 分钟后恢复）');
     expect(t.kind).toBe('success');
     // 勾选落 builtin 兜底行(调度真值:目标行冷却中,selectAuto 回落 builtin),
     // 目标行不亮勾——回读确认仍通过(激活本身已生效)。刷新后同行 glm 退清单,
@@ -658,6 +687,167 @@ describe('EndpointZone 挂载 DOM 契约', () => {
     release();
     await flushAsync();
     expect(api.activateEndpoint).toHaveBeenCalledTimes(1);
+  });
+
+  it('点击已是勾选态的行 = 破坏性空操作早退:零请求、零 toast、勾选不动(A)', async () => {
+    // A 行(组内唯一 rank>=1 ok 池行)已是勾选态;同组 B 行 rank2 冷却若被
+    // ActivateInGroup 的互斥关停成 enabled=0,就失去懒恢复通道=永久手动停用。
+    // 点已选中的 radio 行本就应该无操作,不得触发这组关停。
+    const eps = makeEndpoints({
+      groups: [
+        makeGroup(
+          'anthropic',
+          [
+            makeItem('a-current', { rank: 1, id: 'id-a' }),
+            makeItem('b-cool', { rank: 2, state: 'cooldown', cd: 60, id: 'id-b' }),
+          ],
+          'a-current'
+        ),
+      ],
+    });
+    api.activateEndpoint.mockResolvedValue({ protocol: 'anthropic', id: 'id-a' });
+    const { el, refresh } = mountZone({ endpoints: eps, ai: makeAI(true) });
+    q(el, '.g-head').click();
+    await flush();
+    const items = qa(el, '.ep-item');
+    expect(items[0].className).toContain('on');
+    items[0].click();
+    await flushAsync();
+    expect(api.activateEndpoint).not.toHaveBeenCalled();
+    expect(refresh).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(useToast().toasts.value).toHaveLength(0);
+    // 勾选原地不动(仍是 A)
+    expect(qa(el, '.ep-item')[0].className).toContain('on');
+    expect(qa(el, '.ep-item')[1].className).not.toContain('on');
+    expect(qa(el, '.check-mark')).toHaveLength(1);
+  });
+
+  it('乐观勾移:在途期间(pending)DOM 勾选已从旧行移到点击行,不等回读(B)', async () => {
+    // activateEndpoint 永不 resolve:点击后只可能靠乐观态点亮,回读永远没来。
+    api.activateEndpoint.mockImplementation(() => new Promise(() => {}));
+    const eps = makeEndpoints({
+      groups: [
+        makeGroup(
+          'anthropic',
+          [makeItem('a-rank1', { rank: 1 }), makeItem('b-rank2', { rank: 2 })],
+          'a-rank1'
+        ),
+      ],
+    });
+    const { el } = mountZone({ endpoints: eps, ai: makeAI(true) });
+    q(el, '.g-head').click();
+    await flush();
+    expect(qa(el, '.ep-item')[0].className).toContain('on');
+    qa(el, '.ep-item')[1].click();
+    await flush(); // onItem 已同步置 pending,随后 await 未决 promise
+    const onItems = qa(el, '.ep-item.on');
+    expect(onItems).toHaveLength(1);
+    expect(onItems[0].getAttribute('data-nm')).toBe('b-rank2');
+    expect(qa(el, '.check-mark')).toHaveLength(1);
+    expect(qa(el, '.ep-item')[0].className).not.toContain('on');
+  });
+
+  it('回读未发生(旧快照本身可确认)→ 仍 warn「激活结果未确认」(引用比对分支,C)', async () => {
+    // 旧快照:目标行是组内唯一 rank>=1 行 → confirmActivated(旧快照) 恒 true;
+    // 只有 refresh 前后引用比对(after===before)能识别「回读没发生」。
+    // 目标行是冷却池行(勾选按调度语义落 builtin),因此可点击。
+    const eps = makeEndpoints({
+      groups: [
+        makeGroup(
+          'anthropic',
+          [
+            makeItem('内置 aliang 隧道', { rank: 0 }),
+            makeItem('only-pool', { rank: 1, state: 'cooldown', cd: 60 }),
+          ],
+          '内置 aliang 隧道'
+        ),
+      ],
+    });
+    api.activateEndpoint.mockResolvedValue({ protocol: 'anthropic', id: 'id-only-pool' });
+    // 不给 refreshedEndpoints → refresh 为空操作(summary 引用不变)
+    const { el, refresh } = mountZone({ endpoints: eps, ai: makeAI(true) });
+    q(el, '.g-head').click();
+    await flush();
+    qa(el, '.ep-item')[1].click();
+    await flushAsync();
+    expect(refresh).toHaveBeenCalledTimes(1);
+    const t = useToast().toasts.value.at(-1);
+    expect(t.msg).toBe('激活结果未确认，请稍后查看');
+    expect(t.kind).toBe('warn');
+  });
+
+  it('单飞闸丢弃可见化:在途期间点任意行 → toast「激活进行中，请稍候」且请求数不变(E)', async () => {
+    let release;
+    api.activateEndpoint.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        })
+    );
+    const { el } = mountZone({ endpoints: demoEndpoints(), ai: makeAI(true) });
+    q(el, '.g-head').click();
+    qa(el, '.g-head')[1].click();
+    await flush();
+    qa(el, '.ep-item')[1].click(); // 首拍:anthropic/glm
+    await flush();
+    expect(api.activateEndpoint).toHaveBeenCalledTimes(1);
+    // 异行(openai 组的勾选行 deepseek-official)在途点击 → 静默丢弃已可见化
+    qa(el, '.ep-item')[3].click();
+    await flush();
+    expect(api.activateEndpoint).toHaveBeenCalledTimes(1);
+    let t = useToast().toasts.value.at(-1);
+    expect(t.msg).toBe('激活进行中，请稍候');
+    expect(t.kind).toBe('warn');
+    // 重复点同一行也走这条(早退 A 只针对 it.on,pending 期间点任意行都提示)
+    qa(el, '.ep-item')[1].click();
+    await flush();
+    expect(api.activateEndpoint).toHaveBeenCalledTimes(1);
+    t = useToast().toasts.value.at(-1);
+    expect(t.msg).toBe('激活进行中，请稍候');
+    release({ protocol: 'anthropic', id: 'id-glm-coding-plan' });
+    await flushAsync();
+  });
+
+  it('humanize 超时分支:超时转译串 → toast「激活超时，请重试」(H-1)', async () => {
+    api.activateEndpoint.mockRejectedValueOnce(new Error('POST /api/endpoints/activate 超时(10000ms)'));
+    const { el } = mountZone({ endpoints: demoEndpoints(), ai: makeAI(true) });
+    q(el, '.g-head').click();
+    await flush();
+    qa(el, '.ep-item')[1].click();
+    await flushAsync();
+    const t = useToast().toasts.value.at(-1);
+    expect(t.msg).toBe('激活超时，请重试');
+    expect(t.kind).toBe('warn');
+  });
+
+  it('humanize 网络错分支:TypeError(Failed to fetch)→ toast「激活失败，请稍后重试」(H-1)', async () => {
+    api.activateEndpoint.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    const { el } = mountZone({ endpoints: demoEndpoints(), ai: makeAI(true) });
+    q(el, '.g-head').click();
+    await flush();
+    qa(el, '.ep-item')[1].click();
+    await flushAsync();
+    const t = useToast().toasts.value.at(-1);
+    expect(t.msg).toBe('激活失败，请稍后重试');
+    expect(t.kind).toBe('warn');
+  });
+
+  it('builtin rank0 真实形态:徽标「—」、不被推定勾选、点击命中 rank 闸零请求(I)', async () => {
+    const { el } = mountZone({ endpoints: realEndpoints(), ai: makeAI(true) });
+    q(el, '.g-head').click();
+    await flush();
+    const items = qa(el, '.ep-item');
+    expect(q(items[0], '.badge').textContent).toBe('—');
+    expect(items[0].className).not.toContain('on');
+    expect(items[1].className).toContain('on'); // 池行 rank1 承接勾选
+    items[0].click(); // 点真实 builtin 行
+    await flushAsync();
+    const t = useToast().toasts.value.at(-1);
+    expect(t.msg).toBe('builtin 为兜底行/该行不在 auto 调度池，激活无效');
+    expect(t.kind).toBe('warn');
+    expect(api.activateEndpoint).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it('勾选圈只钉在推定行(白勾 svg);其余行空圈', () => {
