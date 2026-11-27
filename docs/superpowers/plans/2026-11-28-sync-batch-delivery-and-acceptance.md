@@ -30,14 +30,12 @@
 
 | 仓库 | 分支 | 提交 | 远端 |
 |---|---|---|---|
-| alianggate（Go agent + 网页） | master | `4e5617c6` | 已推送，tag `v1.1.130` 已触发构建 |
-| AliangPhoneServer | main | `96ddb17` | 已推送，镜像 `aliang-20261127-sync-all` 已推到 registry |
-| AliangVibeCodingPhone（RN） | main | `74d04c1` | 已推送，iOS 1.0.10 (42) 已装到 iPhone 16 Pro |
+| alianggate（Go agent + 网页） | master | `4b35a1dc` | 已推送；tag `v1.1.130` 构建成功并发布；门禁改动待下个 tag 生效 |
+| AliangPhoneServer | main | `1e2bfbf` | 已推送，线上 `nursor/aliang-phone-agent-server` 已滚动更新 |
+| AliangVibeCodingPhone（RN） | main | `1b139df` | 已推送，iOS 1.0.10 (42) 已装到 iPhone 16 Pro |
 
-**未完成**：PhoneServer 的 k8s 部署。镜像在 registry 就位，但本机没有
-kubeconfig，aliangboard 工具在本会话不可用，`nursor` 命名空间的
-`aliang-phone-server` 仍运行旧镜像 `aliang-20261127-hello-delta-p2`。
-需要把 deployment 的 image 切到 `aliang-20261127-sync-all` 后重启。
+PhoneServer 的 k8s 部署已完成（见 §5.1）。真实服务名是
+`aliang-phone-agent-server`，本文件早期版本写的 `aliang-phone-server` 有误。
 
 ## 3. 真机验收步骤
 
@@ -95,3 +93,90 @@ v1.1.130；手机与电脑登录同一账号，网络正常。
 - RN：typecheck 通过；重连、审批恢复、流式合批相关测试 22 项通过。
   全量中另有 4 个套件在基线分支同样失败，属既有问题。
 - iOS Release 真机包构建成功并已安装。
+
+## 5. B 批进展（2026-11-28 续）
+
+行动方案 B 批的入口是「先清掉基线失败，再把关键回归接到发布门禁，
+然后做 RUN-01～03」。本节按这个顺序推进。
+
+### 5.1 PhoneServer 已部署
+
+`nursor/aliang-phone-agent-server`（注意真实服务名带 `agent`，容器名是
+`phone-server`）已通过 aliangboard 滚动更新，新 pod 启动日志确认
+Postgres 初始化、1454 会话加载、4 台设备自动重连。部署清单
+`deploy/k8s/deployment.yaml` 已同步镜像 tag，它是恢复锚点，换镜像后
+必须同步，否则重新应用会静默回滚。
+
+### 5.2 三仓测试基线清零
+
+| 仓 | 清零前 | 清零后 | 修掉的真缺陷 |
+|---|---|---|---|
+| PhoneServer | 5 个失败 | 1330 文件 / 3658 用例，0 失败 | 2 个 |
+| RN | 8 个套件失败 | 302 套件 / 2768 用例，0 失败 | 1 个 |
+| Go | `services` 包偶发串扰 | 三轮全量 0 失败 | 0 个（本轮之前已修 2 个） |
+
+PhoneServer 的两个真缺陷。`finalizeTurnActivity` 先 `void` 调
+`flushDirtyThinking` 落库一次（此时 `active=true`），紧接着 finalized 链把
+同一对象翻成 `active=false` 再落一次，两条异步链完成顺序不定，慢的那次把
+终态覆盖回 `active=true`，正是 2026-11-10 那次修复要消灭的「历史详情永转
+spinner」。改为回合末只取走 dirty 记账，落库统一交给 finalized 链。
+`generatePlan` 调 `buildUserContext` 漏传 `this.now()`，与同文件
+`previewContext` 口径不一致，导致「预览看到的内容」与「实际生成用到的内容」
+不同。
+
+RN 的真缺陷。`formatHarnessEnvelopes` 在计算 code fence 范围之前就对全文做
+正则替换，```md 围栏里的字面 `<command-name>` 也被误改成 `<harness-command>`
+卡片。改为先算 range，匹配落在围栏内则原样保留。
+
+其余均为测试过期，逐项对齐新契约。其中 RN `localService` 两个用例值得记：
+一个没给第三通道 `hk` 置 fail，hk 以 0ms 假赢把断言引偏；另一个只把时钟推
+6 分钟，但 2026-11-03 的「数据面逐出」是 10 分钟，primary 根本没回到选举池。
+
+Go `app/mesh/lanbeacon` 的 3 个用例依赖「`255.255.255.255` 全局广播回环到
+同端口全部 listener」，默认路由走 VPN 隧道时该广播发不出去，用例必然各等
+4 秒超时。加前置探测，环境不具备时 Skip 并写明原因。
+
+### 5.3 发布门禁（DEBT-07 第二步）
+
+新增 `ai-regression` job，在 `frontend` 之后、`build` 之前跑
+`app / agentcore / agentruntime / http / mesh / tools / tunnel` 的全部测试，
+`build` 显式 `needs` 它。带一次重试，用于区分稳定回归与偶发串扰；串扰彻底
+清零后应去掉重试。
+
+### 5.4 RUN-01/02 云端重启感知
+
+此前 PhoneServer 对 agent 重启是「盲」的。hello 忠实存储 `started_at`（agent
+进程自己的启动时刻）却从不比较新旧值，结算只靠「断线 + 15 秒宽限」。agent
+快速重启或看门狗拉起时，设备在宽限内就重连、宽限被取消，上一进程的在途
+回合和待审批就悬着没人结算。
+
+新增 `device/restartSettle.ts`。hello 的 `started_at` 与 existing 不同即证明
+上一进程已不在，不等宽限，就地结算。顺序是「先审批、后回合」，因为
+`releaseDeviceRunningSessions` 会跳过仍挂 pending 审批的会话。三种情况刻意
+不触发：`started_at` 相等（同进程重发 hello，内核 companion 每 10 秒一次）、
+旧 agent 不上报该字段、首次上线。
+
+未覆盖，留给后续：agent 侧的进程丢失判定、手动续跑入口、RUN-03 的托管子
+进程收口、RUN-04 的连续中断熔断。
+
+### 5.5 上线即回滚：`started_at` 不是进程启动时刻
+
+重启裁决的 PhoneServer 镜像上线后，线上日志立刻暴露问题：服务端一次滚动
+更新，4 台设备各被「检测到重启」2～3 次，且跨设备同步发生。agent 没有理由
+这样重启。查 agent 侧发现 `agentHelloPayload` 里的 `started_at` 写的是
+`time.Now()`，即**本次 hello 的构建时刻**，不是进程启动时刻。包内本就有语义
+正确的 `agentProcessStartedAt`（包初始化时捕获，注释已写明「when this binary
+started, not when the remote WS session connected」），只是没被用上。
+
+后果是每次 hello 的 `started_at` 都不同，裁决会把每次重连都当成重启，把在途
+回合误结算。镜像随即回滚到 `sync-all-r2`。这个缺陷在接入裁决之前一直存在，
+只是没有消费方，所以从未暴露。
+
+修复：`started_at` 改用 `agentProcessStartedAt`，`RFC3339Nano` 保留毫秒（同一
+秒内重启也能区分）。补 `TestAgentHelloStartedAtIsProcessStable` 锁死语义，
+该测试在还原到 `time.Now()` 时准确失败。随 `v1.1.131` 发布。
+
+**重启裁决的 PhoneServer 代码已在 main（`1e2bfbf`），但线上未启用。** 重新
+启用前必须确认全部在线 agent 已升级到 `v1.1.131` 及以上——旧 agent 上报的
+`started_at` 仍会每次变化，裁决会误杀。可用日志 `[agent-restart] detected`
+的频率判断：健康状态下它只在 agent 真正重启时出现。
