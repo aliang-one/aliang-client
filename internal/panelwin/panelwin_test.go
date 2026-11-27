@@ -71,6 +71,28 @@ func TestAnchorToWindowPos(t *testing.T) {
 			side: SideBottom, panelW: panelW, panelH: panelH,
 			wantX: 200 - panelW/2, wantY: 30 - panelH - 8,
 		},
+		{
+			// panelwin.go 的 default 分支:SideBottom 与未知值同款兜底
+			// (接线层已先校验 --side,壳内不再二次防御)。
+			name: "未知 side 兜底按 bottom(default 分支)",
+			ax:   800, ay: 40, w: iconW, h: iconH,
+			side: Side("left"), panelW: panelW, panelH: panelH,
+			wantX: 800 + iconW/2 - panelW/2, wantY: 40 - panelH - 8,
+		},
+		{
+			// 零/负面板尺寸不做防御直通参与运算:合法性归接线层判废兜底。
+			// panelW=0 只影响 x 居中项,y 仍按 panelH 算(bottom 分支)。
+			name: "panelW=0:x 居中项归零、y 照用 panelH",
+			ax:   200, ay: 40, w: iconW, h: iconH,
+			side: SideBottom, panelW: 0, panelH: panelH,
+			wantX: 200 + iconW/2, wantY: 40 - panelH - 8,
+		},
+		{
+			name: "panelW 负值:直通运算(x 反向偏移)",
+			ax:   200, ay: 40, w: iconW, h: iconH,
+			side: SideBottom, panelW: -340, panelH: panelH,
+			wantX: 200 + iconW/2 + 340/2, wantY: 40 - panelH - 8,
+		},
 	}
 
 	for _, tc := range cases {

@@ -239,8 +239,19 @@ func runPanelWindow(opts Options) error {
 		if err == nil && AllowDocument(uri, allowOrigin) {
 			return // 白名单内:放行
 		}
-		if resp, respErr := chromium.Environment().CreateWebResourceResponse(nil, 403, "Forbidden", ""); respErr == nil {
-			_ = args.PutResponse(resp)
+		// 拒绝构造/挂载失败=安全闸无法闭合,宁可整面板退出(退出码 1 进
+		// launcher 崩溃判据,崩溃计数可见)不可静默放行(fail-closed):
+		// 原 fail-open(出错就什么都不做)会让请求落回 WebView2 默认处理,
+		// 非 白 origin 内容可能直接加载。
+		resp, respErr := chromium.Environment().CreateWebResourceResponse(nil, 403, "Forbidden", "")
+		if respErr != nil {
+			logger.Error(fmt.Sprintf("panelwin 403 拒绝响应构造失败,fail-closed 退出面板: %v", respErr))
+			procPostQuitMessage.Call(1)
+			return
+		}
+		if putErr := args.PutResponse(resp); putErr != nil {
+			logger.Error(fmt.Sprintf("panelwin 403 拒绝响应挂载失败,fail-closed 退出面板: %v", putErr))
+			procPostQuitMessage.Call(1)
 		}
 	}
 
@@ -271,18 +282,28 @@ func runPanelWindow(opts Options) error {
 	// 授予资格,不调则 WM_ACTIVATE 激活不发、失焦即退整条失效)。
 	procSetForegroundWindow.Call(hwnd)
 	procShowWindow.Call(hwnd, uintptr(swShow))
+	// 首帧键盘焦点:SetForegroundWindow 只把窗口推到前台,WebView2 内部
+	// 文档不一定拿到焦点(首帧键盘输入丢失);程序化 MoveFocus 补齐
+	// (pkg/edge 的 Focus() 无返回值,失败形态随 Task 16 实机探针收口)。
+	chromium.Focus()
 
-	// 自建消息循环:WM_QUIT 的 wParam 即退出码(60=quit;WM_ACTIVATE 失活
-	// 与 WM_DESTROY 都 PostQuitMessage(0))。ret 经 int32 归一:-1=错误
-	// (防自旋,按失焦退出码收尾)、0=WM_QUIT,与 vendored systray 同款形态。
+	// 自建消息循环:GetMessageW 返回 0 才是收到 WM_QUIT(wParam 即退出码:
+	// 60=quit;WM_ACTIVATE 失活与 WM_DESTROY 都 PostQuitMessage(0))。
 	var m msgW
 	gotQuit := false
 	for {
 		ret, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
 		switch int32(ret) {
 		case -1:
-			gotQuit = true // 错误路径跳出,退出码走下面的兜底
+			// -1=错误,按失焦自退处置(进程退出码 0,launcher 记正常关闭),
+			// 错误本身 logger.Error 留痕。不读 m.WParam:GetMessageW 失败时
+			// 结构体内容未定义,读它是残渣面。
+			logger.Error("panelwin 消息循环 GetMessageW 返回 -1,按失焦自退收尾(退出码 0)")
+			lastExitCode = ExitFocusLoss
+			gotQuit = true
 		case 0:
+			// WM_QUIT:wParam 即退出码(0=失焦/销毁,60=quit)。
+			lastExitCode = int(int32(m.WParam))
 			gotQuit = true
 		default:
 			procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
@@ -291,11 +312,6 @@ func runPanelWindow(opts Options) error {
 		if gotQuit {
 			break
 		}
-	}
-	lastExitCode = int(int32(m.WParam))
-	if m.Message != wmQuit && lastExitCode == 0 {
-		// GetMessageW 因错误路径跳出而非收到 WM_QUIT 时兜底失焦退出码。
-		lastExitCode = ExitFocusLoss
 	}
 	return nil
 }

@@ -82,8 +82,17 @@
   NSString* type = nil;
   NSString* kind = nil;
   if ([body isKindOfClass:[NSDictionary class]]) {
-    type = body[@"type"];
-    kind = body[@"kind"];
+    // 畸形 payload 守卫:{"type":123}/{"type":"open","kind":[]} 这类形态
+    // 会让 body[@"type"]/body[@"kind"] 拿到 NSNumber/NSArray,后续
+    // isEqualToString: 直接 unrecognized selector 崩——协议注释是
+    // 「未知形态忽略不崩」。取值先过 isKindOfClass:[NSString class] 闸,
+    // 非 NSString 一律置 nil,落进下面的「未知忽略」分支。
+    if ([body[@"type"] isKindOfClass:[NSString class]]) {
+      type = body[@"type"];
+    }
+    if ([body[@"kind"] isKindOfClass:[NSString class]]) {
+      kind = body[@"kind"];
+    }
   } else if ([body isKindOfClass:[NSString class]]) {
     // 兜底:若前端改为发 JSON 字符串也能解(当前形态是对象→NSDictionary)。
     NSData* data = [(NSString *)body dataUsingEncoding:NSUTF8StringEncoding];
@@ -91,8 +100,13 @@
                                                            options:0
                                                              error:nil];
     if ([parsed isKindOfClass:[NSDictionary class]]) {
-      type = parsed[@"type"];
-      kind = parsed[@"kind"];
+      // 同上的类守卫:JSON 里 type/kind 是数字/数组时不得崩。
+      if ([parsed[@"type"] isKindOfClass:[NSString class]]) {
+        type = parsed[@"type"];
+      }
+      if ([parsed[@"kind"] isKindOfClass:[NSString class]]) {
+        kind = parsed[@"kind"];
+      }
     }
   }
 
@@ -195,7 +209,15 @@ void panelwin_run(const char* url, int x, int yTop, int w, int h,
     web.navigationDelegate = delegate;
     [effect addSubview:web];
 
-    [web loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:urlStr]]];
+    // NSURL URLWithString 对畸形串返回 nil:NSLog 留痕(Task 16 取证用)且
+    // 不 loadRequest——面板空白但失焦链(NSApp run)仍活,宿主可正常关闭;
+    // 不做这层防御,requestWithURL:nil 属未定义形态。
+    NSURL* pageURL = [NSURL URLWithString:urlStr];
+    if (pageURL) {
+      [web loadRequest:[NSURLRequest requestWithURL:pageURL]];
+    } else {
+      NSLog(@"panelwin: --url 解析为 nil,面板不加载内容(失焦自退链仍生效)");
+    }
 
     // 激活双保险:不取焦点则失焦即退永不触发。
     [panel makeKeyAndOrderFront:nil];

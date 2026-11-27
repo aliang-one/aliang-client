@@ -358,6 +358,10 @@ func (l *PanelLauncher) RetryFromFallback()
 1. **状态项窗口有约 800ms 的占位期**：创建后立即取 `TrayRect` 会拿到占位矩形（实测形态 (0,-33)）且 `ok=true`——接线层必须**现取现用**（点击时取，那时必然已摆放），禁止启动早期缓存矩形；或对「y≥屏高 或 x=0 且 y<0」形态判废（与 Windows S_FALSE 判废同型）。
 2. **`button.menu` 不可作接回判据**：AppKit 不把 `statusItem.menu` 传播到按钮视图的 menu（两态均空）——判接回状态用 `statusItem.menu` 本身 + action/target 是否摘除。
 
+**⚠️ panelwin 壳质量评审（M2 Task 13）追加的两条硬验收项：**
+3. **DPI>100% 锚定收口（150% 实机必现破损）**：锚定现用逻辑面板宽高对物理图标坐标，150% 下面板底边越过图标顶约 280px——接线设计必须收口（launcher 侧按 scale 换算面板尺寸传物理值，或壳内拿到 DPI 后对 Y 重锚），Windows 150% 实机走查为硬验收。
+4. **Windows 键盘首帧焦点（SetForegroundWindow 时序/chromium.Focus）与 403 fail-closed 退出路径列入 Task 16 实机探针。**
+
 **Files:**
 - Create: `app/tray/panel_bridge_m2.go` 接线扩展 + 测试追加
 - Modify: `app/tray/companion.go`、`companion_windows.go`

@@ -29,7 +29,11 @@ import (
 //     @autoreleasepool(cgo 调用跑在调用者线程上,Go 运行时线程没有
 //     autorelease pool——同款泄漏先例见 third_party/systray/systray_darwin.m
 //     与 PATCH_NOTES);全文件零裸 autorelease 消息(ARC 下对象生命周期
-//     确定性,面板进程存活即对象存活,不需要手工 autorelease)。
+//     确定性,面板进程存活即对象存活,不需要手工 autorelease);
+//  5. 主线程钉定:panelwin_darwin.go 必须 runtime.LockOSThread——AppKit
+//     UI 事件循环必须在主线程,不钉则 NSApp run 失效、失焦即退链死成僵尸;
+//  6. 畸形 payload 守卫:type/kind 提取先过 isKindOfClass:[NSString class]
+//     闸({"type":123} 这类形态走「未知忽略」,不得 unrecognized selector 崩)。
 
 func TestPanelwinDarwinShellStructure(t *testing.T) {
 	src := panelwinDarwinSource(t)
@@ -37,7 +41,6 @@ func TestPanelwinDarwinShellStructure(t *testing.T) {
 	t.Run("失焦即退与激活面", func(t *testing.T) {
 		for _, want := range []string{
 			"windowDidResignKey",                     // NSWindowDelegate 失焦回调
-			"exit(0)",                                // 失焦自退(退出码契约 0)
 			"exit(60)",                               // quit 消息退出码 60
 			"makeKeyAndOrderFront",                   // 不取焦点则失焦即退永不触发
 			"activateIgnoringOtherApps:YES",          // 同上:程序化激活(12.0 可用,14 起弃用仍有效)
@@ -48,6 +51,11 @@ func TestPanelwinDarwinShellStructure(t *testing.T) {
 				t.Errorf("panelwin_darwin.m 缺少 %q(失焦即退/激活链路不完整)", want)
 			}
 		}
+		// 失焦自退 exit(0) 用正则锚:精确字面量对空白变体(exit ( 0 ))会
+		// 误报缺失,钉的是「零参 exit 调用」这个形态本身。
+		if !regexp.MustCompile(`exit\s*\(\s*0\s*\)`).MatchString(src) {
+			t.Errorf("panelwin_darwin.m 缺少 exit(0)(失焦自退,退出码契约 0)")
+		}
 	})
 
 	t.Run("毛玻璃材质层与透明底", func(t *testing.T) {
@@ -56,11 +64,14 @@ func TestPanelwinDarwinShellStructure(t *testing.T) {
 			"NSVisualEffectBlendingModeBehindWindow", // behindWindow 混合
 			"drawsBackground",                        // WKWebView 私有 KVC 面
 			"@NO",                                    // drawsBackground=false 的赋值形态
-			"opaque = NO",                            // NSPanel 不透明底关掉
 		} {
 			if !strings.Contains(src, want) {
 				t.Errorf("panelwin_darwin.m 缺少 %q(材质层/透明底形态不完整,毛玻璃验收必挂)", want)
 			}
+		}
+		// NSPanel 不透明底关掉:正则锚容忍空白变体(opaque=NO / opaque = NO)。
+		if !regexp.MustCompile(`opaque\s*=\s*NO`).MatchString(src) {
+			t.Errorf("panelwin_darwin.m 缺少 opaque=NO(NSPanel 不透明底会盖住材质层,毛玻璃验收必挂)")
 		}
 		// drawsBackground 必须是 setValue:forKey: 的 KVC 面(plan 口径:
 		// 私有面,公证探针随 Task 16 同批)——不许写成属性点语法误装公有。
@@ -89,6 +100,19 @@ func TestPanelwinDarwinShellStructure(t *testing.T) {
 		// 显式忽略分支(注释锚点),不得崩。
 		if !strings.Contains(src, "未知类型") {
 			t.Errorf("panelwin_darwin.m 缺少「未知类型」忽略分支(协议冻结:未知 type 必须忽略不崩)")
+		}
+	})
+
+	t.Run("畸形 payload 类守卫", func(t *testing.T) {
+		// {"type":123}/{"type":"open","kind":[]} 这类畸形 payload 会让
+		// body[@"type"]/body[@"kind"] 拿到 NSNumber/NSArray,后续
+		// isEqualToString: 直接 unrecognized selector 崩——协议注释是
+		// 「未知形态忽略不崩」。type/kind 的每处提取(NSDictionary 直取与
+		// JSON 字符串兜底解析,共两段×两键)都必须先过
+		// isKindOfClass:[NSString class] 闸,非 NSString 一律走「未知忽略」。
+		if got := strings.Count(src, "isKindOfClass:[NSString class]"); got < 4 {
+			t.Errorf("panelwin_darwin.m 的 type/kind 提取缺 isKindOfClass:[NSString class] 守卫(需 ≥4 处,现 %d 处):畸形 payload {\"type\":123} 会 unrecognized selector 崩",
+				got)
 		}
 	})
 
@@ -122,10 +146,23 @@ func TestPanelwinDarwinShellStructure(t *testing.T) {
 		}
 		// 无裸 autorelease 创建点:ARC 下全文件不允许手写 autorelease 消息
 		// ——手工 autorelease 只会引入对 pool 的隐性依赖;对象生命周期=
-		// 进程存活(面板是叶子进程),显式管理无意义。
-		if idx := strings.Index(src, "autorelease]"); idx >= 0 {
+		// 进程存活(面板是叶子进程),显式管理无意义。对剥注释后的代码断言:
+		// 注释里提到 autorelease(纪律说明本身)不算实现里有,否则误报。
+		code := stripObjcComments(src)
+		if idx := strings.Index(code, "autorelease]"); idx >= 0 {
 			t.Errorf("panelwin_darwin.m 出现裸 autorelease 消息(ARC 纪律:不手写 autorelease),位置 %d 附近:\n%s",
-				idx, lineAround(src, idx))
+				idx, lineAround(code, idx))
+		}
+	})
+
+	t.Run("主线程钉定", func(t *testing.T) {
+		// AppKit 强约束:UI 事件循环必须在主线程。包 init 必然在主 goroutine
+		// 执行,runtime.LockOSThread 钉住后 cgo 的 C.panelwin_run 才跑在主
+		// 线程——不钉则调度器可能把主 goroutine 迁走,NSApp run 失效,
+		// 失焦即退整条链死成僵尸(非崩溃,launcher 崩溃计数看不见)。
+		goSrc := panelwinDarwinGoSource(t)
+		if !strings.Contains(goSrc, "LockOSThread") {
+			t.Errorf("panelwin_darwin.go 缺少 runtime.LockOSThread(主 goroutine 未钉主线程,NSApp run 失效→失焦即退链死成僵尸)")
 		}
 	})
 
@@ -168,6 +205,70 @@ func panelwinDarwinSource(t *testing.T) string {
 		t.Fatalf("读取 panelwin_darwin.m: %v", err)
 	}
 	return string(src)
+}
+
+// panelwinDarwinGoSource 读取本包的 Go cgo 包装层源码(主线程钉定断言用)。
+func panelwinDarwinGoSource(t *testing.T) string {
+	t.Helper()
+
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller: 无法定位测试文件")
+	}
+	src, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "panelwin_darwin.go"))
+	if err != nil {
+		t.Fatalf("读取 panelwin_darwin.go: %v", err)
+	}
+	return string(src)
+}
+
+// stripObjcComments 剥掉 ObjC 源码的 // 行注释与 /* */ 块注释(字符串字面量
+// 原样保留)——「实现里不得出现 X」类断言必须对剥注释后的代码做,否则注释里
+// 提一句 X 就会误报。
+func stripObjcComments(src string) string {
+	var b strings.Builder
+	b.Grow(len(src))
+	inLine, inBlock, inStr := false, false, false
+	for i := 0; i < len(src); i++ {
+		c := src[i]
+		var next byte
+		if i+1 < len(src) {
+			next = src[i+1]
+		}
+		switch {
+		case inLine:
+			if c == '\n' {
+				inLine = false
+				b.WriteByte(c)
+			}
+		case inBlock:
+			if c == '*' && next == '/' {
+				inBlock = false
+				i++
+			}
+		case inStr:
+			b.WriteByte(c)
+			switch {
+			case c == '\\' && next != 0:
+				b.WriteByte(next)
+				i++
+			case c == '"':
+				inStr = false
+			}
+		case c == '/' && next == '/':
+			inLine = true
+			i++
+		case c == '/' && next == '*':
+			inBlock = true
+			i++
+		default:
+			if c == '"' {
+				inStr = true
+			}
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // cFunctionDefs 列出顶格书写的 C 函数定义名(不含 ObjC 方法)。

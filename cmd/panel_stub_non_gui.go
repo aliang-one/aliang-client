@@ -26,14 +26,17 @@ This build does not include the panel window shell on this platform.`,
 }
 
 func init() {
+	// 默认值与 panel.go(darwin||windows 形态)逐字对齐:托盘图标矩形宽高
+	// 22、面板逻辑尺寸 340×560、side 兜底 bottom。字面量就地自含——本平台
+	// 构建不 import internal/panelwin(Linux 依赖闭包闸把守),拿不到其常量。
 	panelCmd.Flags().String("url", "", "panel page URL")
 	panelCmd.Flags().Int("ax", 0, "tray icon rectangle X")
 	panelCmd.Flags().Int("ay", 0, "tray icon rectangle Y")
-	panelCmd.Flags().Int("w", 0, "tray icon rectangle width")
-	panelCmd.Flags().Int("h", 0, "tray icon rectangle height")
-	panelCmd.Flags().Int("pw", 0, "panel logical width")
-	panelCmd.Flags().Int("ph", 0, "panel logical height")
-	panelCmd.Flags().String("side", "", "panel side relative to the tray icon")
+	panelCmd.Flags().Int("w", 22, "tray icon rectangle width")
+	panelCmd.Flags().Int("h", 22, "tray icon rectangle height")
+	panelCmd.Flags().Int("pw", 340, "panel logical width")
+	panelCmd.Flags().Int("ph", 560, "panel logical height")
+	panelCmd.Flags().String("side", "bottom", "panel side relative to the tray icon")
 	panelCmd.Flags().String("open-dashboard", "", "URL opened for open kind=dashboard")
 	panelCmd.Flags().String("open-peer", "", "URL opened for open kind=peer")
 	rootCmd.AddCommand(panelCmd)

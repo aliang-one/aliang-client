@@ -20,7 +20,17 @@ void panelwin_run(const char* url, int x, int y, int w, int h,
 */
 import "C"
 
-import "unsafe"
+import (
+	"runtime"
+	"unsafe"
+)
+
+// AppKit 强约束:UI 事件循环必须在主线程。包 init 必然在主 goroutine 执行,
+// 钉住后 cgo 的 C.panelwin_run 跑在主线程——不钉则调度器可能把主 goroutine
+// 迁走,NSApp run 失效→windowDidResignKey 永不触发→失焦即退整条链死成僵尸
+// (非崩溃,launcher 崩溃计数看不见)。与 third_party/systray/systray.go、
+// jchv/go-webview2(pkg/edge,Windows 侧)双先例同构。
+func init() { runtime.LockOSThread() }
 
 type nativeHost struct{}
 
