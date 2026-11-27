@@ -1064,6 +1064,11 @@ func TestEndpointService_ReportFailureDeletedID(t *testing.T) {
 // 同 protocol 组内其余 auto 行 enabled=0;builtin 行、auto_group=0 行、
 // 其他 protocol 组的行一律不动。激活后 selectAuto 只剩目标行可用——
 // 钉选即调度面生效(auto 池准入=enabled ∧ auto_group,plan 已定语义)。
+// 另钉两条语义裁定(review 增益补断言):
+//   - 用户摘除(health=disabled)且 enabled=1 的同行同样被连带翻成
+//     enabled=0——此后失去懒恢复自愈通道(selectAuto 的 enabled 过滤先于
+//     recoverIfNeeded),等效手动停用,是钉选持久性的必要代价;
+//   - 目标即当前唯一 enabled 行(同行循环全 skip)→ 幂等重钉 no-op。
 func TestEndpointService_ActivateInGroupExclusive(t *testing.T) {
 	svc, store := newEndpointTestHarness(t)
 
@@ -1076,6 +1081,12 @@ func TestEndpointService_ActivateInGroupExclusive(t *testing.T) {
 	epM := anthropicEP("ep-m", 30)
 	epM.AutoGroup = false // 非池行,不在互斥写集里
 	createEndpoint(t, store, epM)
+	// 用户摘除的同行:enabled=1 ∧ health_status=disabled(摘除不动 enabled 列)。
+	epR := anthropicEP("ep-r", 25)
+	createEndpoint(t, store, epR)
+	markHealth(t, store, "ep-r", storage.HealthUpdate{
+		Status: "disabled", Failures: 3, CooldownUntil: 1900000000, LastErr: "boom x3",
+	})
 
 	if err := svc.ActivateInGroup("anthropic", "ep-b"); err != nil {
 		t.Fatalf("activate ep-b: %v", err)
@@ -1086,6 +1097,9 @@ func TestEndpointService_ActivateInGroupExclusive(t *testing.T) {
 	}
 	if got := mustGet(t, store, "ep-a"); got.Enabled {
 		t.Fatalf("同组其他行 ep-a 应 enabled=0(组内互斥)")
+	}
+	if got := mustGet(t, store, "ep-r"); got.Enabled {
+		t.Fatalf("摘除同行 ep-r(enabled=1)应被连带翻成 enabled=0(钉选持久性,失去懒恢复通道)")
 	}
 	if got := mustGet(t, store, "ep-o"); !got.Enabled {
 		t.Fatalf("openai 组行 ep-o 不应被波及(protocol 过滤), got enabled=%v", got.Enabled)
@@ -1100,6 +1114,29 @@ func TestEndpointService_ActivateInGroupExclusive(t *testing.T) {
 	got, err := svc.Select("anthropic", "", "")
 	if err != nil || got.ID != "ep-b" {
 		t.Fatalf("激活后 anthropic select = %v, %v, want ep-b(唯一启用行)", got, err)
+	}
+
+	// 幂等重钉:目标已是组内唯一 enabled 行,同行循环全 skip;再次激活
+	// no-op——终态与首次激活完全一致,无行被额外写坏。
+	if err := svc.ActivateInGroup("anthropic", "ep-b"); err != nil {
+		t.Fatalf("幂等重钉应成功: %v", err)
+	}
+	if got := mustGet(t, store, "ep-b"); !got.Enabled {
+		t.Fatalf("重钉后目标行应保持 enabled=1")
+	}
+	for _, id := range []string{"ep-a", "ep-r"} {
+		if got := mustGet(t, store, id); got.Enabled {
+			t.Fatalf("重钉 no-op:%s 应保持 enabled=0", id)
+		}
+	}
+	if got := mustGet(t, store, "ep-o"); !got.Enabled {
+		t.Fatalf("重钉不得波及 openai 组行 ep-o")
+	}
+	if got := mustGet(t, store, "ep-m"); !got.Enabled {
+		t.Fatalf("重钉不得波及 auto_group=0 行 ep-m")
+	}
+	if got := mustGet(t, store, storage.BuiltinEndpointID); !got.Enabled {
+		t.Fatalf("重钉不得波及 builtin 行")
 	}
 }
 

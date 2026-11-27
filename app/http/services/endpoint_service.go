@@ -904,13 +904,23 @@ func (s *EndpointService) SetPolicy(p *config.EndpointGroupPolicy) error { retur
 //     徽标持续到懒恢复;健康列不在 Update 的配置列白名单(endpointConfig
 //     Columns)里,本写路径天然不 clobber 健康态。「激活顺带迁移清零」是
 //     二期 §5.6(与自动升级合入),一期刻意不做。
+//   - 同行连带关停的知情取舍(勿当缺陷修):互斥关同行只看 enabled,
+//     会把「enabled=1 ∧ health_status=disabled(用户摘除)」的同组行也翻成
+//     enabled=0——此后该行失去懒恢复自愈通道(selectAuto 的 enabled 过滤
+//     先于 recoverIfNeeded,禁用行永远进不了恢复闸),等效手动停用,须
+//     仪表盘重新启用。这是钉选持久性的必要代价:若豁免摘除同行,它会在
+//     冷却到期的懒恢复后带着 enabled=1 重进池,radio 钉选即被击穿。
+//     Exclusive 测试钉死该行为。
 //
 // 落库走管理面既有持久化路径(store.Update 白名单整行,Get→改列→Update,
 // 同 HandleUpdate 的写法):互斥只写配置列,健康列不被触碰。写序=先互斥关
 // 同组行、最后钉目标行——目标写是激活语义的提交点;中途失败返回 wrapped
 // raw error(handler 映射 500),半程状态组内全关、selectAuto 回落 builtin,
 // 可自查可重试。写路径不经 s.mu(只动配置列,与 HandleUpdate 同级并发面;
-// 健康态写仍只走 Report*/ResetHealth 的锁内 UpdateHealth)。
+// 健康态写仍只走 Report*/ResetHealth 的锁内 UpdateHealth)。已知取舍:
+// 整组写是「一次 List 后逐行整行写穿配置列」,并发管理面 PUT 落在 List 与
+// 某行 Update 之间会被旧值静默回滚——并发面与 HandleUpdate 同级,但窗口
+// 横跨整组(家族一致,plan 已接受)。
 func (s *EndpointService) ActivateInGroup(protocol, targetID string) error {
 	protocol = strings.ToLower(strings.TrimSpace(protocol))
 	targetID = strings.TrimSpace(targetID)
@@ -959,7 +969,6 @@ func (s *EndpointService) ActivateInGroup(protocol, targetID string) error {
 	}
 	target.Enabled = true
 	if err := s.store.Update(target); err != nil {
-		target.Enabled = false
 		return fmt.Errorf("endpoint: 激活 %s 失败: %w", target.ID, err)
 	}
 	logger.Info(fmt.Sprintf("endpoint: 托盘激活 id=%s protocol=%s(组内互斥,其余同组 auto 行已停用)", target.ID, protocol))
