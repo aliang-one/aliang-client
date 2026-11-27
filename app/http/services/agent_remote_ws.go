@@ -1500,10 +1500,13 @@ func (s *AgentService) agentHelloPayload() map[string]interface{} {
 		"vibe_sessions":          snapshot.VibeSessions,
 		"authorized_directories": snapshot.AuthorizedDirectories,
 		"collected_at":           snapshot.CollectedAt,
-		"started_at":             time.Now().UTC().Format(time.RFC3339),
-		"load":                   collectAgentLoadSnapshot(),
-		"system":                 systemSnap,
-		"net":                    collectAgentNetSnapshot(),
+		// 进程启动时刻,不是本次 hello 的构建时刻:服务端据此识别 agent 重启
+		// (RUN-01/02)——同一进程的重连/digest 重发必须恒等,否则每次 hello 都会
+		// 被当成重启,把在途回合误杀。RFC3339Nano 保留毫秒,避免同一秒内重启漏判。
+		"started_at": agentProcessStartedAt.UTC().Format(time.RFC3339Nano),
+		"load":       collectAgentLoadSnapshot(),
+		"system":     systemSnap,
+		"net":        collectAgentNetSnapshot(),
 		// 冷层规范化摘要：服务端可用它识别「能力画像未变」的重复 hello
 		// (spec §4.2 profile_hash)。老服务端忽略未知字段，向前兼容。
 		"profile_hash": agentProfileHash(snapshot.Platform, snapshot.Capabilities, toolVersions, snapshot.AuthorizedDirectories),
