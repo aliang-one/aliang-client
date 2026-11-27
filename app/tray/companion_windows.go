@@ -38,6 +38,11 @@ type CompanionApp struct {
 	ipcClient *ipc.Client
 	httpURL   string
 	isRunning bool
+	// autostart 标记本次 companion 由登录自启拉起(MSI HKCU Run 键传
+	// --autostart,2026-11-27 P0)。与手动双击的行为差异只有两点:不自动
+	// 弹仪表盘浏览器、启动失败不弹模态 MessageBox(无人值守,只落 trace);
+	// 托盘菜单、agent 拉起与看护完全一致。
+	autostart bool
 	// lastViewKey 记录上次实际落到 GDI 面的可见面签名(签名构造见
 	// state_gate.go):周期轮询撞到相同签名即整轮跳过,止血 systray
 	// MenuItem.SetIcon 每次新建 HBITMAP 不销毁的泄漏(~83min 耗尽 10k 配额)。
@@ -170,10 +175,15 @@ func (a *CompanionApp) connectAndStartHTTP() {
 	}
 
 	a.syncState()
-	go func() {
-		time.Sleep(300 * time.Millisecond)
-		a.openDashboard()
-	}()
+	if !a.autostart {
+		// 自动弹面板只属于「用户主动双击启动」语义;登录自启(Run 键)
+		// 形态弹浏览器等于每次登录必开一个窗口(2026-11-27 对抗评审
+		// blocker)。macOS companion 本就不自动弹,此处对齐。
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			a.openDashboard()
+		}()
+	}
 }
 
 func (a *CompanionApp) waitForIPC(timeout time.Duration) bool {
@@ -512,6 +522,16 @@ func (a *CompanionApp) hideAIStatus() {
 }
 
 func RunCompanion() {
+	runCompanion(false)
+}
+
+// RunCompanionAutostart 是登录自启形态入口(Run 键 `companion --autostart`):
+// 无人值守启动,见 CompanionApp.autostart 注释。
+func RunCompanionAutostart() {
+	runCompanion(true)
+}
+
+func runCompanion(autostart bool) {
 	// 必须在 systray 创建任何窗口/菜单之前声明 DPI 感知：
 	// Win11 非 100% 缩放下，DPI-unaware 进程的托盘菜单会渲染成空白方块。
 	enableWindowsDPIAwareness()
@@ -528,12 +548,25 @@ func RunCompanion() {
 	defer guard.Close()
 
 	app := NewCompanionApp()
+	app.autostart = autostart
 	systray.Run(app.onReady, app.onExit)
 }
 
 func (a *CompanionApp) failStartup(reason, message string) {
 	a.applyUnavailableState(reason)
 	writeWindowsCompanionTrace("failStartup reason=%s", reason)
+	if a.autostart {
+		// 登录自启形态无人值守:模态 MessageBox 会拦在登录现场等一个
+		// 不存在的点击。只落 trace,静默退出等下轮登录/手动启动重试
+		// (2026-11-27 对抗评审 blocker 的次级问题)。
+		logger.Warn(fmt.Sprintf("companion autostart failed: reason=%s", reason))
+		go func() {
+			time.Sleep(200 * time.Millisecond)
+			systray.Quit()
+			os.Exit(1)
+		}()
+		return
+	}
 	showWindowsCompanionMessage("Aliang", message)
 	go func() {
 		time.Sleep(200 * time.Millisecond)

@@ -38,21 +38,37 @@ func init() {
 
 // ensureAgentAfterAuth 是 auth-success 钩子的真实实现。
 //
-// core（root daemon）在此跳过 spawn：user-agent 必须以登录用户身份运行，才能读到
-// 正确的家目录、Claude/Codex 凭证与 ~/.aliang 状态。core 是 root，spawn 出的子进程
-// 会继承 root 身份，家目录与凭证全部错位；更糟的是它会与 .app 之后 spawn 的用户态
-// agent 共用 ~/.aliang/agent（HOME 继承），抢 56433 端口和 flock，形成 root+mac 双
-// agent 混战。所以 user-agent 的 spawn 必须交给用户态 .app——它的冷启动 EnsureStarted
-// （companion.go）+ watchdog（companion_watchdog.go）负责拉起并看护。
+// core（root daemon / Windows LocalSystem 服务）在此跳过 spawn：user-agent 必须
+// 以登录用户身份运行，才能读到正确的家目录、Claude/Codex 凭证与 ~/.aliang
+// 状态。core 是 root，spawn 出的子进程会继承 root 身份，家目录与凭证全部错位；
+// 更糟的是它会与 .app 之后 spawn 的用户态 agent 共用 ~/.aliang/agent（HOME 继
+// 承），抢 56433 端口和 flock，形成 root+mac 双 agent 混战。所以 user-agent 的
+// spawn 必须交给用户态 .app——它的冷启动 EnsureStarted（companion.go）
+// + watchdog（companion_watchdog.go）负责拉起并看护。
 //
 // core 跳过 spawn 不影响 token 下发：core 仍会经 agentSyncDispatch 把 token 转发给
 // 已在跑的 user-agent（POST 127.0.0.1:56433/api/agent/sync）。
 func ensureAgentAfterAuth() error {
-	if os.Geteuid() == 0 {
-		logger.Info("[AGENT-BOOT] ensure_agent_after_auth skipped reason=root_daemon (user-agent must run as login user; spawn left to .app)")
+	if isCoreDaemonProcess() {
+		logger.Info("[AGENT-BOOT] ensure_agent_after_auth skipped reason=core_daemon (user-agent must run as login user; spawn left to .app)")
 		return nil
 	}
 	return EnsureStarted()
+}
+
+// isCoreDaemonProcess 判定本进程是否 core 守护形态（root daemon / Windows
+// LocalSystem 服务）。两级判据：
+//  1. services.CoreProcessEnv 标记（cmd core 入口显式置位，跨平台可靠）——
+//     Windows LocalSystem 服务的 uid 语义不存在，这是唯一可靠判据；
+//  2. os.Geteuid()==0（macOS/Linux root daemon，服务入口统一走 core 命令，
+//     此分支兜底历史直接以 root 运行 core 的部署形态）。
+//
+// 2026-11-27 客户案定案：原守卫只有 Geteuid==0 一条腿，而 Go 在 Windows 上
+// Geteuid 恒返回 -1，守卫恒失效——LocalSystem core 在每次登录/会话恢复事件
+// 后都会 spawn root 身份 agent（HOME=systemprofile），与用户 agent 抢 56433/
+// flock 互杀，是仪表盘 agent 页「设备 agent 可能未运行」弹窗的共根。
+func isCoreDaemonProcess() bool {
+	return services.IsCoreProcess() || os.Geteuid() == 0
 }
 
 // EnsureStarted ensures the local user-agent process is running and ready.
@@ -428,6 +444,9 @@ func userAgentEnv(env []string) []string {
 		"ALIANG_CACHE_DIR":   true,
 		"ALIANG_LOG_DIR":     true,
 		"ALIANG_SOCKET_PATH": true,
+		// core 守护形态标记绝不外泄：owner 若恰为 core（不该发生，但守卫
+		// 修复前的存量形态仍可能），agent 子进程带此标记会让代理分流误判。
+		services.CoreProcessEnv: true,
 	}
 
 	next := make([]string, 0, len(env)+2)

@@ -73,4 +73,8 @@ func ensureUserAgentEnvironment() {
 	_ = os.Unsetenv("ALIANG_CACHE_DIR")
 	_ = os.Unsetenv("ALIANG_LOG_DIR")
 	_ = os.Unsetenv("ALIANG_SOCKET_PATH")
+	// 与 manager.userAgentEnv 的 blocked 名单对称(2026-11-27 评审 nit):
+	// 手动 `aliang agent` 不经 manager spawn,core 守卫标记若从外层环境漏进
+	// 本进程,代理/角色分派会在 agent 里误判自己是 core。
+	_ = os.Unsetenv(services.CoreProcessEnv)
 }

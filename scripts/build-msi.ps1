@@ -113,6 +113,37 @@ New-Item -ItemType Directory -Force -Path $payloadDir | Out-Null
 Write-Host "Copying binary and icon..." -ForegroundColor Cyan
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Copy-Item ".\dist\$BINARY_NAME" -Destination "$payloadDir\" -Force
+
+# HKCU Run 自启(2026-11-27)对 PE 子系统有硬要求:console 子系统的二进制每次
+# 登录都会闪一个控制台窗。CI(tag-build-release.yml)的 Windows 矩阵带
+# -H=windowsgui,但本地手搓构建容易漏;fail-loud 与 GOARCH 白名单检查同型。
+function Assert-WindowsGuiSubsystem {
+    param([string]$Path)
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -lt 0x40 -or ($bytes[0] -ne 0x4D) -or ($bytes[1] -ne 0x5A)) {
+        throw "Not a PE executable: $Path"
+    }
+    $peOffset = [System.BitConverter]::ToInt32($bytes, 0x3C)
+    if ($peOffset -le 0 -or ($peOffset + 4) -gt $bytes.Length) {
+        throw "Malformed PE header (bad e_lfanew): $Path"
+    }
+    if (($bytes[$peOffset] -ne 0x50) -or ($bytes[$peOffset + 1] -ne 0x45)) {
+        throw "Malformed PE header (no PE signature): $Path"
+    }
+    # Subsystem 字段:COFF 头(PE 签名后 20 字节)+ 可选头偏移 68(PE32/PE32+ 同值)
+    # = PE+0x5C。2=GUI,3=console。
+    $subsystemOffset = $peOffset + 0x5C
+    if (($subsystemOffset + 2) -gt $bytes.Length) {
+        throw "Truncated PE header: $Path"
+    }
+    $subsystem = [System.BitConverter]::ToUInt16($bytes, $subsystemOffset)
+    if ($subsystem -ne 2) {
+        throw "dist\$BINARY_NAME is not a GUI-subsystem executable (Subsystem=$subsystem, expected 2). The login autostart entry would flash a console window on every boot. Build with -ldflags '-H=windowsgui' (the release CI matrix does this)."
+    }
+    Write-Host "PE subsystem check passed (GUI)." -ForegroundColor Green
+}
+Assert-WindowsGuiSubsystem -Path "$payloadDir\$BINARY_NAME"
+
 $iconPath = Join-Path $scriptDir $ICON_FILE
 if (Test-Path $iconPath) {
     Copy-Item $iconPath -Destination "$payloadDir\" -Force
@@ -165,12 +196,18 @@ Write-Host "Creating WiX source..." -ForegroundColor Cyan
 
 $wxsContent = @"
 <?xml version="1.0" encoding="UTF-8"?>
-<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi" xmlns:util="http://schemas.microsoft.com/wix/2006/wi/util">
     <Product Id="*" Name="Aliang" Language="1033" Version="$Version" Manufacturer="$MANUFACTURER" UpgradeCode="$UPGRADE_CODE">
         <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64" Description="Aliang Gateway Proxy Client" Manufacturer="$MANUFACTURER"/>
 
         <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed."/>
         <MediaTemplate EmbedCab="yes"/>
+        <!-- 升级/卸载时关闭常驻的 companion/agent（同一个 aliang.exe，2026-11-27
+             Run 键自启后必然在跑）：CloseMessage 发 WM_CLOSE，托盘隐藏窗无响应
+             时交给 Restart Manager 收尾；RebootPrompt=no 不主动求重启，文件
+             替换最多延后到下次重启，重启后 Run 键+SCM 服务自然恢复。无此元素
+             每次升级必撞 aliang.exe files-in-use。 -->
+        <util:CloseApplication Id="CloseAliangApp" Target="$BINARY_NAME" CloseMessage="yes" RebootPrompt="no"/>
 $iconDefXml
         <!-- Directory Structure -->
         <Directory Id="TARGETDIR" Name="SourceDir">
@@ -235,6 +272,7 @@ $iconDefXml
             <ComponentRef Id="EnvironmentComponent"/>
             <ComponentRef Id="StartMenuShortcut"/>
             <ComponentRef Id="DesktopShortcut"/>
+            <ComponentRef Id="AutoStartRunKey"/>
         </Feature>
 
         <!-- Environment Variables (must be inside a Component) -->
@@ -244,6 +282,25 @@ $iconDefXml
                 <Environment Id="ALIANG_DATA_DIR" Name="ALIANG_DATA_DIR" Value="[AliangData]" Permanent="yes" Part="last" Action="set" System="yes"/>
                 <Environment Id="ALIANG_LOG_DIR" Name="ALIANG_LOG_DIR" Value="[AliangData]\logs" Permanent="yes" Part="last" Action="set" System="yes"/>
                 <Environment Id="ALIANG_SOCKET_PATH" Name="ALIANG_SOCKET_PATH" Value="\\.\pipe\aliang-core" Permanent="yes" Part="last" Action="set" System="yes"/>
+            </Component>
+            <!-- Companion 登录自启（2026-11-27 客户案 F1 根因修复）：此前 MSI 只装
+                 开始菜单/桌面两个手动快捷方式，Windows 重启/注销后 core 服务（SCM
+                 自启）会自动拉起仪表盘（startCoreDashboardIfHeadless）但从不 spawn
+                 user agent——user agent 的 spawn 与看护唯一住在 companion 托盘进程
+                 里。用户不手动双击快捷方式，56433 永远没人听，仪表盘 agent 页/
+                 aliangcode 全族端点弹「读取失败：设备 agent 可能未运行」。
+                 HKCU Run 键与既有两个快捷方式组件同为 per-user 形态（HKCU
+                 KeyPath），装机用户登录即自动拉起 companion（binary 为
+                 windowsgui 子系统，无控制台闪窗；单实例守卫防与手动双击双开），
+                 companion 冷启动 EnsureStarted + watchdog 负责拉起并看护 user
+                 agent。卸载随组件自动清除。
+                 命令行追加 autostart 标记参数让 companion 走无人值守形态（不自动
+                 弹仪表盘浏览器、失败不弹模态错误框——对抗评审 blocker 修复）；
+                 perMachine 包内 HKCU 只落装机（管理员）账户 hive，与既有快捷方式
+                 组件同款已知取舍：装机账户≠登录账户时自启不生效，手动双击一次
+                 即可补位。 -->
+            <Component Id="AutoStartRunKey" Guid="*" Win64="yes">
+                <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="Aliang" Type="string" Value="&quot;[INSTALLFOLDER]$BINARY_NAME&quot; companion --autostart" KeyPath="yes"/>
             </Component>
         </DirectoryRef>
     </Product>
@@ -272,14 +329,14 @@ try {
 
     # Compile WiX source
     Write-Host "Compiling WiX source with: $useCandleExe" -ForegroundColor Yellow
-    & $useCandleExe -nologo -ext WixUIExtension -out "$sourceDir\aliang.wixobj" "$wxsPath"
+    & $useCandleExe -nologo -ext WixUIExtension -ext WixUtilExtension -out "$sourceDir\aliang.wixobj" "$wxsPath"
     if ($LASTEXITCODE -ne 0) {
         throw "candle.exe failed with exit code $LASTEXITCODE"
     }
 
     # Link/Combine into MSI
     Write-Host "Linking into MSI with: $useLightExe" -ForegroundColor Yellow
-    & $useLightExe -nologo -ext WixUIExtension -o "$resolvedOutputDir\aliang-$Version.msi" "$sourceDir\aliang.wixobj"
+    & $useLightExe -nologo -ext WixUIExtension -ext WixUtilExtension -o "$resolvedOutputDir\aliang-$Version.msi" "$sourceDir\aliang.wixobj"
     if ($LASTEXITCODE -ne 0) {
         throw "light.exe failed with exit code $LASTEXITCODE"
     }

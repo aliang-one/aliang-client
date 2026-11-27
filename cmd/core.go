@@ -54,6 +54,13 @@ func runCoreWithContext(ctx context.Context) error {
 	debug.SetTraceback("wer")
 	ensureCoreRuntimeEnvironment()
 	auth.SetSessionOwnerProcess(true)
+	// core 守护形态进程内标记(2026-11-27 客户案):ensureAgentAfterAuth 用它
+	// 实现「core 永不 spawn user agent」的跨平台守卫——原先只靠
+	// os.Geteuid()==0,Windows 上恒返回 -1,LocalSystem core 在每次登录
+	// 事件后都会 spawn root 身份 agent(HOME=systemprofile),与用户会话
+	// agent 抢 56433/flock 互杀。spawn agent 子进程时该标记被
+	// userAgentEnv 剥离,不会外泄。
+	_ = os.Setenv(services.CoreProcessEnv, "1")
 
 	logger.Info("========================================")
 	logger.Info("Starting Aliang Core Daemon")

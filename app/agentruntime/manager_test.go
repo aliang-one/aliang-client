@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -270,5 +271,55 @@ func TestNeedsRegistrationRecoveryProbeFailureIsConservative(t *testing.T) {
 
 	if bad, probeOK := NeedsRegistrationRecovery(time.Second); bad || probeOK {
 		t.Fatalf("probe failure must be conservative unknown: bad=%t probeOK=%t", bad, probeOK)
+	}
+}
+
+// TestIsCoreDaemonProcessCoversBothLegs 钉死守卫判据两级:core 进程标记
+// (Windows LocalSystem 唯一可靠判据——Go 在 Windows 上 Geteuid 恒 -1,原守卫
+// 恒失效导致 root agent 互杀,2026-11-27 客户案)与 root 兜底(非 Windows 上
+// uid==0 的历史部署形态)。无标记分支用自洽断言(== Geteuid==0),root CI
+// runner 上不误红;标记分支任何身份下都必须翻 true。
+func TestIsCoreDaemonProcessCoversBothLegs(t *testing.T) {
+	t.Setenv(services.CoreProcessEnv, "")
+	if got, want := isCoreDaemonProcess(), os.Geteuid() == 0; got != want {
+		t.Fatalf("isCoreDaemonProcess() = %t, want %t (matches geteuid==%d without marker)", got, want, os.Geteuid())
+	}
+	t.Setenv(services.CoreProcessEnv, "1")
+	if !isCoreDaemonProcess() {
+		t.Fatalf("isCoreDaemonProcess() = false with %s=1", services.CoreProcessEnv)
+	}
+}
+
+// TestEnsureAgentAfterAuthSkipsCoreDaemon 钉死核心契约:core 守护形态收到
+// auth-success 钩子必须直接跳过(返回 nil、绝不 spawn),与 macOS root 行为
+// 对齐。回归指纹=Windows 客户机上 core 每次登录事件 spawn root agent 与
+// 用户 agent 抢 56433/flock。
+func TestEnsureAgentAfterAuthSkipsCoreDaemon(t *testing.T) {
+	t.Setenv(services.CoreProcessEnv, "1")
+	// 指向一个必失败的地址:若守卫失效走到 EnsureStarted,会真的 spawn
+	// agent 子进程(污染开发机并大概率超时)。守卫正确时这行永远不会被
+	// 触碰。
+	originalAddr := config.DefaultUserAgentAddr
+	config.DefaultUserAgentAddr = "127.0.0.1:1"
+	t.Cleanup(func() { config.DefaultUserAgentAddr = originalAddr })
+
+	if err := ensureAgentAfterAuth(); err != nil {
+		t.Fatalf("ensureAgentAfterAuth() in core process = %v, want nil (skip)", err)
+	}
+}
+
+// TestUserAgentEnvBlocksCoreProcessEnv 钉死 core 标记不外泄:owner 若恰为
+// core(修复前存量形态),spawn 出的 agent 子进程绝不能带上 CoreProcessEnv
+// ——否则代理/角色分派会在子进程里误判。
+func TestUserAgentEnvBlocksCoreProcessEnv(t *testing.T) {
+	withOwnerNotifyDisabled(t)
+	env := userAgentEnv([]string{
+		services.CoreProcessEnv + "=1",
+		"PATH=/usr/bin:/bin",
+	})
+	for _, item := range env {
+		if strings.HasPrefix(item, services.CoreProcessEnv+"=") {
+			t.Fatalf("%s leaked into agent environment: %q", services.CoreProcessEnv, item)
+		}
 	}
 }
