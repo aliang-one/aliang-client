@@ -28,6 +28,7 @@
     />
     <ChatPage v-if="currentPage === 'chat'" />
     <TerminalWorkspace v-if="currentPage === 'terminal'" />
+    <AssistWatchPage v-if="currentPage === 'assist'" />
     <ErrorDialog />
     </template>
   </div>
@@ -40,6 +41,7 @@ import DashboardPage from './components/DashboardPage.vue';
 import SettingsPage from './components/SettingsPage.vue';
 import ChatPage from './components/ChatPage.vue';
 import TerminalWorkspace from './components/TerminalWorkspace.vue';
+import AssistWatchPage from './components/assist/AssistWatchPage.vue';
 import CertManagementModal from './components/CertManagementModal.vue';
 import QuickSetupModal from './components/QuickSetupModal.vue';
 import SoftwareUpdateNotice from './components/SoftwareUpdateNotice.vue';

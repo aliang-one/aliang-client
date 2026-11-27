@@ -149,6 +149,13 @@ type agentState struct {
 	// 项目和会话才会被扫描并上传。空或 ScanDirectoriesEnabled=false 表示不过滤。
 	ScanDirectories        []string `json:"scan_directories,omitempty"`
 	ScanDirectoriesEnabled bool     `json:"scan_directories_enabled,omitempty"`
+
+	// RemoteAssistEnabled 远程协助总开关(spec 2026-11-26-remote-assist-design §7.1)。
+	// 零值纪律(§14 坑 6):键缺席=false,装机即无此功能——不进任何缺省 true
+	// 分支。挂 agentState 顶层而非 models.AgentDevice:Device 会被注册/同步
+	// 的服务端回显整体替换(webTerminal 同坑,见 agent_web_terminal.go 头注),
+	// 平台侧未识别该键前 Device 内放置会被每次 sync 冲回 false。
+	RemoteAssistEnabled bool `json:"remote_assist_enabled"`
 }
 
 type AgentService struct {
@@ -169,6 +176,7 @@ type AgentService struct {
 	client                *http.Client
 	terminal              *agentTerminalManager
 	webTerminal           *webTerminalVault
+	assist                *remoteAssistManager
 	ai                    *agentAIManager
 	progress              agentProgressTransport
 	operations            agentOperationMirror
@@ -283,6 +291,7 @@ func NewAgentService() *AgentService {
 		client:            &http.Client{Timeout: agentHTTPTimeout},
 		terminal:          newAgentTerminalManager(),
 		webTerminal:       newWebTerminalVault(),
+		assist:            newRemoteAssistManager(time.Now),
 		ai:                newAgentAIManager(),
 		sessionRefreshSig: make(chan struct{}, 1),
 	}
@@ -294,6 +303,10 @@ func NewAgentService() *AgentService {
 	// (构造期陈旧镜像),状态读一律在 proxy 之后(runtime 角色)。
 	s.webTerminal.onLock = func() { s.terminal.closeAll() }
 	s.webTerminal.startSweep()
+	// 远程协助 P1(Task 5):协助终端腿接线(approved 激活建 PTY/终态关
+	// PTY+观看扇出收摊),构造期一次性注入——照 webTerminal.onLock 先例,早
+	// 于任何流量;钩子是覆盖式设置无需幂等防。
+	s.wireAssistTerminalLeg()
 	s.ai.loadPendingTerminals()
 	// 审批请求投递 journal 回灌(L1,2026-11-01):上次进程未确认送达的审批
 	// 请求,注册成功后重放(服务端 intake 幂等)。
@@ -623,6 +636,11 @@ func (s *AgentService) disableWithReasonMessage(reason string, message string) m
 	if releaseAuthHeader != "" && releaseDeviceID != "" {
 		s.dispatchDeviceRelease(releaseAuthHeader, releaseDeviceID)
 	}
+	// 远程协助 P1(Task 4):用户侧禁用/登出按 client_end 收口(计划语义),
+	// 且先于连接拆除执行——writer 尚活,assist.cancel 有机会送达云端。后续
+	// forceDisconnectRemote 的 assistEndForConnectionDown 落在已终态上,
+	// ErrAssistNothingToEnd 幂等吞掉。
+	s.assistEndForDisable()
 	s.forceDisconnectRemote(reason)
 	return status
 }
@@ -2752,6 +2770,7 @@ func (s *AgentService) applyRemoteDeviceSettings(msg map[string]interface{}) {
 	}
 	terminalDisabled := false
 	aiDisabled := false
+	assistDisabled := false
 	if name := remoteString(rawDevice, "name"); name != "" {
 		s.state.Device.Name = name
 	}
@@ -2786,6 +2805,12 @@ func (s *AgentService) applyRemoteDeviceSettings(msg map[string]interface{}) {
 		s.state.Device.AIControlEnabled = value
 		aiDisabled = !value
 	}
+	// remote_assist_enabled:设备 settings 推送同样可落地(键缺席=零值纪律
+	// false,不翻 true——remote_terminal 缺省 true 分支刻意不复刻)。
+	if value, ok := rawDevice["remote_assist_enabled"].(bool); ok {
+		s.state.RemoteAssistEnabled = value
+		assistDisabled = !value
+	}
 	s.state.LastSyncAt = time.Now().UTC().Format(time.RFC3339)
 	s.state.LastSyncStatus = "settings_updated"
 	s.state.LastSyncMessage = ""
@@ -2798,6 +2823,153 @@ func (s *AgentService) applyRemoteDeviceSettings(msg map[string]interface{}) {
 	if aiDisabled {
 		s.ai.closeAllWithReason("ai_control_disabled")
 	}
+	if assistDisabled {
+		s.assistEndForDisable()
+	}
+}
+
+// ——— 远程协助 P1:总开关读写面(Task 3) ———
+
+// RemoteAssistEnabled 读侧:gates 端点 GET / 状态面用。纯配置读,不做
+// enable/registered 复核(那是远端腿门的事;开关本身如实回显)。
+func (s *AgentService) RemoteAssistEnabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state.RemoteAssistEnabled
+}
+
+// SetRemoteAssistEnabled 写侧:落盘经 saveStateLocked(同 remote_terminal
+// 家族持久化路径)。翻 false 时活跃会话按 client_end 收口——照
+// webTerminal.onLock→closeAll 联动语义,但联动体在锁外执行(s.mu 与
+// assist.mu 无嵌套,锁纪律:持锁区禁调会取 s.mu 的函数)。Task 5 接线
+// 协助终端关闭,Task 4 接线云端终态广播——挂点即 assistEndForDisable。
+func (s *AgentService) SetRemoteAssistEnabled(enabled bool) {
+	s.mu.Lock()
+	s.state.RemoteAssistEnabled = enabled
+	if err := s.saveStateLocked(); err != nil {
+		logger.Warn(fmt.Sprintf("[ASSIST] persist remote_assist_enabled=%t failed error=%v", enabled, err))
+	}
+	s.mu.Unlock()
+	// 审计(plan Task 11:每次生效的 enabled 设置留痕(含同值重写);锁外
+	// 执行——持锁区禁调会取 s.mu 的函数,本审计虽不取 s.mu,纪律上仍随
+	// 联动体一并出锁)。仅 handler 调用面(门禁 PUT),无启动期调用,不产生
+	// 引导期审计噪声。
+	s.RemoteAssistAudit("gates", fmt.Sprintf("enabled=%t", enabled))
+	if !enabled {
+		s.assistEndForDisable()
+	}
+}
+
+// assistEndForDisable 关闸联动:总开关翻 false → 活跃/待审批会话统一按
+// AssistEndClient 终态收口(Task 4:终态后经 EndAndSignal 上行 assist.cancel,
+// 云端收口房间)。End 在 idle 态返回 ErrAssistNothingToEnd,属正常幂等路径,
+// 忽略。Task 5:会话 active 时同步关协助终端。
+func (s *AgentService) assistEndForDisable() {
+	if s.assist == nil {
+		return
+	}
+	// 信令失败不回滚终态(云侧 device_offline 语义自愈),错误仅记日志——
+	// 关闸是本地权威决策,不该被网络状态否决。
+	if _, err := s.assist.EndAndSignal(AssistEndClient); err != nil && !errors.Is(err, ErrAssistNothingToEnd) {
+		logger.Warn(fmt.Sprintf("[ASSIST] end for disable failed error=%v", err))
+	}
+}
+
+// assistEndForConnectionDown 连接级终态联动(forceDisconnectRemote/
+// remoteLoopExitCleanup 不可恢复分支,Task 4):活跃协助会话按
+// AssistEndDeviceRestart 收口——spec §5 状态机的「核心进程重启」终因,
+// §14 坑 3 明文设备重连后勿复活。上行 assist.end 预期失败(writer 已随
+// 连接拆除,非本调用目标),目标仅本地状态收敛;云端由 device_offline/
+// admin_timeout 自愈。信号失败仅记日志,不影响收口。
+func (s *AgentService) assistEndForConnectionDown() {
+	if s.assist == nil {
+		return
+	}
+	if _, err := s.assist.EndAndSignal(AssistEndDeviceRestart); err != nil && !errors.Is(err, ErrAssistNothingToEnd) {
+		logger.Warn(fmt.Sprintf("[ASSIST] end for connection down failed error=%v", err))
+	}
+}
+
+// ——— 远程协助 P1:客户端会话面(Task 6)———
+
+// errAssistUnavailable 半构造服务(assist 管理器缺失)的防御哨兵:handler 侧
+// 映射 CodeServiceUnavailable 信封。生产构造恒非 nil(NewAgentService 构造期
+// 建 manager),此臂只是 nil-safe 纪律(同 ScheduleWebOrphanTerminalClose)。
+var errAssistUnavailable = errors.New("assist: manager unavailable")
+
+// AssistRequest 申请协助(POST /api/agent/assist/request 的 service 壳,plan
+// Task 6)。信令失败(离线/断连)原样上抛——申请必须可见地失败让用户看到
+// (spec Task 4;新建会话由 manager rollbackCreated 回滚到纯净 idle,不设
+// 冷却锚),HTTP 侧映射 CodeServiceUnavailable 信封。requested 态重复申请
+// = 同态更新留言,session_id 不变。
+func (s *AgentService) AssistRequest(message string) (string, error) {
+	if s.assist == nil {
+		return "", errAssistUnavailable
+	}
+	return s.assist.RequestAndSignal(message)
+}
+
+// AssistSnapshot 当前会话态快照(GET /api/agent/assist/session 的 service 壳)。
+// 读路径懒扫一次(pending 过期/时长上限在读取时即收敛);终态粘性字段让
+// ended 态在槽位释放后仍可读(id/end_reason/ended_at)。idle 返回零值快照:
+// state 为空串(空串=idle 前端契约,handler 注记)。
+func (s *AgentService) AssistSnapshot() RemoteAssistSnapshot {
+	if s.assist == nil {
+		return RemoteAssistSnapshot{}
+	}
+	return s.assist.Snapshot()
+}
+
+// AssistCancel 撤销申请(POST /api/agent/assist/cancel 的 service 壳):
+// 仅 requested 态合法(其余态 ErrAssistNotPending → HTTP 409);成功即上行
+// assist.cancel(附录 A #4 客户端发起收口恒 cancel 帧型)。信令失败不回滚
+// 终态,错误上抛由 handler 决定呈现。
+func (s *AgentService) AssistCancel() error {
+	if s.assist == nil {
+		return errAssistUnavailable
+	}
+	return s.assist.CancelAndSignal()
+}
+
+// AssistEnd 客户端结束会话(POST /api/agent/assist/end 的 service 壳):上行
+// 帧型按附录 A #4 恒 assist.cancel(EndAndSignal 按 AssistEndClient 分流)。
+// plan Task 6 明文「idle 时 409」——空串 idle 与粘性 ended 两态都算「无会话
+// 可结束」,前置快照判返 ErrAssistNothingToEnd。行为中性澄清(评审 Fix 2
+// 勘误):manager 的 endLocked 本就对 sticky-ended 落 ErrAssistNothingToEnd
+// (finishLocked 后 session==nil → idle,任何帧构造之前即返回),有无本
+// 前置判结果一致——前置判不改变可观测行为,价值是不依赖 manager 内部
+// 顺序的防御性清晰(将来 endLocked 语义演化时本壳的 409 契约自持)。快照
+// 判与迁移间的 TOCTOU 窗同样无害:active→ended 的并发终态撞进窗口,拿到
+// 409-while-actually-ending——end 本就幂等,前端重试/收下一帧即收敛。
+func (s *AgentService) AssistEnd() (string, error) {
+	if s.assist == nil {
+		return "", errAssistUnavailable
+	}
+	if snap := s.assist.Snapshot(); snap.State != assistStateRequested && snap.State != assistStateActive {
+		return "", ErrAssistNothingToEnd
+	}
+	return s.assist.EndAndSignal(AssistEndClient)
+}
+
+// remoteAssistJournalSession 是远程协助审计行的 journal 会话名
+// (webTerminalJournalSession 同款幽灵防御约定):文件 remote-assist.jsonl
+// 只含 kind=tool 行、无 kind=session 头行——读侧扫描 parsedAny=false 整文件
+// 跳过,审计留痕进磁盘但不会在仪表盘 AI 会话列表里冒出假会话卡。与
+// web-terminal.jsonl 分文件:assist 面审计(spec §审计清单)独立成档,取证
+// 时不用混在终端审计里翻。
+const remoteAssistJournalSession = "remote-assist"
+
+// RemoteAssistAudit 落 assist.* 审计行(handler 层 request/cancel/end,
+// service 层 terminal.create/terminal.close/gates;同 WebTerminalAuditFS
+// 家族理由:真源 origin 只有 HTTP 层可见;session 轮询刻意不审——plan
+// Task 6「不审 session 轮询」)。摘要不落留言内容(隐私
+// +噪声,spec §审计「不落键击与 rrweb 内容」同纪律),只落长度。
+// nil-safe(ai/coreJournal 为空时静默跳过,同 webTerminalJournalAudit)。
+func (s *AgentService) RemoteAssistAudit(action, summary string) {
+	if s.ai == nil {
+		return
+	}
+	s.ai.coreJournal.appendTool(remoteAssistJournalSession, "assist."+action, summary, false, "")
 }
 
 // applyRemoteProjectSettings handles a project.settings.updated push: the server

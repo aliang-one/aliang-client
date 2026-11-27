@@ -188,6 +188,23 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/agent/peer/note", agentHandler.HandlePeerNote)
 	mux.HandleFunc("/api/agent/peer/mcp", agentHandler.HandlePeerMcp)
 	mux.HandleFunc("/api/agent/peer/gates", agentHandler.HandlePeerGates)
+	// 远程协助总开关 gates(spec 2026-11-26-remote-assist-design §7.1):GET 读 /
+	// POST 写 remote_assist_enabled,真身在本 runtime;core routes.go 侧同名
+	// 注册只做 proxy 透传。缺任一侧=404(双注册纪律,route_parity_test 兜底)。
+	mux.HandleFunc("/api/agent/assist/gates", agentHandler.HandleAssistGates)
+	// 远程协助客户端会话面(Task 6):request/session/end/cancel 四端点真身
+	// 在本 runtime(状态机+信令+审计);core routes.go 侧同名注册只做双闸+
+	// 同源闸+真源标记+proxy 透传(零 body 解析)。方法前缀模式与 core 侧
+	// register 形态对齐(同 /api/agent/fs/* 先例);缺任一侧=404(双注册纪律,
+	// route_parity_test 兜底)。
+	mux.HandleFunc("POST /api/agent/assist/request", agentHandler.HandleAssistRequest)
+	mux.HandleFunc("GET /api/agent/assist/session", agentHandler.HandleAssistSession)
+	mux.HandleFunc("POST /api/agent/assist/end", agentHandler.HandleAssistEnd)
+	mux.HandleFunc("POST /api/agent/assist/cancel", agentHandler.HandleAssistCancel)
+	// 远程协助观看 WS(Task 7):纯推送只读+回放续屏,真身在本 runtime;
+	// core routes.go 侧同名注册只做双闸+同源闸+proxyAIStream 透传。缺任一
+	// 侧=404(双注册纪律,route_parity_test 兜底)。
+	mux.HandleFunc("/api/agent/assist/stream", agentHandler.HandleAssistStream)
 	mux.HandleFunc("/api/agent/operations/events", agentHandler.HandleOperationEvents)
 	mux.HandleFunc("/api/agent/ai/approval-hook", agentHandler.HandleAIApprovalHook)
 	// agent-as-MCP 工具面端点（spec §7）：真身在此（AI 管理器住本 runtime），

@@ -328,6 +328,25 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/openviking/apply", h.Agent.HandleOpenVikingApply, http.MethodPost)
 	// 设备门禁开关(GET 读本机现值,POST 部分更新落库)。
 	register("/api/agent/peer/gates", h.Agent.HandlePeerGates, http.MethodGet, http.MethodPost)
+	// 远程协助总开关 gates(spec 2026-11-26-remote-assist-design §7.1):GET 读 /
+	// POST 写 remote_assist_enabled。真身在 user agent runtime,core 侧
+	// proxyIfNeeded 透传;双注册另一处 agentruntime/server.go(缺任一侧=404
+	// 透传,route_parity_test 兜底)。
+	register("/api/agent/assist/gates", h.Agent.HandleAssistGates, http.MethodGet, http.MethodPost)
+	// 远程协助客户端会话面(Task 6):request(申请,POST)/session(会话态
+	// 轮询,GET)/end(主动结束,POST)/cancel(撤销待审批申请,POST)。core
+	// 侧闸门①(双闸)+同源闸+真源标记+proxy 透传且**零 body 解析**
+	// (PROXY-FIRST);runtime 腿总开关 403 门+状态机+审计。方法前缀模式防
+	// 同路径互相覆盖(同 /api/agent/fs/* 先例)。双注册另一处
+	// agentruntime/server.go(缺任一侧=404 透传,route_parity_test 兜底)。
+	register("POST /api/agent/assist/request", h.Agent.HandleAssistRequest, http.MethodPost)
+	register("GET /api/agent/assist/session", h.Agent.HandleAssistSession, http.MethodGet)
+	register("POST /api/agent/assist/end", h.Agent.HandleAssistEnd, http.MethodPost)
+	register("POST /api/agent/assist/cancel", h.Agent.HandleAssistCancel, http.MethodPost)
+	// 远程协助观看 WS(Task 7,spec §7.1):纯推送只读+回放续屏。真身在本
+	// runtime(会话闸/注册/回放/只读循环),core 侧闸门②+同源闸+proxy 透传
+	// (proxyAIStream,与聊天/网页终端同管线)。缺任一侧=404(双注册纪律)。
+	register("/api/agent/assist/stream", h.Agent.HandleAssistStream, http.MethodGet)
 	register("/api/agent/operations/events", h.Agent.HandleOperationEvents, http.MethodGet)
 	register("/api/agent/ai/stream", h.Agent.HandleAIStream, http.MethodGet)
 	register("/api/agent/ai/approval-hook", h.Agent.HandleAIApprovalHook, http.MethodPost)

@@ -4525,3 +4525,114 @@ func waitForAgentEvent(t *testing.T, mu *sync.Mutex, events *[]map[string]interf
 	t.Fatalf("timed out waiting for %s in events: %#v", eventType, *events)
 	return nil
 }
+
+// ——— 远程协助 P1 Task 3:总开关零值纪律 + 持久化往返 + 翻转联动 ———
+
+// newAssistTestService 构造带隔离 state 目录的 AgentService(照既有用例的
+// t.Setenv(ALIANG_DATA_DIR)+cache/auth/config 复位手法);同一 temp 目录上
+// 再构造一次即为「重启重载」夹具。
+func newAssistTestService(t *testing.T) *AgentService {
+	t.Helper()
+	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
+	cache.ResetCacheDirForTest()
+	auth.ResetAuthPersistenceForTest()
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(func() {
+		auth.ResetAuthPersistenceForTest()
+		config.ResetGlobalConfigForTest()
+	})
+	return NewAgentService()
+}
+
+// TestRemoteAssistEnabledDefaultsFalse 零值纪律(spec §14 坑 6):键缺席时
+// remote_assist_enabled 必须是 false——不进任何缺省 true 分支
+// (applyAgentDeviceFeatureDefaults 对 remote_terminal/ai_control 的缺省
+// true 补丁刻意不复刻)。
+func TestRemoteAssistEnabledDefaultsFalse(t *testing.T) {
+	s := newAssistTestService(t)
+	if s.RemoteAssistEnabled() {
+		t.Fatal("remote_assist_enabled must default to false")
+	}
+
+	// 落盘零值同样必须显式 false(web_terminal_enabled 同款断言;
+	// agent_state.json 走 MarshalIndent,key 后带空格)。
+	s.mu.Lock()
+	if err := s.saveStateLocked(); err != nil {
+		s.mu.Unlock()
+		t.Fatalf("saveStateLocked() error = %v", err)
+	}
+	statePath, err := agentStatePath()
+	s.mu.Unlock()
+	if err != nil {
+		t.Fatalf("agentStatePath() error = %v", err)
+	}
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read persisted state: %v", err)
+	}
+	if !strings.Contains(string(raw), `"remote_assist_enabled": false`) {
+		t.Fatalf("persisted JSON must carry explicit remote_assist_enabled:false: %s", raw)
+	}
+
+	// 键缺席经 applyAgentDeviceFeatureDefaults 不得翻 true(remote_terminal
+	// 的缺省 true 分支反例护栏)。
+	var state agentState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatalf("unmarshal persisted state: %v", err)
+	}
+	applyAgentDeviceFeatureDefaults(raw, &state)
+	if state.RemoteAssistEnabled {
+		t.Fatal("applyAgentDeviceFeatureDefaults must not default remote_assist_enabled to true")
+	}
+}
+
+// TestRemoteAssistEnabledPersistRoundTrip 持久化往返:SetRemoteAssistEnabled
+// 落盘后,同目录上重建 AgentService(重启语义)必须读回同值。
+func TestRemoteAssistEnabledPersistRoundTrip(t *testing.T) {
+	s := newAssistTestService(t)
+	s.SetRemoteAssistEnabled(true)
+	if !s.RemoteAssistEnabled() {
+		t.Fatal("RemoteAssistEnabled() must be true after SetRemoteAssistEnabled(true)")
+	}
+
+	reloaded := NewAgentService()
+	if !reloaded.RemoteAssistEnabled() {
+		t.Fatal("remote_assist_enabled must survive process restart (persisted true)")
+	}
+
+	reloaded.SetRemoteAssistEnabled(false)
+	if reloaded.RemoteAssistEnabled() {
+		t.Fatal("RemoteAssistEnabled() must be false after SetRemoteAssistEnabled(false)")
+	}
+	again := NewAgentService()
+	if again.RemoteAssistEnabled() {
+		t.Fatal("remote_assist_enabled must persist false after reload")
+	}
+}
+
+// TestSetRemoteAssistEnabledFalseEndsActiveSession 总开关关闸联动:翻转
+// false 时活跃会话按 client_end 终态收口(照 webTerminal.onLock→closeAll
+// 联动语义;Task 5 会补终端关闭接线,Task 4 会补云端广播)。
+func TestSetRemoteAssistEnabledFalseEndsActiveSession(t *testing.T) {
+	s := newAssistTestService(t)
+	s.SetRemoteAssistEnabled(true)
+	sid, err := s.assist.Request("请帮我看下配置")
+	if err != nil {
+		t.Fatalf("assist Request: %v", err)
+	}
+	if err := s.assist.CloudApproved(sid); err != nil {
+		t.Fatalf("assist CloudApproved: %v", err)
+	}
+	if got := s.assist.Snapshot().State; got != assistStateActive {
+		t.Fatalf("precondition state = %q, want active", got)
+	}
+
+	s.SetRemoteAssistEnabled(false)
+	snap := s.assist.Snapshot()
+	if snap.State != assistStateEnded || snap.EndReason != AssistEndClient {
+		t.Fatalf("after toggle-off snapshot = %+v, want ended/client_end", snap)
+	}
+	if s.RemoteAssistEnabled() {
+		t.Fatal("remote_assist_enabled must be false after toggle-off")
+	}
+}

@@ -995,6 +995,17 @@ func (m *agentTerminalManager) cancelWebOrphanClose(sessionID string) {
 	}
 }
 
+// hasHeadroom 只读余量探测:协助腿批准激活前查池(spec §14 坑 1:全局
+// agentMaxTerminalSessions 会话池与手机腿共享,池满时协助终端让路收口
+// terminal_limit,不挤掉手机在用会话)。快照语义:返回后余量仍可能被并发
+// create 抢占,真落池由 createWithSink 自带上限闸兜底(失败仅错误帧上抛,
+// 不伤既有会话)。
+func (m *agentTerminalManager) hasHeadroom() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.sessions) < agentMaxTerminalSessions
+}
+
 // markAllDetached stamps every live session as detached (zero = attached) at
 // the moment the WebSocket dropped, WITHOUT touching the PTY processes. A
 // transient agent↔server disconnect must not kill shells or AI-adjacent state:
