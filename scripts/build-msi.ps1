@@ -196,18 +196,17 @@ Write-Host "Creating WiX source..." -ForegroundColor Cyan
 
 $wxsContent = @"
 <?xml version="1.0" encoding="UTF-8"?>
-<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi" xmlns:util="http://schemas.microsoft.com/wix/2006/wi/util">
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
     <Product Id="*" Name="Aliang" Language="1033" Version="$Version" Manufacturer="$MANUFACTURER" UpgradeCode="$UPGRADE_CODE">
         <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64" Description="Aliang Gateway Proxy Client" Manufacturer="$MANUFACTURER"/>
 
         <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed."/>
         <MediaTemplate EmbedCab="yes"/>
-        <!-- 升级/卸载时关闭常驻的 companion/agent（同一个 aliang.exe，2026-11-27
-             Run 键自启后必然在跑）：CloseMessage 发 WM_CLOSE，托盘隐藏窗无响应
-             时交给 Restart Manager 收尾；RebootPrompt=no 不主动求重启，文件
-             替换最多延后到下次重启，重启后 Run 键+SCM 服务自然恢复。无此元素
-             每次升级必撞 aliang.exe files-in-use。 -->
-        <util:CloseApplication Id="CloseAliangApp" Target="$BINARY_NAME" CloseMessage="yes" RebootPrompt="no"/>
+        <!-- util:CloseApplication(升级时自动关闭常驻 companion/agent)已暂时移除:
+             v1.1.127 CI 实证 WiX 3.11.2 nuget 包在同 runner 上 candle 无法绑定
+             WixUtilExtension(CNDL0200,无加载告警;WixUIExtension 同机制却正常,
+             谜团未解),该扩展未在 CI 实证过。恢复前需先在 CI 验证扩展绑定。
+             升级时请按发布说明先退出托盘;未退出时文件替换延后到下次重启。 -->
 $iconDefXml
         <!-- Directory Structure -->
         <Directory Id="TARGETDIR" Name="SourceDir">
@@ -329,14 +328,14 @@ try {
 
     # Compile WiX source
     Write-Host "Compiling WiX source with: $useCandleExe" -ForegroundColor Yellow
-    & $useCandleExe -nologo -ext WixUIExtension -ext WixUtilExtension -out "$sourceDir\aliang.wixobj" "$wxsPath"
+    & $useCandleExe -nologo -ext WixUIExtension -out "$sourceDir\aliang.wixobj" "$wxsPath"
     if ($LASTEXITCODE -ne 0) {
         throw "candle.exe failed with exit code $LASTEXITCODE"
     }
 
     # Link/Combine into MSI
     Write-Host "Linking into MSI with: $useLightExe" -ForegroundColor Yellow
-    & $useLightExe -nologo -ext WixUIExtension -ext WixUtilExtension -o "$resolvedOutputDir\aliang-$Version.msi" "$sourceDir\aliang.wixobj"
+    & $useLightExe -nologo -ext WixUIExtension -o "$resolvedOutputDir\aliang-$Version.msi" "$sourceDir\aliang.wixobj"
     if ($LASTEXITCODE -ne 0) {
         throw "light.exe failed with exit code $LASTEXITCODE"
     }

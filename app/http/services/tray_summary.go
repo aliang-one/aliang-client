@@ -94,7 +94,10 @@ type TrayAgentsSummary struct {
 // TrayEndpointItem endpoint 列表项(spec §4.4:radio+名称+优先级徽标+可用态)。
 // rank=组内 priority 升序 1 基排名(P1/P2…);auto_group=0 或 priority=0
 // (未设优先级,含内置行)→ rank=0,面板渲染「—」。
+// id=源行 ID 透传(钉选定位键,plan 2026-11-27 Task 1):面板 radio 激活按
+// id 点名 POST /api/endpoints/activate——按名字定位会撞重名行,必须用主键。
 type TrayEndpointItem struct {
+	ID                   string `json:"id"`
 	Name                 string `json:"name"`
 	Rank                 int    `json:"rank"`
 	State                string `json:"state"`
@@ -375,6 +378,7 @@ func trayEndpointGroup(protocol string, list []*config.LLMEndpoint, now int64) T
 		}
 		state, remaining := trayEndpointState(e, now)
 		group.Items = append(group.Items, TrayEndpointItem{
+			ID:                   e.ID,
 			Name:                 e.Name,
 			Rank:                 0,
 			State:                state,
