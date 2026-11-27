@@ -1990,4 +1990,18 @@ export default {
   assist_error_disabled: 'Remote assist is not enabled',
   assist_error_bad_request: 'The request is invalid',
   assist_error_generic: 'Something went wrong — please try again',
+  // -- Remote assist P1 Task 10: client watch page --
+  assist_watch_manager_acting: 'Administrator is operating',
+  assist_watch_status_waiting: 'Waiting',
+  assist_watch_status_ended: 'Ended',
+  assist_watch_waiting: 'Waiting for the administrator to start…',
+  assist_watch_none: 'No assist session in progress',
+  assist_watch_back: 'Back',
+  assist_watch_end: 'End assist',
+  assist_watch_end_confirm: 'End the assist session?',
+  assist_watch_confirm: 'Confirm',
+  assist_watch_cancel_confirm: 'Cancel',
+  assist_watch_connecting: 'Connecting…',
+  assist_watch_disconnected: 'Disconnected',
+  assist_watch_elapsed: 'Assisting {time}',
 };

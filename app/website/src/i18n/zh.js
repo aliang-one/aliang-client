@@ -1988,4 +1988,18 @@ export default {
   assist_error_disabled: '远程协助未启用',
   assist_error_bad_request: '申请内容不合法',
   assist_error_generic: '操作失败，请稍后重试',
+  // -- 远程协助 P1 Task 10:客户端观看页 --
+  assist_watch_manager_acting: '管理员正在操作',
+  assist_watch_status_waiting: '等待中',
+  assist_watch_status_ended: '已结束',
+  assist_watch_waiting: '等待管理员开始…',
+  assist_watch_none: '无进行中的协助',
+  assist_watch_back: '返回',
+  assist_watch_end: '结束协助',
+  assist_watch_end_confirm: '确认结束协助？',
+  assist_watch_confirm: '确认',
+  assist_watch_cancel_confirm: '取消',
+  assist_watch_connecting: '正在连接…',
+  assist_watch_disconnected: '连接已断开',
+  assist_watch_elapsed: '已协助 {time}',
 };

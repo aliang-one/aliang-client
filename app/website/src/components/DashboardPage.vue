@@ -1112,7 +1112,7 @@ const isProdBuild = import.meta.env.PROD || ['prod', 'production'].includes(Stri
 const frontEndLogsFetchLimit = isProdBuild ? 200 : 800;
 
 const { certStatus, loading: certLoading, startPolling: startCertPolling, stopPolling: stopCertPolling } = useCertStatus();
-const { currentPage, showPage, showSettings, showAgent, showChat, showTerminal } = useNavigation();
+const { currentPage, showPage, showSettings, showAgent, showChat, showTerminal, showAssist } = useNavigation();
 // Agent 入口的状态点：与 Agent 页共享同一份 /api/agent/status 单例，
 // 仪表盘加载时预热一次，进 Agent 页不再重复拉取。
 const { runtimeOnline, agentEnabled, statusLabel, ensureLoaded } = useAgentStatus();
@@ -1148,8 +1148,9 @@ function openAssist() {
   assistOpen.value = true;
 }
 function handleAssistWatch() {
-  // 导航交接到 Task 10 的 /assist 观看路由;在此之前先收起弹窗。
+  // 弹窗在 state 翻 active 时 emit('watch') → 导航到全屏观看页(Task 10)。
   assistOpen.value = false;
+  showAssist();
 }
 
 const requestFilter = ref('all');
