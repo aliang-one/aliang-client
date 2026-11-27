@@ -3,6 +3,7 @@ package cmd
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -12,7 +13,15 @@ import (
 )
 
 func TestInitializeUserWithoutTokenStartsTokenRefreshFromPersistedSession(t *testing.T) {
-	baseDir := t.TempDir()
+	baseDir, err := os.MkdirTemp("", "aliang-user-init-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	// 注册最早 = 执行最晚:InitializeUser 拉起的后台协程(auth_sync 重试、
+	// 日志刷盘)在本用例函数返回、各 defer 跑完之后仍可能往临时目录写文件,
+	// Linux 上 t.TempDir 的 RemoveAll 撞「directory not empty」会把用例误判
+	// 失败(2026-11-27 v1.1.128 CI 实证);删除改 best-effort,不影响断言。
+	t.Cleanup(func() { _ = os.RemoveAll(baseDir) })
 	t.Setenv("HOME", filepath.Join(baseDir, "home"))
 	t.Setenv("ALIANG_CACHE_DIR", filepath.Join(baseDir, "cache"))
 
