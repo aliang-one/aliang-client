@@ -380,3 +380,52 @@ export async function fsDelete(path, recursive, token) {
     headers: { 'X-Web-Terminal-Token': token },
   });
 }
+
+// ---- 远程协助 P1(Task 9):客户端会话端点 ----------------
+// 与通用 request() 的区别:协助族错误语义靠信封 code 区分(105 冷却/104 忙碌
+// 或前置不满足/201 信令离线),前端 composable 需要拿到 code 与 HTTP 状态做
+// 文案映射。通用 request() 只抛 Error(msg),这里在抛错前把 code/status 挂到
+// Error 上(仅协助族,不改动既有调用面)。
+async function assistRequest(path, options = {}) {
+  const response = await fetch(path, {
+    credentials: 'same-origin',
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(options.headers || {}),
+    },
+  });
+  const json = await response.json().catch(() => ({}));
+  const envelope = extractEnvelope(json);
+  handleAuthenticationFailure(response.status, envelope, syncUnauthenticatedAuthState);
+  if (!response.ok || envelope.code !== 0) {
+    const err = new Error(envelope.msg || `Request failed with HTTP ${response.status}`);
+    err.status = response.status;
+    err.code = envelope.code;
+    throw err;
+  }
+  return envelope.data;
+}
+
+export async function getAssistGates() {
+  return assistRequest('/api/agent/assist/gates', { method: 'GET' });
+}
+
+export async function getAssistSession() {
+  return assistRequest('/api/agent/assist/session', { method: 'GET' });
+}
+
+export async function requestAssist(message = '') {
+  return assistRequest('/api/agent/assist/request', {
+    method: 'POST',
+    body: JSON.stringify({ message }),
+  });
+}
+
+export async function cancelAssist() {
+  return assistRequest('/api/agent/assist/cancel', { method: 'POST' });
+}
+
+export async function endAssist() {
+  return assistRequest('/api/agent/assist/end', { method: 'POST' });
+}

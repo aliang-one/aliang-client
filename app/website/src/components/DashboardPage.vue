@@ -159,6 +159,16 @@
           {{ t('dash_aliangChat') }}
         </button>
         <button
+          v-if="assistGatesEnabled"
+          type="button"
+          data-testid="assist-entry-sidebar"
+          class="w-full flex items-center gap-3 px-4 py-2.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded text-sm font-medium hover:border-primary transition-colors"
+          @click="openAssist()"
+        >
+          <span class="material-symbols-outlined text-slate-400 text-lg">support_agent</span>
+          {{ t('assist_button') }}
+        </button>
+        <button
           type="button"
           class="w-full flex items-center gap-3 px-4 py-2.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded text-sm font-medium hover:border-primary transition-colors"
           @click="handleShowSettings"
@@ -368,6 +378,16 @@
             >
               <span class="material-symbols-outlined text-lg text-slate-400">smart_toy</span>
               {{ t('dash_aliangChat') }}
+            </button>
+            <button
+              v-if="assistGatesEnabled"
+              type="button"
+              data-testid="assist-entry-panel"
+              class="flex w-full items-center gap-3 rounded border border-slate-200 bg-white px-4 py-3 text-sm font-medium hover:border-primary dark:border-slate-700 dark:bg-slate-900"
+              @click="openAssist()"
+            >
+              <span class="material-symbols-outlined text-lg text-slate-400">support_agent</span>
+              {{ t('assist_button') }}
             </button>
             <button
               type="button"
@@ -1040,6 +1060,12 @@
 
     <ListenerSettings v-if="listenerPanelOpen" @close="listenerPanelOpen = false" />
 
+    <AssistDialog
+      v-if="assistOpen"
+      @close="assistOpen = false"
+      @watch="handleAssistWatch"
+    />
+
     <OnboardingGuide
       @open-cert="openCertModal"
       @open-login="openLoginModal"
@@ -1056,6 +1082,7 @@ import OnboardingGuide from './OnboardingGuide.vue';
 import { useEscLayer } from '../composables/useEscStack';
 import ScanLoginPanel from './settings/ScanLoginPanel.vue';
 import ListenerSettings from './settings/ListenerSettings.vue';
+import AssistDialog from './assist/AssistDialog.vue';
 import { isOnboardingCompleted, openOnboardingGuide } from '../composables/useOnboardingGuide';
 import { openTutorialDocs } from '../composables/useTutorialDocs';
 import { useI18n } from '../i18n';
@@ -1064,6 +1091,7 @@ import { useCertStatus } from '../composables/useCertStatus';
 import { useNavigation } from '../composables/useNavigation';
 import { useAgentStatus } from '../composables/useAgentStatus';
 import { useRunStatus } from '../composables/useRunStatus';
+import { useAssist } from '../composables/useAssist';
 import { useSoftwareUpdate } from '../composables/useSoftwareUpdate';
 import { useAuthStore } from '../stores/auth';
 import { getUserCenterProfile } from '../services/userCenterApi';
@@ -1111,6 +1139,18 @@ const {
 } = useSoftwareUpdate();
 
 const emit = defineEmits(['openQuickSetup', 'openCertModal', 'startCertReinstall']);
+
+// 远程协助入口开关:gates 一次拉取,关=按钮隐藏(与后端四端点同门)。
+// 弹窗状态机/WS 在 useAssist 单例内,Task 10 观看页复用同一份。
+const assistOpen = ref(false);
+const { gatesEnabled: assistGatesEnabled, checkGates: checkAssistGates } = useAssist();
+function openAssist() {
+  assistOpen.value = true;
+}
+function handleAssistWatch() {
+  // 导航交接到 Task 10 的 /assist 观看路由;在此之前先收起弹窗。
+  assistOpen.value = false;
+}
 
 const requestFilter = ref('all');
 const pathSearch = ref('');
@@ -2292,6 +2332,8 @@ const agentEntryTitle = computed(() => `${t('settings_tabAgent')} · ${statusLab
 
 onMounted(() => {
   ensureLoaded().catch(() => {});
+  // 远程协助入口按 gates 显隐:一次拉取,失败保守隐藏。
+  checkAssistGates().catch(() => {});
   startCertPolling();
   startRunStatusPolling();
   refreshSoftwareUpdateStatus().catch(() => {});
