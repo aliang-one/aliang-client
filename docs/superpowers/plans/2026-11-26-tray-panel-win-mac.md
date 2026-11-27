@@ -322,9 +322,9 @@ Agent 区（§4.5）：标题「AI AGENT · 24H」；每内核一卡（🤖+名+
 - **macOS（panelwin_darwin.m）**：NSPanel（borderless + `NSWindowStyleMaskNonactivatingPanel`，`canBecomeKey=YES`）+ **`NSVisualEffectView`（behindWindow）材质铺底 + WKWebView `drawsBackground=false` + NSPanel `opaque=false`**（spec §1/§7：毛玻璃归系统材质层，前端只画半透明底；`drawsBackground` 为私有 KVC 面——公证探针随 Task 16 亚克力探针同批，调研 §6.5）+ `windowDidResignKey` → exit 0 + `WKUserContentController addScriptMessageHandler name:@"panel"`（**handler 名必须为 "panel"**，与前端 `messageHandlers.panel` 对齐，结构测试断言）+ `makeKeyAndOrderFront` + `NSApp activate`（不取焦点则失焦即退永不触发）+ open → `NSWorkspace openURL`。导航白名单：`decidePolicyFor` 仅放行回环 origin。
 - 结构测试（.m）：含 resignKey、`NSVisualEffectView`、`addScriptMessageHandler name:@"panel"`、全部 autoreleasepool、无裸 autorelease 创建点。
 
-- [ ] 锚定测试红→绿；结构测试红→实现→绿；`go build ./cmd/...` + `GOOS=windows go build ./cmd/...` + `GOOS=linux go list -deps ./cmd/aliang | grep -cE "webview2|panelwin|wails"`（期望 0）
-- [ ] **手工冒烟（本机 macOS）**：面板出现在图标下方、无 Dock 图标、毛玻璃材质可见、点击内部获焦、点外部退出、quit 消息退出码 60、open 开浏览器后驻留
-- [ ] Commit（`新增:internal/panelwin——纯原生窗口壳(NSPanel+WKWebView / WS_POPUP+WebView2)`）
+- [x] 锚定测试红→绿；结构测试红→实现→绿；`go build ./cmd/...` + `GOOS=windows go build ./cmd/...` + `GOOS=linux go list -deps ./cmd/aliang | grep -cE "webview2|panelwin|wails"`（期望 0）。**实作备注（终审回填）**：实现=33209324 + 评审增益=5728a7f1（darwin 主线程钉定 + ObjC 畸形 payload 守卫 + fail-closed 退出路径）。
+- [ ] **手工冒烟（本机 macOS）**：面板出现在图标下方、无 Dock 图标、毛玻璃材质可见、点击内部获焦、点外部退出、quit 消息退出码 60、open 开浏览器后驻留（**待装包走查**——归 Task 16 出包节）。
+- [x] Commit（`新增:internal/panelwin——纯原生窗口壳(NSPanel+WKWebView / WS_POPUP+WebView2)`）
 
 ---
 
@@ -348,7 +348,7 @@ func (l *PanelLauncher) RetryFromFallback()
 
 表驱动必测：正常开合；快速双击 toggle 不计数；失焦自退（code=0, alive<2s）不计数；连崩 3 次→fallback；fallback 后 Click 无效、Retry 恢复；60 分派；>60s 清零。
 
-- [ ] 红→实现→绿→Commit（`新增:面板 launcher 状态机——崩溃兜底/正常关闭零惩罚`）
+- [x] 红→实现→绿→Commit（`新增:面板 launcher 状态机——崩溃兜底/正常关闭零惩罚`）。**实作备注（终审回填）**：实现=8e709082 + 评审增益=89d2a198（pendingRetry 真登记闭合幽灵重拉 + spawn panic 兜底转崩溃 + 注释契约修正）。
 
 ---
 
@@ -382,10 +382,11 @@ func (l *PanelLauncher) RetryFromFallback()
 - [x] 全量测试：`go test ./app/tray/ ./internal/ipc/ ./internal/singleinstance/ ./cmd/ ./internal/panelwin/ ./app/http/services/ -count=1` + `cd app/website && npx vitest run src/panel`。**实作备注（Task 16 收口批,2026-11-28）**：Go 六包全绿（tray 1.118s / ipc 2.877s / singleinstance 2.290s / cmd 47.721s / panelwin 4.165s+编辑后复跑 0.878s / services 255.824s,EXIT=0,两已知预存 flake 未触发）;vitest 10 文件 193/193 全绿（基线 193 一致）。
 - [x] PATCH_NOTES 登记 Task 3/4 补丁（重放锚点清单）；调研文档随本批提交入库。**实作备注（Task 16 收口批）**：登记已随 M1/M2 前序批次完成（systray.go 1 锚 / systray_windows.go 12 锚 / darwin.m 18 锚 / darwin.go 2 / nonwindows.go 1 / systray.h 2,与文件实测逐一对上）;本批复核发现 windows 节编号引用漂移（「钉住 4~11」为增锚前旧值）已修正并消歧条目号/锚点号;调研文档两份已随 11f6768e / c53cefb9 入库,与主仓原件逐字节一致。
 - [ ] 出包：macOS `VERSION=v1.1.129-local bash scripts/build-pkg.sh` 装机；Windows 走 MSI 链。**（待主控收口批后执行,本批红线不出包）**
-- [ ] **验收走查（spec §9 + 调研 §7 探针）**：macOS 26/27 各一台七态逐项 + 深浅色 + 失焦 + 锚定 + 崩溃演练 + `footprint` 对照 + **毛玻璃材质可见**；Windows 11 真机（4070）：同清单 + GDI 平坦（GetGuiResources）+ 溢出区锚定回退 + DPI 125%/150%（CSS 视口宽必须恒 340）+ **亚克力/圆角实机探针**（不生效→回退纯半透明并回写 spec §7）+ **WKWebView 透明底公证探针**。**（待装机走查;材质探针结论已在 spec §10 先行占位）**
+- [ ] **验收走查（spec §9 + 调研 §6.9 探针）**：macOS 26/27 各一台七态逐项 + 深浅色 + 失焦 + 锚定 + 崩溃演练 + `footprint` 对照 + **毛玻璃材质可见**；Windows 11 真机（4070）：同清单 + GDI 平坦（GetGuiResources）+ 溢出区锚定回退 + DPI 125%/150%（CSS 视口宽必须恒 340）+ **亚克力/圆角实机探针**（不生效→回退纯半透明并回写 spec §7）+ **WKWebView 透明底公证探针**。**（待装机走查;材质探针结论已在 spec §10 先行占位;⚠️ 4070 走查前须先撤 IFEO/WER 取证三件套,或 Windows 腿改用另一台 Win11 真机——调研 §6.9:「4070 处于 WER 取证态且 companion / agent 是红线,需另选机器」）**
 - [ ] **M2 接线评审挂账（2026-11-27 评审判定 Needs fixes→本批收口余项，随本任务出包走查定夺）**：
   - **M-5**：M1 形态 `panel_bridge.go` 的 `installPanelBridge`/`uninstallPanelBridge`/`panelClickCallback` 失去生产调用方（仅测试引用）——出包走查时拍板去留（删码须同步裁撤对应测试）。
   - **M-6**：reanchor side 判别两边界：①Win10 垂直任务栏误判（视觉错位级）；②`SM_CYFULLSCREEN` 主屏归属对副屏锚定坐标可能反向误判——根治=壳内 `MonitorFromPoint`+`GetMonitorInfo` 取真实工作区，随实机走查定夺。
+  - **M-7（终审回填,预存,Task 13 评审范围）**：负坐标副屏钳边（panelwin.go `AnchorToWindowPos` 对 x 无条件钳 >=8——主屏左侧副屏的托盘图标会把面板弹到主屏；macOS 可达,Windows 主屏恒原点不可达）——根治=按 ax 所在屏矩形钳制,挂后续批。
 - [x] spec 回写备注（豁免项：错误行跳日志、设备互访 v1=仪表盘根页、§7 材质探针结论）。**实作备注（Task 16 收口批）**：已落 spec 文档尾新增「§10 M2 实现备注（2026-11-28）」——①豁免项定案（两处 v1 均开仪表盘根页）;②材质探针结论占位待装机回填 §7;③组头 g-current 瞬切已实现、淡入留样式打磨。
 - [x] Commit（`文档:M2 收口——全量门禁绿+PATCH_NOTES 补登+调研报告入库+panelwin nit 清理`）
 

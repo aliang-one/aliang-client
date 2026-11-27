@@ -94,8 +94,8 @@ type ChildProcess interface {
 // 装配:launcher 每次 spawn 现取现用,锚定坐标禁止启动早期缓存)。
 type SpawnOpts struct {
 	URL     string // --url 面板页地址(回环 origin)
-	AnchorX int    // --ax 托盘图标矩形 X(全局左上原点,物理单位)
-	AnchorY int    // --ay 托盘图标矩形 Y(全局左上原点,物理单位)
+	AnchorX int    // --ax 托盘图标矩形 X(全局左上原点;单位随平台:macOS=点、Windows=物理像素,同 TrayRect 语义)
+	AnchorY int    // --ay 托盘图标矩形 Y(全局左上原点;单位随平台:macOS=点、Windows=物理像素,同 TrayRect 语义)
 	IconW   int    // --w 托盘图标矩形宽
 	IconH   int    // --h 托盘图标矩形高
 	PanelW  int    // --pw 面板逻辑宽
@@ -151,7 +151,8 @@ type PanelLauncher struct {
 // Click 托盘图标点击入口:未开 → spawn;已开 → Kill(标有意收起,退出走
 // 正常关闭零惩罚);兜底态无效(不发 spawn 不报错,仅 RetryFromFallback
 // 可恢复);重拉 1s 延迟窗内视为「未开」→ 立即 spawn 并作废挂起重拉
-// (裁定 2)。
+// (裁定 2);「崩溃已死未转投」窗口内视为「未开」→ 消费退出码代行收尸
+// (原样分诊,崩溃照计)后立即 spawn。
 func (l *PanelLauncher) Click() {
 	l.mu.Lock()
 	if l.phase == phaseFallback {
@@ -160,12 +161,39 @@ func (l *PanelLauncher) Click() {
 		return
 	}
 	if l.child != nil {
-		// 已开 → 收起:Kill 并打标,退出经 killedByUs 走正常关闭(零惩罚)
-		l.killedByUs = true
 		child := l.child
-		l.mu.Unlock()
-		child.Kill()
-		return
+		// 「崩溃已死未转投」窗口的非阻塞探测:面板已死但转投 goroutine
+		// 尚未跑到 childExited 的间隙里 child 仍非 nil——此窗内直接打
+		// killedByUs + Kill(对死进程 no-op)会让迟到的崩溃码被正常关闭
+		// 分支吞掉(崩溃漏计 + 「开」点击被反转为「收起」),须先探测。
+		select {
+		case code := <-child.Wait():
+			// 退出码已送达 = 面板已死,本次点击是「开」不是「收起」,
+			// 不打 killedByUs。退出码已被本点击抢先消费,转投 goroutine
+			// 的 <-child.Wait() 按「送达一次」契约永不再送达,其收尸
+			// (exitReport+childExited)永不执行——收尸由本点击代行:
+			// 先 exitReport(取即清零契约照旧,须先于 childExited)再
+			// childExited 原样分诊(killedByUs 如实传递——前击已 Kill
+			// 的有意收起仍归零惩罚;崩溃照计;满 3 兜底由其自处),随后
+			// 按「开」语义作废挂起重拉立即 spawn(与重拉延迟窗的 Click
+			// 让位同型)。代价:转投 goroutine 永久阻塞泄漏一枚(窗口=
+			// 崩溃落地到转投执行之间,罕见且每窗至多一枚,接受)。
+			l.mu.Unlock()
+			alive, killedByUs := l.exitReport()
+			l.childExited(code, alive, killedByUs)
+			l.mu.Lock()
+			l.pendingRetry = nil
+			l.mu.Unlock()
+			l.spawnAttempt()
+			return
+		default:
+			// 存活 → 收起:Kill 并打标,退出经 killedByUs 走正常关闭
+			// (零惩罚)
+			l.killedByUs = true
+			l.mu.Unlock()
+			child.Kill()
+			return
+		}
 	}
 	// 未开(含重拉延迟窗):立即 spawn,并作废挂起的重拉(裁定 2;
 	// retryNow 的二次校验兜住迟到的旧到期动作)

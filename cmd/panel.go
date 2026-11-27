@@ -32,8 +32,8 @@ interactive use.`,
 
 func init() {
 	panelCmd.Flags().String("url", "", "panel page URL (loopback origin becomes the navigation whitelist)")
-	panelCmd.Flags().Int("ax", 0, "tray icon rectangle X (global, top-left origin, physical units)")
-	panelCmd.Flags().Int("ay", 0, "tray icon rectangle Y (global, top-left origin, physical units)")
+	panelCmd.Flags().Int("ax", 0, "tray icon rectangle X (global top-left origin; unit follows platform: macOS=points, Windows=physical pixels, same as TrayRect)")
+	panelCmd.Flags().Int("ay", 0, "tray icon rectangle Y (global top-left origin; unit follows platform: macOS=points, Windows=physical pixels, same as TrayRect)")
 	panelCmd.Flags().Int("w", 22, "tray icon rectangle width")
 	panelCmd.Flags().Int("h", 22, "tray icon rectangle height")
 	panelCmd.Flags().Int("pw", panelwin.DefaultPanelW, "panel logical width")

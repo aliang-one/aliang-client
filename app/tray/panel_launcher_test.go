@@ -495,6 +495,72 @@ func TestPanelLauncherSpawnOptsFreshEachAttempt(t *testing.T) {
 	}
 }
 
+// TestPanelLauncherClickOnCrashedButUnforwardedChildSpawns 崩溃已死未转投
+// 窗口内点击:面板 T 时刻崩溃死亡(退出码已送达 Wait 通道),转投 goroutine
+// 尚未跑到 childExited——此窗内 child 仍非 nil,Click 是「开」不是「收起」:
+// 不得打 killedByUs(Kill 对死进程 no-op,迟到的崩溃码会被正常关闭分支吞掉
+// = 崩溃漏计 + 点击语义反转)。退出码被 Click 抢先消费后按送达一次契约转投
+// 方永不送达,收尸(exitReport+childExited)由 Click 代行:崩溃照计 + 立即
+// spawn。反向锚定:若此窗点击走「收起」,spawn 不发生且崩溃零计数。
+func TestPanelLauncherClickOnCrashedButUnforwardedChildSpawns(t *testing.T) {
+	h := newLauncherHarness()
+	h.launcher.Click()
+	child := h.lastChild()
+
+	// 崩溃已落地(退出码已进通道)、转投 goroutine 未执行——测试直发通道
+	// 模拟(不起 goroutine;真实形态转投方此刻正阻塞在 <-child.Wait())。
+	child.wait <- 1
+
+	h.launcher.Click() // 崩溃未转投窗口内的点击 = 开
+	if h.spawnCalls != 2 {
+		t.Fatalf("崩溃窗口内点击未立即 spawn:calls=%d", h.spawnCalls)
+	}
+	if len(h.scheduled) != 1 {
+		t.Fatalf("崩溃码被吞(killedByUs 误吞或漏计数):scheduled=%d, want 1", len(h.scheduled))
+	}
+	if h.fallbacks != 0 || h.focusCloses != 0 || h.quits != 0 {
+		t.Fatalf("崩溃被误分诊:fallback=%d focus=%d quit=%d", h.fallbacks, h.focusCloses, h.quits)
+	}
+	if _, killedByUs := h.launcher.exitReport(); killedByUs {
+		t.Fatalf("崩溃窗口收尸后 killedByUs 残留(会污染下一轮分诊)")
+	}
+
+	// 代行分诊排出的 1s 重拉已被本次「开」作废(立即 spawn 取代):迟到的
+	// 到期动作让位,不二次 spawn。
+	h.firePendingRetry(t)
+	if h.spawnCalls != 2 {
+		t.Fatalf("已作废的重拉到期仍二次 spawn:calls=%d", h.spawnCalls)
+	}
+}
+
+// TestPanelLauncherClickWindowHonorsPriorKillFlag 窗口内代行收尸时
+// killedByUs 如实传递:前次点击已对存活面板 Kill(有意收起打标),面板信号
+// 死亡(exit −1)但退出码未转投——此窗内的下一次点击消费退出码代行收尸,
+// 分诊须携原标记(信号死亡归正常关闭零惩罚零重拉),随后本次点击按「开」
+// 语义 spawn。
+func TestPanelLauncherClickWindowHonorsPriorKillFlag(t *testing.T) {
+	h := newLauncherHarness()
+	h.launcher.Click()
+	child := h.lastChild()
+	h.launcher.Click() // 第一击:收起(killedByUs 打标 + Kill)
+	if child.kills != 1 {
+		t.Fatalf("前置收起未 Kill:kills=%d", child.kills)
+	}
+	child.wait <- -1 // 信号死亡,退出码落地未转投
+	if child.kills != 1 {
+		t.Fatalf("窗口内点击误 Kill 死进程:kills=%d", child.kills)
+	}
+
+	h.launcher.Click() // 收起未转投窗口内的点击:代行收尸 + 开
+	if h.spawnCalls != 2 {
+		t.Fatalf("崩溃窗口内点击未立即 spawn:calls=%d", h.spawnCalls)
+	}
+	if len(h.scheduled) != 0 || h.fallbacks != 0 || h.focusCloses != 0 || h.quits != 0 {
+		t.Fatalf("携原标记的有意收起被惩罚:scheduled=%d fallback=%d focus=%d quit=%d",
+			len(h.scheduled), h.fallbacks, h.focusCloses, h.quits)
+	}
+}
+
 // TestPanelLauncherSideLiterals Side 字面量与 panelwin 对齐。不 import
 // internal/panelwin(其无 Linux 形态,app/tray 引用会破 Linux 依赖闭包闸,
 // 见 cmd/panel.go 闭包纪律),故拷贝字面量并以本测试锚定漂移。

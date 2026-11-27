@@ -21,8 +21,9 @@ import (
 //     (壳内 SetForegroundWindow 只认「已授予 AllowSetForegroundWindow 资格」
 //     的调用,时序差会让失焦即退整条链失效——panelwin_windows.go 文件头);
 //   - AllowSetForegroundWindow(pid):授予面板进程前台资格。best-effort,
-//     失败只落日志(companion 在托盘点击瞬间未必持前台权,资格授予可能被
-//     拒;实测行为归 Task 16 实机探针);
+//     失败落 Warn(失败 = 失焦即退链失效:面板弹出不激活、点外部不自退,
+//     真机归因靠此日志;companion 在托盘点击瞬间未必持前台权,资格授予
+//     可能被拒;实测行为归 Task 16 实机探针);
 //   - Job(KILL_ON_JOB_CLOSE):面板进程入 companion 的收割树——companion
 //     退出时句柄由内核回收,Job 连带终止面板(⚠️ 刻意不 Close:关闭即收割,
 //     面板会当场死掉;句柄泄漏给进程生命周期,KILL_ON_JOB_CLOSE 的语义就是
@@ -107,12 +108,14 @@ func readPanelTrayAnchor() panelAnchorSample {
 }
 
 // allowSetForegroundWindow 前台资格授予(AllowSetForegroundWindow(pid))。
+// 失败 = 失焦即退链失效(面板弹出不激活、点外部不自退),落 Warn 供真机
+// 归因(Task 16 探针清单挂账项)。
 func allowSetForegroundWindow(pid uint32) {
 	if panelProcAllowSetForegroundWindow.Find() != nil {
 		return
 	}
 	if r, _, _ := panelProcAllowSetForegroundWindow.Call(uintptr(pid)); r == 0 {
-		logger.Debug(fmt.Sprintf("AllowSetForegroundWindow(%d) rejected (best-effort)", pid))
+		logger.Warn(fmt.Sprintf("AllowSetForegroundWindow(%d) rejected (best-effort)", pid))
 	}
 }
 

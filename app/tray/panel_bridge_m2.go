@@ -4,7 +4,7 @@ package tray
 // launcher 状态机(Task 14)→ spawn 本机可执行文件的 panel 子命令(进程即
 // 面板:失焦自退 / quit 退出 / 崩溃,退出码契约见 internal/panelwin.go)。
 // M1 的浏览器形态(panel_bridge.go)被取代:面板模式点图标 = launcher.Click,
-// 不再开浏览器;openPanelInBrowser 与 installPanelBridge 保留(M1 行为不变,
+// 不再开浏览器;openPanelURLInBrowser 与 installPanelBridge 保留(M1 行为不变,
 // 浏览器打开能力仍可被其它路径复用)。
 //
 // 平台差异收敛在 panel_spawn_darwin.go / panel_spawn_windows.go 两个 shim:
