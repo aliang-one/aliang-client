@@ -77,6 +77,14 @@ func (e *LLMEndpoint) Validate() error {
 	if !e.ProtocolAnthropic && !e.ProtocolOpenAI {
 		return fmt.Errorf("llm_endpoint.protocol 至少勾选 anthropic/openai 之一")
 	}
+	// 出口规则(spec 二期 §4: Validate+store 双层):egress_kernel=1 只可能落在
+	// anthropic 行上——AliangCode 出口是内核定向出口,内核只说 anthropic 协议。
+	// 本层与 store.SetEgressKernel 双层设防:store 堵「把非 anthropic 行设成出口」
+	// 的正面写缝,这里堵「翻协议留标记」的旁路——PUT 翻转 protocol_anthropic 时
+	// 请求体没有 egress 字段,merge 后的行带着 egress=1 进 Update,被本条拦成 400。
+	if e.EgressKernel && !e.ProtocolAnthropic {
+		return fmt.Errorf("llm_endpoint.egress_kernel 出口指定只接受 anthropic 协议(先取消出口再改协议)")
+	}
 	if strings.TrimSpace(e.BaseURL) != "" {
 		u, err := url.Parse(strings.TrimSpace(e.BaseURL))
 		if err != nil || u.Scheme == "" || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {

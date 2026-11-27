@@ -25,6 +25,14 @@ func TestLLMEndpointValidate(t *testing.T) {
 		{"双协议全 0", func(e *LLMEndpoint) { e.ProtocolAnthropic = false }, "protocol"},
 		{"非法 URL", func(e *LLMEndpoint) { e.BaseURL = "not-a-url" }, "base_url"},
 		{"builtin 带 base_url", func(e *LLMEndpoint) { e.Builtin = true }, "builtin"},
+		// 出口规则(spec 二期 §4):egress=1 落在非 anthropic 行 → 拒。openai-only
+		// 合法行(单一协议)叠加出口标记才是要拦的形态。
+		{"openai-only 行带出口标记", func(e *LLMEndpoint) {
+			e.ProtocolAnthropic = false
+			e.ProtocolOpenAI = true
+			e.EgressKernel = true
+		}, "egress_kernel"},
+		{"双协议行带出口标记", func(e *LLMEndpoint) { e.EgressKernel = true }, ""},
 	}
 	for _, tc := range cases {
 		e := base()

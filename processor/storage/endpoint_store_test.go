@@ -519,6 +519,49 @@ func TestEndpointStore_EgressColumnsOutsideConfigWhitelist(t *testing.T) {
 	}
 }
 
+// PUT 翻协议旁路被 Validate 拦(spec 二期 §4 Validate+store 双层):请求体没有
+// egress 字段,GET-merge-PUT 翻 protocol_anthropic 时行上残留 egress=1——
+// 这里在 store.Update 的真实调用链上断言:它先跑 Validate,把「翻协议留标记」
+// 的合并行拒掉(handler 路径 UpdateEndpoint→Update 同缝,非单独造的第二条链)。
+// 行上的 egress=1 用裸 SQL 预置(模拟 SetEgressKernel 之外的旁路/历史残留)。
+func TestEndpointStore_UpdateProtocolFlipOnEgressRowRejected(t *testing.T) {
+	s := newTestStore(t)
+	newAnthropicEndpoint(t, s, "flip1")
+	if err := s.db.Exec("UPDATE llm_endpoints SET egress_kernel = 1 WHERE id = ?", "flip1").Error; err != nil {
+		t.Fatal(err)
+	}
+	// GET-merge-PUT 形状:读回整行(带 egress=1)→ 翻 anthropic 关、开 openai
+	// (双协议变 openai-only,自身合法)→ Update 必须被 Validate 拒。
+	row, err := s.Get("flip1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	row.ProtocolAnthropic = false
+	row.ProtocolOpenAI = true
+	err = s.Update(row)
+	if err == nil {
+		t.Fatal("protocol flip on an egress row must be rejected by Validate (spec §4 second layer)")
+	}
+	if !strings.Contains(err.Error(), "egress_kernel") {
+		t.Fatalf("rejection must be the egress rule (handler maps 400), got %q", err)
+	}
+	// 反向正常路径:先取消出口,再 GET-merge-PUT 翻协议 → 通过——错误文案里
+	// 「先取消出口再改协议」的指引必须是可执行的真路径。(GET 必须发生在取消
+	// 之后:merge 快照里的 egress 值就是落库值,先取快照后取消会带着旧标记。)
+	if err := s.SetEgressKernel("flip1", false); err != nil {
+		t.Fatal(err)
+	}
+	row2, err := s.Get("flip1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	row2.ProtocolAnthropic = false
+	row2.ProtocolOpenAI = true
+	if err := s.Update(row2); err != nil {
+		t.Fatalf("flip after cancelling egress must pass, got %v", err)
+	}
+}
+
 // DDL 实证:四条新列必须以 spec §4 的精确列名落表——gorm 蛇形纪律一期踩过
 // (ProtocolOpenAI → protocol_open_ai),显式 column tag 钉住后用真 DDL 收口,
 // 不赌 NamingStrategy。
