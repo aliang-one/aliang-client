@@ -19,6 +19,7 @@ vi.mock('../../services/agentApi', () => ({
   testEndpoint: vi.fn(),
   fetchEndpointModels: vi.fn(),
   resetEndpointHealth: vi.fn(),
+  setEndpointEgressKernel: vi.fn(),
   getEndpointPolicy: vi.fn(),
   setEndpointPolicy: vi.fn(),
 }));
@@ -32,6 +33,7 @@ import EndpointManagerSettings, {
   endpointToneClass,
 } from './EndpointManagerSettings.vue';
 import { showErrorDialog } from '../../composables/useErrorDialog';
+import { formatClockTime } from '../../utils/endpointSettings';
 import {
   createEndpoint,
   deleteEndpoint,
@@ -39,6 +41,7 @@ import {
   getEndpointPolicy,
   getEndpoints,
   resetEndpointHealth,
+  setEndpointEgressKernel,
   setEndpointPolicy,
   testEndpoint,
   updateEndpoint,
@@ -61,6 +64,12 @@ const endpointsData = () => [
     health_status: 'ok',
     last_error: '',
     inflight: 2,
+    egress_kernel: false,
+    last_used_at: 0,
+    total_requests: 0,
+    failed_requests: 0,
+    cooldown_until: 0,
+    rate_limited_until: 0,
   },
   {
     id: 'e1',
@@ -78,6 +87,36 @@ const endpointsData = () => [
     health_status: 'ok',
     last_error: '',
     inflight: 1,
+    egress_kernel: false,
+    last_used_at: Math.floor(Date.now() / 1000) - 180,
+    total_requests: 42,
+    failed_requests: 2,
+    cooldown_until: 0,
+    rate_limited_until: 0,
+  },
+  // 非 anthropic 行:出口按钮不显示的负例(只有 O 协议)
+  {
+    id: 'e2',
+    name: 'openai-only',
+    base_url: 'https://o.example.com',
+    api_key: 'sk-o***1234',
+    protocol_anthropic: false,
+    protocol_openai: true,
+    auto_group: true,
+    priority: 20,
+    max_concurrency: 0,
+    models: '[]',
+    enabled: true,
+    builtin: false,
+    health_status: 'ok',
+    last_error: '',
+    inflight: 0,
+    egress_kernel: false,
+    last_used_at: 0,
+    total_requests: 7,
+    failed_requests: 1,
+    cooldown_until: 0,
+    rate_limited_until: 0,
   },
 ];
 
@@ -127,6 +166,7 @@ describe('EndpointManagerSettings LLM 端点管理卡', () => {
     testEndpoint.mockResolvedValue({ ok: true, model_count: 12, error: '' });
     resetEndpointHealth.mockResolvedValue({ id: 'e1' });
     fetchEndpointModels.mockResolvedValue(['glm-4.6', 'glm-4.5']);
+    setEndpointEgressKernel.mockResolvedValue({ id: 'e1', egress_kernel: true });
   });
 
   afterEach(() => {
@@ -188,7 +228,7 @@ describe('EndpointManagerSettings LLM 端点管理卡', () => {
     expect(el.querySelector('[data-field="name"]')).toBeTruthy(); // 弹窗保持打开
   });
 
-  it('新增成功:POST 载荷是线格式(models 为 JSON 数组串,enabled 缺省 true)', async () => {
+  it('新增成功:POST 载荷是线格式(models 为 JSON 数组串;enabled 不再进载荷,POST 缺键服务端默认 true)', async () => {
     const el = mountComp();
     await flush();
     buttonByText(el, 'endpointManager_add').click();
@@ -211,8 +251,8 @@ describe('EndpointManagerSettings LLM 端点管理卡', () => {
       priority: 0,
       max_concurrency: 0,
       models: '["glm-4.6","claude-3"]',
-      enabled: true,
     });
+    expect('enabled' in payload).toBe(false);
   });
 
   it('§17 不变量 7:编辑时 api_key 留空 → PUT 载荷不含 api_key 键(空=不改)', async () => {
@@ -329,6 +369,142 @@ describe('EndpointManagerSettings LLM 端点管理卡', () => {
     expect(el.textContent).toContain('endpointManager_resetHealthDone');
   });
 
+  // —— 二期:行上激活开关 / 出口指定 / 三词徽标 / 行尾计数(spec 二期 §7.1)——
+
+  function rowToggle(el, index) {
+    return [...el.querySelectorAll('[data-field="rowEnabledToggle"]')][index];
+  }
+
+  it('行上激活开关:点击 = PUT enabled 快速路径(不进弹窗)并刷新列表', async () => {
+    const el = mountComp();
+    await flush();
+    expect(getEndpoints.mock.calls.length).toBe(1);
+    // 第二行开关 = prov-a(e1),当前启用 → 停用
+    rowToggle(el, 1).click();
+    await flush();
+    expect(updateEndpoint).toHaveBeenCalledTimes(1);
+    expect(updateEndpoint).toHaveBeenCalledWith('e1', { enabled: false });
+    expect(getEndpoints.mock.calls.length).toBeGreaterThanOrEqual(2); // 刷新
+    // 编辑弹窗没有因此打开
+    expect(el.querySelector('[data-field="name"]')).toBeNull();
+  });
+
+  it('行上激活开关:停用行点击 → PUT {enabled:true} 重新启用', async () => {
+    getEndpoints.mockResolvedValue(endpointsData().map((r) => (
+      r.id === 'e1' ? { ...r, enabled: false } : r)));
+    const el = mountComp();
+    await flush();
+    rowToggle(el, 1).click();
+    await flush();
+    expect(updateEndpoint).toHaveBeenCalledWith('e1', { enabled: true });
+  });
+
+  it('停用行视觉区分:整行灰显 + 健康徽标位显示「已停用」(灰),不再另挂第二枚停用徽标', async () => {
+    getEndpoints.mockResolvedValue(endpointsData().map((r) => (
+      r.id === 'e1' ? { ...r, enabled: false } : r)));
+    const el = mountComp();
+    await flush();
+    const items = [...el.querySelectorAll('ul > li')];
+    expect(items[1].className).toContain('opacity-60');
+    const badges = [...items[1].querySelectorAll('[data-testid="endpoint-health-badge"]')]
+      .map((s) => s.textContent.trim());
+    expect(badges).toEqual(['endpointManager_disabledBadge']);
+    const text = items[1].textContent;
+    expect(text.split('endpointManager_disabledBadge').length - 1).toBe(1); // 恰好一枚
+    // 开关 aria 态同步
+    expect(rowToggle(el, 1).getAttribute('aria-checked')).toBe('false');
+  });
+
+  it('出口按钮:anthropic 行显示「设为 AliangCode 出口」(builtin 可设),非 anthropic 行不显示', async () => {
+    const el = mountComp();
+    await flush();
+    const setBtns = [...el.querySelectorAll('button')]
+      .filter((b) => b.textContent.replace(/\s+/g, ' ').trim() === 'endpointManager_setEgress');
+    expect(setBtns.length).toBe(2); // builtin + prov-a(双 anthropic);openai-only 无
+    const items = [...el.querySelectorAll('ul > li')];
+    expect(items[2].textContent).not.toContain('endpointManager_setEgress');
+    expect(items[2].textContent).not.toContain('endpointManager_unsetEgress');
+  });
+
+  it('出口换绑:点击设出口 → POST set-egress-kernel {set:true} + 刷新 + 行内成功提示', async () => {
+    const el = mountComp();
+    await flush();
+    const setBtns = [...el.querySelectorAll('button')]
+      .filter((b) => b.textContent.replace(/\s+/g, ' ').trim() === 'endpointManager_setEgress');
+    setBtns[1].click(); // prov-a
+    await flush();
+    expect(setEndpointEgressKernel).toHaveBeenCalledTimes(1);
+    expect(setEndpointEgressKernel).toHaveBeenCalledWith('e1', true);
+    expect(getEndpoints.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(el.textContent).toContain('endpointManager_egressSet');
+  });
+
+  it('当前出口行:徽标「出口」(primary) + 按钮变「取消出口」,取消 → POST {set:false}', async () => {
+    getEndpoints.mockResolvedValue(endpointsData().map((r) => (
+      r.id === 'e1' ? { ...r, egress_kernel: true } : r)));
+    const el = mountComp();
+    await flush();
+    // 徽标只在出口行
+    const badgeRows = [...el.querySelectorAll('[data-testid="endpoint-egress-badge"]')];
+    expect(badgeRows.length).toBe(1);
+    expect(badgeRows[0].textContent.trim()).toBe('endpointManager_egressBadge');
+    expect(badgeRows[0].className).toContain('bg-primary');
+    // 当前出口行按钮 = 取消出口
+    const unsetBtns = [...el.querySelectorAll('button')]
+      .filter((b) => b.textContent.replace(/\s+/g, ' ').trim() === 'endpointManager_unsetEgress');
+    expect(unsetBtns.length).toBe(1);
+    unsetBtns[0].click();
+    await flush();
+    expect(setEndpointEgressKernel).toHaveBeenCalledWith('e1', false);
+    expect(el.textContent).toContain('endpointManager_egressUnset');
+  });
+
+  it('三词徽章·熔断红:disabled+冷却中行 tooltip「恢复于 HH:MM」;限流行 tooltip「限流至 HH:MM」', async () => {
+    const recoverAt = Math.floor(Date.now() / 1000) + 600;
+    const limitedUntil = Math.floor(Date.now() / 1000) + 300;
+    getEndpoints.mockResolvedValue(endpointsData().map((r) => {
+      if (r.id === 'e1') return { ...r, health_status: 'disabled', cooldown_until: recoverAt };
+      if (r.id === 'e2') return { ...r, rate_limited_until: limitedUntil };
+      return r;
+    }));
+    const el = mountComp();
+    await flush();
+    const items = [...el.querySelectorAll('ul > li')];
+    const e1Badge = items[1].querySelector('[data-testid="endpoint-health-badge"]');
+    expect(e1Badge.textContent.trim()).toBe('endpointManager_healthDisabled');
+    expect(e1Badge.getAttribute('title'))
+      .toBe(`endpointManager_tooltipRecoverAt ${formatClockTime(recoverAt)}`);
+    const e2Badge = items[2].querySelector('[data-testid="endpoint-health-badge"]');
+    expect(e2Badge.textContent.trim()).toBe('endpointManager_healthRateLimited');
+    expect(e2Badge.getAttribute('title'))
+      .toBe(`endpointManager_tooltipLimitedUntil ${formatClockTime(limitedUntil)}`);
+    // builtin 行无 tooltip
+    expect(items[0].querySelector('[data-testid="endpoint-health-badge"]').getAttribute('title')).toBe('');
+  });
+
+  it('行尾计数:调用/失败 + last_used_at 相对时间(3 分钟前);从未调用行显示从未', async () => {
+    const el = mountComp();
+    await flush();
+    const tails = [...el.querySelectorAll('[data-testid="endpoint-usage-tail"]')]
+      .map((s) => s.textContent.replace(/\s+/g, ' ').trim());
+    expect(tails[1]).toContain('endpointManager_totalRequests 42');
+    expect(tails[1]).toContain('endpointManager_failedRequests 2');
+    expect(tails[1]).toContain('endpointManager_lastUsedMinAgo 3');
+    // builtin 与 openai-only 的 last_used_at=0 → 从未调用
+    expect(tails[0]).toContain('endpointManager_lastUsedNever');
+    expect(tails[2]).toContain('endpointManager_lastUsedNever');
+  });
+
+  it('二期:编辑弹窗不再有 enabled 勾选(行上开关取代)', async () => {
+    const el = mountComp();
+    await flush();
+    const editButtons = [...el.querySelectorAll('button')]
+      .filter((b) => b.textContent.replace(/\s+/g, ' ').trim() === 'endpointManager_edit');
+    editButtons[1].click();
+    await flush();
+    expect(el.querySelector('[data-field="enabled"]')).toBeNull();
+  });
+
   it('组策略卡:挂载读取默认值,保存走 PUT(数值为整数)', async () => {
     const el = mountComp();
     await flush();
@@ -372,27 +548,91 @@ describe('EndpointManagerSettings LLM 端点管理卡', () => {
   });
 });
 
-describe('endpointHealthBadge / endpointToneClass 徽标纯函数', () => {
-  it('health_status 权威:ok 绿/cooldown 琥珀/disabled 红', () => {
-    expect(endpointHealthBadge({ healthStatus: 'ok', lastError: '' })).toEqual({
+describe('endpointHealthBadge / endpointToneClass 三词徽标纯函数(不变量 16)', () => {
+  // 固定「现在」,cooldown/ratelimited 窗口以它为基准
+  const NOW = 1700000000000;
+  const future = NOW / 1000 + 600; // +10 分钟(unix 秒)
+
+  it('停用最高优先:enabled=0 → 灰(已停用),健康列不再展示', () => {
+    expect(endpointHealthBadge({ enabled: false, healthStatus: 'ok' }, NOW)).toEqual({
+      key: 'endpointManager_disabledBadge', tone: 'muted',
+    });
+    // 停用行即使挂着熔断/限流态,徽标仍只说「已停用」——不混词
+    expect(endpointHealthBadge({
+      enabled: false, healthStatus: 'disabled', cooldownUntil: future,
+    }, NOW).key).toBe('endpointManager_disabledBadge');
+  });
+
+  it('熔断红:health=disabled ∧ cooldown_until>now → tooltip 恢复于 HH:MM', () => {
+    const badge = endpointHealthBadge({
+      enabled: true, healthStatus: 'disabled', cooldownUntil: future,
+    }, NOW);
+    expect(badge.tone).toBe('error');
+    expect(badge.key).toBe('endpointManager_healthDisabled');
+    expect(badge.tooltipKey).toBe('endpointManager_tooltipRecoverAt');
+    expect(badge.tooltipTime).toBe(formatClockTime(future));
+    expect(badge.tooltipTime).toMatch(/^\d{2}:\d{2}$/);
+  });
+
+  it('熔断红·锁存:health=disabled ∧ cooldown_until=0(401/402 不自愈)→ 无 tooltip', () => {
+    const badge = endpointHealthBadge({
+      enabled: true, healthStatus: 'disabled', cooldownUntil: 0,
+    }, NOW);
+    expect(badge.tone).toBe('error');
+    expect(badge.tooltipKey).toBeUndefined();
+    expect(badge.tooltipTime).toBeUndefined();
+  });
+
+  it('熔断红·冷却已过:cooldown_until<=now → 红但无 tooltip(等真实成功/重置回池)', () => {
+    const badge = endpointHealthBadge({
+      enabled: true, healthStatus: 'disabled', cooldownUntil: future - 1200,
+    }, NOW);
+    expect(badge.tone).toBe('error');
+    expect(badge.tooltipKey).toBeUndefined();
+  });
+
+  it('限流蓝灰:health 仍 ok ∧ rate_limited_until>now → tooltip 限流至 HH:MM', () => {
+    const badge = endpointHealthBadge({
+      enabled: true, healthStatus: 'ok', rateLimitedUntil: future,
+    }, NOW);
+    expect(badge).toEqual({
+      key: 'endpointManager_healthRateLimited',
+      tone: 'muted',
+      tooltipKey: 'endpointManager_tooltipLimitedUntil',
+      tooltipTime: formatClockTime(future),
+    });
+  });
+
+  it('限流窗已过(rate_limited_until<=now)回正常——不再看 last_error 的陈旧 429 文案', () => {
+    expect(endpointHealthBadge({
+      enabled: true, healthStatus: 'ok', rateLimitedUntil: future - 1200,
+      lastError: 'HTTP 429: rate limited',
+    }, NOW)).toEqual({ key: 'endpointManager_healthOk', tone: 'ok' });
+    expect(endpointHealthBadge({
+      enabled: true, healthStatus: 'ok', rateLimitedUntil: 0,
+    }, NOW).key).toBe('endpointManager_healthOk');
+  });
+
+  it('熔断压过限流:disabled ∧ rate_limited_until>now → 红熔断(严重度优先)', () => {
+    const badge = endpointHealthBadge({
+      enabled: true, healthStatus: 'disabled', cooldownUntil: 0, rateLimitedUntil: future,
+    }, NOW);
+    expect(badge.key).toBe('endpointManager_healthDisabled');
+    expect(badge.tone).toBe('error');
+  });
+
+  it('legacy cooldown 健康值(一期历史行)按非 ok → 熔断红', () => {
+    expect(endpointHealthBadge({
+      enabled: true, healthStatus: 'cooldown', cooldownUntil: future,
+    }, NOW).tone).toBe('error');
+  });
+
+  it('正常绿 + 缺省回落/未知 tone 回落 muted', () => {
+    expect(endpointHealthBadge({ enabled: true, healthStatus: 'ok' }, NOW)).toEqual({
       key: 'endpointManager_healthOk', tone: 'ok',
     });
-    expect(endpointHealthBadge({ healthStatus: 'cooldown', lastError: '' }).tone).toBe('warn');
-    expect(endpointHealthBadge({ healthStatus: 'disabled', lastError: '' }).tone).toBe('error');
-  });
-
-  it('429 限流从 last_error 识别(蓝灰);health_status 仍是 ok', () => {
-    expect(endpointHealthBadge({ healthStatus: 'ok', lastError: 'HTTP 429: rate limited' })).toEqual({
-      key: 'endpointManager_healthRateLimited', tone: 'muted',
-    });
-    expect(endpointHealthBadge({ healthStatus: 'ok', lastError: 'rate_limit hit' }).tone).toBe('muted');
-    // 普通错误不误判
-    expect(endpointHealthBadge({ healthStatus: 'ok', lastError: 'dial timeout' }).tone).toBe('ok');
-  });
-
-  it('缺省回落 ok/未知 tone 回落 muted', () => {
-    expect(endpointHealthBadge({}).key).toBe('endpointManager_healthOk');
-    expect(endpointHealthBadge(null).tone).toBe('ok');
+    expect(endpointHealthBadge({}, NOW).key).toBe('endpointManager_healthOk');
+    expect(endpointHealthBadge(null, NOW).tone).toBe('ok');
     expect(endpointToneClass('ok')).toContain('bg-emerald-100');
     expect(endpointToneClass('warn')).toContain('bg-amber-100');
     expect(endpointToneClass('error')).toContain('bg-red-100');

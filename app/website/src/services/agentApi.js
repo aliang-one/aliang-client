@@ -280,6 +280,16 @@ export async function resetEndpointHealth(id) {
   return request(`/api/endpoints/${encodeURIComponent(id)}/reset-health`, { method: 'POST' });
 }
 
+// 出口指定换绑(spec 二期 §8):POST set-egress-kernel {set}。set=true 经
+// 服务端事务换绑全局唯一出口行(非 anthropic 400/builtin 行允许),false 取消
+// 回 auto 调度。换绑即事务生效,前端不落任何本地状态。
+export async function setEndpointEgressKernel(id, set) {
+  return request(`/api/endpoints/${encodeURIComponent(id)}/set-egress-kernel`, {
+    method: 'POST',
+    body: JSON.stringify({ set: set === true }),
+  });
+}
+
 // 组策略(auto 组单行;GET/PUT /api/endpoint-groups/auto/policy)。
 export async function getEndpointPolicy() {
   return request('/api/endpoint-groups/auto/policy', { method: 'GET' });

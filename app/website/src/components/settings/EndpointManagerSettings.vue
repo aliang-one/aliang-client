@@ -1,9 +1,11 @@
 <template>
-  <!-- LLM 端点管理卡(spec 2026-11-25 §10):56432 多 endpoint 聚合路由的上游
-       入口注册表。自管 REST 面(/api/endpoints),不进 customer 保存链;写路径
-       走 utils/endpointSettings.js 的 endpointToPayload 线格式。列表 5s 轮询
-       (ListenerSettings 同模式);弹窗形态对照 AgentMCPRegistrySettings;
-       api_key 全程只显示服务端掩码(§17 不变量 7)。 -->
+  <!-- LLM 端点管理卡(spec 2026-11-25 §10 + 二期 2026-11-27 §7.1):56432 多
+       endpoint 聚合路由的上游入口注册表。自管 REST 面(/api/endpoints),不进
+       customer 保存链;写路径走 utils/endpointSettings.js 的 endpointToPayload
+       线格式。二期:行上激活开关(PUT enabled 快速路径)+ 出口指定按钮
+       (set-egress-kernel)+ 三词健康徽标(停用/熔断/限流,不变量 16)+ 行尾
+       调用计数与相对时间。列表 5s 轮询(ListenerSettings 同模式);弹窗形态
+       对照 AgentMCPRegistrySettings;api_key 全程只显示服务端掩码(§17 不变量 7)。 -->
   <div class="flex h-full flex-col rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-background-dark">
     <div class="flex items-start justify-between gap-3">
       <div class="flex min-w-0 items-start gap-3">
@@ -45,13 +47,18 @@
 
     <template v-else>
       <ul v-if="rows.length" class="mt-5 divide-y divide-slate-100 dark:divide-slate-800">
-        <li v-for="row in rows" :key="row.id" class="py-3">
+        <li v-for="row in rows" :key="row.id" class="py-3" :class="{ 'opacity-60': !row.enabled }">
           <div class="flex flex-wrap items-center gap-x-2 gap-y-1.5">
             <span class="text-xs font-semibold text-slate-800 dark:text-slate-100">{{ row.name }}</span>
             <span
               v-if="row.builtin"
               class="rounded bg-primary/10 px-1.5 py-0.5 text-[10px] font-bold text-primary"
             >{{ t('endpointManager_builtinBadge') }}</span>
+            <span
+              v-if="row.egressKernel"
+              class="rounded bg-primary px-1.5 py-0.5 text-[10px] font-bold text-white"
+              data-testid="endpoint-egress-badge"
+            >{{ t('endpointManager_egressBadge') }}</span>
             <span
               v-for="proto in row.protocolBadges"
               :key="proto.label"
@@ -63,17 +70,26 @@
                 ? 'bg-primary/10 text-primary'
                 : 'bg-slate-100 text-slate-500 dark:bg-slate-700/40 dark:text-slate-400'"
             >{{ t('endpointManager_autoGroup') }}</span>
+            <!-- 健康徽标三词分明(spec 二期不变量 16):停用(灰,enabled=0 最高
+                 优先)/熔断(红,tooltip 恢复于 HH:MM;锁存无冷却不画时间)/限流
+                 (蓝灰,tooltip 限流至 HH:MM)/正常(绿)。 -->
             <span
               class="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold"
               :class="endpointToneClass(row.health.tone)"
+              data-testid="endpoint-health-badge"
+              :title="row.health.tooltipKey
+                ? t(row.health.tooltipKey, { time: row.health.tooltipTime })
+                : ''"
             >{{ t(row.health.key) }}</span>
-            <span
-              v-if="!row.enabled"
-              class="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-bold text-slate-500 dark:bg-slate-700/40 dark:text-slate-400"
-            >{{ t('endpointManager_disabledBadge') }}</span>
             <span class="text-[10px] text-slate-400">
               {{ t('endpointManager_priority') }} {{ row.priority }}
               · {{ t('endpointManager_inflightLabel') }} {{ row.inflight }}/{{ row.maxConcurrency === 0 ? '∞' : row.maxConcurrency }}
+            </span>
+            <!-- 行尾运行态:调用/失败计数 + last_used_at 相对时间(二期 §7.1) -->
+            <span class="text-[10px] text-slate-400" data-testid="endpoint-usage-tail">
+              {{ t('endpointManager_totalRequests') }} {{ row.totalRequests }}
+              · {{ t('endpointManager_failedRequests') }} {{ row.failedRequests }}
+              · {{ t(row.lastUsedKey, row.lastUsedParams) }}
             </span>
           </div>
           <p class="mt-1 break-all text-[11px] leading-4 text-slate-500 dark:text-slate-400">
@@ -86,6 +102,36 @@
             {{ t('endpointManager_lastError') }}: {{ row.lastError }}
           </p>
           <div class="mt-2 flex flex-wrap items-center gap-1.5">
+            <!-- 行上激活开关(升格为一等公民):点击 = PUT enabled 快速路径,
+                 不进编辑弹窗;builtin 行开关照常可用(停 builtin=只停兜底行)。 -->
+            <button
+              type="button"
+              role="switch"
+              data-field="rowEnabledToggle"
+              :aria-checked="row.enabled ? 'true' : 'false'"
+              :aria-label="t('endpointManager_enabled')"
+              class="relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 disabled:cursor-not-allowed disabled:opacity-60"
+              :class="row.enabled ? 'bg-primary' : 'bg-slate-300 dark:bg-slate-600'"
+              :disabled="actionPendingId === row.id"
+              @click="toggleEnabled(row)"
+            >
+              <span
+                class="inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform"
+                :class="row.enabled ? 'translate-x-6' : 'translate-x-1'"
+              ></span>
+            </button>
+            <!-- 出口指定(spec 二期 §7.1):anthropic 行显示;当前出口行变
+                 「取消出口」;换绑即事务生效。非 anthropic 行不显示。 -->
+            <button
+              v-if="row.protocolAnthropic"
+              type="button"
+              class="inline-flex h-9 items-center rounded-lg border px-2.5 text-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/20 disabled:cursor-not-allowed disabled:opacity-60"
+              :class="row.egressKernel
+                ? 'border-primary/40 bg-primary/10 font-bold text-primary hover:bg-primary/20'
+                : 'border-slate-200 text-slate-600 hover:border-primary/40 hover:bg-primary/5 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-primary/10'"
+              :disabled="actionPendingId === row.id"
+              @click="toggleEgress(row)"
+            >{{ row.egressKernel ? t('endpointManager_unsetEgress') : t('endpointManager_setEgress') }}</button>
             <button
               type="button"
               class="inline-flex h-9 items-center rounded-lg border border-slate-200 px-2.5 text-xs font-semibold text-slate-600 transition-colors hover:border-primary/40 hover:bg-primary/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/20 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-primary/10"
@@ -331,15 +377,8 @@
             <span class="mt-1 block text-[10px] leading-4 text-slate-400">{{ t('endpointManager_modelsHint') }}</span>
           </label>
 
-          <label class="flex min-h-9 cursor-pointer items-center gap-2 py-1 text-xs font-semibold text-slate-600 dark:text-slate-300">
-            <input
-              v-model="form.enabled"
-              type="checkbox"
-              data-field="enabled"
-              class="h-4 w-4 rounded border-slate-300 text-primary focus:ring-primary/30 dark:border-slate-600 dark:bg-slate-800"
-            >
-            {{ t('endpointManager_enabled') }}
-          </label>
+          <!-- enabled 勾选已移除(二期 §7.1):行上开关取代,编辑弹窗不再
+               承担激活语义;PUT 不带 enabled 键 = 不改。 -->
         </div>
 
         <div class="mt-5 flex justify-end gap-2">
@@ -408,12 +447,15 @@ import {
   getEndpoints,
   probeEndpointModels,
   resetEndpointHealth,
+  setEndpointEgressKernel,
   setEndpointPolicy,
   testEndpoint,
   updateEndpoint,
 } from '../../services/agentApi';
 import {
   endpointToPayload,
+  formatClockTime,
+  formatLastUsedAt,
   formatModelsText,
   normalizeEndpointView,
   parseModelsText,
@@ -436,15 +478,45 @@ export function endpointToneClass(tone) {
     : TONE_CLASSES.muted;
 }
 
-// 健康徽标决策纯函数:health_status 是权威(ok/cooldown/disabled);429 冷却期
-// 服务端不改 health_status(rate_limited_until 不出 REST 面),从 last_error
-// 文案识别(429/rate limit),蓝灰表达「暂时限流、健康仍在」。
-export function endpointHealthBadge(row) {
+// 健康徽标决策纯函数(二期三词分明,spec 不变量 16):停用/熔断/限流/正常,
+// 四态互斥按优先级短路——
+//   1. enabled=0 → 停用(灰):用户停用是最高优先级(不变量 11),健康列如何
+//      都不再展示,避免「停用但显示正常」的混词;
+//   2. health_status 非 ok → 熔断(红):含阈值摘除(cooldown_until>now,tooltip
+//      「恢复于 HH:MM」)与 401/402 锁存(cooldown_until=0,无冷却,不画时间);
+//      legacy 'cooldown' 值(一期历史行)按非 ok 同路处理;
+//   3. rate_limited_until>now → 限流(蓝灰,tooltip「限流至 HH:MM」):429 不改
+//      健康态,一期靠 last_error 文案猜,二期起 Task 6 已把该字段出 REST 面,
+//      按时间窗权威判定(窗过即回正常,不看陈旧错误文案);
+//   4. 其余 → 正常(绿)。
+// now 可注入(毫秒,纯测);cooldown_until/rate_limited_until 是 Go 侧 unix 秒
+// (time.Now().Unix()),比较时 *1000 对齐毫秒。tooltipTime 是 formatClockTime
+// 折出的本地 HH:MM。
+export function endpointHealthBadge(row, now = Date.now()) {
+  const nowMs = typeof now === 'number' && Number.isFinite(now) && now > 0 ? now : Date.now();
+  if (row && row.enabled === false) {
+    return { key: 'endpointManager_disabledBadge', tone: 'muted' };
+  }
   const status = String(row?.healthStatus || 'ok');
-  if (status === 'disabled') return { key: 'endpointManager_healthDisabled', tone: 'error' };
-  if (status === 'cooldown') return { key: 'endpointManager_healthCooldown', tone: 'warn' };
-  if (/\b429\b|rate[ _-]?limit/i.test(String(row?.lastError || ''))) {
-    return { key: 'endpointManager_healthRateLimited', tone: 'muted' };
+  const cooldownUntil = Number(row?.cooldownUntil) || 0; // unix 秒,0 = 无冷却(锁存)
+  const rateLimitedUntil = Number(row?.rateLimitedUntil) || 0;
+  if (status !== 'ok') {
+    return cooldownUntil * 1000 > nowMs
+      ? {
+        key: 'endpointManager_healthDisabled',
+        tone: 'error',
+        tooltipKey: 'endpointManager_tooltipRecoverAt',
+        tooltipTime: formatClockTime(cooldownUntil),
+      }
+      : { key: 'endpointManager_healthDisabled', tone: 'error' };
+  }
+  if (rateLimitedUntil * 1000 > nowMs) {
+    return {
+      key: 'endpointManager_healthRateLimited',
+      tone: 'muted',
+      tooltipKey: 'endpointManager_tooltipLimitedUntil',
+      tooltipTime: formatClockTime(rateLimitedUntil),
+    };
   }
   return { key: 'endpointManager_healthOk', tone: 'ok' };
 }
@@ -461,7 +533,6 @@ function emptyForm() {
     priority: '0',
     maxConcurrency: '0',
     modelsText: '',
-    enabled: true,
   };
 }
 
@@ -515,14 +586,19 @@ export default {
   },
   computed: {
     rows() {
-      return this.endpoints.map((view) => ({
-        ...view,
-        health: endpointHealthBadge(view),
-        protocolBadges: [
-          ...(view.protocolAnthropic ? [{ label: 'A' }] : []),
-          ...(view.protocolOpenAI ? [{ label: 'O' }] : []),
-        ],
-      }));
+      return this.endpoints.map((view) => {
+        const lastUsed = formatLastUsedAt(view.lastUsedAt);
+        return {
+          ...view,
+          health: endpointHealthBadge(view),
+          lastUsedKey: lastUsed.key,
+          lastUsedParams: lastUsed.params,
+          protocolBadges: [
+            ...(view.protocolAnthropic ? [{ label: 'A' }] : []),
+            ...(view.protocolOpenAI ? [{ label: 'O' }] : []),
+          ],
+        };
+      });
     },
   },
   mounted() {
@@ -631,7 +707,7 @@ export default {
         priority: String(row.priority ?? 0),
         maxConcurrency: String(row.maxConcurrency ?? 0),
         modelsText: formatModelsText(row.models),
-        enabled: row.enabled !== false,
+        // enabled 不进表单(二期 §7.1):行上开关取代,PUT 载荷不带该键 = 不改。
       };
       this.showKey = false;
       this.formOpen = true;
@@ -759,6 +835,43 @@ export default {
       this.closeFetchedModels();
       this.openEdit(row);
       this.form.modelsText = models.join('\n');
+    },
+    // 行上激活开关快速路径(二期 §7.1):PUT 只带 enabled 一键(服务端全字段
+    // 可选合并,零值=不改),激活清零健康逻辑在服务层此路径触发;完成后刷新
+    // 列表拿新 enabled/健康态。不进编辑弹窗。
+    async toggleEnabled(row) {
+      if (this.actionPendingId) return;
+      this.actionPendingId = row.id;
+      try {
+        await updateEndpoint(row.id, { enabled: !row.enabled });
+        await this.loadEndpoints();
+      } catch (error) {
+        showErrorDialog(this.t('endpointManager_actionFailed', { error: error?.message || '' }));
+      } finally {
+        this.actionPendingId = '';
+      }
+    },
+    // 出口指定换绑(二期 §7.1):anthropic 行设为 AliangCode 出口 / 出口行取消。
+    // set 语义取「当前态取反」,POST set-egress-kernel 事务换绑,刷新列表拿
+    // egress_kernel 新分布(徽标与按钮文案随行数据走)。
+    async toggleEgress(row) {
+      if (this.actionPendingId) return;
+      this.actionPendingId = row.id;
+      const setting = row.egressKernel !== true;
+      try {
+        await setEndpointEgressKernel(row.id, setting);
+        this.setNotice(
+          setting
+            ? this.t('endpointManager_egressSet', { name: row.name })
+            : this.t('endpointManager_egressUnset', { name: row.name }),
+          true,
+        );
+        await this.loadEndpoints();
+      } catch (error) {
+        showErrorDialog(this.t('endpointManager_actionFailed', { error: error?.message || '' }));
+      } finally {
+        this.actionPendingId = '';
+      }
     },
     async runResetHealth(row) {
       if (this.actionPendingId) return;

@@ -2,9 +2,24 @@
 // （常驻挂载+translate 切换）、五区块渲染门（有数据画表/无数据显示空态/失败
 // 区块仅错误态渲染）、行点击上抛 open-subagent-panel。直接 mount 组件，事件
 // 经 onXxx 捕获，文案断言走 en（jsdom navigator.language 默认 en-US）。
-import { describe, it, expect } from 'vitest';
+// endpoint 二期 §7.2：⑥ 出口指示区块自带数据源（GET /api/endpoints），所以
+// agentApi 必须 mock——既断言三态文案，也阻止真实网络请求。
+import { beforeEach, describe, it, expect, vi } from 'vitest';
+
+vi.mock('../../services/agentApi', () => ({
+  getEndpoints: vi.fn(),
+}));
+
 import { createApp, h, nextTick } from 'vue';
 import ChatInfoDrawer from './ChatInfoDrawer.vue';
+import { getEndpoints } from '../../services/agentApi';
+
+// 抽屉打开即拉出口状态；默认给「无 egress 行」的 auto 形态，避免既有用例
+// 碰到未设置返回值的 mock（undefined → egressIndicator 容错为 auto，同样安全）。
+const flushMicrotasks = async () => {
+  for (let i = 0; i < 6; i += 1) await Promise.resolve();
+  await nextTick();
+};
 
 const SUBAGENTS = [
   { taskId: 'ta_1', name: 'Explore', description: null, phase: 'progress', currentStep: '搜索文件', lastTool: null, toolUses: 3, totalTokens: 1234, durationMs: 5200, summary: null },
@@ -128,5 +143,63 @@ describe('ChatInfoDrawer running 徽标', () => {
   it('会话运行中时头部显示 running 徽标（en 文案 chat_statusRunning）', async () => {
     const { el } = await mountDrawer({ open: true, running: true });
     expect(el.textContent).toContain('In conversation');
+  });
+});
+
+// —— ⑥ 出口指示(endpoint 二期 spec §7.2):三态只读,数据=GET /api/endpoints
+//    过滤 egress_kernel=1;切换只在管理页,抽屉无任何切换控件。 ——
+describe('ChatInfoDrawer 出口指示三态', () => {
+  beforeEach(() => {
+    getEndpoints.mockReset();
+    getEndpoints.mockResolvedValue([]);
+  });
+
+  const egressSection = (el) => el.querySelector('[data-testid="chat-info-drawer-egress"]');
+
+  it('出口行生效(egress_kernel=1 且 enabled):出口：{name}', async () => {
+    getEndpoints.mockResolvedValue([
+      { id: 'e1', name: 'prov-a', enabled: true, egress_kernel: true },
+      { id: 'e2', name: 'other', enabled: true, egress_kernel: false },
+    ]);
+    const { el } = await mountDrawer({ open: true });
+    await flushMicrotasks();
+    expect(getEndpoints).toHaveBeenCalledTimes(1);
+    expect(egressSection(el).textContent).toContain('Egress: prov-a');
+  });
+
+  it('出口行已停用(enabled=0,暂停保留):出口：{name}（已停用，auto 调度中）', async () => {
+    getEndpoints.mockResolvedValue([
+      { id: 'e1', name: 'prov-a', enabled: false, egress_kernel: true },
+    ]);
+    const { el } = await mountDrawer({ open: true });
+    await flushMicrotasks();
+    expect(egressSection(el).textContent).toContain('Egress: prov-a (disabled, auto dispatching)');
+  });
+
+  it('无出口行:出口：auto 调度;关闭态不拉数据(区块常驻 DOM,滑出范式)', async () => {
+    const { el } = await mountDrawer({ open: true });
+    await flushMicrotasks();
+    expect(egressSection(el).textContent).toContain('Egress: auto dispatch');
+
+    const closed = await mountDrawer({ open: false });
+    expect(getEndpoints).toHaveBeenCalledTimes(1); // 只算上面 open:true 那次
+    // 关闭只是位移屏外,区块仍在 DOM(其余区块同款,不做 open 条件渲染)
+    expect(closed.el.querySelector('[data-testid="chat-info-drawer-egress"]')).toBeTruthy();
+  });
+
+  it('读取失败且无历史值:出口状态不可用(不画假态)', async () => {
+    getEndpoints.mockRejectedValue(new Error('network down'));
+    const { el } = await mountDrawer({ open: true });
+    await flushMicrotasks();
+    expect(egressSection(el).textContent).toContain('Egress status unavailable');
+  });
+
+  it('抽屉无切换控件(出口切换只在管理页)', async () => {
+    getEndpoints.mockResolvedValue([
+      { id: 'e1', name: 'prov-a', enabled: true, egress_kernel: true },
+    ]);
+    const { el } = await mountDrawer({ open: true });
+    await flushMicrotasks();
+    expect(egressSection(el).querySelectorAll('button').length).toBe(0);
   });
 });

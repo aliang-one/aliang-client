@@ -8,6 +8,8 @@
       ③ 运行状态（回合数/触碰文件/Git 变更/耗时/停止原因）
       ④ 无进展守卫（dup 3 / err 5 / trunc 2 连击进度）
       ⑤ 失败原因（journal end 终态快照：status/reason/error）
+      ⑥ LLM 出口指示（endpoint 二期 spec §7.2：GET /api/endpoints 过滤
+        egress_kernel=1 的三态只读指示）
     滑出范式镜像 ChatSidebar：面板常驻挂载（v-if 只挂遮罩），transition-transform
     duration-200 + translate-x-full ↔ translate-x-0。层序低于子agent面板
     （z-920/930 < 940/950）——抽屉里点「查看详情」时子agent面板盖在上面。
@@ -159,6 +161,22 @@
           <p v-else class="mt-2 text-xs text-slate-400 dark:text-slate-500">{{ t('chat_infoRuntimeNone') }}</p>
         </section>
 
+        <!-- ⑥ LLM 出口指示（endpoint 二期 spec §7.2）：GET /api/endpoints 过滤
+             egress_kernel=1，三态只读——生效 / 已停用（暂停保留，auto 调度中）/
+             未指定（auto 调度）。切换只在管理页（EndpointManagerSettings），
+             聊天页不可切；读取失败显示不可用空态，不画假态。 -->
+        <section data-testid="chat-info-drawer-egress" class="border-b border-slate-100 px-4 py-3 dark:border-slate-800">
+          <h3 class="text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">
+            {{ t('chat_infoEgress') }}
+          </h3>
+          <p
+            class="mt-2 text-xs"
+            :class="egressValue && egressValue.mode === 'paused'
+              ? 'text-amber-600 dark:text-amber-400'
+              : 'text-slate-500 dark:text-slate-400'"
+          >{{ egressLabel }}</p>
+        </section>
+
         <!-- ④ 无进展守卫（手机 DiagnosticsPanel 守卫卡对齐：连击/阈值进度条） -->
         <section v-if="diag" data-testid="chat-info-drawer-guards" class="border-b border-slate-100 px-4 py-3 dark:border-slate-800">
           <h3 class="text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">
@@ -210,8 +228,13 @@
 // 纯渲染+轻派生：数据归一在 useAliangChat（实时心跳 + 详情回填双通道），
 // 展示数学在 utils/chatDiagnostics（阈值/百分比），子agent行内格式化复用
 // utils/subagentPanel 的同源函数（与子agent面板同一套数字口径）。
-import { computed } from 'vue';
+// 例外：⑥ 出口指示（endpoint 二期 §7.2）自带数据源——GET /api/endpoints 过滤
+// egress_kernel=1（egressIndicator 纯函数归一+三态判定），抽屉打开时拉取并
+// 30s 慢轮询（出口换绑低频，不与 5s 管理页轮询抢流量）。
+import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { useI18n } from '../../i18n';
+import { getEndpoints } from '../../services/agentApi';
+import { egressIndicator } from '../../utils/endpointSettings';
 import {
   subagentPhaseMeta,
   formatSubagentDuration,
@@ -271,4 +294,43 @@ const guardRows = computed(() => [
   { key: 'err', label: t('chat_infoGuardErr'), value: Number(diag.value?.errStreak) || 0, max: GUARD_MAXES.errStreak },
   { key: 'trunc', label: t('chat_infoGuardTrunc'), value: Number(diag.value?.truncStreak) || 0, max: GUARD_MAXES.truncStreak },
 ].map((g) => ({ ...g, pct: guardPct(g.value, g.max) ?? 0 })));
+
+// ---- ⑥ 出口指示（endpoint 二期 spec §7.2）----
+// null = 尚无数据/读取失败（显示不可用空态，不画假态）；{mode,name} 见
+// utils/endpointSettings.egressIndicator。
+const egressValue = ref(null);
+let egressTimer = null;
+
+async function loadEgress() {
+  try {
+    egressValue.value = egressIndicator(await getEndpoints());
+  } catch {
+    // 读取失败保持现值（首读失败则维持 null 的不可用空态）；下一轮打开/轮询再试。
+  }
+}
+
+function startEgressPolling() {
+  loadEgress();
+  if (!egressTimer) egressTimer = window.setInterval(loadEgress, 30000);
+}
+
+function stopEgressPolling() {
+  if (egressTimer) {
+    window.clearInterval(egressTimer);
+    egressTimer = null;
+  }
+}
+
+// 抽屉打开才拉取/轮询（常驻挂载组件，关着时不打接口）；immediate 覆盖
+// 「挂载即开」的首帧。
+watch(() => props.open, (v) => (v ? startEgressPolling() : stopEgressPolling()), { immediate: true });
+onBeforeUnmount(stopEgressPolling);
+
+const egressLabel = computed(() => {
+  const e = egressValue.value;
+  if (!e) return t('chat_infoEgressNone');
+  if (e.mode === 'paused') return t('chat_infoEgressPaused', { name: e.name });
+  if (e.mode === 'active') return t('chat_infoEgressActive', { name: e.name });
+  return t('chat_infoEgressAuto');
+});
 </script>
