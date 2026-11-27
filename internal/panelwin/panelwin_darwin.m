@@ -22,6 +22,9 @@
 // 双保险——不取到焦点,windowDidResignKey 永不触发、失焦即退整条失效。
 // NSWindowStyleMaskNonactivatingPanel 让面板不抢走宿主(托盘)的 key 状态;
 // canBecomeKey 覆写为 YES 让面板内部可交互(按钮、hover)。
+//
+// ⚠️ 窗口创建时序(2026-11-28 实机走查坐实,见 applicationDidFinishLaunching):
+// 窗口必须在 app 完成启动后创建, Spaces 归属/key 资格才有正确语义。
 
 #import <Cocoa/Cocoa.h>
 #import <WebKit/WebKit.h>
@@ -42,6 +45,8 @@
 @property (copy) NSString* allowOrigin;    // 导航白名单唯一放行 origin
 @property (copy) NSString* dashboardURL;   // open kind=dashboard → 此 URL
 @property (copy) NSString* peerURL;        // open kind=peer → 此 URL
+@property (copy) NSString* launchURL;      // --url,panel.html 完整地址
+@property (assign) NSRect contentRect;     // AppKit 全局左下原点的窗口 frame
 @end
 
 @implementation PanelAppDelegate
@@ -49,7 +54,23 @@
 // 失焦自退:面板点到外部/宿主切换即退出。退出码 0=正常关闭(Task 14
 // launcher 判据:0 与 60 零惩罚,其余非零=崩溃)。
 - (void)windowDidResignKey:(NSNotification *)notification {
+  NSLog(@"panelwin: resignKey → exit(0)");
   exit(0);
+}
+
+- (void)windowDidBecomeKey:(NSNotification *)notification {
+  NSLog(@"panelwin: becomeKey");
+}
+
+// 导航取证(Task 16 探针):页面加载成败一行日志,白名单误拦/网络失败不再哑。
+- (void)webView:(WKWebView *)webView
+    didCommitNavigation:(WKNavigation *)navigation {
+  NSLog(@"panelwin: web didCommit %@", webView.URL ?: [NSURL URLWithString:@"(nil)"]);
+}
+- (void)webView:(WKWebView *)webView
+        didFailNavigation:(WKNavigation *)navigation
+                    withError:(NSError *)error {
+  NSLog(@"panelwin: web didFail %@", error.localizedDescription);
 }
 
 // 导航白名单:仅放行白名单 origin 的主文档导航(调研 §6.3 不变量——面板
@@ -133,6 +154,88 @@
   // 未知类型默认忽略不崩(协议冻结:只有 quit/open 两类型)。
 }
 
+// applicationDidFinishLaunching — 窗口/WebView 全部在 app 完成启动后创建。
+// ⚠️ 2026-11-28 实机走查坐实:run loop 起来之前建窗口,Spaces 会把它钉在
+// 错误位置(窗口服务器在册、CGWindowList onscreen 有名,但【不在当前 Space
+// 合成】且永不成为 key,失焦自退链死)。AppKit 惯例:窗口创建不早于 app
+// 完成启动。
+- (void)applicationDidFinishLaunching:(NSNotification *)notification {
+  PanelWindow* panel = [[PanelWindow alloc]
+      initWithContentRect:self.contentRect
+                styleMask:NSWindowStyleMaskBorderless |
+                          NSWindowStyleMaskNonactivatingPanel
+                  backing:NSBackingStoreBuffered
+                    defer:NO];
+  panel.opaque = NO;                 // 透明底:让系统材质层透出来
+  panel.backgroundColor = [NSColor clearColor];
+  panel.level = NSPopUpMenuWindowLevel; // 悬浮于普通窗口之上
+  panel.releasedWhenClosed = NO;
+  // Space 语义(2026-11-28 实机走查坐实):托盘弹层要与系统托盘菜单同
+  // 语义——任何 Space(含全屏应用)上都可见。
+  panel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+                             NSWindowCollectionBehaviorFullScreenAuxiliary;
+  self.panel = panel;
+
+  CGFloat w = NSWidth(self.contentRect);
+  CGFloat h = NSHeight(self.contentRect);
+
+  // 系统材质层铺底:毛玻璃归它,前端只画半透明底色(spec §1/§7)。
+  // ⚠️ frame 必须用 contentView 本地坐标——2026-11-28 实机走查坐实:此前
+  // 用 contentRectForFrameRect:panel.frame 拿到的是屏幕全局坐标,addSubview
+  // 后材质层整个落到 contentView 可视区外,窗口成为全透明空壳(透过它看到
+  // 底下浏览器,「面板没弹出」的真相)。borderless 窗口的 contentView
+  // bounds 就是 {0,0,w,h}。
+  NSVisualEffectView* effect = [[NSVisualEffectView alloc]
+      initWithFrame:NSMakeRect(0, 0, w, h)];
+  effect.material = NSVisualEffectMaterialPopover;
+  effect.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+  effect.state = NSVisualEffectStateActive;
+  effect.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  [panel.contentView addSubview:effect];
+
+  // WKWebView 透明底:drawsBackground 是私有 KVC 面(不在公开头文件,
+  // 公证探针随 Task 16 同批);不关它 WKWebView 白底会盖住材质。
+  WKWebViewConfiguration* config = [[WKWebViewConfiguration alloc] init];
+  [config.userContentController addScriptMessageHandler:self name:@"panel"];
+  // 前端错误取证(atDocumentStart,先于页面脚本):模块加载/运行错误收进
+  // window.__perr——WKWebView 的 JS 错误默认无处可看,留 Task 16 探针取证口。
+  [config.userContentController addUserScript:[[WKUserScript alloc]
+      initWithSource:@"window.__perr=[];window.addEventListener('error',function(e){window.__perr.push(String(e.message||e.filename))});window.addEventListener('unhandledrejection',function(e){window.__perr.push('rej:'+String(e.reason))});"
+       injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+     forMainFrameOnly:YES]];
+  WKWebView* web = [[WKWebView alloc] initWithFrame:effect.bounds
+                                      configuration:config];
+  web.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  [web setValue:@NO forKey:@"drawsBackground"];
+  web.navigationDelegate = self;
+  [effect addSubview:web];
+
+  // NSURL URLWithString 对畸形串返回 nil:NSLog 留痕(Task 16 取证用)且
+  // 不 loadRequest——面板空白但失焦链(NSApp run)仍活,宿主可正常关闭;
+  // 不做这层防御,requestWithURL:nil 属未定义形态。
+  NSURL* pageURL = [NSURL URLWithString:self.launchURL];
+  if (pageURL) {
+    [web loadRequest:[NSURLRequest requestWithURL:pageURL]];
+  } else {
+    NSLog(@"panelwin: --url 解析为 nil,面板不加载内容(失焦自退链仍生效)");
+  }
+
+  // 激活双保险:不取焦点则失焦即退永不触发。
+  [panel makeKeyAndOrderFront:nil];
+  [NSApp activateIgnoringOtherApps:YES];
+
+  // 上屏取证(Task 16 探针):0.5s 后回报 occlusion/key 状态——Space 事故
+  // (窗口在册但不在屏)在这里一行日志就能归因。
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                 dispatch_get_main_queue(), ^{
+    NSLog(@"panelwin: frame=%@ visible=%d occlusion=%lu key=%d",
+          NSStringFromRect(panel.frame),
+          panel.isVisible ? 1 : 0,
+          (unsigned long)panel.occlusionState,
+          panel.isKeyWindow ? 1 : 0);
+  });
+}
+
 @end
 
 // originOfURL — 白名单锚点 origin(scheme://host[:port],小写;IPv6 字面量
@@ -171,56 +274,19 @@ void panelwin_run(const char* url, int x, int yTop, int w, int h,
         : (CGFloat)yTop + (CGFloat)h;
     CGFloat bottomLeftY = screenH - (CGFloat)yTop - (CGFloat)h;
 
-    PanelWindow* panel = [[PanelWindow alloc]
-        initWithContentRect:NSMakeRect((CGFloat)x, bottomLeftY, (CGFloat)w, (CGFloat)h)
-                  styleMask:NSWindowStyleMaskBorderless |
-                            NSWindowStyleMaskNonactivatingPanel
-                    backing:NSBackingStoreBuffered
-                      defer:NO];
-    panel.opaque = NO;                 // 透明底:让系统材质层透出来
-    panel.backgroundColor = [NSColor clearColor];
-    panel.level = NSPopUpMenuWindowLevel; // 悬浮于普通窗口之上
-    panel.releasedWhenClosed = NO;
-
     PanelAppDelegate* delegate = [[PanelAppDelegate alloc] init];
     delegate.allowOrigin = originOfURL(urlStr);
     delegate.dashboardURL = dashStr;
     delegate.peerURL = peerStr;
-    delegate.panel = panel;
+    delegate.launchURL = urlStr;
+    delegate.contentRect = NSMakeRect((CGFloat)x, bottomLeftY, (CGFloat)w, (CGFloat)h);
     [NSApp setDelegate:delegate];
 
-    // 系统材质层铺底:毛玻璃归它,前端只画半透明底色(spec §1/§7)。
-    NSVisualEffectView* effect = [[NSVisualEffectView alloc]
-        initWithFrame:[panel contentRectForFrameRect:panel.frame]];
-    effect.material = NSVisualEffectMaterialPopover;
-    effect.blendingMode = NSVisualEffectBlendingModeBehindWindow;
-    effect.state = NSVisualEffectStateActive;
-    effect.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    [panel.contentView addSubview:effect];
-
-    // WKWebView 透明底:drawsBackground 是私有 KVC 面(不在公开头文件,
-    // 公证探针随 Task 16 同批);不关它 WKWebView 白底会盖住材质。
-    WKWebViewConfiguration* config = [[WKWebViewConfiguration alloc] init];
-    [config.userContentController addScriptMessageHandler:delegate name:@"panel"];
-    WKWebView* web = [[WKWebView alloc] initWithFrame:effect.bounds
-                                        configuration:config];
-    web.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    [web setValue:@NO forKey:@"drawsBackground"];
-    web.navigationDelegate = delegate;
-    [effect addSubview:web];
-
-    // NSURL URLWithString 对畸形串返回 nil:NSLog 留痕(Task 16 取证用)且
-    // 不 loadRequest——面板空白但失焦链(NSApp run)仍活,宿主可正常关闭;
-    // 不做这层防御,requestWithURL:nil 属未定义形态。
-    NSURL* pageURL = [NSURL URLWithString:urlStr];
-    if (pageURL) {
-      [web loadRequest:[NSURLRequest requestWithURL:pageURL]];
-    } else {
-      NSLog(@"panelwin: --url 解析为 nil,面板不加载内容(失焦自退链仍生效)");
-    }
-
-    // 激活双保险:不取焦点则失焦即退永不触发。
-    [panel makeKeyAndOrderFront:nil];
+    // ⚠️ 窗口创建必须等 applicationDidFinishLaunching(见上方委托方法)——
+    // 2026-11-28 实机走查坐实:run loop 起来之前建窗口,Spaces 会把它钉在
+    // 错误位置(窗口服务器在册、CGWindowList onscreen 有名,但【不在当前
+    // Space 合成】且永不成为 key,失焦自退链死)。AppKit 惯例:窗口创建
+    // 不早于 app 完成启动。
     [NSApp activateIgnoringOtherApps:YES];
 
     // 不返回——退出只发生在 exit(0)/exit(60) 两个出口上。
