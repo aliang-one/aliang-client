@@ -45,6 +45,22 @@ type LLMEndpoint struct {
 	// LastError 是最近一次失败摘要,展示用,不承载错误链。
 	LastError string `gorm:"type:text" json:"last_error"`
 
+	// ---- 二期增量(spec 2026-11-27 §4)--------------------------------------
+	// EgressKernel 是「AliangCode 出口指定」标记:全表至多一行=1,唯一写入口是
+	// store.SetEgressKernel 事务换绑(REST 请求体没有这个字段,PUT 列白名单也
+	// 不收它)。列名显式钉住:ProtocolOpenAI 一期曾被 gorm 蛇形成
+	// protocol_open_ai,不赌 NamingStrategy 对缩写边界的行为。
+	EgressKernel bool `gorm:"column:egress_kernel;not null;default:0" json:"egress_kernel"`
+	// LastUsedAt 是最近一次被内核选中的时刻(unix 秒,纯观测,不参与调度)。
+	// 写缝两条:MarkUsed 窄写打点 / UpdateHealth 显式值;列值 0 = 从未使用。
+	// 不进 endpointConfigColumns 白名单(spec §5.7:防 GET-merge-PUT 陈旧快照
+	// 回写盖掉打点)。
+	LastUsedAt int64 `gorm:"not null;default:0" json:"last_used_at"`
+	// TotalRequests/FailedRequests 是生命周期请求计数器:ReportSuccess/
+	// ReportFailure 增量 +1(SQL 侧原子累加),只累计不清零。
+	TotalRequests  int64 `gorm:"not null;default:0" json:"total_requests"`
+	FailedRequests int64 `gorm:"not null;default:0" json:"failed_requests"`
+
 	CreatedAt int64 `gorm:"not null" json:"created_at"`
 	UpdatedAt int64 `gorm:"not null" json:"updated_at"`
 }
