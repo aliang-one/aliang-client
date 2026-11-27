@@ -91,6 +91,12 @@ type fakeAISelector struct {
 	// 不进路由层的反向断言)。
 	failOnSelect func(protocol, model, explicitID string)
 
+	// acquireErrByID 命中的 id,Acquire 恒返回该错误(队满场景:忙行模拟,
+	// ErrAIQueueTimeout);未命中的 id 照常成功。服务端真 Acquire 队满返回
+	// (nil, ErrQueueTimeout) 无槽位——这里同样返回 nil release,供测试断言
+	// 忙行绝不触发 release。
+	acquireErrByID map[string]error
+
 	releaseOnce func()
 }
 
@@ -117,6 +123,10 @@ func (f *fakeAISelector) Select(protocol, model, explicitID, excludeID string) (
 func (f *fakeAISelector) Acquire(id string, maxConcurrency int) (func(), error) {
 	f.mu.Lock()
 	f.acquired = append(f.acquired, id)
+	if err, ok := f.acquireErrByID[id]; ok {
+		f.mu.Unlock()
+		return nil, err
+	}
 	once := f.releaseOnce
 	f.mu.Unlock()
 	return func() {
@@ -1050,5 +1060,358 @@ func TestAIPathRetryExhaustedPassesLast5xx(t *testing.T) {
 	auths, _, _, _ := capture.snapshot()
 	if len(auths) != 2 || auths[0] != "Bearer k1" || auths[1] != "Bearer k2" {
 		t.Fatalf("auths = %v, want [Bearer k1 Bearer k2]", auths)
+	}
+}
+
+// ---- 二期 Task 5:路由层三项必修(排队超时 failover / 显式点名忙 503 / 401 锁存链) ----
+
+// 二期 spec §6 必修 1:Acquire 队满(ErrAIQueueTimeout)≠ 病,是忙——不计失败
+// 不动健康列,排除忙行后切下一候选重试(attempt 上限仍 2)。客户端必须拿到
+// 候选2 的 200,而不是被忙行拖成 503。
+func TestAIPathQueueTimeoutFailsOverToNextCandidate(t *testing.T) {
+	capture := &upstreamCapture{}
+	upstream := newFakeUpstream(t, capture)
+
+	sel := &fakeAISelector{
+		selectQueue: []selectResult{
+			{id: "busy-1", baseURL: upstream.URL, apiKey: "k1"},
+			{id: "cand-2", baseURL: upstream.URL, apiKey: "k2"},
+		},
+		acquireErrByID: map[string]error{"busy-1": ErrAIQueueTimeout},
+	}
+	setAISelectorForTest(t, sel)
+
+	client, handled := serveRawRequest(t,
+		"POST /v1/messages HTTP/1.1\r\n"+
+			"Host: 127.0.0.1:56432\r\n"+
+			"Content-Length: "+fmt.Sprintf("%d", len(anthropicRequestBody))+"\r\n"+
+			"\r\n"+anthropicRequestBody)
+
+	select {
+	case <-handled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not finish")
+	}
+
+	_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	resp, err := stdhttp.ReadResponse(bufio.NewReader(client), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != stdhttp.StatusOK {
+		t.Fatalf("status = %d body=%q, want 200(忙行应被排除,failover 到候选2)", resp.StatusCode, string(respBody))
+	}
+
+	calls, acquired, released, successes, failures := sel.snapshot()
+	if len(calls) != 2 {
+		t.Fatalf("select calls = %d, want 2", len(calls))
+	}
+	if calls[1].excludeID != "busy-1" {
+		t.Fatalf("calls[1].excludeID = %q, want busy-1(重试必须排除忙行)", calls[1].excludeID)
+	}
+	// 忙不是病:零 ReportFailure、零 ReportSuccess(忙行),成功只归候选2。
+	if len(failures) != 0 {
+		t.Fatalf("failures = %+v, want none(队满不计失败不动健康列)", failures)
+	}
+	if len(successes) != 1 || successes[0] != "cand-2" {
+		t.Fatalf("successes = %v, want [cand-2]", successes)
+	}
+	// release 语义:忙行 Acquire 失败无槽位,绝不 release;只有候选2 恰好一次。
+	if len(acquired) != 2 || acquired[0] != "busy-1" || acquired[1] != "cand-2" {
+		t.Fatalf("acquired = %v", acquired)
+	}
+	if len(released) != 1 || released[0] != "cand-2" {
+		t.Fatalf("released = %v, want [cand-2](忙行无槽位不可 release)", released)
+	}
+
+	auths, _, _, _ := capture.snapshot()
+	if len(auths) != 1 || auths[0] != "Bearer k2" {
+		t.Fatalf("auths = %v, want single [Bearer k2]", auths)
+	}
+}
+
+// 二期 spec §6 必修 1(耗尽侧):两个候选全忙 → attempt 上限仍 2,耗尽后 503
+// endpoint_queue_timeout;全程零失败计数。
+func TestAIPathAllCandidatesQueuedReturns503(t *testing.T) {
+	capture := &upstreamCapture{}
+	upstream := newFakeUpstream(t, capture)
+
+	sel := &fakeAISelector{
+		selectQueue: []selectResult{
+			{id: "busy-1", baseURL: upstream.URL, apiKey: "k1"},
+			{id: "busy-2", baseURL: upstream.URL, apiKey: "k2"},
+		},
+		acquireErrByID: map[string]error{"busy-1": ErrAIQueueTimeout, "busy-2": ErrAIQueueTimeout},
+	}
+	setAISelectorForTest(t, sel)
+
+	client, handled := serveRawRequest(t,
+		"POST /v1/messages HTTP/1.1\r\n"+
+			"Host: 127.0.0.1:56432\r\n"+
+			"Content-Length: "+fmt.Sprintf("%d", len(anthropicRequestBody))+"\r\n"+
+			"\r\n"+anthropicRequestBody)
+
+	select {
+	case <-handled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not finish")
+	}
+
+	_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	resp, err := stdhttp.ReadResponse(bufio.NewReader(client), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != stdhttp.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%q, want 503(全部候选队满)", resp.StatusCode, string(respBody))
+	}
+	if !strings.Contains(string(respBody), "endpoint_queue_timeout") {
+		t.Fatalf("body = %q, want endpoint_queue_timeout", string(respBody))
+	}
+
+	calls, _, released, _, failures := sel.snapshot()
+	if len(calls) != aiMaxAttempts {
+		t.Fatalf("select calls = %d, want %d(attempt 上限不因队满扩)", len(calls), aiMaxAttempts)
+	}
+	if len(failures) != 0 {
+		t.Fatalf("failures = %+v, want none(队满不计失败)", failures)
+	}
+	if len(released) != 0 {
+		t.Fatalf("released = %v, want none(忙行无槽位)", released)
+	}
+	auths, _, _, _ := capture.snapshot()
+	if len(auths) != 0 {
+		t.Fatalf("upstream got %d requests, want 0(没有一个候选真正持有槽位)", len(auths))
+	}
+}
+
+// 二期 spec §6 必修 1(≥3 行):前两行全忙时第三行本轮不试——不为队满扩
+// attempt,下一请求自然轮到。
+func TestAIPathThirdCandidateNotTriedWhenFirstTwoBusy(t *testing.T) {
+	capture := &upstreamCapture{}
+	upstream := newFakeUpstream(t, capture)
+
+	sel := &fakeAISelector{
+		selectQueue: []selectResult{
+			{id: "busy-1", baseURL: upstream.URL, apiKey: "k1"},
+			{id: "busy-2", baseURL: upstream.URL, apiKey: "k2"},
+			{id: "healthy-3", baseURL: upstream.URL, apiKey: "k3"},
+		},
+		acquireErrByID: map[string]error{"busy-1": ErrAIQueueTimeout, "busy-2": ErrAIQueueTimeout},
+	}
+	setAISelectorForTest(t, sel)
+
+	client, handled := serveRawRequest(t,
+		"POST /v1/messages HTTP/1.1\r\n"+
+			"Host: 127.0.0.1:56432\r\n"+
+			"Content-Length: "+fmt.Sprintf("%d", len(anthropicRequestBody))+"\r\n"+
+			"\r\n"+anthropicRequestBody)
+
+	select {
+	case <-handled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not finish")
+	}
+
+	_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	resp, err := stdhttp.ReadResponse(bufio.NewReader(client), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != stdhttp.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503(前两行忙耗尽 attempt,第三行本轮不试)", resp.StatusCode)
+	}
+
+	_, acquired, released, successes, _ := sel.snapshot()
+	if len(acquired) != 2 || acquired[0] != "busy-1" || acquired[1] != "busy-2" {
+		t.Fatalf("acquired = %v, want [busy-1 busy-2](healthy-3 本轮不被触碰)", acquired)
+	}
+	if len(successes) != 0 || len(released) != 0 {
+		t.Fatalf("successes=%v released=%v, want none", successes, released)
+	}
+}
+
+// 二期 spec §6 必修 2:显式点名 + 该行忙 → 立即 503,不重选(重选违背点名
+// 语义,且会再烧一个 30s 排队等待)。
+func TestAIPathExplicitBusyEndpointReturns503Immediately(t *testing.T) {
+	capture := &upstreamCapture{}
+	upstream := newFakeUpstream(t, capture)
+
+	sel := &fakeAISelector{
+		selectQueue: []selectResult{
+			{id: "busy-explicit", baseURL: upstream.URL, apiKey: "k1"},
+			{id: "cand-2", baseURL: upstream.URL, apiKey: "k2"},
+		},
+		acquireErrByID: map[string]error{"busy-explicit": ErrAIQueueTimeout},
+	}
+	setAISelectorForTest(t, sel)
+
+	client, handled := serveRawRequest(t,
+		"POST /v1/messages HTTP/1.1\r\n"+
+			"Host: 127.0.0.1:56432\r\n"+
+			"X-Endpoint-Id: busy-explicit\r\n"+
+			"Content-Length: "+fmt.Sprintf("%d", len(anthropicRequestBody))+"\r\n"+
+			"\r\n"+anthropicRequestBody)
+
+	select {
+	case <-handled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not finish")
+	}
+
+	_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	resp, err := stdhttp.ReadResponse(bufio.NewReader(client), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != stdhttp.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%q, want 503(点名行忙立即收场)", resp.StatusCode, string(respBody))
+	}
+	if !strings.Contains(string(respBody), "endpoint_queue_timeout") {
+		t.Fatalf("body = %q, want endpoint_queue_timeout", string(respBody))
+	}
+
+	// 点名就是点名:第二次 Select 不得发生(哪怕还有候选2)。
+	calls, acquired, released, _, failures := sel.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("select calls = %d, want 1(显式点名忙不重选)", len(calls))
+	}
+	if len(acquired) != 1 || acquired[0] != "busy-explicit" {
+		t.Fatalf("acquired = %v", acquired)
+	}
+	if len(released) != 0 {
+		t.Fatalf("released = %v, want none", released)
+	}
+	if len(failures) != 0 {
+		t.Fatalf("failures = %+v, want none(忙不计失败)", failures)
+	}
+	auths, _, _, _ := capture.snapshot()
+	if len(auths) != 0 {
+		t.Fatalf("upstream got %d requests, want 0", len(auths))
+	}
+}
+
+// 二期 spec §6 必修 3(路由层半程):BYO 上游 401 → 必须经 ReportFailure 上报
+// status=401(service 侧锁存),并切下一候选重试(第二次 Select 带 excludeID)。
+// 客户端拿到候选2 的 200;service 侧行已 disabled 由真链测试钉死
+// (TestAIPathRealChain401LatchesEndpointDisabled)。
+func TestAIPath401ReportsFailureAndSwitchesCandidate(t *testing.T) {
+	capture := &upstreamCapture{}
+	upstream := newFakeUpstream(t, capture,
+		func(w stdhttp.ResponseWriter, r *stdhttp.Request) { plainBody(w, 401, `{"error":"invalid api key"}`) },
+		func(w stdhttp.ResponseWriter, r *stdhttp.Request) { plainBody(w, 200, `{"ok":true}`) },
+	)
+
+	sel := &fakeAISelector{selectQueue: []selectResult{
+		{id: "bad-key", baseURL: upstream.URL, apiKey: "k1"},
+		{id: "good-key", baseURL: upstream.URL, apiKey: "k2"},
+	}}
+	setAISelectorForTest(t, sel)
+
+	client, handled := serveRawRequest(t,
+		"POST /v1/messages HTTP/1.1\r\n"+
+			"Host: 127.0.0.1:56432\r\n"+
+			"Content-Length: "+fmt.Sprintf("%d", len(anthropicRequestBody))+"\r\n"+
+			"\r\n"+anthropicRequestBody)
+
+	select {
+	case <-handled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not finish")
+	}
+
+	_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	resp, err := stdhttp.ReadResponse(bufio.NewReader(client), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != stdhttp.StatusOK {
+		t.Fatalf("status = %d body=%q, want 200(候选1 401 应 failover 到候选2)", resp.StatusCode, string(respBody))
+	}
+
+	_, _, _, successes, failures := sel.snapshot()
+	// 401 上报:status 原样透传(service 靠它进锁存分支),until=0(非 429)。
+	if len(failures) != 1 || failures[0].id != "bad-key" || failures[0].status != 401 {
+		t.Fatalf("failures = %+v, want single bad-key/401(路由层必须把 401 传给 ReportFailure)", failures)
+	}
+	if len(successes) != 1 || successes[0] != "good-key" {
+		t.Fatalf("successes = %v, want [good-key]", successes)
+	}
+
+	calls, _, released, _, _ := sel.snapshot()
+	if len(calls) != 2 || calls[1].excludeID != "bad-key" {
+		t.Fatalf("select calls = %+v, want second call exclude=bad-key", calls)
+	}
+	if len(released) != 2 {
+		t.Fatalf("released = %v, want 2(每 attempt 各释放一次)", released)
+	}
+
+	auths, _, _, _ := capture.snapshot()
+	if len(auths) != 2 || auths[0] != "Bearer k1" || auths[1] != "Bearer k2" {
+		t.Fatalf("auths = %v, want [Bearer k1 Bearer k2]", auths)
+	}
+}
+
+// 二期 spec §6 必修 3(耗尽侧):唯一候选持续 401 → 两次尝试耗尽后透传最后一次
+// 上游 401(与 429/5xx 同一收尾通道);两次都经 ReportFailure(锁存语义,
+// until=0)。
+func TestAIPath401ExhaustedPassesLast401Through(t *testing.T) {
+	capture := &upstreamCapture{}
+	upstream := newFakeUpstream(t, capture, func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+		plainBody(w, 401, `{"error":"invalid api key"}`)
+	})
+
+	sel := &fakeAISelector{selectQueue: []selectResult{
+		{id: "only-bad-key", baseURL: upstream.URL, apiKey: "k1"},
+	}}
+	setAISelectorForTest(t, sel)
+
+	client, handled := serveRawRequest(t,
+		"POST /v1/messages HTTP/1.1\r\n"+
+			"Host: 127.0.0.1:56432\r\n"+
+			"Content-Length: "+fmt.Sprintf("%d", len(anthropicRequestBody))+"\r\n"+
+			"\r\n"+anthropicRequestBody)
+
+	select {
+	case <-handled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not finish")
+	}
+
+	_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	resp, err := stdhttp.ReadResponse(bufio.NewReader(client), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != stdhttp.StatusUnauthorized {
+		t.Fatalf("status = %d body=%q, want 401(重试耗尽透传最后一次上游错误)", resp.StatusCode, string(respBody))
+	}
+	if !strings.Contains(string(respBody), "invalid api key") {
+		t.Fatalf("body = %q, want the upstream 401 body", string(respBody))
+	}
+
+	_, _, _, successes, failures := sel.snapshot()
+	if len(successes) != 0 {
+		t.Fatalf("successes = %v, want none", successes)
+	}
+	if len(failures) != aiMaxAttempts {
+		t.Fatalf("failures = %d, want %d(每次 attempt 都上报)", len(failures), aiMaxAttempts)
+	}
+	for i, f := range failures {
+		if f.id != "only-bad-key" || f.status != 401 || f.until != 0 {
+			t.Fatalf("failures[%d] = %+v, want only-bad-key/401/until=0(非 429 不消费冷却)", i, f)
+		}
 	}
 }

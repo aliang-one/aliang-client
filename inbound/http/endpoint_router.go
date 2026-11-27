@@ -49,7 +49,9 @@ type AIEndpointSelector interface {
 	// 其它 wrapped raw error 由路由层映射 500(registry 读挂是服务端故障)。
 	Select(protocol, model, explicitID, excludeID string) (id string, baseURL string, apiKey string, builtin bool, err error)
 	// Acquire 拿并发令牌;maxConcurrency 传 0 = 以 endpoint 行内配置为准。
-	// 返回的 release 必须恰好调用一次。
+	// 返回的 release 必须恰好调用一次;返回 err(队满/排队超时)时无槽位,
+	// 无 release 可调。ErrAIQueueTimeout 的路由语义(二期 spec §6):自动路径
+	// =排除忙行切下一候选(不计失败不动健康列),显式点名路径=立即 503。
 	Acquire(id string, maxConcurrency int) (release func(), err error)
 	ReportSuccess(id string)
 	// ReportFailure 上报一次失败。until 是调用方在能拿到响应头处（BYO 完整响应
@@ -173,6 +175,31 @@ func handleAIRequest(conn net.Conn, reader *bufio.Reader, req *http.Request, met
 
 		release, err := aiSelector.Acquire(id, 0)
 		if err != nil {
+			if errors.Is(err, ErrAIQueueTimeout) {
+				// 队满≠病,是忙(二期 spec §6):不计失败、不动健康列。service 的
+				// Acquire 队满/超时返回 (nil, ErrQueueTimeout) 无槽位,release
+				// 语义天然满足——没有任何可释放的东西,绝不能在此调 release。
+				if explicitID != "" {
+					// 显式点名 + 该行忙 → 立即 503:点名不重选(重选违背点名
+					// 语义,且会再烧一个 30s 排队等待)。
+					logger.Warn(fmt.Sprintf("ai route: 显式点名 endpoint 忙,立即 503 endpoint=%s explicit=%s attempt=%d", id, explicitID, attempt))
+					writeAIErrorBody(conn, http.StatusServiceUnavailable, "endpoint_queue_timeout",
+						fmt.Sprintf("explicit endpoint %s is busy", id))
+					return
+				}
+				if attempt < aiMaxAttempts {
+					// 自动路径:排除忙行切下一候选重试(attempt 上限仍 2,不为
+					// 队满扩——≥3 行且前两行全忙时第三行本轮不试,下一请求
+					// 自然轮到)。
+					logger.Info(fmt.Sprintf("ai route: endpoint 队满,排除后切下一候选 endpoint=%s attempt=%d", id, attempt))
+					excludeID = id
+					continue
+				}
+				logger.Warn(fmt.Sprintf("ai route: 全部候选队满,503 endpoint=%s attempt=%d", id, attempt))
+				writeAIErrorBody(conn, http.StatusServiceUnavailable, "endpoint_queue_timeout",
+					"all endpoint candidates are busy")
+				return
+			}
 			status, code := mapAISelectorError(err)
 			logger.Warn(fmt.Sprintf("ai route: acquire 失败 endpoint=%s attempt=%d status=%d code=%s err=%v", id, attempt, status, code, err))
 			writeAIErrorBody(conn, status, code, "endpoint acquire failed")
@@ -189,7 +216,8 @@ func handleAIRequest(conn net.Conn, reader *bufio.Reader, req *http.Request, met
 			writeAIErrorBody(conn, http.StatusInternalServerError, "endpoint_config_invalid", "endpoint base_url is invalid")
 			return
 		case res.completed && res.status >= 400 && res.status != http.StatusTooManyRequests:
-			// 其它 4xx:已透传,不重试不计数(spec §6.2 不变量 5)。
+			// 其它 4xx(400/403/404/413/422 等,不含已走 held 通道的 401/402/429):
+			// 已透传,不重试不计数(spec §6.2 不变量 5)。
 			logger.Info(fmt.Sprintf("ai route: 客户端错误透传 endpoint=%s status=%d protocol=%s", id, res.status, protocol))
 			return
 		case res.completed:
@@ -204,9 +232,11 @@ func handleAIRequest(conn net.Conn, reader *bufio.Reader, req *http.Request, met
 		}
 
 		if res.held != nil {
-			// 429 的冷却截止在能拿到响应头处预解析（spec §5.5）：Retry-After
-			// （秒/HTTP-date）与 anthropic-ratelimit-unified-reset 取更远者，
-			// clamp 60..21600。非 429 不消费 until，传 0。
+			// held 通道(429/5xx/401/402):429 的冷却截止在能拿到响应头处预解析
+			// （spec §5.5）：Retry-After（秒/HTTP-date）与
+			// anthropic-ratelimit-unified-reset 取更远者，clamp 60..21600。
+			// 401/402 走同一条 ReportFailure 缝,until 传 0——service 按 status
+			// 进锁存分支(spec §5.3),不消费冷却。
 			var until int64
 			if res.status == http.StatusTooManyRequests {
 				until = ratelimitwin.Parse(res.status, res.held.Header)
@@ -316,7 +346,12 @@ func forwardAIByoAttempt(conn net.Conn, req *http.Request, body []byte, baseURL,
 	}
 
 	status := resp.StatusCode
-	if status == http.StatusTooManyRequests || status >= 500 {
+	// 401/402 与 429/5xx 同走 held 通道(二期 spec §5.3+§6):确定性凭据错误
+	// 既要经 ReportFailure(status 原样透传)进 service 锁存,又值得切下一候选
+	// 重试——held 意味着响应头未写客户端,切换不违反不变量 4;重试耗尽时
+	// 透传最后一次上游错误响应。其余 4xx 仍照旧直通(不重试不计数)。
+	if status == http.StatusTooManyRequests || status >= 500 ||
+		status == http.StatusUnauthorized || status == http.StatusPaymentRequired {
 		// 不透传(留着重试/收尾),body 保持打开交还调用方处置。
 		return aiForwardResult{status: status, held: resp}
 	}
