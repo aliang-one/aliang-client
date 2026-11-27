@@ -16,7 +16,7 @@ import (
 
 var progressAgentInstance = uuid.NewString()
 
-const progressToolDescription = "Publish progress for a long task the user would benefit from following on another device. Use start once, then update when the phase or measured progress changes, and finish when the task ends. Omit totals you cannot measure. Skip short work and tasks already tracked by Aliang, such as device file transfers. Use short plain-text summaries without paths, commands, or secrets."
+const progressToolDescription = "Publish progress for a long task the user would benefit from following on another device. Use start once, then update when the phase or measured progress changes, and finish when the task ends. Omit totals you cannot measure. Skip short work and tasks already tracked by Aliang, such as device file transfers. Use short plain-text summaries without paths, commands, or secrets. Bash and PowerShell already report long commands automatically. For a custom title for one command, start with kind shell and pass the returned operation_id as progress_operation_id; the command finishes the existing card."
 
 const shellProgressDelay = 500 * time.Millisecond
 
@@ -134,6 +134,13 @@ func (s *AgentService) reportOperation(ctx context.Context, account string, fram
 	}
 }
 
+type progressTask struct {
+	kind      string
+	attached  bool
+	measured  bool
+	reporting bool
+}
+
 type agentProgressTool struct {
 	service   *AgentService
 	sessionID string
@@ -142,12 +149,14 @@ type agentProgressTool struct {
 	runID     string
 	mu        sync.Mutex
 	sequence  atomic.Int64
-	active    map[string]struct{}
+	tasksMu   sync.Mutex
+	active    map[string]progressTask
 	closed    bool
 }
 
 func newAgentProgressTool(service *AgentService, sessionID, runID string) *agentProgressTool {
-	return &agentProgressTool{service: service, sessionID: sessionID, account: service.operationAccount(), instance: progressAgentInstance, runID: runID, active: make(map[string]struct{})}
+	return &agentProgressTool{service: service, sessionID: sessionID, account: service.operationAccount(), instance: progressAgentInstance, runID: runID,
+		active: make(map[string]progressTask)}
 }
 
 func (*agentProgressTool) Name() string        { return "progress" }
@@ -185,17 +194,34 @@ func (p *agentProgressTool) Execute(ctx context.Context, input map[string]interf
 		if title, _ := input["title"].(string); title == "" {
 			return agentcore.ErrorResult("A title is required to start progress.")
 		}
-		if len(p.active) >= 16 {
+		p.tasksMu.Lock()
+		full := len(p.active) >= 16
+		p.tasksMu.Unlock()
+		if full {
 			return agentcore.ErrorResult("Finish an active progress task before starting another.")
 		}
 	case "update", "finish":
-		if _, ok := p.active[op]; !ok {
-			return agentcore.ErrorResult("This run has no active task with that operation_id.")
-		}
 		outcome, _ := input["outcome"].(string)
 		if action == "finish" && outcome != "completed" && outcome != "failed" && outcome != "cancelled" {
 			return agentcore.ErrorResult("Finish requires completed, failed, or cancelled.")
 		}
+		p.tasksMu.Lock()
+		task, ok := p.active[op]
+		if !ok || task.attached {
+			p.tasksMu.Unlock()
+			return agentcore.ErrorResult("This run has no model-controlled task with that operation_id.")
+		}
+		task.reporting = true
+		p.active[op] = task
+		p.tasksMu.Unlock()
+		defer func(id string) {
+			p.tasksMu.Lock()
+			defer p.tasksMu.Unlock()
+			if current, exists := p.active[id]; exists {
+				current.reporting = false
+				p.active[id] = current
+			}
+		}(op)
 	default:
 		return agentcore.ErrorResult("Progress action must be start, update, or finish.")
 	}
@@ -216,9 +242,20 @@ func (p *agentProgressTool) Execute(ctx context.Context, input map[string]interf
 			if op == "" {
 				return agentcore.ErrorResult("Cloud did not return a task ID.")
 			}
-			p.active[op] = struct{}{}
+			kind, _ := input["kind"].(string)
+			p.tasksMu.Lock()
+			p.active[op] = progressTask{kind: kind, measured: input["current"] != nil || input["total"] != nil || input["unit"] != nil}
+			p.tasksMu.Unlock()
 		} else if action == "finish" {
+			p.tasksMu.Lock()
 			delete(p.active, op)
+			p.tasksMu.Unlock()
+		} else if input["current"] != nil || input["total"] != nil || input["unit"] != nil {
+			p.tasksMu.Lock()
+			task := p.active[op]
+			task.measured = true
+			p.active[op] = task
+			p.tasksMu.Unlock()
 		}
 	case "throttled":
 		body, _ := json.Marshal(map[string]interface{}{
@@ -274,10 +311,15 @@ func (p *agentProgressTool) close() {
 		return
 	}
 	p.closed = true
+	p.tasksMu.Lock()
+	defer p.tasksMu.Unlock()
 	if len(p.active) == 0 || p.service == nil {
 		return
 	}
-	for id := range p.active {
+	for id, task := range p.active {
+		if task.attached {
+			continue
+		}
 		p.service.queueOperationFinish(p.account, p.frame(map[string]interface{}{
 			"action": "finish", "operation_id": id, "outcome": "interrupted",
 		}))
@@ -286,66 +328,129 @@ func (p *agentProgressTool) close() {
 	go p.service.flushOperationFinishes(context.Background())
 }
 
-func (p *agentProgressTool) shellObserver() func(string) func(agentcore.ShellOutcome) {
-	// At most one shell report is in flight per run. Network acknowledgements
-	// stay off the tool execution path.
+// A Shell invocation may claim a model-created Shell card in the same run.
+func (p *agentProgressTool) claimShellOperation(id string) (progressTask, bool) {
+	if id == "" {
+		return progressTask{}, false
+	}
+	p.tasksMu.Lock()
+	defer p.tasksMu.Unlock()
+	task, ok := p.active[id]
+	if !ok || task.kind != "shell" || task.attached || task.reporting {
+		return progressTask{}, false
+	}
+	task.attached = true
+	p.active[id] = task
+	return task, true
+}
+
+func (p *agentProgressTool) shellObserver() func(string, string, func() int64) func(agentcore.ShellOutcome) {
+	// At most one automatic shell report is in flight per run. Explicitly
+	// associated operations are already subject to the model tool's active cap.
 	busy := make(chan struct{}, 1)
-	return func(tool string) func(agentcore.ShellOutcome) {
+	return func(tool, requestedID string, outputBytes func() int64) func(agentcore.ShellOutcome) {
 		done := make(chan agentcore.ShellOutcome, 1)
+		task, attached := p.claimShellOperation(requestedID)
 		go func() {
-			timer := time.NewTimer(shellProgressDelay)
-			defer timer.Stop()
-			select {
-			case <-done:
-				return
-			case <-timer.C:
-			}
-			select {
-			case <-done:
-				return
-			case busy <- struct{}{}:
-				defer func() { <-busy }()
-			default:
-				return
-			}
-
 			ctx := context.Background()
-			if !p.service.progress.supported.Load() || p.service.currentRemoteWriter() == nil {
-				return
+			operationID := requestedID
+			var startFrame map[string]interface{}
+			var startErr error
+			if attached {
+				defer func() {
+					p.tasksMu.Lock()
+					delete(p.active, requestedID)
+					p.tasksMu.Unlock()
+				}()
+			} else {
+				timer := time.NewTimer(shellProgressDelay)
+				defer timer.Stop()
+				select {
+				case <-done:
+					return
+				case <-timer.C:
+				}
+				select {
+				case <-done:
+					return
+				case busy <- struct{}{}:
+					defer func() { <-busy }()
+				default:
+					return
+				}
+				if !p.service.progress.supported.Load() || p.service.currentRemoteWriter() == nil {
+					return
+				}
+				startFrame = p.frame(map[string]interface{}{
+					"action": "start", "title": tool, "kind": "shell",
+				})
+				ack, err := p.sendFrame(ctx, startFrame)
+				startErr = err
+				operationID = remoteString(ack, "operation_id")
+				if err == nil && (remoteString(ack, "status") != "accepted" || operationID == "") {
+					return
+				}
 			}
-			startFrame := p.frame(map[string]interface{}{
-				"action": "start", "title": tool, "kind": "shell",
-			})
-			ack, err := p.sendFrame(ctx, startFrame)
-			operationID := remoteString(ack, "operation_id")
-			if err == nil && (remoteString(ack, "status") != "accepted" || operationID == "") {
-				return
+			var outcome agentcore.ShellOutcome
+			if startErr == nil && !task.measured && outputBytes != nil {
+				outcome = p.observeShellOutput(ctx, operationID, outputBytes, done)
+			} else {
+				outcome = <-done
 			}
-
-			outcome := <-done
-			fields := map[string]interface{}{"action": "finish", "operation_id": operationID, "outcome": string(outcome)}
-			switch outcome {
-			case agentcore.ShellTimedOut:
-				fields["outcome"] = "failed"
-				fields["error_code"] = "tool_timeout"
-				fields["message"] = "Shell command timed out."
-			case agentcore.ShellFailed:
-				fields["error_code"] = "tool_failed"
-				fields["message"] = "Shell command failed. See the conversation for details."
-			}
-			frame := p.frame(fields)
-			if err != nil {
+			finish := p.frame(shellFinishFields(operationID, outcome))
+			if startErr != nil {
 				if p.account == p.service.operationAccount() {
 					p.service.queuePendingOperationFinish(pendingOperationFinish{
-						account: p.account, frame: frame, startFrame: startFrame,
+						account: p.account, frame: finish, startFrame: startFrame,
 					})
 				}
 				return
 			}
-			if _, err := p.sendFrame(ctx, frame); err != nil {
-				p.service.queueOperationFinish(p.account, frame)
+			if _, err := p.sendFrame(ctx, finish); err != nil {
+				p.service.queueOperationFinish(p.account, finish)
 			}
 		}()
 		return func(outcome agentcore.ShellOutcome) { done <- outcome }
+	}
+}
+
+func shellFinishFields(operationID string, outcome agentcore.ShellOutcome) map[string]interface{} {
+	fields := map[string]interface{}{"action": "finish", "operation_id": operationID, "outcome": string(outcome)}
+	switch outcome {
+	case agentcore.ShellTimedOut:
+		fields["outcome"] = "failed"
+		fields["error_code"] = "tool_timeout"
+		fields["message"] = "Shell command timed out."
+	case agentcore.ShellFailed:
+		fields["error_code"] = "tool_failed"
+		fields["message"] = "Shell command failed. See the conversation for details."
+	}
+	return fields
+}
+
+func (p *agentProgressTool) observeShellOutput(ctx context.Context, operationID string, outputBytes func() int64, done <-chan agentcore.ShellOutcome) agentcore.ShellOutcome {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	var reported int64
+	for {
+		select {
+		case outcome := <-done:
+			return outcome
+		case <-ticker.C:
+			count := outputBytes()
+			if count <= reported {
+				continue
+			}
+			// A stalled network must not delay the terminal frame for the full
+			// retry window. The next tick samples the cumulative count again.
+			attempt, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
+			ack, err := p.service.reportOperation(attempt, p.account, p.frame(map[string]interface{}{
+				"action": "update", "operation_id": operationID, "current": count, "unit": "bytes",
+			}))
+			cancel()
+			if err == nil && remoteString(ack, "status") == "accepted" {
+				reported = count
+			}
+		}
 	}
 }

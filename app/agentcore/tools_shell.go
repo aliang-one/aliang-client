@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,9 +54,10 @@ func (t *bashTool) Description() string {
 
 func (t *bashTool) InputSchema() map[string]interface{} {
 	return objectSchema(map[string]interface{}{
-		"command":     stringProp("要执行的命令"),
-		"description": stringProp("一句话说明这条命令做什么（用于给用户展示）"),
-		"timeout":     intProp(fmt.Sprintf("超时毫秒数，默认 %d", defaultShellTimeout.Milliseconds())),
+		"command":               stringProp("要执行的命令"),
+		"description":           stringProp("一句话说明这条命令做什么（用于给用户展示）"),
+		"timeout":               intProp(fmt.Sprintf("超时毫秒数，默认 %d", defaultShellTimeout.Milliseconds())),
+		"progress_operation_id": stringProp("可选：本条命令对应的 progress start 返回的 operation_id。命令的真实结果会更新到该进度卡上，无需再对它调用 finish。"),
 	}, "command")
 }
 
@@ -77,9 +79,10 @@ func (t *powershellTool) Description() string {
 
 func (t *powershellTool) InputSchema() map[string]interface{} {
 	return objectSchema(map[string]interface{}{
-		"command":     stringProp("要执行的 PowerShell 命令"),
-		"description": stringProp("一句话说明这条命令做什么"),
-		"timeout":     intProp(fmt.Sprintf("超时毫秒数，默认 %d", defaultShellTimeout.Milliseconds())),
+		"command":               stringProp("要执行的 PowerShell 命令"),
+		"description":           stringProp("一句话说明这条命令做什么"),
+		"timeout":               intProp(fmt.Sprintf("超时毫秒数，默认 %d", defaultShellTimeout.Milliseconds())),
+		"progress_operation_id": stringProp("可选：本条命令对应的 progress start 返回的 operation_id。命令的真实结果会更新到该进度卡上，无需再对它调用 finish。"),
 	}, "command")
 }
 
@@ -159,8 +162,10 @@ func runShell(ctx context.Context, kind string, input map[string]interface{}, en
 
 	var stdout, stderr strings.Builder
 	// 各自独立封顶，避免 stderr 刷屏挤掉 stdout。
-	cmd.Stdout = &cappedWriter{buf: &stdout, limit: maxToolOutputBytes}
-	cmd.Stderr = &cappedWriter{buf: &stderr, limit: maxToolOutputBytes}
+	stdoutWriter := &cappedWriter{buf: &stdout, limit: maxToolOutputBytes}
+	stderrWriter := &cappedWriter{buf: &stderr, limit: maxToolOutputBytes}
+	cmd.Stdout = stdoutWriter
+	cmd.Stderr = stderrWriter
 
 	runErr := cmd.Start()
 	if runErr == nil {
@@ -169,7 +174,8 @@ func runShell(ctx context.Context, kind string, input map[string]interface{}, en
 			if kind == "powershell" {
 				tool = "PowerShell"
 			}
-			if finish := env.OnShellStart(tool); finish != nil {
+			outputBytes := func() int64 { return stdoutWriter.bytes.Load() + stderrWriter.bytes.Load() }
+			if finish := env.OnShellStart(tool, strings.TrimSpace(inputString(input, "progress_operation_id")), outputBytes); finish != nil {
 				defer func() {
 					switch {
 					case result.TimedOut:
@@ -243,9 +249,11 @@ type cappedWriter struct {
 	buf       *strings.Builder
 	limit     int
 	truncated bool
+	bytes     atomic.Int64
 }
 
 func (w *cappedWriter) Write(p []byte) (int, error) {
+	w.bytes.Add(int64(len(p)))
 	if w.truncated {
 		return len(p), nil
 	}

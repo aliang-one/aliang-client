@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -31,14 +32,14 @@ func TestAutomaticShellProgressReportsOnlyLongCommands(t *testing.T) {
 		progress := newAgentProgressTool(&service, "session-shell", "run-shell")
 		start := progress.shellObserver()
 
-		start("PowerShell")(agentcore.ShellOutcome("completed"))
+		start("PowerShell", "", nil)(agentcore.ShellOutcome("completed"))
 		time.Sleep(time.Second)
 		synctest.Wait()
 		if len(reports) != 0 {
 			t.Fatalf("short command wrote %d progress reports", len(reports))
 		}
 
-		finish := start("Bash")
+		finish := start("Bash", "", nil)
 		time.Sleep(750 * time.Millisecond)
 		synctest.Wait()
 		if len(reports) != 1 || reports[0]["action"] != "start" ||
@@ -80,7 +81,7 @@ func TestAutomaticShellProgressRestoresFinishAfterLostStartAck(t *testing.T) {
 		})
 
 		progress := newAgentProgressTool(&service, "session-shell", "run-shell")
-		finish := progress.shellObserver()("Bash")
+		finish := progress.shellObserver()("Bash", "", nil)
 		time.Sleep(time.Second)
 		finish(agentcore.ShellCancelled)
 		time.Sleep(8 * time.Second)
@@ -193,6 +194,62 @@ func TestProgressToolViaClaudeMCP(t *testing.T) {
 	}
 }
 
+func TestShellProgressReusesExplicitCardAndReportsOutput(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		service := AgentService{state: agentState{RegisteredUser: "test-account"}}
+		service.progress.supported.Store(true)
+		var reports []map[string]interface{}
+		service.setCurrentRemoteWriter(func(payload interface{}) error {
+			frame := payload.(map[string]interface{})
+			reports = append(reports, frame)
+			service.progress.acceptAck(map[string]interface{}{
+				"request_id": frame["request_id"], "status": "accepted", "operation_id": "op_shell",
+			})
+			return nil
+		})
+		progress := newAgentProgressTool(&service, "session-shell", "run-shell")
+		result := progress.Execute(t.Context(), map[string]interface{}{
+			"action": "start", "kind": "shell", "title": "Run tests",
+		}, nil)
+		if result.IsError {
+			t.Fatal(result)
+		}
+		var outputBytes atomic.Int64
+		finish := progress.shellObserver()("Bash", "op_shell", outputBytes.Load)
+		synctest.Wait()
+		outputBytes.Store(321)
+		time.Sleep(time.Second)
+		synctest.Wait()
+		time.Sleep(time.Second)
+		synctest.Wait()
+		outputBytes.Store(654)
+		time.Sleep(time.Second)
+		synctest.Wait()
+		finish(agentcore.ShellCancelled)
+		progress.close()
+		synctest.Wait()
+		if len(reports) != 4 || reports[0]["action"] != "start" ||
+			reports[1]["operation_id"] != "op_shell" || reports[1]["action"] != "update" ||
+			reports[1]["current"] != int64(321) || reports[1]["unit"] != "bytes" ||
+			reports[1]["total"] != nil || reports[1]["command"] != nil ||
+			reports[2]["operation_id"] != "op_shell" || reports[2]["current"] != int64(654) ||
+			reports[3]["operation_id"] != "op_shell" || reports[3]["outcome"] != "cancelled" {
+			t.Fatalf("expected one start, two counts and one actual cancellation: %#v", reports)
+		}
+	})
+}
+
+func TestShellProgressCannotClaimAnotherRunOrUnrelatedTask(t *testing.T) {
+	s := &AgentService{}
+	progress := newAgentProgressTool(s, "session", "run")
+	progress.active["op_download"] = progressTask{kind: "download"}
+	for _, id := range []string{"op_from_other_run", "op_download"} {
+		if _, ok := progress.claimShellOperation(id); ok {
+			t.Fatalf("Shell must not take ownership of %s", id)
+		}
+	}
+}
+
 func TestAgentCoreSubagentBridgesCarryShellObserver(t *testing.T) {
 	// SYNC-16 首片接线（2026-11-27）：子 run 复用主 run 传入的同一份 ToolEnv
 	// ——子 agent 里的长命令（构建/测试/下载）此前对操作进度通道完全静默。
@@ -201,7 +258,7 @@ func TestAgentCoreSubagentBridgesCarryShellObserver(t *testing.T) {
 		"---\nname: researcher\ndescription: 调研任务\n---\n你是调研员。")
 
 	env := &agentcore.ToolEnv{ProjectPath: t.TempDir()}
-	env.OnShellStart = func(tool string) func(agentcore.ShellOutcome) {
+	env.OnShellStart = func(tool string, progressOperationID string, outputBytes func() int64) func(agentcore.ShellOutcome) {
 		return func(agentcore.ShellOutcome) {}
 	}
 	m := newAgentAIManager()

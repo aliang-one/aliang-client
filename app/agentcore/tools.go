@@ -79,9 +79,9 @@ type ToolEnv struct {
 	// 禁止 import services。所以把策略做成窄接口，宿主实现、内核调用。
 	// nil 时 fail closed —— 没配策略就不给执行，而不是默认放行。
 	ShellPolicy ShellPolicy
-	// OnShellStart observes actual process starts. Its returned function receives
-	// the outcome. Both callbacks must return promptly.
-	OnShellStart func(tool string) func(ShellOutcome)
+	// OnShellStart observes actual process starts. outputBytes counts stdout
+	// and stderr without exposing their contents. Both callbacks must return promptly.
+	OnShellStart func(tool, progressOperationID string, outputBytes func() int64) func(ShellOutcome)
 	// Env 是子进程（Bash/PowerShell）的完整环境。nil = 继承宿主进程环境
 	// （旧行为）。宿主通过这里下发「用户登录 shell 快照 + TERM/LANG 兜底」，
 	// 否则 GUI/systemd 启动的 agent 只有系统四件套 PATH，node/npm 等用户级
