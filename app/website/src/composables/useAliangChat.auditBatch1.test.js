@@ -98,6 +98,37 @@ function frame(sock, payload) {
   sock.onmessage({ data: JSON.stringify(payload) });
 }
 
+it('checks an advertised idle socket and recovers an unresponsive one', async () => {
+  localStorage.clear();
+  FakeWebSocket.instances.length = 0;
+  vi.stubGlobal('WebSocket', FakeWebSocket);
+  vi.useFakeTimers();
+  try {
+    const { chat, sock } = await mountRunningSession();
+    frame(sock, { type: 'presence.ready' });
+    await vi.advanceTimersByTimeAsync(1000);
+    await chat.stopRun();
+    const ping = sock.sent.map(JSON.parse).find(message => message.type === 'presence.ping');
+    expect(ping?.nonce).toEqual(expect.any(String));
+
+    // A delayed but valid reply leaves the original socket available.
+    await vi.advanceTimersByTimeAsync(3000);
+    frame(sock, { type: 'presence.pong', nonce: ping.nonce });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(sock.readyState).toBe(FakeWebSocket.OPEN);
+
+    // The next network operation sees no traffic. The existing recovery is bounded.
+    await chat.stopRun();
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(sock.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(FakeWebSocket.instances.length).toBe(2);
+    expect(chat.conversations.value[0].messages.at(-1).status).toBe('running');
+  } finally {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  }
+});
+
 function sentTypes(sock) {
   return sock.sent.map((raw) => {
     try {
