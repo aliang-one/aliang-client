@@ -372,7 +372,7 @@ func (l *PanelLauncher) RetryFromFallback()
 - 锚定判废（在接线层）：Windows `TrayRect()` 失败/超 1.5 倍主屏 → GetCursorPos 兜底；macOS 直传。
 - bridge 测试：接线、fallback 切换、菜单项显隐翻转。
 - **手工验收（本机 macOS）**：弹面板→再点收起（零惩罚）；`kill -9` 面板→自动重拉；连杀 3 次→菜单接回+「打开面板」→点击走通；面板内退出→确认→既有退出闸照旧。
-- [ ] 红→实现→绿→验收记录→Commit（`新增:companion M2 接线——spawn/兜底切回/恢复项`）
+- [x] 红→实现→绿→验收记录→Commit（`新增:companion M2 接线——spawn/兜底切回/恢复项`）。**实作备注（Task 15 批次）**：①落地文件=panel_bridge_m2.go（判废/方位/参数组装/兜底切换/退出对接，纯 Go 双平台）+panel_spawn_darwin.go/panel_spawn_windows.go（spawn 与锚定采样 shim）+panelwin_reanchor.go（DPI 物理重锚纯函数）；②DPI 收口按裁定落在壳内（GetDpiForWindow scale 后重锚），side 经「bottom 假设恒等还原图标顶边→是否落在任务栏条带（SM_CYFULLSCREEN−60px）」判别，scale=1 恒等（100% 机器零变化）；③spawn 组装=同二进制 `panel` 子命令（os.Executable），参数与 cmd/panel.go flags 一一对应（结构测试钉死）；④Windows spawn 顺序=CREATE_SUSPENDED→AllowSetForegroundWindow→Job 入树→Resume（Job 句柄刻意不 Close：KILL_ON_JOB_CLOSE 靠「句柄活到进程死」构成收割语义）；⑤launcher 装配挪到 NewCompanionApp（字段写在菜单/转投 goroutine 启动前，闭合读写 race 面）；⑥门禁全绿（-race 双包/gofmt/Linux 闭包 0/GOOS=windows：panelwin build+vet 干净，app/tray 被 app/http→storage 的 cgo 跨编译墙挡住=基线同源，已用去 storage 脚手架模块完成真类型检查）。**手工验收待装包后走查（本批不执行,见 Task 16 出包节）**。
 
 ---
 

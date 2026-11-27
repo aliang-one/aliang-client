@@ -42,7 +42,8 @@ import (
 // 可测性契约(测试零真实定时器、零真实进程):
 //   - 重拉 1s 延迟经 scheduleRetry 注入钩子(缺省 time.AfterFunc),测试
 //     注入同步/截获版手工触发到期动作;
-//   - 滑窗与存活起点经注入 now(缺省 time.Now);
+//   - 滑窗与存活起点经注入 now(缺省 time.Now);now 注入禁 panic(真实
+//     形态为缺省 time.Now/测试 fakeClock,不会 panic;自定义实现须遵守);
 //   - 子进程退出由接线层(Task 15)转投 childExited(code, alive,
 //     killedByUs),alive 用 time.Since(spawn 起点),killedByUs 取
 //     exitReport() 的有意收起标记;

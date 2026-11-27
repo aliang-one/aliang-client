@@ -82,9 +82,14 @@ var (
 	procSetProcessDpiAwarenessCtx = user32.NewProc("SetProcessDpiAwarenessContext")
 	procSetProcessDPIAware        = user32.NewProc("SetProcessDPIAware")
 	procSetProcessDpiAwareness    = shcore.NewProc("SetProcessDpiAwareness")
+	procGetSystemMetrics          = user32.NewProc("GetSystemMetrics")
 	procDwmSetWindowAttribute     = dwmapi.NewProc("DwmSetWindowAttribute")
 	procShellExecuteW             = shell32.NewProc("ShellExecuteW")
 )
+
+// smCyFullscreen = SM_CYFULLSCREEN:主屏工作区高度(屏高减任务栏,物理 px),
+// 物理重锚的 side 判别入参(reanchorPhysicalPos;见 panelwin_reanchor.go)。
+const smCyFullscreen = 17
 
 // dpiAwarenessContextPerMonitorV2 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
 // 即 (DPI_AWARENESS_CONTEXT)-4;processPerMonitorDpiAware = PROCESS_PER_MONITOR_DPI_AWARE。
@@ -186,9 +191,28 @@ func runPanelWindow(opts Options) error {
 	}
 	physW := int32(float64(opts.PanelW) * scale)
 	physH := int32(float64(opts.PanelH) * scale)
+
+	// Task 15 硬验收收口:逻辑锚定→物理重锚,消除 150% DPI 底边越顶。
+	// 锚定坐标(cmd/panel.go 按逻辑面板宽高算出)在非 100% 缩放下错位——
+	// 高度差 (physH-panelH) 全压在锚定边,150% 下面板底边越过图标顶约
+	// 280px。现拿到窗口 scale 后按物理面板尺寸重锚(公式与 side 判别见
+	// panelwin_reanchor.go;接线层仍传逻辑 pw/ph,与 cmd/panel.go 语义一致)。
+	workH := 0
+	if procGetSystemMetrics.Find() == nil {
+		if r, _, _ := procGetSystemMetrics.Call(smCyFullscreen); r > 0 {
+			workH = int(int32(r))
+		}
+	}
+	reX, reY := reanchorPhysicalPos(
+		int(int32(opts.X)), int(int32(opts.Y)),
+		opts.PanelW, opts.PanelH,
+		int(physW), int(physH),
+		scale, workH,
+	)
+
 	procSetWindowPos.Call(
 		hwnd, 0,
-		uintptr(int32(opts.X)), uintptr(int32(opts.Y)),
+		uintptr(int32(reX)), uintptr(int32(reY)),
 		uintptr(physW), uintptr(physH),
 		uintptr(swpNoZOrder|swpNoActivate),
 	)
