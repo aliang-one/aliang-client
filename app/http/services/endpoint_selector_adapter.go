@@ -55,10 +55,10 @@ func (a *aiEndpointSelectorAdapter) Acquire(id string, maxConcurrency int) (func
 
 func (a *aiEndpointSelectorAdapter) ReportSuccess(id string) { a.svc.ReportSuccess(id) }
 
-func (a *aiEndpointSelectorAdapter) ReportFailure(id string, status int, errMsg string) {
-	// 路由层接口仍是三参(Task 3 才加 until):本任务先传 0 = 无预解析,
-	// service 按状态自行推导(429 回落组策略)。Task 5 补响应头解析后在此透传。
-	a.svc.ReportFailure(id, status, errMsg, 0)
+func (a *aiEndpointSelectorAdapter) ReportFailure(id string, status int, errMsg string, until int64) {
+	// until 是路由层在内核/路由能拿到响应头处用 ratelimitwin.Parse 预解析的
+	// 429 冷却截止(unix 秒);0 = 无预解析,service 按组策略推导。透传即可。
+	a.svc.ReportFailure(id, status, errMsg, until)
 }
 
 func (a *aiEndpointSelectorAdapter) ModelsUnion() []map[string]any {

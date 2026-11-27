@@ -118,6 +118,18 @@ type LoopHooks struct {
 	// （vm129「派完就卡死」审计 2026-11-10）。nil=不启用；回调不得阻塞。
 	OnRetry func(RetryNotice)
 
+	// OnRequestError 在**最终失败**（本次调用不再重试）时调用一次，携带上游
+	// 状态码与响应头。与 OnRetry 互补：OnRetry 只覆盖「还会再试」的瞬态失败，
+	// 而 401/402 这类不可重试错误与重试耗尽永远不会走 OnRetry——一期
+	// ReportFailure 只被 56432 路由层调用，内核 BYO 直连没有任何失败上报缝，
+	// 锁存/限流/计数因此永不落地（spec 二期 §5.3a）。宿主在 runAgentCore 把
+	// 它接到 endpoint resolver：按选中行 id 调 ReportFailure，429 时用响应头
+	// 解析出的 until（§5.5）。
+	//
+	// status=0 表示没有可观测的 HTTP 状态（连接层失败/2xx 体内错误信封），
+	// headers 可能为 nil。nil=不启用；回调不得阻塞。
+	OnRequestError func(status int, headers http.Header)
+
 	// OnToolCall 在每个**实际执行到 executeOne 的**工具调用处触发一次（内置
 	// 与桥接工具统一口径——MCP 桥/子 agent 桥此前各自带 onCall 落 journal，
 	// 内置工具没有任何宿主回调）。宿主用于 journal 工具轨迹（2026-10-28
@@ -1201,6 +1213,9 @@ func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *s
 				r.logf("agentcore: 写 api_retry 帧失败 (attempt=%d): %v", n.Attempt, err)
 			}
 		}),
+		// 失败上报缝（spec 二期 §5.3a）：不再重试的最终失败回调宿主，携带
+		// 状态码+响应头；宿主按选中 endpoint 调 ReportFailure（429 用头算 until）。
+		WithRequestError(r.cfg.Hooks.OnRequestError),
 	)
 	if err != nil {
 		return nil, "", err

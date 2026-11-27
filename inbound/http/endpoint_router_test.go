@@ -67,6 +67,7 @@ type recordedFailure struct {
 	id     string
 	status int
 	errMsg string
+	until  int64
 }
 
 // fakeAISelector 是 AIEndpointSelector 的测试替身:记录全部调用,Select 结果
@@ -134,10 +135,10 @@ func (f *fakeAISelector) ReportSuccess(id string) {
 	f.successes = append(f.successes, id)
 }
 
-func (f *fakeAISelector) ReportFailure(id string, status int, errMsg string) {
+func (f *fakeAISelector) ReportFailure(id string, status int, errMsg string, until int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.failures = append(f.failures, recordedFailure{id, status, errMsg})
+	f.failures = append(f.failures, recordedFailure{id: id, status: status, errMsg: errMsg, until: until})
 }
 
 func (f *fakeAISelector) ModelsUnion() []map[string]any {
@@ -501,6 +502,59 @@ func TestAIPathRetriesOn5xxBeforeResponseWritten(t *testing.T) {
 	}
 	if auths[0] != "Bearer k1" || auths[1] != "Bearer k2" {
 		t.Fatalf("auths = %v, want [Bearer k1 Bearer k2]", auths)
+	}
+}
+
+// 429 窗口解析(spec 二期 §5.5):BYO 上游把 response 头带回来时,ReportFailure
+// 必须收到 ratelimitwin.Parse 算出的 until(unix 秒),而不是恒 0。这里用
+// Retry-After: 120 断言两次 attempt 的 until 都落在 now+120 附近。
+func TestAIPath429PassesParsedUntilToReportFailure(t *testing.T) {
+	capture := &upstreamCapture{}
+	upstream := newFakeUpstream(t, capture, func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+		w.Header().Set("Retry-After", "120")
+		plainBody(w, stdhttp.StatusTooManyRequests, `{"error":"rate limited"}`)
+	})
+
+	sel := &fakeAISelector{selectQueue: []selectResult{
+		{id: "rate-limited", baseURL: upstream.URL, apiKey: "k"},
+	}}
+	setAISelectorForTest(t, sel)
+
+	now := time.Now().Unix()
+	client, handled := serveRawRequest(t,
+		"POST /v1/messages HTTP/1.1\r\n"+
+			"Host: 127.0.0.1:56432\r\n"+
+			"Content-Length: "+fmt.Sprintf("%d", len(anthropicRequestBody))+"\r\n"+
+			"\r\n"+anthropicRequestBody)
+
+	select {
+	case <-handled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not finish")
+	}
+
+	// 重试耗尽后透传上游 429,客户端应收到 429。
+	resp, err := stdhttp.ReadResponse(bufio.NewReader(client), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != stdhttp.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 (retry exhausted passthrough)", resp.StatusCode)
+	}
+
+	_, _, _, _, failures := sel.snapshot()
+	if len(failures) != aiMaxAttempts {
+		t.Fatalf("failures = %+v, want %d (one per attempt)", failures, aiMaxAttempts)
+	}
+	for i, f := range failures {
+		if f.id != "rate-limited" || f.status != stdhttp.StatusTooManyRequests {
+			t.Fatalf("failures[%d] = %+v, want rate-limited/429", i, f)
+		}
+		if d := f.until - now; d < 117 || d > 123 {
+			t.Fatalf("failures[%d].until-now = %ds, want ~120s (parsed from Retry-After)", i, d)
+		}
 	}
 }
 

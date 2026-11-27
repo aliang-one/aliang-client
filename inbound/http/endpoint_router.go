@@ -32,6 +32,7 @@ import (
 
 	"aliang.one/nursorgate/common/logger"
 	M "aliang.one/nursorgate/inbound/tun/metadata"
+	"aliang.one/nursorgate/processor/ratelimitwin"
 	"aliang.one/nursorgate/processor/tcp"
 )
 
@@ -51,7 +52,10 @@ type AIEndpointSelector interface {
 	// 返回的 release 必须恰好调用一次。
 	Acquire(id string, maxConcurrency int) (release func(), err error)
 	ReportSuccess(id string)
-	ReportFailure(id string, status int, errMsg string)
+	// ReportFailure 上报一次失败。until 是调用方在能拿到响应头处（BYO 完整响应
+	// 头/内核 OnRequestError 缝）用 ratelimitwin.Parse 预解析的 429 冷却截止
+	// unix 秒；0/负 = 无预解析，由 service 按组策略推导（只有 429 消费它）。
+	ReportFailure(id string, status int, errMsg string, until int64)
 	// ModelsUnion 返回 /v1/models 聚合数据:{id, owner} 列表(已去重)。
 	ModelsUnion() []map[string]any
 }
@@ -194,13 +198,20 @@ func handleAIRequest(conn net.Conn, reader *bufio.Reader, req *http.Request, met
 			return
 		case res.started:
 			// 不变量 4:流已开始但中断——绝不切换 endpoint,断开收场。
-			aiSelector.ReportFailure(id, 0, res.errMsg())
+			aiSelector.ReportFailure(id, 0, res.errMsg(), 0)
 			logger.Warn(fmt.Sprintf("ai route: 流式响应中断,不重试 endpoint=%s status=%d err=%v", id, res.status, res.err))
 			return
 		}
 
 		if res.held != nil {
-			aiSelector.ReportFailure(id, res.status, res.held.Status)
+			// 429 的冷却截止在能拿到响应头处预解析（spec §5.5）：Retry-After
+			// （秒/HTTP-date）与 anthropic-ratelimit-unified-reset 取更远者，
+			// clamp 60..21600。非 429 不消费 until，传 0。
+			var until int64
+			if res.status == http.StatusTooManyRequests {
+				until = ratelimitwin.Parse(res.status, res.held.Header)
+			}
+			aiSelector.ReportFailure(id, res.status, res.held.Status, until)
 			if attempt < aiMaxAttempts {
 				drainAndCloseAIResponse(res.held)
 				// 重试切下一候选:把本失败 endpoint 记为 exclude,下次 Select
@@ -217,7 +228,7 @@ func handleAIRequest(conn net.Conn, reader *bufio.Reader, req *http.Request, met
 		}
 
 		// 传输失败(无 HTTP 响应)。
-		aiSelector.ReportFailure(id, 0, res.errMsg())
+		aiSelector.ReportFailure(id, 0, res.errMsg(), 0)
 		if attempt < aiMaxAttempts {
 			// 传输失败同样切下一候选(重试不是同 endpoint 重打)。
 			excludeID = id
@@ -249,6 +260,12 @@ func forwardAIAttempt(conn net.Conn, reader *bufio.Reader, req *http.Request, me
 //
 // tcp handler 全程自管流式中继,路由层无法探知响应头是否已写出——因此内置
 // 链一律单次尝试,失败只 ReportFailure + 断开(不变量 4 的保守实现)。
+//
+// 状态可见性(spec 二期 §5.3a):builtin 的上游 HTTP 状态被 tcp handler 吞掉,
+// 本层**尽力而为**——成功返回 completed=true/status=0;handleErr 返回
+// status=0 的失败(由 handleAIRequest 的 res.started 分支 ReportFailure 0)。
+// 上游 4xx/5xx(尤其 429 窗口)在 builtin 路径不可观测,不承诺精确锁存/限流,
+// 这是 spec 明示的尽力语义;需要精确窗口时只能走 BYO(完整响应头)。
 //
 // 已知风险(quality-fix 评审 Important 2,文档化不改行为):本委托用
 // context.Background() 无 deadline——accept 循环的读期限已在 handleRawConnection
