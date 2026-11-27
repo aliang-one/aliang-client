@@ -220,12 +220,14 @@ func TestPanelwinDarwinResizeFollow(t *testing.T) {
 	}
 
 	// ③ 顶边固定 setFrame 形态:origin.y = 顶边 - 新高(全局左下原点),
-	//    display:YES animate:NO(高度跟随即时生效,不做动画)。
+	//    display:YES animate:NO(高度跟随即时生效,不做动画);钳高上限
+	//    非正(maxH=topY-8 ≤ 0,托盘在负坐标屏)时保持原矩形不动(Minor-5)。
 	for _, want := range []string{
-		"topY - newH",                // 顶边固定的 origin.y 形态
-		"topY - 8",                   // 屏幕下缘留 8 的钳高
+		"topY - newH", // 顶边固定的 origin.y 形态
+		"topY - 8",    // 屏幕下缘留 8 的钳高
 		"setFrame:NSMakeRect(f.origin.x, topY - newH, f.size.width, newH)",
 		"animate:NO",
+		"maxH <= 0", // newH 钳后非正守卫(负坐标屏形态不压窗,NSLog 留痕)
 	} {
 		if !strings.Contains(src, want) {
 			t.Errorf("panelwin_darwin.m 缺少 %q(resize 顶边固定跟随形态不完整)", want)

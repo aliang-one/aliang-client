@@ -175,6 +175,13 @@
       NSRect f = self.panel.frame;
       CGFloat topY = f.origin.y + f.size.height; // 顶边(全局左下原点)
       CGFloat maxH = topY - 8;                   // 超出屏幕下缘留 8 → 钳高
+      if (maxH <= 0) {
+        // newH 钳后 ≤0 的守卫(Minor-5):topY-8 ≤ 0——托盘在负坐标屏
+        // (全局坐标系下移)形态时钳不出正高度,硬钳会把窗压没;保持原
+        // 矩形不动,NSLog 留痕(高度自适应在该形态下让位)。
+        NSLog(@"panelwin: resize 钳高上限非正 (topY=%f), 保持原矩形", topY);
+        return;
+      }
       if (newH > maxH) {
         newH = maxH;
       }

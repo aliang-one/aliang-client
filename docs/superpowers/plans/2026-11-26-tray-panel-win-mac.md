@@ -394,7 +394,9 @@ func (l *PanelLauncher) RetryFromFallback()
 
 ## 明确不做
 
-Linux 任何托盘能力；fyne-io/Wails 托盘与窗口栈；v4 协议/GUID；变更门控三端统一；endpoint/会话管理界面；provider 详情 popover（v1 toast）；面板高度自适应（固定 560）；日志页深链（开仪表盘根页）。
+Linux 任何托盘能力；fyne-io/Wails 托盘与窗口栈；v4 协议/GUID；变更门控三端统一；endpoint/会话管理界面；provider 详情 popover（v1 toast）；日志页深链（开仪表盘根页）。
+
+> 撤销项：~~面板高度自适应（固定 560）~~——2026-11-28 用户拍板拉入范围，resize 协议扩展已实现（25864d03 + 评审增益批：applyHeight 几何抽纯函数表驱动、WebView2 Resize 跟随、前端 RO 量高）。
 
 ## 风险与执行注意
 

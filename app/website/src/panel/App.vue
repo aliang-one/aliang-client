@@ -11,7 +11,7 @@
      不随 zone 走,随区显隐是实现层决定;⑥的 mockup border-top 因同因不抄,
      见 FooterBar 文件头)。 -->
 <script setup>
-import { computed, nextTick, onMounted, provide, ref, watch } from 'vue';
+import { computed, nextTick, provide, ref, watch } from 'vue';
 import { postMessageHost } from './api';
 import { useSummary } from './summary';
 import { derivePanelState } from './state';
@@ -57,13 +57,12 @@ function reportHeight() {
   const el = panelEl.value;
   if (!el) return;
   const h = Math.ceil(el.scrollHeight);
-  if (Math.abs(h - lastSentHeight) <= 1) return; // ≤1px 抖动不上报
+  if (Math.abs(h - lastSentHeight) <= 1) return; // ≤1px 抖动不上报(RO 路径同样生效)
   if (postMessageHost({ type: 'resize', height: h })) {
     lastSentHeight = h;
   }
 }
-// rAF 合帧:MutationObserver 回调高频(展开动画逐帧改 style),按帧合并,
-// 一帧最多一次量高与上报。
+// rAF 合帧:RO 与 summary watch 双触发源共用,一帧最多一次量高与上报。
 let heightFrame = 0;
 function scheduleReportHeight() {
   if (heightFrame) return;
@@ -72,20 +71,29 @@ function scheduleReportHeight() {
     reportHeight();
   });
 }
-onMounted(() => {
-  // 首帧量一次 + nextTick(等首屏 DOM 布局落定);
-  nextTick(reportHeight);
-  // 结构变化兜底:AGENT 明细展开/ENDPOINT 组展开等非 summary 驱动的高度
-  // 变化不经过 summary,靠子树 MutationObserver(childList + class/style
-  // 属性)捕捉后合帧上报。
-  new MutationObserver(scheduleReportHeight).observe(panelEl.value, {
-    subtree: true,
-    childList: true,
-    attributeFilter: ['class', 'style'],
-  });
+// 尺寸观察器(评审增益批,替换 MutationObserver 方案):AGENT 明细/ENDPOINT
+// 组的展开动画(max-height 0.25s)逐帧改中间高度——MutationObserver 单次
+// 回调量到的是中间态、终态漏报;ResizeObserver 对尺寸变化逐帧天然覆盖动画
+// 全程,变化停止后最后一次回调量到终态。RO 只当触发器,量法仍是
+// reportHeight 的 scrollHeight(≤1px 抖动门共用)。
+// ⚠️ 延到首个非空 summary 才建(Minor-6):RO 在 observe() 时会带一次当前
+// 尺寸的初始回调,挂在 onMounted 会量到骨架高度、上报一帧错误尺寸;首帧
+// 形态交壳默认高,数据到位再跟随。
+let heightObserver = null;
+function ensureHeightObserver() {
+  if (heightObserver || !panelEl.value) return;
+  heightObserver = new ResizeObserver(scheduleReportHeight);
+  heightObserver.observe(panelEl.value);
+}
+// 数据驱动:首个非空 summary 落地后建 RO + 首量(RO 初始回调与 nextTick
+// 首量同帧合并,≤1px 门去重);summary 为 null(连接失败降级态)不量,
+// 高度交壳默认高兜底。区块显隐/行数变化等数据驱动高度经 nextTick 等 DOM
+// 刷完再量;文字增删若不改高度,RO 不触发也无需上报。
+watch(summary, (val) => {
+  if (!val) return;
+  ensureHeightObserver();
+  nextTick(scheduleReportHeight);
 });
-// 数据驱动:summary 轮询落地(区块显隐/行数变化)后等 DOM 刷完再量。
-watch(summary, () => nextTick(scheduleReportHeight));
 </script>
 
 <template>

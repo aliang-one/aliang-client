@@ -220,44 +220,34 @@ func runPanelWindow(opts Options) error {
 	)
 
 	// 面板高度自适应(2026-11-28 用户拍板):前端量内容高后发 resize 消息,
-	// 壳 clamp 后跟随改窗口高度,超过屏幕可用高才页内滚动。applyHeight 按
-	// opts.Side 锚定边重排:逻辑高×scale 落物理,当前物理矩形用局部变量
-	// 跟踪(初始化=重锚结果,resize 后更新)——消息循环单线程驱动无并发,
-	// 不回读 GetWindowRect,局部量即权威。
+	// 壳 clamp 后跟随改窗口高度,超过屏幕可用高才页内滚动。几何解算抽纯函数
+	// resizeWindowRect(panelwin_resize.go,表驱动钉死),applyHeight 只是薄壳:
+	// 跟踪矩形 → 解算 → SetWindowPos 落窗 → chromium.Resize 同步 bounds →
+	// 回写。当前物理矩形用局部变量跟踪(初始化=重锚结果,resize 后更新)——
+	// 消息循环单线程驱动无并发,不回读 GetWindowRect,局部量即权威。
+	//
+	// chromium 先声明后赋值:applyHeight 定义早于 Embed,但落窗后要调
+	// chromium.Resize()(pkg/edge 的 Chromium 只有显式 Resize
+	// GetClientRect→PutBounds 才同步 controller bounds,不随父 HWND 自动
+	// 跟随,评审必修 1);applyHeight 只在 MessageCallback 里被调,彼时
+	// Embed 必已完成,非 nil。
+	var chromium *edge.Chromium
 	curX, curY, curW, curH := reX, reY, int(physW), int(physH)
 	applyHeight := func(logicalH float64) {
-		newH := int(logicalH * scale)
-		if newH <= 0 || newH == curH {
+		x, y, w, h := resizeWindowRect(curX, curY, curW, curH, logicalH, scale, opts.Side, workH)
+		if h <= 0 || (x == curX && y == curY && w == curW && h == curH) {
 			return // 退化值/无变化:零操作
-		}
-		newY := curY
-		switch opts.Side {
-		case SideTop:
-			// 顶边固定,向下生长:y 不变;超出主屏工作区(workH=SM_CYFULLSCREEN
-			// 物理高,0=采样失败/未知则不钳)时钳高。
-			if workH > 0 && curY+newH > workH {
-				newH = workH - curY
-			}
-		default:
-			// 底边固定,向上生长:锚定底边 y+高 不动,y += 旧物理高-新物理高。
-			// 过度上生长挤过屏顶时钳:y<8 拉回 8,高度随之回补(保住 8 物理
-			// px 顶边可见,面板不没入屏幕外)。
-			newY = curY + curH - newH
-			if newY < 8 {
-				newH += curY - 8
-				newY = 8
-			}
-		}
-		if newH <= 0 {
-			return
 		}
 		procSetWindowPos.Call(
 			hwnd, 0,
-			uintptr(int32(curX)), uintptr(int32(newY)),
-			uintptr(curW), uintptr(newH),
+			uintptr(int32(x)), uintptr(int32(y)),
+			uintptr(w), uintptr(h),
 			uintptr(swpNoZOrder|swpNoActivate),
 		)
-		curY, curH = newY, newH
+		// 内容跟随窗高:SetWindowPos 不传导到 WebView2 controller bounds,
+		// 不显式 Resize 则内容停在旧高(裁剪/透明空区)。
+		chromium.Resize()
+		curX, curY, curW, curH = x, y, w, h
 	}
 
 	// ③ 圆角 + 亚克力(Win11 22621+);低版本 DwmSetWindowAttribute 返回
@@ -267,10 +257,14 @@ func runPanelWindow(opts Options) error {
 
 	// ④ WebView2 必须用 pkg/edge 的 Chromium(见文件头),Embed 到自建
 	// HWND——Embed 内部自泵消息直到 controller 就绪。
-	chromium := edge.NewChromium()
+	chromium = edge.NewChromium()
 	if !chromium.Embed(hwnd) {
 		return fmt.Errorf("WebView2 初始化失败(运行时缺失或加载失败)")
 	}
+	// Embed 后补一次初始 Resize(jchv webview.go L343 同款惯例):controller
+	// bounds 与窗口物理尺寸首帧对齐,不调则首帧内容停在 CreateWindowExW 的
+	// 临时尺寸上;高度自适应链的后续跟随同走 Resize。
+	chromium.Resize()
 
 	// 透明背景:COREWEBVIEW2_COLOR{0,0,0,0}——前端 hosted 态底色透明,
 	// 材质层(亚克力)透出来;失败仅降级为白底,不阻断。
@@ -341,10 +335,12 @@ func runPanelWindow(opts Options) error {
 			// open 后驻留。
 		}
 		if typ == "resize" {
-			// height 缺失/非数值时 ParseHostMessage 返回 0,过不了最低阈值;
-			// >120 才受理(正常内容高恒在其上,这里是壳侧对畸形/退化值的
-			// 兜底,塌缩成一条线的窗高不予跟随)。
-			if height > 120 {
+			// height 缺失/非数值时 ParseHostMessage 返回 0,过不了受理闸;
+			// ≥280 才受理(评审 Minor-7:与 macOS clamp 下限 280 同口径,
+			// 见 panelwin_darwin.m resize 分支的 newH < 280;正常内容高恒在
+			// 其上,这里是壳侧对畸形/退化值的兜底,塌缩成一条线的窗高不予
+			// 跟随;解算层另有 240×scale 的几何兜底,panelwin_resize.go)。
+			if height >= 280 {
 				applyHeight(height)
 			}
 			// resize 后驻留。
