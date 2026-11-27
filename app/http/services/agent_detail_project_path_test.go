@@ -50,8 +50,16 @@ func TestAgentVibeProjectPathMatches(t *testing.T) {
 func TestAgentVibeSessionMatchesProjectPathGate(t *testing.T) {
 	session := models.AgentVibeSession{ID: "claude_abc123", ProjectPath: "/Users/Mac/Work/Proj/"}
 
-	assert.True(t, agentVibeSessionMatches(session, "", "abc123", "/users/mac/work/proj"),
-		"ID 命中 + 归一化后同路径应匹配")
+	// 大小写折叠按平台语义(darwin/windows 不敏感,linux 敏感——见上方同文件用例)。
+	// CI 在 Linux runner 上跑,断言必须跟随平台,不能写死「应匹配」。
+	samePathDifferentCase := agentVibeSessionMatches(session, "", "abc123", "/users/mac/work/proj")
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		assert.True(t, samePathDifferentCase, "darwin/windows:ID 命中 + 大小写归一后同路径应匹配")
+	} else {
+		assert.False(t, samePathDifferentCase, "linux:大小写敏感,不同大小写视为不同路径")
+	}
+	assert.True(t, agentVibeSessionMatches(session, "", "abc123", "/Users/Mac/Work/Proj"),
+		"ID 命中 + 归一化(尾斜杠)后同路径应匹配")
 	assert.True(t, agentVibeSessionMatches(session, "", "abc123", ""),
 		"ID 命中 + 未携带 project_path 应放行")
 	assert.False(t, agentVibeSessionMatches(session, "", "abc123", "/other/place"),

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"testing"
 	"time"
 
@@ -40,7 +41,9 @@ func TestSoftwareUpdateService_TracksDismissalsAndForceUpdates(t *testing.T) {
 		if got := r.URL.Path; got != "/api/public/downloads/check" {
 			t.Fatalf("unexpected update check path: %s", got)
 		}
-		if got := r.URL.Query().Get("platform"); got != "darwin" {
+		// 实现按 runtime.GOOS 上报平台(software_update_service.go:189),CI 在
+		// Linux runner 上跑时是 linux,断言必须跟随平台而非写死 darwin。
+		if got := r.URL.Query().Get("platform"); got != runtime.GOOS {
 			t.Fatalf("unexpected platform query: %s", got)
 		}
 		if got := r.URL.Query().Get("version"); got != "v1.0.0" {
