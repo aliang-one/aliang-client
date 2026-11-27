@@ -34,7 +34,8 @@ third_party/systray/
 internal/ipc/client.go      改：互斥 + 响应 ID + 可注入 deadline
 app/http/services/
   tray_summary.go(+_test)      GET /api/tray/summary
-  tray_endpoint.go(+_test)     POST /api/tray/endpoint/activate
+  endpoint_service.go(ActivateInGroup) + endpoint_handler.go(HandleEndpointActivate) + routes.go:
+                               POST /api/endpoints/activate（见 2026-11-27 钉选计划）
 app/tray/
   panel_bridge.go(+_test)      点击接线：M1=开浏览器；M2=spawn 面板进程/兜底
   companion.go / companion_windows.go  改：onReady 挂接、M2 菜单「打开面板」恢复项、退出码 60 分派
@@ -216,11 +217,12 @@ GOOS=windows GOARCH=amd64 go build github.com/getlantern/systray
 
 ---
 
-### Task 6: POST /api/tray/endpoint/activate —— **已递延（用户 2026-11-27 拍板）**
+### Task 6: POST /api/tray/endpoint/activate —— **已被 2026-11-27 feat/endpoint-pin-activation 增量取代（原递延拍板作废）**
 
 > **递延原因**：Task 6 的 premise「薄委托 registry 现有激活语义」不成立——endpoint-manager 批从未实现任何形态的激活/钉选（`Select` 的显式点名是请求期临时行为、不落状态；policy 只管摘除策略；store 无 pin 列）。实现子代理穷尽定位后按禁令停工报 NEEDS_CONTEXT（正确行为）。
 > **钉选语义另立增量**：registry 加 pin 列/policy + `selectAuto` 优先 pin（pin 行健康可用直取、不可用回落 auto 池）+ service 方法 + handler。它改的是 56432 生产路由核心路径，值得独立设计+测试，不在托盘任务里顺手做。落地后面板 radio 单选即激活（summary 的 `current` 字段读的就是 selectAuto 口径，届时自动跟随钉选语义，无需返工）。
-> **对 Task 10 的影响**：面板 radio 点击降级为 toast「钉选能力即将上线」且不勾选（见 Task 10 合同修订）。
+> **（历史，已废——见下方增量注记）对 Task 10 的影响**：面板 radio 点击降级为 toast「钉选能力即将上线」且不勾选（见 Task 10 合同修订）。
+> **2026-11-27 增量落地（分支 feat/endpoint-pin-activation，已取代上述递延拍板）**：钉选以「组内互斥激活」形态落地，未采用 pin 列方案——`EndpointService.ActivateInGroup(protocol,id)` + `POST /api/endpoints/activate`：目标行 enabled=1，同协议组内其余 `auto_group=1` 非 builtin 行 enabled=0（builtin 兜底行不动）；目标不存在/protocol 不匹配 → 404；disabled/builtin/`auto_group=0` → 400；cooldown 行放行且不清零冷却。面板 radio 已接真激活（Task 10 合同修订见下）。二期 endpoint-phase2 §5.6 合入后自动获得激活迁移清零，托盘零改动。
 
 ---
 
@@ -267,9 +269,9 @@ spec §4.3：⚡+开关（32×19）+ provider 行（Anthropic/OpenAI/Cursor 可�
 
 **Files:** `components/EndpointZone.vue`；Test: `EndpointZone.test.js`
 
-spec §4.4：`available=false`/字段缺失 → **整区不渲染**（v-if 无空壳）；组头展开收起（max-height .25s）；~~radio 单选即激活~~ **（钉选后端未上线，用户 2026-11-27 拍板递延）：radio 点击 → toast「钉选能力即将上线」且不勾选、不发请求**；cooldown → 置灰 + 琥珀「冷却 Xm」（= `cooldown_remaining_sec/60` 向上取整）不可选；disabled →「已摘除」；rank=0 →「—」。**`ai.enabled=false` 时本区同样 `.dimmed` + 锁（二审 I6）。**
+spec §4.4：`available=false`/字段缺失 → **整区不渲染**（v-if 无空壳）；组头展开收起（max-height .25s）；**radio 单选即激活（2026-11-27 钉选增量落地，取代此前的 toast 递延拍板）**：rank≥1 且非 disabled 行点击 = 乐观勾移 + `POST /api/endpoints/activate` + summary 回读确认（失败/未确认回滚 + warn toast；点击已是勾选态的行 = 空操作，防互斥连带关停同组冷却行）；**cooldown 行可激活（plan v1 拍板：放行且不清零冷却，行仍显示冷却徽标直至懒恢复；注意激活会把同组其余 enabled 行互斥置 0）**；rank=0（builtin/非池）与 disabled 行本地 toast 零请求；在途单飞并提示「激活进行中，请稍候」；勾选态按行字段推定（rank 最小 ok 池行，池全冷却回落 builtin 名字），不用 current==name 名字匹配（重名行不撞车）；cooldown → 置灰 + 琥珀「冷却 Xm」（= `cooldown_remaining_sec/60` 向上取整）；disabled →「已摘除」；rank=0 →「—」。**`ai.enabled=false` 时本区同样 `.dimmed` + 锁（二审 I6）。**
 
-vitest 必测：available=false 不渲染；cooldown 点击不发请求且显示分钟数；**radio 点击（任意行，含 ok 行）只 toast、不勾选、不发请求**；ai.enabled=false 整区 dimmed 且点击被锁。
+vitest 必测：available=false 不渲染；**radio 真激活全套（请求体真实 id/成功勾移/失败回滚/回读不符/回读未发生/cooldown 激活/rank0 与 disabled 零请求/在途防重/已选行空操作/重名行）**；cooldown 徽标分钟数；ai.enabled=false 整区 dimmed 且点击被锁。
 
 - [ ] 同节奏；Commit（`新增:面板 ENDPOINT 区——单选即激活+降级+AI 关联动`）
 
@@ -294,7 +296,7 @@ Agent 区（§4.5）：标题「AI AGENT · 24H」；每内核一卡（🤖+名+
 - [ ] **Step 1: 失败测试**：hook 安装后点击回调 → 调用「打开浏览器」（复用既有 openDashboard 的系统调用模式，URL=`http://127.0.0.1:<真实端口>/panel.html`）；`SetPanelClickHook(nil)`/`SetPanelMode(false)` 恢复菜单路径。
 - [ ] **Step 2: 红** → **Step 3: 实现**：onReady 末尾 `SetPanelClickHook(openPanelInBrowser)` + macOS `SetPanelMode(true)`；openPanelInBrowser 复用既有「系统默认浏览器打开 URL」代码（TrayApp/companion 现成模式）。M1 无 launcher/兜底（浏览器不崩，拍板 4）。
 - [ ] **Step 4: 绿**
-- [ ] **Step 5: M1 手工验收（本机 macOS）**：点图标 → 浏览器弹面板页；面板启停/模式/endpoint/agent 各区联调真实 core；浏览器关闭重开状态正确；托盘图标无泄漏（`footprint` 对照）
+- [ ] **Step 5: M1 手工验收（本机 macOS）**：点图标 → 浏览器弹面板页；面板启停/模式/endpoint/agent 各区联调真实 core；浏览器关闭重开状态正确；托盘图标无泄漏（`footprint` 对照）。**endpoint radio 真激活走查（2026-11-27 增量）**：点池内 ok 行 → 勾移 + toast「组 → 名」+ 组头当前名更新；点冷却行 → 乐观勾移 + 冷却 toast，回读后勾选按调度语义落 builtin 兜底行（冷却行不驻留勾选，池全非 ok 时勾圈为空）；点 builtin/已摘除行 → 仅本地 toast 零请求；重复点已选行 → 无请求无变化（防互斥连带关停）；仪表盘核对互斥落库（同组池行（auto_group=1）中仅目标行 enabled=1，非池行与 builtin 不动）
 - [ ] **Step 6: Commit**（`新增:M1 托盘面板——点击开浏览器 + 前端全量上线`）
 
 ---

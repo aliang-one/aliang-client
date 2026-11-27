@@ -455,6 +455,11 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	// 按裸 base_url 探测模型(新建表单自动获取;行未落库没有 id)。
 	register("POST /api/endpoints/probe-models", h.Endpoint.HandleProbeModels, http.MethodPost)
 	register("POST /api/endpoints/{id}/reset-health", h.Endpoint.HandleResetHealth, http.MethodPost)
+	// 托盘组内互斥激活(plan 2026-11-27 Task 2):面板 radio 钉选唯一入口,
+	// body {protocol,id},id 来自 tray/summary items(Task 1);语义与错误
+	// 映射见 HandleEndpointActivate。精确路径注册在 ServeMux 上优先于
+	// {id} 通配,method 前缀模式无双注册冲突。
+	register("POST /api/endpoints/activate", h.Endpoint.HandleEndpointActivate, http.MethodPost)
 	register("/api/endpoint-groups/auto/policy", h.Endpoint.HandlePolicy, http.MethodGet, http.MethodPut)
 
 	registerDocsRoutes(mux, catalog)

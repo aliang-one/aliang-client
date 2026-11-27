@@ -47,7 +47,7 @@ func traySummaryTestGatherers() traySummaryGatherers {
 				Available: true,
 				Groups: []TrayEndpointGroup{
 					{Protocol: "anthropic", Current: "glm-coding-plan",
-						Items: []TrayEndpointItem{{Name: "glm-coding-plan", Rank: 1, State: "ok"}}},
+						Items: []TrayEndpointItem{{ID: "glm-1", Name: "glm-coding-plan", Rank: 1, State: "ok"}}},
 				},
 			}
 		},
@@ -107,7 +107,11 @@ func TestTraySummaryJSONShape(t *testing.T) {
 	g0 := endpoints["groups"].([]interface{})[0].(map[string]interface{})
 	trayAssertKeys(t, g0, "protocol", "current", "items")
 	i0 := g0["items"].([]interface{})[0].(map[string]interface{})
-	trayAssertKeys(t, i0, "name", "rank", "state", "cooldown_remaining_sec")
+	// id=钉选定位键(plan 2026-11-27 Task 1):radio 激活 POST 用它点名行。
+	trayAssertKeys(t, i0, "id", "name", "rank", "state", "cooldown_remaining_sec")
+	if i0["id"] != "glm-1" {
+		t.Fatalf("items[0].id = %v, want glm-1(源行 ID 透传)", i0["id"])
+	}
 }
 
 // TestTraySummarySubSourcePanicDegradesToNull 单源 panic 不能拖死端点:
@@ -308,6 +312,12 @@ func TestTrayEndpointGroupsMapping(t *testing.T) {
 	if byName["manual-only"].Rank != 0 || byName["内置隧道"].Rank != 0 {
 		t.Fatalf("auto_group=0/priority=0 应 rank=0, got manual=%d builtin=%d",
 			byName["manual-only"].Rank, byName["内置隧道"].Rank)
+	}
+	// id=源行 ID 透传(钉选定位键,plan 2026-11-27 Task 1):按名字断言易撞
+	// 重名行,radio 激活必须按 id 点名。
+	if byName["packy-code"].ID != "b" || byName["glm-coding-plan"].ID != "a" ||
+		byName["manual-only"].ID != "c" || byName["内置隧道"].ID != "builtin-aliang" {
+		t.Fatalf("items 的 id 应透传源行 ID: %+v", anthropic.Items)
 	}
 	// cooldown → state=cooldown 且剩余秒>0
 	if byName["packy-code"].State != "cooldown" || byName["packy-code"].CooldownRemainingSec <= 0 {

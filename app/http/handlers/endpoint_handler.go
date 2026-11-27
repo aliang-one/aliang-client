@@ -101,6 +101,23 @@ func endpointRequireSession(w http.ResponseWriter, r *http.Request) bool {
 	return middleware.RequireDashboardSession(w, r)
 }
 
+// endpointActivateGate activate 专用来源闸:回环 ∥ dashboard 会话双闸。
+// 面板(托盘开 127.0.0.1:56431/panel.html)与 core 同进程同源、请求天然回环,
+// 且面板从不调 POST /api/dashboard/session 自举会话——纯 session 闸下 radio
+// 每次必 401,英文信封在面板内也无恢复通道(终审坐实的缺口)。本闸照
+// /api/tray/summary、聊天 WS 握手同口径(app/http/services/tray_summary.go
+// 的「回环免 cookie ∥ 会话」):回环免 cookie 直通;/api/run/* 完全无闸,
+// 本闸严格更紧;LAN/远端来源仍须持有效 dashboard 会话。返回 false 时响应
+// 已写(401 信封)。家族其余 endpoint handler(管理面)保持
+// endpointRequireSession 不动。
+func endpointActivateGate(w http.ResponseWriter, r *http.Request) bool {
+	if !middleware.IsLoopbackRequest(r) && !middleware.ValidateDashboardSession(r) {
+		common.ErrorUnauthorized(w, "Authenticated dashboard session is required")
+		return false
+	}
+	return true
+}
+
 // HandleList GET /api/endpoints — 全量列表(priority,id 升序,store 排序)。
 func (h *EndpointHandler) HandleList(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -521,4 +538,55 @@ func idFromPath(w http.ResponseWriter, r *http.Request) string {
 		common.ErrorBadRequest(w, "endpoint id required", nil)
 	}
 	return id
+}
+
+// endpointActivateRequest 是 POST /api/endpoints/activate 的请求体:协议组 +
+// 目标行 id(托盘 summary items 的 id 字段,plan 2026-11-27 Task 1 透传)。
+type endpointActivateRequest struct {
+	Protocol string `json:"protocol"`
+	ID       string `json:"id"`
+}
+
+// HandleEndpointActivate POST /api/endpoints/activate — 托盘组内互斥激活
+// (cc-switch 式 radio 钉选,plan 2026-11-27 Task 2)。方法闸/降级照本文件
+// 既有端点惯例(405 → service nil 走 endpointServiceUnavailable 业务码 201,
+// 同族九个 handler 一致);来源闸是 activate 专用的「回环 ∥ dashboard 会话」
+// 双闸(endpointActivateGate,面板免 cookie 可用),非家族既有 session 闸;
+// 错误映射:ErrEndpointNotAvailable(不存在/协议不匹配)→404,
+// ErrEndpointNotActivatable(builtin/非池行/已摘除)→400 且文案透传面板
+// toast,其余(读/写库失败)→500。成功回 200 信封回显 protocol/id。
+func (h *EndpointHandler) HandleEndpointActivate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !endpointActivateGate(w, r) {
+		return
+	}
+	if h.service == nil {
+		endpointServiceUnavailable(w)
+		return
+	}
+	var req endpointActivateRequest
+	if !endpointDecodeBody(w, r, &req) {
+		return
+	}
+	protocol := strings.TrimSpace(req.Protocol)
+	id := strings.TrimSpace(req.ID)
+	if protocol == "" || id == "" {
+		common.ErrorBadRequest(w, "protocol 与 id 均必填", nil)
+		return
+	}
+	if err := h.service.ActivateInGroup(protocol, id); err != nil {
+		switch {
+		case errors.Is(err, services.ErrEndpointNotAvailable):
+			common.ErrorNotFound(w, err.Error())
+		case errors.Is(err, services.ErrEndpointNotActivatable):
+			common.ErrorBadRequest(w, err.Error(), nil)
+		default:
+			common.ErrorInternalServer(w, "激活 endpoint 失败", map[string]interface{}{"error": err.Error()})
+		}
+		return
+	}
+	common.Success(w, map[string]interface{}{"protocol": protocol, "id": id})
 }
