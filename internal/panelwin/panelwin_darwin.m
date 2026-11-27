@@ -6,7 +6,8 @@
 // 毛玻璃归系统材质层,面板前端 hosted 态只画半透明底(Task 7 评审固化)。
 //
 // 生命周期:windowDidResignKey → exit(0) 失焦自退;页面 quit 消息 →
-// exit(60);open 消息 → NSWorkspace openURL 开默认浏览器后驻留。
+// exit(60);open 消息 → NSWorkspace openURL 开默认浏览器后驻留;resize
+// 消息 → 跟随改窗高(高度自适应,2026-11-28 用户拍板)。
 // 进程是叶子进程,窗口/对象生命周期=进程存活,不做显式释放。
 //
 // 内存纪律(同 third_party/systray/systray_darwin.m 的教训,上游 #135):
@@ -95,24 +96,30 @@
 }
 
 // WebMessage 通道:handler 名固定 "panel"(与前端 messageHandlers.panel
-// 逐字对齐,结构测试断言)。协议冻结为 quit/open 两类型;页面 postMessage
+// 逐字对齐,结构测试断言)。类型白名单为 quit/open/resize 三类型(resize=
+// 高度自适应,2026-11-28 用户拍板;新增类型需双侧同批);页面 postMessage
 // 一个 JS 对象时 WebKit 会转成 NSDictionary 送达,兼容 JSON 字符串形态。
 - (void)userContentController:(WKUserContentController *)userContentController
           didReceiveScriptMessage:(WKScriptMessage *)message {
   id body = message.body;
   NSString* type = nil;
   NSString* kind = nil;
+  NSNumber* heightNum = nil;
   if ([body isKindOfClass:[NSDictionary class]]) {
     // 畸形 payload 守卫:{"type":123}/{"type":"open","kind":[]} 这类形态
     // 会让 body[@"type"]/body[@"kind"] 拿到 NSNumber/NSArray,后续
     // isEqualToString: 直接 unrecognized selector 崩——协议注释是
     // 「未知形态忽略不崩」。取值先过 isKindOfClass:[NSString class] 闸,
-    // 非 NSString 一律置 nil,落进下面的「未知忽略」分支。
+    // 非 NSString 一律置 nil,落进下面的「未知忽略」分支;height 同款过
+    // NSNumber 类闸(字符串 height 不得被 doubleValue 撑崩)。
     if ([body[@"type"] isKindOfClass:[NSString class]]) {
       type = body[@"type"];
     }
     if ([body[@"kind"] isKindOfClass:[NSString class]]) {
       kind = body[@"kind"];
+    }
+    if ([body[@"height"] isKindOfClass:[NSNumber class]]) {
+      heightNum = body[@"height"];
     }
   } else if ([body isKindOfClass:[NSString class]]) {
     // 兜底:若前端改为发 JSON 字符串也能解(当前形态是对象→NSDictionary)。
@@ -127,6 +134,9 @@
       }
       if ([parsed[@"kind"] isKindOfClass:[NSString class]]) {
         kind = parsed[@"kind"];
+      }
+      if ([parsed[@"height"] isKindOfClass:[NSNumber class]]) {
+        heightNum = parsed[@"height"];
       }
     }
   }
@@ -151,7 +161,32 @@
     // open 后驻留(面板不退出);未知 kind 落到这里同样静默驻留。
     return;
   }
-  // 未知类型默认忽略不崩(协议冻结:只有 quit/open 两类型)。
+  if ([type isEqualToString:@"resize"]) {
+    // 面板高度自适应(2026-11-28 用户拍板):height 过 NSNumber 类闸(畸形
+    // payload 守卫同款),clamp [280, 顶边-8] 后跟随改窗高。macOS 托盘恒
+    // 菜单栏,resize 恒顶边固定、向下生长;Windows 侧 side-aware 见
+    // panelwin_windows.go(Options.Side)。height 缺失/非数值(heightNum
+    // 为 nil)走「未知忽略」同款静默,不崩。
+    if (heightNum && self.panel) {
+      CGFloat newH = heightNum.doubleValue;
+      if (newH < 280) {
+        newH = 280; // 最低可用高:再矮内容就塞不下了
+      }
+      NSRect f = self.panel.frame;
+      CGFloat topY = f.origin.y + f.size.height; // 顶边(全局左下原点)
+      CGFloat maxH = topY - 8;                   // 超出屏幕下缘留 8 → 钳高
+      if (newH > maxH) {
+        newH = maxH;
+      }
+      // 顶边固定向下生长:origin.y = 顶边 - 新高,宽与 x 不动。
+      [self.panel setFrame:NSMakeRect(f.origin.x, topY - newH, f.size.width, newH)
+                   display:YES
+                    animate:NO];
+    }
+    // resize 后驻留(面板不退出)。
+    return;
+  }
+  // 未知类型默认忽略不崩(类型白名单:quit/open/resize,新增需双侧同批)。
 }
 
 // applicationDidFinishLaunching — 窗口/WebView 全部在 app 完成启动后创建。

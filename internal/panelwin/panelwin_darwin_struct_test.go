@@ -24,7 +24,8 @@ import (
 //     盖住材质、验收必挂;
 //  3. WebMessage 通道:addScriptMessageHandler 的 handler 名必须为
 //     "panel"(与前端 messageHandlers.panel 对齐);quit→exit(60)、
-//     open→NSWorkspace openURL、未知类型默认忽略;
+//     open→NSWorkspace openURL、resize→顶边固定跟随改窗高、未知类型
+//     默认忽略;
 //  4. 内存纪律:每个可被 Go goroutine 直接调到的 C 入口,函数体整体包一层
 //     @autoreleasepool(cgo 调用跑在调用者线程上,Go 运行时线程没有
 //     autorelease pool——同款泄漏先例见 third_party/systray/systray_darwin.m
@@ -106,10 +107,10 @@ func TestPanelwinDarwinShellStructure(t *testing.T) {
 				t.Errorf("panelwin_darwin.m 缺少 %q(open 分派不完整)", want)
 			}
 		}
-		// 未知类型默认忽略:协议冻结(quit/open 两类型),handler 必须有
-		// 显式忽略分支(注释锚点),不得崩。
+		// 未知类型默认忽略:类型白名单(quit/open/resize,新增需双侧同批),
+		// handler 必须有显式忽略分支(注释锚点),不得崩。
 		if !strings.Contains(src, "未知类型") {
-			t.Errorf("panelwin_darwin.m 缺少「未知类型」忽略分支(协议冻结:未知 type 必须忽略不崩)")
+			t.Errorf("panelwin_darwin.m 缺少「未知类型」忽略分支(类型白名单:未知 type 必须忽略不崩)")
 		}
 	})
 
@@ -195,6 +196,46 @@ func TestPanelwinDarwinShellStructure(t *testing.T) {
 			t.Errorf("panelwin_darwin.m 出现未归类的 C 函数 %q:请判断它是否会被 Go goroutine 直接调用并登记到对应清单", fn)
 		}
 	})
+}
+
+// TestPanelwinDarwinResizeFollow — resize 高度自适应链(2026-11-28 用户
+// 拍板)的 .m 结构断言:height 过 NSNumber 类闸(畸形 payload 不得崩)、
+// clamp [280, 顶边-8]、顶边固定向下生长的 setFrame 形态(topY - newH)。
+// macOS 托盘恒菜单栏,resize 恒顶边固定;Windows 侧 side-aware 在
+// panelwin_windows_struct_test.go 锚。
+func TestPanelwinDarwinResizeFollow(t *testing.T) {
+	src := panelwinDarwinSource(t)
+
+	// ① resize 分派在册(类型白名单第三类型)。
+	dispIdx := strings.Index(src, `@"resize"`)
+	if dispIdx < 0 {
+		t.Fatal("panelwin_darwin.m 缺 resize 分派(高度自适应链断裂):\n" + src)
+	}
+
+	// ② height 提取必须过 NSNumber 类闸(两段提取:NSDictionary 直取与
+	//    JSON 字符串兜底解析;{"height":"abc"} 这类形态不得 unrecognized
+	//    selector 崩)。
+	if got := strings.Count(src, "isKindOfClass:[NSNumber class]"); got < 2 {
+		t.Errorf("panelwin_darwin.m 的 height 提取缺 isKindOfClass:[NSNumber class] 守卫(需 ≥2 处=两段提取,现 %d 处):畸形 payload {\"height\":\"abc\"} 会崩", got)
+	}
+
+	// ③ 顶边固定 setFrame 形态:origin.y = 顶边 - 新高(全局左下原点),
+	//    display:YES animate:NO(高度跟随即时生效,不做动画)。
+	for _, want := range []string{
+		"topY - newH",                // 顶边固定的 origin.y 形态
+		"topY - 8",                   // 屏幕下缘留 8 的钳高
+		"setFrame:NSMakeRect(f.origin.x, topY - newH, f.size.width, newH)",
+		"animate:NO",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("panelwin_darwin.m 缺少 %q(resize 顶边固定跟随形态不完整)", want)
+		}
+	}
+
+	// ④ 最低可用高 280 在册(防 height 畸形小值把窗压成一条线)。
+	if !strings.Contains(src, "newH < 280") {
+		t.Error("panelwin_darwin.m 缺少 newH < 280 最低可用高钳制(畸形 height 会把窗压成一条线)")
+	}
 }
 
 // poolWrappedEntries — 会被 Go goroutine 所在线程直接调到的 C 入口:

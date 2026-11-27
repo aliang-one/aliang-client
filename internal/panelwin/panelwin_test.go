@@ -184,15 +184,18 @@ func TestAllowDocument(t *testing.T) {
 	}
 }
 
-// WebMessage 协议冻结(Task 7 评审固化):只有 quit/open 两类型;未知类型
-// 必须被识别为「忽略」而非崩溃。
+// WebMessage 类型白名单(Task 7 评审固化;resize 为 2026-11-28 用户拍板的
+// 追加):quit/open/resize 三类型;未知类型必须被识别为「忽略」而非崩溃。
+// resize 的 height 三态:合法数值随 typ 返回;缺失/非数值时 height=0 且
+// known 仍 true(类型认、值拒,调用方自行忽略)。
 func TestParseHostMessage(t *testing.T) {
 	cases := []struct {
-		name      string
-		payload   string
-		wantType  string
-		wantKind  string
-		wantKnown bool
+		name       string
+		payload    string
+		wantType   string
+		wantKind   string
+		wantHeight float64
+		wantKnown  bool
 	}{
 		{
 			name: "quit", payload: `{"type":"quit"}`,
@@ -211,6 +214,26 @@ func TestParseHostMessage(t *testing.T) {
 			wantType: "open", wantKnown: true,
 		},
 		{
+			name: "resize 合法整数 height", payload: `{"type":"resize","height":420}`,
+			wantType: "resize", wantHeight: 420, wantKnown: true,
+		},
+		{
+			name: "resize 合法小数 height", payload: `{"type":"resize","height":420.7}`,
+			wantType: "resize", wantHeight: 420.7, wantKnown: true,
+		},
+		{
+			name: "resize 缺 height→height=0 但 known=true", payload: `{"type":"resize"}`,
+			wantType: "resize", wantKnown: true,
+		},
+		{
+			name: "resize height 非数值→height=0 但 known=true", payload: `{"type":"resize","height":"abc"}`,
+			wantType: "resize", wantKnown: true,
+		},
+		{
+			name: "resize height null→height=0 但 known=true", payload: `{"type":"resize","height":null}`,
+			wantType: "resize", wantKnown: true,
+		},
+		{
 			name: "未知类型→忽略不崩", payload: `{"type":"panel_ready"}`, wantKnown: false,
 		},
 		{
@@ -225,10 +248,10 @@ func TestParseHostMessage(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			typ, kind, known := ParseHostMessage(tc.payload)
-			if typ != tc.wantType || kind != tc.wantKind || known != tc.wantKnown {
-				t.Fatalf("ParseHostMessage(%q) = (%q,%q,%v), want (%q,%q,%v)",
-					tc.payload, typ, kind, known, tc.wantType, tc.wantKind, tc.wantKnown)
+			typ, kind, height, known := ParseHostMessage(tc.payload)
+			if typ != tc.wantType || kind != tc.wantKind || height != tc.wantHeight || known != tc.wantKnown {
+				t.Fatalf("ParseHostMessage(%q) = (%q,%q,%v,%v), want (%q,%q,%v,%v)",
+					tc.payload, typ, kind, height, known, tc.wantType, tc.wantKind, tc.wantHeight, tc.wantKnown)
 			}
 		})
 	}

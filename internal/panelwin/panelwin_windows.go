@@ -10,7 +10,8 @@
 // 不得反向依赖 app 包(二审阻塞 2)——下方自含一份十几行的 DPI 声明。
 //
 // 生命周期:WM_ACTIVATE 失活 → 退出码 0(失焦自退);页面 quit 消息 →
-// 退出码 60;open 消息 → ShellExecute 开默认浏览器后驻留。退出码契约见
+// 退出码 60;open 消息 → ShellExecute 开默认浏览器后驻留;resize 消息 →
+// applyHeight 跟随改窗高(高度自适应,2026-11-28 用户拍板)。退出码契约见
 // panelwin.go(Task 14 launcher:0/60 正常关闭,其余=崩溃)。
 //
 // 前台交接:显示前必须 SetForegroundWindow——companion spawn 时的
@@ -218,6 +219,47 @@ func runPanelWindow(opts Options) error {
 		uintptr(swpNoZOrder|swpNoActivate),
 	)
 
+	// 面板高度自适应(2026-11-28 用户拍板):前端量内容高后发 resize 消息,
+	// 壳 clamp 后跟随改窗口高度,超过屏幕可用高才页内滚动。applyHeight 按
+	// opts.Side 锚定边重排:逻辑高×scale 落物理,当前物理矩形用局部变量
+	// 跟踪(初始化=重锚结果,resize 后更新)——消息循环单线程驱动无并发,
+	// 不回读 GetWindowRect,局部量即权威。
+	curX, curY, curW, curH := reX, reY, int(physW), int(physH)
+	applyHeight := func(logicalH float64) {
+		newH := int(logicalH * scale)
+		if newH <= 0 || newH == curH {
+			return // 退化值/无变化:零操作
+		}
+		newY := curY
+		switch opts.Side {
+		case SideTop:
+			// 顶边固定,向下生长:y 不变;超出主屏工作区(workH=SM_CYFULLSCREEN
+			// 物理高,0=采样失败/未知则不钳)时钳高。
+			if workH > 0 && curY+newH > workH {
+				newH = workH - curY
+			}
+		default:
+			// 底边固定,向上生长:锚定底边 y+高 不动,y += 旧物理高-新物理高。
+			// 过度上生长挤过屏顶时钳:y<8 拉回 8,高度随之回补(保住 8 物理
+			// px 顶边可见,面板不没入屏幕外)。
+			newY = curY + curH - newH
+			if newY < 8 {
+				newH += curY - 8
+				newY = 8
+			}
+		}
+		if newH <= 0 {
+			return
+		}
+		procSetWindowPos.Call(
+			hwnd, 0,
+			uintptr(int32(curX)), uintptr(int32(newY)),
+			uintptr(curW), uintptr(newH),
+			uintptr(swpNoZOrder|swpNoActivate),
+		)
+		curY, curH = newY, newH
+	}
+
 	// ③ 圆角 + 亚克力(Win11 22621+);低版本 DwmSetWindowAttribute 返回
 	// 失败,静默降级为纯半透明底(前端半透明底色仍是完整可用的形态)。
 	setDwmAttributeU32(hwnd, dwmwaWindowCornerPreference, dwmwcpRound)
@@ -281,9 +323,10 @@ func runPanelWindow(opts Options) error {
 	}
 
 	// ⑨ 消息 handler:quit → 退出码 60;open → ShellExecute 开默认浏览器
-	// 后驻留;未知类型默认忽略不崩(协议冻结:quit/open 两类型)。
+	// 后驻留;resize → applyHeight 跟随改窗高;未知类型默认忽略不崩(类型
+	// 白名单:quit/open/resize,新增需双侧同批)。
 	chromium.MessageCallback = func(payload string) {
-		typ, kind, known := ParseHostMessage(payload)
+		typ, kind, height, known := ParseHostMessage(payload)
 		if !known {
 			return // 未知类型/垃圾 JSON:忽略
 		}
@@ -296,6 +339,15 @@ func runPanelWindow(opts Options) error {
 				openInDefaultBrowser(target)
 			}
 			// open 后驻留。
+		}
+		if typ == "resize" {
+			// height 缺失/非数值时 ParseHostMessage 返回 0,过不了最低阈值;
+			// >120 才受理(正常内容高恒在其上,这里是壳侧对畸形/退化值的
+			// 兜底,塌缩成一条线的窗高不予跟随)。
+			if height > 120 {
+				applyHeight(height)
+			}
+			// resize 后驻留。
 		}
 	}
 

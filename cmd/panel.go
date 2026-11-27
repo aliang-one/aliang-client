@@ -85,6 +85,7 @@ func runPanel(cmd *cobra.Command, args []string) error {
 		PanelH:        panelH,
 		OpenDashboard: openDashboard,
 		OpenPeer:      openPeer,
+		Side:          side, // resize 高度变化的锚定边(Windows 壳 applyHeight 消费)
 	}
 
 	logger.Info(fmt.Sprintf("panel window: anchor=(%d,%d) panel=%dx%d side=%s", x, y, panelW, panelH, side))

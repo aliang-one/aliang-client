@@ -11,11 +11,12 @@
 // 消息链会静默断裂——只用 pkg/edge.Chromium(Embed 自建 HWND + MessageCallback
 // + 自建消息循环)。依赖在 go.mod 钉死 pseudo-version,见 go.mod 注释。
 //
-// 与前端的契约(Task 7 评审固化):
+// 与前端的契约(Task 7 评审固化;resize 为 2026-11-28 用户拍板的追加):
 //   - 页面经 window.webkit.messageHandlers.panel.postMessage(macOS)或
-//     window.chrome.webview.postMessage(Windows)发 JSON;协议冻结为
-//     {"type":"quit"} 与 {"type":"open","kind":"dashboard"|"peer"} 两类型,
-//     未知类型默认忽略,不得崩。
+//     window.chrome.webview.postMessage(Windows)发 JSON;类型白名单为
+//     {"type":"quit"}、{"type":"open","kind":"dashboard"|"peer"} 与
+//     {"type":"resize","height":<数值>}(高度自适应)三类型;新增类型需
+//     双侧同批(前端+双平台壳),未知类型默认忽略,不得崩。
 //   - 页面检测到宿主后给 <html> 打 hosted 类,底色转透明——壳必须
 //     drawsBackground=false(macOS)/WebView2 透明背景(Windows)+ 系统材质层
 //     铺底,否则半透明面板底色失去意义、毛玻璃验收必挂。
@@ -48,8 +49,10 @@ const (
 	ExitQuit      = 60 // 页面 quit 消息
 )
 
-// 面板默认逻辑尺寸(spec §4 面板 340px 宽;高度固定 560,不做自适应——
-// 「明确不做」清单)。
+// 面板默认逻辑尺寸(spec §4 面板 340px 宽;高度默认 560)。高度自适应
+// (2026-11-28 用户拍板,推翻此前「固定 560 不做自适应」的明确不做清单):
+// 页面量内容高经 resize 消息上报,壳 clamp 后跟随改窗口高度——默认值只是
+// 首帧形态,稳态高度由页面内容决定。
 const (
 	DefaultPanelW = 340
 	DefaultPanelH = 560
@@ -69,6 +72,11 @@ type Options struct {
 	// (v1 两 kind 均传仪表盘根 URL,见实现计划)。
 	OpenDashboard string
 	OpenPeer      string
+	// Side —— resize 高度变化的锚定边:top=顶边固定向下生长(y 不变),
+	// bottom=底边固定向上生长(y += 旧物理高-新物理高)。macOS 托盘恒菜单
+	// 栏不消费本字段(恒顶边固定);Windows 壳按它重排 y(panelwin_windows.go
+	// applyHeight)。未知值兜底按 bottom(与 AnchorToWindowPos 同口径)。
+	Side Side
 }
 
 // OpenTarget —— open 消息按 kind 取目标 URL;未知 kind 返回空串=忽略分派
@@ -204,29 +212,42 @@ func AllowDocument(uri, allowOrigin string) bool {
 	return strings.EqualFold(origin, allowOrigin)
 }
 
-// ParseHostMessage —— WebMessage 协议解析(协议冻结:quit/open 两类型)。
-// 返回 (type, kind, known);known=false 的形态(未知 type、垃圾 JSON、
-// 非 JSON 主体)由调用方直接忽略,不得崩。kind 仅对 open 有意义。
-func ParseHostMessage(payload string) (typ string, kind string, known bool) {
+// ParseHostMessage —— WebMessage 协议解析(类型白名单:quit/open/resize,
+// 新增需双侧同批)。返回 (type, kind, height, known);known=false 的形态
+// (未知 type、垃圾 JSON、非 JSON 主体)由调用方直接忽略,不得崩。kind 仅
+// 对 open 有意义;height 仅对 resize 有意义——height 缺失或非数值(字符串、
+// null、对象等)时返回 0 但 known 仍 true:类型合法、值非法,由调用方自行
+// 忽略(Windows 壳以最低阈值闸过滤)。
+func ParseHostMessage(payload string) (typ string, kind string, height float64, known bool) {
+	// Height 用 RawMessage 拆值:直接 float64 会在 height 为非数值时让整体
+	// Unmarshal 报 UnmarshalTypeError、known 被打成 false——类型白名单口径
+	// 是「类型认、值拒」,故拆出来单独解,解不动落 0(known 仍 true)。
 	var m struct {
-		Type string `json:"type"`
-		Kind string `json:"kind"`
+		Type   string          `json:"type"`
+		Kind   string          `json:"kind"`
+		Height json.RawMessage `json:"height"`
 	}
 	trimmed := strings.TrimSpace(payload)
 	if trimmed == "" {
-		return "", "", false
+		return "", "", 0, false
 	}
 	if err := json.Unmarshal([]byte(trimmed), &m); err != nil {
-		return "", "", false
+		return "", "", 0, false
 	}
 	switch m.Type {
 	case "quit":
-		return "quit", "", true
+		return "quit", "", 0, true
 	case "open":
-		return "open", m.Kind, true
+		return "open", m.Kind, 0, true
+	case "resize":
+		var h float64
+		if len(m.Height) > 0 && json.Unmarshal(m.Height, &h) == nil {
+			return "resize", "", h, true
+		}
+		return "resize", "", 0, true
 	default:
-		// 未知类型默认忽略(协议冻结;前端已删除协议外 panel_ready):
+		// 未知类型默认忽略(类型白名单;前端已删除协议外 panel_ready):
 		// 返回空 type,调用方拿到 known=false 直接丢弃,零分派零崩溃。
-		return "", "", false
+		return "", "", 0, false
 	}
 }
