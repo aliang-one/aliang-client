@@ -56,7 +56,9 @@ func (a *aiEndpointSelectorAdapter) Acquire(id string, maxConcurrency int) (func
 func (a *aiEndpointSelectorAdapter) ReportSuccess(id string) { a.svc.ReportSuccess(id) }
 
 func (a *aiEndpointSelectorAdapter) ReportFailure(id string, status int, errMsg string) {
-	a.svc.ReportFailure(id, status, errMsg)
+	// 路由层接口仍是三参(Task 3 才加 until):本任务先传 0 = 无预解析,
+	// service 按状态自行推导(429 回落组策略)。Task 5 补响应头解析后在此透传。
+	a.svc.ReportFailure(id, status, errMsg, 0)
 }
 
 func (a *aiEndpointSelectorAdapter) ModelsUnion() []map[string]any {
