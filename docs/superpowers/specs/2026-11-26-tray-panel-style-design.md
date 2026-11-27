@@ -87,8 +87,9 @@
 - 点组头展开/收起：chevron 旋转 180°，列表 `max-height` 0→200px 过渡 0.25s。
 - 列表项：单选 radio 语义——14px 圆形勾选圈（选中 = 品牌绿实底白勾）+ endpoint 名（11.5px/600，截断）+ 优先级徽标（P1/P2，绿描边 ghost）。
 - **优先级徽标映射**：endpoint-manager 的整数 `priority`（默认 50，越小越优先）在组内按升序排名映射为 P1 / P2 / P3…；`auto_group=0`（不进 auto 池）或未设优先级的显示「—」。
-- **不可用 endpoint 的渲染**：`health_status='cooldown'`（含 429 专用冷却）→ 置灰（0.55 透明）+ 琥珀「冷却 Xm」徽标，不可选（点击 toast 提示）；`health_status='disabled'`（摘除）→ 同款置灰 + 琥珀「已摘除」徽标，不可选；`enabled=0`（用户手动停用）→ **不渲染**（用户刻意停用的不出现在托盘，管理归仪表盘）。
+- **不可用 endpoint 的渲染**：`health_status='cooldown'`（含 429 专用冷却）→ 置灰（0.55 透明）+ 琥珀「冷却 Xm」徽标；**托盘 v1 拍板：可点击激活（放行且不清零冷却，激活后行仍显示冷却徽标直至懒恢复；激活会把同组其余 enabled 行互斥置 0）**；`health_status='disabled'`（摘除）→ 同款置灰 + 琥珀「已摘除」徽标，不可选（点击 toast「已摘除的行请先在仪表盘恢复」零请求）；`enabled=0`（用户手动停用）→ **不渲染**（用户刻意停用的不出现在托盘，管理归仪表盘）。
 - **单选即激活**：点击候选项立即切换该组激活 endpoint（勾移动 + 组头 g-current 更新 + toast 反馈）。实现层注意：此交互与 auto 组「按优先级 failover」是两种调度语义，托盘单选 = 将该组流量钉到选定 endpoint；如何兼容 auto 池由功能会话对齐，本 spec 只定展示与交互。
+  - **2026-11-27 落地裁定（钉选增量）**：v1 实现为「组内互斥激活」——点击 `rank≥1` 且非 disabled 的行 = 该行 `enabled=1`、同协议组内其余 `auto_group=1` 非 builtin 行 `enabled=0`（builtin 兜底行不参与互斥）；`rank=0`（builtin/`auto_group=0`）行与 disabled 行点击仅本地 toast、不发请求；点击已是勾选态的行 = 空操作（避免互斥连带关停同组冷却行）；在途单飞；乐观勾移 + summary 回读确认，失败/未确认回滚。勾选态按行字段推定（`rank` 最小的 ok 池行；池全冷却回落 builtin 名字），不用 `current==name` 名字匹配（重名行不撞车）。toast 带组名上下文（「组 → 名」）。二期 endpoint-phase2 §5.6（激活迁移清零）合入后自动升级，托盘零改动。
 
 ### 4.5 AI AGENT 区
 - 分区标题「AI AGENT · 24H」。
@@ -141,7 +142,7 @@
 3. **模式切换**：即时切换选中态 + toast；运行中切换是否热切换由功能会话拍板。
 4. **AI 加速开关**：关 → provider 行与 endpoint 区降透明（0.35）+ 锁交互；开 → 恢复。toast 反馈。
 5. **provider 图标**：点亮由检测驱动；点击查详情（toast/popover）。
-6. **endpoint 组**：组头点开展开/收起；列表项单选即激活（勾移动 + 组头 g-current 淡入更新 + toast「Anthropic 组 → glm-coding-plan」）；冷却项不可选。
+6. **endpoint 组**：组头点开展开/收起；列表项单选即激活（勾移动 + 组头 g-current 更新 + toast「Anthropic 组 → glm-coding-plan」；v1 组头名更新为瞬切，淡入过渡留作样式打磨）；冷却项可激活（v1 拍板：放行且不清零冷却，徽标持续至懒恢复——覆盖本行此前「不可选」）。
 7. **agent 卡片**：点击展开/收起 24h 会话明细。
 8. **底部三键**：外部动作——仪表盘开浏览器、设备互访开互访页、退出弹确认后退出。
 9. 通用：所有破坏性/外部动作均有 toast 或确认兜底；面板内不做页面跳转，重操作（endpoint 增删改、会话管理）一律引导去仪表盘。
