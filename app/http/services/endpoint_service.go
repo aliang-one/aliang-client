@@ -911,6 +911,12 @@ func (s *EndpointService) SetPolicy(p *config.EndpointGroupPolicy) error { retur
 //     仪表盘重新启用。这是钉选持久性的必要代价:若豁免摘除同行,它会在
 //     冷却到期的懒恢复后带着 enabled=1 重进池,radio 钉选即被击穿。
 //     Exclusive 测试钉死该行为。
+//   - 跨组连带与显式点名的知情取舍(终审修复批补记,勿当缺陷修):enabled
+//     是行级全局开关——同开 anthropic∧openai 双 toggle 的行被任一组互斥
+//     关停后,会从另一组的调度池一并消失(该组无其他候选时回落 builtin);
+//     被显式 X-Endpoint-Id 点名的行若恰在同组内且 enabled=1,同样被连带
+//     置 0,此后 selectExplicit 对它 404「已停用」(等价 dashboard 手动停用
+//     的预存语义)。托盘操作者对两处连带均无提示(plan 挂账③④)。
 //
 // 落库走管理面既有持久化路径(store.Update 白名单整行,Get→改列→Update,
 // 同 HandleUpdate 的写法):互斥只写配置列,健康列不被触碰。写序=先互斥关
@@ -920,7 +926,8 @@ func (s *EndpointService) SetPolicy(p *config.EndpointGroupPolicy) error { retur
 // 健康态写仍只走 Report*/ResetHealth 的锁内 UpdateHealth)。已知取舍:
 // 整组写是「一次 List 后逐行整行写穿配置列」,并发管理面 PUT 落在 List 与
 // 某行 Update 之间会被旧值静默回滚——并发面与 HandleUpdate 同级,但窗口
-// 横跨整组(家族一致,plan 已接受)。
+// 横跨整组(家族一致;plan 风险段已按 N+1 写窗如实记录,并发 activate 交错
+// 另见 plan 挂账②)。
 func (s *EndpointService) ActivateInGroup(protocol, targetID string) error {
 	protocol = strings.ToLower(strings.TrimSpace(protocol))
 	targetID = strings.TrimSpace(targetID)

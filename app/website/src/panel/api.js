@@ -35,9 +35,14 @@ const RUN_MODE_PATH = '/api/run/swift';
 //   目标不存在/protocol 不匹配→404(ErrEndpointNotAvailable)、builtin 兜底行/
 //   auto_group=0/已摘除→400(ErrEndpointNotActivatable)、registry 不可用→
 //   HTTP 500+业务码 201。这些 common.Error* 路径的信封 body 恒带服务端人话
-//   msg(app/http/common/response.go Error)。例外:非 POST→405 是 handler 直接
-//   http.Error("Method not allowed") 的纯文本、【不是信封】;客户端恒发 POST,
-//   该分支实际不可达,万一读不到 msg 会回落 HTTP 文案。
+//   msg(app/http/common/response.go Error)。来源闸(终审修复批):回环 ∥
+//   dashboard 会话双闸——面板与 core 同进程同源(回环)免 cookie 可用,与
+//   /api/tray/summary、聊天 WS 握手同档;非回环来源无会话 → 401 信封英文
+//   msg「Authenticated dashboard session is required」(LAN/远端防御态,面板
+//   正常形态不会命中;组件 humanizeActionError 有对应转译兜底)。例外:
+//   非 POST→405 是 handler 直接 http.Error("Method not allowed") 的纯文本、
+//   【不是信封】;客户端恒发 POST,该分支实际不可达,万一读不到 msg 会回落
+//   HTTP 文案。
 const ENDPOINT_ACTIVATE_PATH = '/api/endpoints/activate';
 
 // getSummary 的超时预算:面板 2s 轮询一次,超时 1.5s 保证不堆叠

@@ -497,7 +497,7 @@ describe('EndpointZone 挂载 DOM 契约', () => {
     expect(refresh).toHaveBeenCalledTimes(1);
     // 成功 toast
     const t = useToast().toasts.value.at(-1);
-    expect(t.msg).toBe('已激活「Anthropic → glm-coding-plan」');
+    expect(t.msg).toBe('已激活「Anthropic 组 → glm-coding-plan」');
     expect(t.kind).toBe('success');
     // 勾移:新行亮勾,旧行回空圈
     const items = qa(el, '.ep-item');
@@ -608,7 +608,7 @@ describe('EndpointZone 挂载 DOM 契约', () => {
     expect(api.activateEndpoint).toHaveBeenCalledWith('anthropic', 'id-byo-relay-02');
     expect(refresh).toHaveBeenCalledTimes(1);
     const t = useToast().toasts.value.at(-1);
-    expect(t.msg).toBe('已激活「Anthropic → byo-relay-02」（冷却中，约 2 分钟后恢复）');
+    expect(t.msg).toBe('已激活「Anthropic 组 → byo-relay-02」（冷却中，约 2 分钟后恢复）');
     expect(t.kind).toBe('success');
     // 勾选落 builtin 兜底行(调度真值:目标行冷却中,selectAuto 回落 builtin),
     // 目标行不亮勾——回读确认仍通过(激活本身已生效)。刷新后同行 glm 退清单,
@@ -619,7 +619,7 @@ describe('EndpointZone 挂载 DOM 契约', () => {
     expect(items[1].className).not.toContain('on');
   });
 
-  it('rank=0 行(builtin 兜底/auto_group=0/未设优先级,含冷却中)点击 → 本地 warn toast,零请求', async () => {
+  it('rank=0 行(builtin 兜底/auto_group=0/未设优先级,含冷却中)点击 → 本地 warn toast(中性文案),零请求', async () => {
     const { el } = mountZone({ endpoints: demoEndpoints(), ai: makeAI(true) });
     q(el, '.g-head').click();
     await flush();
@@ -628,7 +628,10 @@ describe('EndpointZone 挂载 DOM 契约', () => {
     item.click();
     await flushAsync();
     const t = useToast().toasts.value.at(-1);
-    expect(t.msg).toBe('builtin 为兜底行/该行不在 auto 调度池，激活无效');
+    // 中性文案(终审修复批):rank 池缝隙(priority=0 ∧ auto_group=1 的行在
+    // selectAuto 池里但 tray 不授 rank)未收口前,旧合并文案对该场景失真,
+    // 中性文案对 builtin/非池/在池-rank0 都准确。
+    expect(t.msg).toBe('该行不支持在面板钉选，请在仪表盘操作');
     expect(t.kind).toBe('warn');
     // 零请求:api 层与全局 fetch 双双未被触碰
     expect(api.activateEndpoint).not.toHaveBeenCalled();
@@ -639,7 +642,7 @@ describe('EndpointZone 挂载 DOM 契约', () => {
     await flush();
     qa(el, '.ep-item')[4].click();
     await flushAsync();
-    expect(useToast().toasts.value.at(-1).msg).toBe('builtin 为兜底行/该行不在 auto 调度池，激活无效');
+    expect(useToast().toasts.value.at(-1).msg).toBe('该行不支持在面板钉选，请在仪表盘操作');
     expect(api.activateEndpoint).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
   });
@@ -844,10 +847,26 @@ describe('EndpointZone 挂载 DOM 契约', () => {
     items[0].click(); // 点真实 builtin 行
     await flushAsync();
     const t = useToast().toasts.value.at(-1);
-    expect(t.msg).toBe('builtin 为兜底行/该行不在 auto 调度池，激活无效');
+    expect(t.msg).toBe('该行不支持在面板钉选，请在仪表盘操作');
     expect(t.kind).toBe('warn');
     expect(api.activateEndpoint).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('humanize 401 防御分支:服务端英文信封「Authenticated dashboard session…」→ toast「请先在仪表盘登录后重试」', async () => {
+    // 双闸后面板回环请求已不可能 401;此分支只兜非回环/异常态(代理异常改写
+    // 来源等)——英文串不上屏,给可执行的人话指引。
+    api.activateEndpoint.mockRejectedValueOnce(
+      new Error('Authenticated dashboard session is required')
+    );
+    const { el } = mountZone({ endpoints: demoEndpoints(), ai: makeAI(true) });
+    q(el, '.g-head').click();
+    await flush();
+    qa(el, '.ep-item')[1].click();
+    await flushAsync();
+    const t = useToast().toasts.value.at(-1);
+    expect(t.msg).toBe('请先在仪表盘登录后重试');
+    expect(t.kind).toBe('warn');
   });
 
   it('勾选圈只钉在推定行(白勾 svg);其余行空圈', () => {

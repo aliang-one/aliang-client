@@ -243,23 +243,31 @@ export default {
     // humanizeActionError — 错误 toast 人话化(与 TransportRow 同口径,本
     // 组件本地一份:面板组件自含不互引):api 层超时转译串(含「超时」)→
     // 明确提示重试;网络/HTTP 层错(TypeError / 「…失败: HTTP xxx」)→
-    // 通用稍后重试;其余是服务端人话 msg(如「已摘除的行请先在仪表盘恢复」),
+    // 通用稍后重试;401 信封英文串(「Authenticated dashboard session…」,
+    // 非 POST 动作不会命中的防御态:后端 activate 是回环∥会话双闸,面板
+    // 回环请求本不该 401,只有代理异常改写来源等异常态才会走到)→ 提示去
+    // 仪表盘登录;其余是服务端人话 msg(如「已摘除的行请先在仪表盘恢复」),
     // 原样上屏——它好于任何技术转译串。
     function humanizeActionError(err) {
       const msg = err && err.message ? String(err.message) : '';
       if (!msg) return '激活失败，请稍后重试';
+      if (msg.includes('Authenticated dashboard session')) return '请先在仪表盘登录后重试';
       if (msg.includes('超时')) return '激活超时，请重试';
       if (err instanceof TypeError || /HTTP \d+/.test(msg)) return '激活失败，请稍后重试';
       return msg;
     }
 
     // onItem — 行点击(radio 真激活,plan 2026-11-27 Task 3 语义裁定):
-    //   rank=0/缺 id 行 → 本地 warn toast 零请求。rank 池口径如实说明:rank
-    //     只授给 auto_group ∧ priority>0 的行(tray_summary.go:388 的 rankOf),
-    //     selectAuto 的候选池却只看 enabled∧auto_group——priority=0 且
-    //     auto_group=1 的行后端 ActivateInGroup 会接受,面板这里却因 rank=0
-    //     本地拒绝。这是已挂账的计划层缝隙(待产品对齐),本闸【不与后端
-    //     同构】,不能把 rank 闸当成 builtin/非池闸的完整等价物;
+    //   rank=0/缺 id 行 → 本地 warn toast 零请求,文案中性(「该行不支持在
+    //     面板钉选，请在仪表盘操作」)。为什么中性:rank 池口径如实说明——
+    //     rank 只授给 auto_group ∧ priority>0 的行(tray_summary.go:388 的
+    //     rankOf),selectAuto 的候选池却只看 enabled∧auto_group——priority=0
+    //     且 auto_group=1 的行后端 ActivateInGroup 会接受,面板这里却因
+    //     rank=0 本地拒绝。这是已挂账的计划层缝隙(待产品对齐,见钉选计划
+    //     挂账清单),本闸【不与后端同构】,不能把 rank 闸当成 builtin/非池
+    //     闸的完整等价物——旧文案「builtin 为兜底行/该行不在 auto 调度池」
+    //     对这种在池行失真,中性文案对 builtin/非池/在池-rank0 三种场景都
+    //     准确,缝隙收口前先不指认具体原因;
     //   disabled 行(rank>=1 池内摘除行)→ 本地 warn toast 零请求(后端 400
     //     同文案「已摘除的行请先在仪表盘恢复」);
     //   已勾选行(it.on)→ 静默早退(见下方「A」注释:radio 空操作);
@@ -271,7 +279,7 @@ export default {
     async function onItem(g, it) {
       if (!model.value.aiOn) return;
       if (it.rank < 1 || !it.id) {
-        toast.show('builtin 为兜底行/该行不在 auto 调度池，激活无效', 'warn');
+        toast.show('该行不支持在面板钉选，请在仪表盘操作', 'warn');
         return;
       }
       if (it.state === 'disabled') {
@@ -304,13 +312,15 @@ export default {
           toast.show('激活结果未确认，请稍后查看', 'warn');
           return; // finally 释放 pending,勾选回派生值(回滚)
         }
-        // 成功 toast:带组名上下文(spec §6-6「Anthropic 组 → 名」口径);
-        // cooldown 行附冷却恢复预期(分钟向上取整,徽标同口径)。
+        // 成功 toast:带组名上下文(spec §6-6 逐字契约「Anthropic 组 →
+        // glm-coding-plan」),用 g.name=「Anthropic 组」(带「组」后缀;
+        // g.label 是裸协议名,§6-6 口径不含);cooldown 行附冷却恢复预期
+        // (分钟向上取整,徽标同口径)。
         if (wasCooldown) {
           const min = Math.max(1, Math.ceil((it.cooldownSec || 0) / 60));
-          toast.show(`已激活「${g.label} → ${it.name}」（冷却中，约 ${min} 分钟后恢复）`);
+          toast.show(`已激活「${g.name} → ${it.name}」（冷却中，约 ${min} 分钟后恢复）`);
         } else {
-          toast.show(`已激活「${g.label} → ${it.name}」`);
+          toast.show(`已激活「${g.name} → ${it.name}」`);
         }
       } catch (err) {
         toast.show(humanizeActionError(err), 'warn');

@@ -707,3 +707,64 @@ func TestEndpointHandlerActivateContract(t *testing.T) {
 		t.Fatalf("缺 id 应 400, got %d", rec.Code)
 	}
 }
+
+// TestEndpointHandlerActivateSourceGate activate 专用来源闸:回环 ∥ dashboard
+// 会话双闸(终审修复批,先于实现写——纯 session 闸下回环无 cookie 必 401,本
+// 测试红即坐实缺口)。面板(托盘开 127.0.0.1:56431/panel.html)与 core 同进程
+// 同源、从不调 POST /api/dashboard/session 自举会话,纯 session 闸下 radio
+// 每次必 401 且面板内无恢复通道。修法与 /api/tray/summary、聊天 WS 握手同档
+// 「回环免 cookie ∥ 会话」双闸:回环直通;LAN/远端来源仍须会话。家族其余
+// handler(列表/详情/增删改等管理面)保持 endpointRequireSession 不动,由
+// TestEndpointHandlerRequiresDashboardSession 继续钉。
+func TestEndpointHandlerActivateSourceGate(t *testing.T) {
+	// 回环无 cookie → 过闸。用 nil service 证明放行落点:过闸后走降级路径
+	// (HTTP 500 + 业务码 201);若闸没放行,看到的将是 401 而非 500。
+	hNil := &EndpointHandler{}
+	loopback := httptest.NewRequest(http.MethodPost, "/api/endpoints/activate",
+		strings.NewReader(`{"protocol":"anthropic","id":"ep-x"}`))
+	loopback.RemoteAddr = "127.0.0.1:55555"
+	recLoop := httptest.NewRecorder()
+	hNil.HandleEndpointActivate(recLoop, loopback)
+	codeLoop, _ := endpointDecode(t, recLoop)
+	if recLoop.Code != http.StatusInternalServerError || codeLoop != 201 {
+		t.Fatalf("回环无 cookie activate = http=%d code=%d, want 过闸后 nil service 降级(HTTP 500/业务码 201);得 401 即双闸未生效",
+			recLoop.Code, codeLoop)
+	}
+
+	// 非回环无 cookie(httptest.NewRequest 默认 RemoteAddr=192.0.2.1:1234)
+	// → 401:免 cookie 只限回环,LAN/远端来源不得外溢。
+	remote := httptest.NewRequest(http.MethodPost, "/api/endpoints/activate",
+		strings.NewReader(`{"protocol":"anthropic","id":"ep-x"}`))
+	recRemote := httptest.NewRecorder()
+	hNil.HandleEndpointActivate(recRemote, remote)
+	if recRemote.Code != http.StatusUnauthorized {
+		t.Fatalf("非回环无 cookie activate = %d, want 401(免 cookie 闸只放回环)", recRemote.Code)
+	}
+
+	// 非回环 + 有效 session cookie → 过闸:真 service 正常激活路径走通
+	// (200 信封 + 组内互斥落库),证 cookie 分支与回环分支同权。
+	svc, h, cookie := newEndpointHandlerHarnessSvc(t)
+	if err := svc.CreateEndpoint(&config.LLMEndpoint{
+		ID: "ep-gate", Name: "gate-a", BaseURL: "http://127.0.0.1:9/g",
+		ProtocolAnthropic: true, AutoGroup: true, Enabled: true, Priority: 10, Models: "[]",
+	}); err != nil {
+		t.Fatalf("create ep-gate: %v", err)
+	}
+	if err := svc.CreateEndpoint(&config.LLMEndpoint{
+		ID: "ep-gate-peer", Name: "gate-b", BaseURL: "http://127.0.0.1:9/h",
+		ProtocolAnthropic: true, AutoGroup: true, Enabled: true, Priority: 20, Models: "[]",
+	}); err != nil {
+		t.Fatalf("create ep-gate-peer: %v", err)
+	}
+	remoteAuthed := httptest.NewRequest(http.MethodPost, "/api/endpoints/activate",
+		strings.NewReader(`{"protocol":"anthropic","id":"ep-gate"}`))
+	remoteAuthed.AddCookie(cookie)
+	recAuthed := httptest.NewRecorder()
+	h.HandleEndpointActivate(recAuthed, remoteAuthed)
+	if recAuthed.Code != http.StatusOK {
+		t.Fatalf("非回环带会话 activate = %d body=%s, want 200(会话分支过闸)", recAuthed.Code, recAuthed.Body.String())
+	}
+	if got, err := svc.GetEndpoint("ep-gate-peer"); err != nil || got.Enabled {
+		t.Fatalf("会话分支应真落库互斥: peer err=%v enabled=%v", err, got != nil && got.Enabled)
+	}
+}
