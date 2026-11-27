@@ -159,7 +159,7 @@ func wrapAgentBusyRoute(h http.HandlerFunc) http.Handler {
 }
 
 func registerAgentRoutes(mux *http.ServeMux) {
-	logger.Info("[AGENT-BOOT] local_server registering_routes routes=/api/agent/status,/api/agent/sync,/api/agent/enable,/api/agent/auth-recover,/api/agent/disable,/api/agent/tools,/api/agent/protocol,/api/agent/tools/launch,/api/agent/ai/approval-hook,/api/agent/ai/stream,/api/agent/web-terminal*,/api/agent/fs/*,/api/agent/peer/*")
+	logger.Info("[AGENT-BOOT] local_server registering_routes routes=/api/agent/status,/api/agent/sync,/api/agent/enable,/api/agent/auth-recover,/api/agent/disable,/api/agent/tools,/api/agent/protocol,/api/agent/tools/launch,/api/agent/ai/approval-hook,/api/agent/ai/stream,/api/agent/web-terminal*,/api/agent/fs/*,/api/agent/peer/*,/assist/service/*")
 	agentHandler := handlers.NewAgentHandler(services.GetSharedAgentService())
 	mux.Handle("/api/agent/status", wrapAgentBusyRoute(agentHandler.HandleStatus))
 	mux.Handle("/api/agent/sync", wrapAgentBusyRoute(agentHandler.HandleSync))
@@ -205,6 +205,12 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	// core routes.go 侧同名注册只做双闸+同源闸+proxyAIStream 透传。缺任一
 	// 侧=404(双注册纪律,route_parity_test 兜底)。
 	mux.HandleFunc("/api/agent/assist/stream", agentHandler.HandleAssistStream)
+	// 远程协助同构代理路由(P2 Task 2,spec §7.3/§8.3):core 侧 routes.go
+	// 同名注册;本腿会话闸读进程内快照,剥 /assist/service 前缀反代 core
+	// 管理口(SessionOwnerAddr 解析链)。方法白名单在 handler 内统一裁决
+	// (镜像操作面须放行写方法,评审修订;裸路径注册,同 gates 形态)。
+	// 缺任一侧=404(双注册纪律,route_parity_test 兜底)。
+	mux.HandleFunc("/assist/service/", agentHandler.HandleAssistServiceProxy)
 	mux.HandleFunc("/api/agent/operations/events", agentHandler.HandleOperationEvents)
 	mux.HandleFunc("/api/agent/ai/approval-hook", agentHandler.HandleAIApprovalHook)
 	// agent-as-MCP 工具面端点（spec §7）：真身在此（AI 管理器住本 runtime），

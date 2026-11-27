@@ -64,8 +64,9 @@ func TestWebTerminalCommandRejectsForgedCookie(t *testing.T) {
 }
 
 func TestWebTerminalCommandResetRequiresLoopback(t *testing.T) {
-	// 有效 cookie 过闸门②后,reset 的 loopback-only 拦截必须在 proxyIfNeeded
-	// 之前(core 腿拦截;runtime 侧天然 loopback 拦不住)。
+	// 有效 cookie 过闸门②后,reset 的 loopback-only 在 core 腿预 proxy 拦截
+	// (便利层预检;权威闸在服务层 loopback 布尔,见 WebTerminalRunCommand
+	// case "reset" 与 TestWebTerminalResetServiceGateDefeatsProxyJumpShape)。
 	h := NewAgentHandler(nil)
 	rec := httptest.NewRecorder()
 	h.HandleWebTerminalCommand(rec, webTerminalGateRequest(http.MethodPost, "/api/agent/web-terminal", `{"action":"reset"}`, mintDashboardCookie(t)))

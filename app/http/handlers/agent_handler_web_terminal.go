@@ -36,15 +36,29 @@ const WebTerminalTokenHeader = "X-Web-Terminal-Token"
 // 恒真,只能靠此头区分 LAN cookie 来源与 loopback 来源,审计 origin 才真实。
 const WebTerminalLoopbackHeader = "X-Aliang-WT-Loopback"
 
+// webTerminalLoopbackCookieMarker 真-source=cookie 的显式背书哨兵(P2 评审
+// Fix 2):同构代理路由(/assist/service/*)的透传腿按入腿真源决策写入——
+// 上游(core 侧 handler)的入口 mark 只见本跳 RemoteAddr=拨号源(恒 loopback),
+// 无哨兵时按本跳重标会把 LAN cookie 真源洗成 loopback,fs_*/lock 等审计与
+// bad-token 豁免判定失真。伪造面收口:伪 "1" 仍走 Del-first(mark 只对哨兵
+// 早期返回);伪哨兵只能把审计写成保守方向的 cookie、且拿不到 bad-token
+// lock 的 loopback 豁免(loopback=false 才走严格拒),无权限增益。
+const webTerminalLoopbackCookieMarker = "cookie"
+
 // markWebTerminalLoopbackSource 真源标记(仅 core 腿执行):先无条件 Del 再按
 // IsLoopbackRequest 决定 Set——Del 不可省:LAN 客户端伪造同名头若不被剥净,会经
 // proxy 原样透传,在 runtime 侧冒充 loopback(lock 坏令牌豁免/审计标记都会被
-// 冒充)。runtime 腿(IsUserAgentRuntime)不做标记:头是 core 透传来的真源凭证,
-// 按本跳 RemoteAddr(proxy 拨号恒 loopback)重写会把 LAN 又误标回 loopback。
-// 直呼 runtime HTTP 口的本机进程无此头 → 按无头=cookie 保守误标(审计价值在
-// 区分 LAN;直呼路径归属 loopback 的场景经 core 走即可正确标记)。
+// 冒充)。唯一例外是显式 cookie 哨兵(见常量注记):它只能来自代理透传腿按
+// 入腿真源的背书,采信跳过重标。runtime 腿(IsUserAgentRuntime)不做标记:头是
+// core 透传来的真源凭证,按本跳 RemoteAddr(proxy 拨号恒 loopback)重写会把
+// LAN 又误标回 loopback。直呼 runtime HTTP 口的本机进程无此头 → 按无头=cookie
+// 保守误标(审计价值在区分 LAN;直呼路径归属 loopback 的场景经 core 走即可
+// 正确标记)。
 func markWebTerminalLoopbackSource(r *http.Request) {
 	if services.IsUserAgentRuntime() {
+		return
+	}
+	if r.Header.Get(WebTerminalLoopbackHeader) == webTerminalLoopbackCookieMarker {
 		return
 	}
 	r.Header.Del(WebTerminalLoopbackHeader)
@@ -129,7 +143,9 @@ func (h *AgentHandler) HandleWebTerminalCommand(w http.ResponseWriter, r *http.R
 		common.ErrorBadRequest(w, "Invalid request body", nil)
 		return
 	}
-	// reset 仅 loopback(core 腿拦截;runtime 侧天然 loopback)
+	// reset 仅 loopback:core 腿=便利层预检,权威闸在服务层 loopback 布尔
+	// (见 WebTerminalRunCommand case "reset"——同构代理自拨腿可把透传
+	// RemoteAddr 呈现为 loopback,仅凭本预检可被代理形穿透)
 	if action == "reset" && !middleware.IsLoopbackRequest(r) {
 		common.Error(w, common.CodeForbidden, "PIN reset is loopback only", nil)
 		return

@@ -580,7 +580,10 @@ func webTerminalChangeReason(err error) string {
 // 门语义注记(spec §6.4 字面要求 vs §11 首启流程的现实解,刻意如此勿"修"回):
 // gates 不要求令牌/loopback——首次 LAN 开启时根本不存在已解锁令牌,要求即
 // 死锁(§11 验收第 1 步依赖);lock 允许空令牌是安全方向(上锁只会收权);
-// reset 的 loopback-only 在 handler 层拦(runtime 侧天然全 loopback,拦不住)。
+// reset 的 loopback-only 双层执法:handler 预检(core 腿 RemoteAddr)=便利层,
+// 本层按校验后的 loopback 布尔执法=权威层(P2 评审 Critical 修订——同构代理
+// 自拨腿把透传 RemoteAddr 恒呈现为 loopback,仅凭 handler 预检可被代理形
+// 穿透,见 case "reset" 注记)。
 func (s *AgentService) WebTerminalRunCommand(action, pin, oldPin, newPin string, enabled *bool, token string, loopback bool) map[string]interface{} {
 	origin := "cookie"
 	if loopback {
@@ -642,18 +645,22 @@ func (s *AgentService) WebTerminalRunCommand(action, pin, oldPin, newPin string,
 		}
 		return webTerminalOkPayload(nil)
 	case "reset":
-		// loopback-only 的调用门在 handler 层(core 腿拦截)。P3.6 真源标记
-		// (X-Aliang-WT-Loopback)只修正本函数收到的 loopback 判定真伪,不改
-		// 拦截位置:reset 的 core 腿 403 仍在,[NON-LOOPBACK] 高亮经 HTTP 仍
-		// 不可达,维持防御性留痕。
-		s.webTerminal.Reset()
-		summary := "origin=" + origin
+		// reset 是 loopback-only,每一层都执法(P2 评审 Critical 修订):handler
+		// 预检(core 腿 IsLoopbackRequest 403)=便利层,本层=权威层——killall/
+		// lock 的服务级闸都按校验后的 loopback 布尔执法,reset 此前无兜底,
+		// 只靠 handler 预检。该预检在同构代理拓扑下可被代理形穿透:assist 代理
+		// (P2 Task 2 /assist/service/*)的自拨腿把 core→runtime 透传的
+		// RemoteAddr 恒呈现为 loopback,LAN cookie 持有者经
+		// /assist/service/api/agent/web-terminal {"action":"reset"} 即可清库并
+		// 重设攻击者 PIN(评审 scratch probe 端到端复现)。权威闸以
+		// webTerminalLoopbackOrigin==loopback(真源标记头校验,伪造 "1" 在 core
+		// 入腿被剥净)为准:cookie 透传腿一律拒,合法本机 reset 走 core 置 1 的
+		// 既有链路不受影响。
 		if !loopback {
-			// 防御性/HTTP 面不可达分支(handler 已 pre-proxy 403 拦死),
-			// 保留给直接服务调用方留痕。
-			summary += " [NON-LOOPBACK]"
+			return webTerminalFailPayload("loopback_only", nil)
 		}
-		s.webTerminalJournalAudit("pin_reset", summary, false)
+		s.webTerminal.Reset()
+		s.webTerminalJournalAudit("pin_reset", "origin="+origin, false)
 		return webTerminalOkPayload(nil)
 	case "lock":
 		// 空令牌允许上锁(安全方向:只会收权);带错令牌且非 loopback 才拒。
