@@ -482,6 +482,10 @@ func TestAssemblySeamsPunchThreeStates(t *testing.T) {
 				LANAddrs: []string{"192.168.1.20:56432"},
 				HostKey:  "SHA256:AAAA",
 			}},
+			// 出口链路 toggle(f5cd14c7 起是 egressPeer 取 peer 源的硬门):
+			// Enable+next_hop 钉到 peers[0],缺了整条装配恒 nil——本用例断言
+			// 的是 punch 三态,不是 toggle 门,夹具须先满足门再谈载体矩阵。
+			Fallback: &config.MeshFallbackConfig{Enable: boolPtr(true), NextHop: "dev-b"},
 		}
 	}
 
