@@ -26,7 +26,7 @@ package services
 //     errors.Is(err, ErrAssistCooldown),两层合起来即完整 429 契约。
 //
 // 复用纪律:本文件只 compose 既有夹具(fakeAssistSpawner/assistViewProbe/
-// assistHarness 及其 quiesce/read-only 读口/payloadCollector/waitUntil),
+// assistHarness 及其 quiesce/read-only 读口/payloadCollector/assistWaitUntil),
 // 不新造假件——夹具语义已在 Task 2/5/7 各自用例里钉住。
 
 import (
@@ -71,7 +71,7 @@ func newAssistContractHarness(t *testing.T) *assistHarness {
 // (create/exit 走异步腿,断言必须轮询而非裸读)。
 func contractWaitUplinkTypeFor(t *testing.T, h *assistHarness, frameType string, sid string) {
 	t.Helper()
-	if !waitUntil(5*time.Second, func() bool {
+	if !assistWaitUntil(5*time.Second, func() bool {
 		for _, f := range h.upOfTypes(frameType) {
 			if f["session_id"] == sid {
 				return true
@@ -123,7 +123,7 @@ func TestAssistContractCloudPeerFullChain(t *testing.T) {
 		"type":       models.AgentEventAssistApproved,
 		"session_id": sid,
 	}, cloudWrite)
-	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
 		t.Fatalf("approval must create the assist terminal, ws frames=%v", cloud.snapshot())
 	}
 	if got := h.spawner.spawnedCount(); got != 1 {
@@ -139,7 +139,7 @@ func TestAssistContractCloudPeerFullChain(t *testing.T) {
 		"session_id": sid,
 		"data":       "echo contract\r",
 	}, cloudWrite)
-	if !waitUntil(5*time.Second, func() bool {
+	if !assistWaitUntil(5*time.Second, func() bool {
 		h.spawner.mu.Lock()
 		defer h.spawner.mu.Unlock()
 		buf := h.spawner.inputBufs[sid]
@@ -153,7 +153,7 @@ func TestAssistContractCloudPeerFullChain(t *testing.T) {
 	probe := &assistViewProbe{}
 	s.AssistRegisterViewSink(sid, "view-contract", probe.fan)
 	h.fakeTerminalEmit(sid, "contract-output")
-	if !waitUntil(5*time.Second, func() bool {
+	if !assistWaitUntil(5*time.Second, func() bool {
 		return h.upGot("contract-output") && probe.Got("contract-output")
 	}) {
 		t.Fatalf("PTY output must fan out to both the uplink sink and the view sink (up=%v view=%d)",
@@ -166,7 +166,7 @@ func TestAssistContractCloudPeerFullChain(t *testing.T) {
 		"session_id": sid,
 		"reason":     string(AssistEndAdmin),
 	}, cloudWrite)
-	if !waitUntil(5*time.Second, func() bool { return !h.fakeTerminalAlive(sid) }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return !h.fakeTerminalAlive(sid) }) {
 		t.Fatal("cloud end must close the assist PTY")
 	}
 	endFrame, ok := probe.endFrame()
@@ -306,7 +306,7 @@ func TestAssistContractSessionIDMismatchRejected(t *testing.T) {
 		"type":       models.AgentEventAssistApproved,
 		"session_id": sid,
 	}, cloudWrite)
-	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
 		t.Fatal("approved session must create its terminal")
 	}
 
@@ -358,7 +358,7 @@ func TestAssistContractDuplicateCloudEndSwallowed(t *testing.T) {
 		"type":       models.AgentEventAssistApproved,
 		"session_id": sid,
 	}, cloudWrite)
-	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
 		t.Fatal("approved session must create its terminal")
 	}
 
@@ -368,7 +368,7 @@ func TestAssistContractDuplicateCloudEndSwallowed(t *testing.T) {
 		"session_id": sid,
 		"reason":     string(AssistEndAdmin),
 	}, cloudWrite)
-	if !waitUntil(5*time.Second, func() bool { return !h.fakeTerminalAlive(sid) }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return !h.fakeTerminalAlive(sid) }) {
 		t.Fatal("cloud end must close the assist PTY")
 	}
 	h.spawner.mu.Lock()

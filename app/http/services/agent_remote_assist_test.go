@@ -768,8 +768,8 @@ func (p *assistViewProbe) endFrame() (map[string]interface{}, bool) {
 	return nil, false
 }
 
-// waitUntil 轮询断言辅助:cond 在超时前变真返回 true。
-func waitUntil(timeout time.Duration, cond func() bool) bool {
+// assistWaitUntil 轮询断言辅助:cond 在超时前变真返回 true。
+func assistWaitUntil(timeout time.Duration, cond func() bool) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if cond() {
@@ -795,7 +795,7 @@ func TestAssistTerminalLifecycle(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
 		t.Fatal("terminal must be created at approval with home cwd")
 	}
 
@@ -803,7 +803,7 @@ func TestAssistTerminalLifecycle(t *testing.T) {
 	probe := &assistViewProbe{}
 	h.svc.assist.RegisterViewSink(sid, "view1", probe.fan)
 	h.fakeTerminalEmit(sid, "hello")
-	if !waitUntil(5*time.Second, func() bool { return h.upGot("hello") && probe.Got("hello") }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return h.upGot("hello") && probe.Got("hello") }) {
 		t.Fatalf("output must fan out to both uplink and view sinks (up=%v view=%d frames)",
 			h.upOfTypes(models.AgentEventTerminalOutput), len(probe.frames))
 	}
@@ -812,7 +812,7 @@ func TestAssistTerminalLifecycle(t *testing.T) {
 	if err := h.svc.assist.End(AssistEndAdmin); err != nil {
 		t.Fatal(err)
 	}
-	if !waitUntil(5*time.Second, func() bool { return !h.fakeTerminalAlive(sid) }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return !h.fakeTerminalAlive(sid) }) {
 		t.Fatal("end must close the assist terminal")
 	}
 	endFrame, ok := probe.endFrame()
@@ -846,7 +846,7 @@ func TestAssistTerminalCreationIsAsyncOffReadLoop(t *testing.T) {
 	if d := time.Since(start); d > time.Second {
 		t.Fatalf("approved frame handling blocked %v (create must be off the hook body)", d)
 	}
-	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
 		t.Fatal("terminal must still land asynchronously")
 	}
 }
@@ -865,7 +865,7 @@ func TestAssistTerminalRapidApproveEndRace(t *testing.T) {
 	if err := h.svc.assist.End(AssistEndClient); err != nil {
 		t.Fatal(err)
 	}
-	if !waitUntil(8*time.Second, func() bool { return !h.fakeTerminalAlive(sid) }) {
+	if !assistWaitUntil(8*time.Second, func() bool { return !h.fakeTerminalAlive(sid) }) {
 		t.Fatal("rapid approve→end must still close the terminal (in-flight create awaited)")
 	}
 }
@@ -951,7 +951,7 @@ func TestAssistTerminalPrefixRouting(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
 		t.Fatal("terminal must be live before routing input")
 	}
 	collActive, writeActive := newPayloadCollector()
@@ -965,7 +965,7 @@ func TestAssistTerminalPrefixRouting(t *testing.T) {
 	if errs := collActive.ofTypes(models.AgentEventTerminalError); len(errs) != 0 {
 		t.Fatalf("active-session input must dispatch into the engine, got errors %v", errs)
 	}
-	if !waitUntil(5*time.Second, func() bool {
+	if !assistWaitUntil(5*time.Second, func() bool {
 		h.spawner.mu.Lock()
 		defer h.spawner.mu.Unlock()
 		return strings.Contains(h.spawner.inputBufs[sid].String(), "echo routed")
@@ -1021,7 +1021,7 @@ func TestAssistTerminalPoolHeadroom(t *testing.T) {
 
 	// approved 撞满池 → EndAndSignal(AssistEndTerminalLimit):状态终态、
 	// 上行 assist.end{reason=terminal_limit}、无 PTY 被挤掉。
-	if !waitUntil(5*time.Second, func() bool {
+	if !assistWaitUntil(5*time.Second, func() bool {
 		snap := s.assist.Snapshot()
 		return snap.State == assistStateEnded && snap.EndReason == AssistEndTerminalLimit
 	}) {
@@ -1070,7 +1070,7 @@ func TestAssistTerminalCompositeWriterUplinkDropViewsLive(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
 		t.Fatal("terminal must be live")
 	}
 	// 换掉上行 sink 为失败 writer(admin 掉线等价)。还原挂 Cleanup 于换帧
@@ -1081,7 +1081,7 @@ func TestAssistTerminalCompositeWriterUplinkDropViewsLive(t *testing.T) {
 	probe := &assistViewProbe{}
 	s.assist.RegisterViewSink(sid, "view1", probe.fan)
 	h.fakeTerminalEmit(sid, "still-visible")
-	if !waitUntil(5*time.Second, func() bool { return probe.Got("still-visible") }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return probe.Got("still-visible") }) {
 		t.Fatal("view sinks must keep receiving output while the uplink leg is down")
 	}
 }
@@ -1097,14 +1097,14 @@ func TestAssistViewSinkRegistrySemantics(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
 		t.Fatal("terminal must be live")
 	}
 	p1, p2 := &assistViewProbe{}, &assistViewProbe{}
 	s.assist.RegisterViewSink(sid, "v1", p1.fan)
 	s.assist.RegisterViewSink(sid, "v2", p2.fan)
 	h.fakeTerminalEmit(sid, "multi")
-	if !waitUntil(5*time.Second, func() bool { return p1.Got("multi") && p2.Got("multi") }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return p1.Got("multi") && p2.Got("multi") }) {
 		t.Fatal("all registered view sinks must receive output")
 	}
 	// 幂等覆盖:同 viewID 重注册换函数,旧函数不再收。
@@ -1112,7 +1112,7 @@ func TestAssistViewSinkRegistrySemantics(t *testing.T) {
 	s.assist.RegisterViewSink(sid, "v1", p1b.fan)
 	s.assist.UnregisterViewSink(sid, "v2")
 	h.fakeTerminalEmit(sid, "after-swap")
-	if !waitUntil(5*time.Second, func() bool { return p1b.Got("after-swap") }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return p1b.Got("after-swap") }) {
 		t.Fatal("re-registered sink must receive output")
 	}
 	if p1.Got("after-swap") {
@@ -1143,7 +1143,7 @@ func TestAssistViewSinkPanicDoesNotKillFanLoop(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
 		t.Fatal("terminal must be live")
 	}
 	healthy := &assistViewProbe{}
@@ -1156,7 +1156,7 @@ func TestAssistViewSinkPanicDoesNotKillFanLoop(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		h.fakeTerminalEmit(sid, "round")
 	}
-	if !waitUntil(5*time.Second, func() bool {
+	if !assistWaitUntil(5*time.Second, func() bool {
 		healthy.mu.Lock()
 		defer healthy.mu.Unlock()
 		return len(healthy.frames) >= 3
@@ -1269,7 +1269,7 @@ func TestAssistTerminalCloseGiveUpOnBlockedCreate(t *testing.T) {
 
 	// 放行 spawner:延迟 create 落地(会话注册进 live 表)。
 	close(blocked)
-	if !waitUntil(5*time.Second, func() bool { return s.terminal.get(sid) != nil }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return s.terminal.get(sid) != nil }) {
 		t.Fatal("delayed terminal must land after the spawner unblocks")
 	}
 
@@ -1313,11 +1313,11 @@ func TestAssistTerminalCloseGiveUpOnBlockedCreate(t *testing.T) {
 	}
 	time.Sleep(300 * time.Millisecond) // 烧完缩短的放弃窗
 	close(blocked2)
-	if !waitUntil(5*time.Second, func() bool { return s.terminal.get(sid2) != nil }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return s.terminal.get(sid2) != nil }) {
 		t.Fatal("second delayed terminal must land")
 	}
 	s.assistCloseTerminal(sid2) // 已无在途 create:立即杀
-	if !waitUntil(5*time.Second, func() bool { return !h.fakeTerminalAlive(sid2) }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return !h.fakeTerminalAlive(sid2) }) {
 		t.Fatal("assistCloseTerminal must kill the delayed terminal once it has landed")
 	}
 }
@@ -1337,7 +1337,7 @@ func TestAssistViewFanErrorAutoUnregisters(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
 		t.Fatal("terminal must be live")
 	}
 	healthy := &assistViewProbe{}
@@ -1347,12 +1347,12 @@ func TestAssistViewFanErrorAutoUnregisters(t *testing.T) {
 	s.assist.RegisterViewSink(sid, "v-live", healthy.fan)
 	// 触发一次输出:死 sink 报错 → 自动注销。
 	h.fakeTerminalEmit(sid, "one")
-	if !waitUntil(5*time.Second, func() bool { return healthy.Got("one") }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return healthy.Got("one") }) {
 		t.Fatal("healthy sink must receive the frame")
 	}
 	// 注销是 fanOneView 返回错误后的下一步,中间隔着 recover/日志落盘——
 	// 有界等待而非裸断言(裸查会在窗口期假红,-race 下偶发)。
-	if !waitUntil(5*time.Second, func() bool {
+	if !assistWaitUntil(5*time.Second, func() bool {
 		s.assist.viewsMu.Lock()
 		defer s.assist.viewsMu.Unlock()
 		_, deadStill := s.assist.views[sid]["v-dead"]
@@ -1368,7 +1368,7 @@ func TestAssistViewFanErrorAutoUnregisters(t *testing.T) {
 	}
 	// 注销后的后续输出只到健康 sink(死 sink 不再被调用,也无错误堆积)。
 	h.fakeTerminalEmit(sid, "two")
-	if !waitUntil(5*time.Second, func() bool { return healthy.Got("two") }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return healthy.Got("two") }) {
 		t.Fatal("healthy sink must keep receiving after sibling auto-unregister")
 	}
 }
@@ -1390,7 +1390,7 @@ func TestAssistReplayThenLiveOrderingUnderOneMutex(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
 		t.Fatal("terminal must be live")
 	}
 	// 预灌 ring(admin 早期输出,观看端中途加入前的存量)。复制循环把
@@ -1401,7 +1401,7 @@ func TestAssistReplayThenLiveOrderingUnderOneMutex(t *testing.T) {
 	// outputGate 做一次 Lock/Unlock 探针——互斥量保证此刻临界区(含扇出)
 	// 已完整走完,注册才发生,窗口归零。
 	h.fakeTerminalEmit(sid, "replay-bytes-1")
-	if !waitUntil(5*time.Second, func() bool { return h.upGot("replay-bytes-1") }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return h.upGot("replay-bytes-1") }) {
 		t.Fatal("uplink must carry the prefilled bytes")
 	}
 	if sess := s.terminal.get(sid); sess != nil {
@@ -1432,8 +1432,8 @@ func TestAssistReplayThenLiveOrderingUnderOneMutex(t *testing.T) {
 	// 回放:不持 view.mu(handler 纪律,见函数头注释)。
 	s.AssistTerminalReplayTo(sid, viewWrite)
 
-	// 等 live 帧落地(emit 是异步复制,waitUntil 消竞态)。
-	if !waitUntil(5*time.Second, func() bool { return probe.Got("live-after") }) {
+	// 等 live 帧落地(emit 是异步复制,assistWaitUntil 消竞态)。
+	if !assistWaitUntil(5*time.Second, func() bool { return probe.Got("live-after") }) {
 		t.Fatal("live frame must arrive after replay")
 	}
 
@@ -1459,7 +1459,7 @@ func TestAssistReplayThenLiveOrderingUnderOneMutex(t *testing.T) {
 }
 
 // spawnerRingHas 探协助 PTY 的 ring 是否已含给定字节(fakeTerminalEmit 的
-// 写入到 ring 落地是异步复制,waitUntil 配合消竞态)。
+// 写入到 ring 落地是异步复制,assistWaitUntil 配合消竞态)。
 func (h *assistHarness) spawnerRingHas(sid string, substr string) bool {
 	s := h.svc.terminal.get(sid)
 	if s == nil || s.ring == nil {
@@ -1482,18 +1482,18 @@ func TestAssistTerminalReplayToTombstone(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !waitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return h.fakeTerminalCWD(sid) != "" }) {
 		t.Fatal("terminal must be live")
 	}
 	h.fakeTerminalEmit(sid, "tomb-replay")
-	if !waitUntil(5*time.Second, func() bool { return h.spawnerRingHas(sid, "tomb-replay") }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return h.spawnerRingHas(sid, "tomb-replay") }) {
 		t.Fatal("ring must hold the emitted bytes")
 	}
 	// 终态:杀 PTY → tombstone 落 history(exit 帧走复合 writer 上行)。
 	if err := s.assist.End(AssistEndAdmin); err != nil {
 		t.Fatal(err)
 	}
-	if !waitUntil(5*time.Second, func() bool { return !h.fakeTerminalAlive(sid) }) {
+	if !assistWaitUntil(5*time.Second, func() bool { return !h.fakeTerminalAlive(sid) }) {
 		t.Fatal("end must close the assist terminal")
 	}
 	// 假身的 kill 不归返 waiter(生产 kill 后真进程退出、waiter 归返):
@@ -1502,7 +1502,7 @@ func TestAssistTerminalReplayToTombstone(t *testing.T) {
 	h.spawner.releaseExit()
 	// history 读必须持 m.mu(waitTerminal 的归档写在锁内,quiesce 同款
 	// 纪律):裸读=与 recordTerminalHistoryLocked 竞态,-race 必红。
-	if !waitUntil(5*time.Second, func() bool {
+	if !assistWaitUntil(5*time.Second, func() bool {
 		s.terminal.mu.Lock()
 		defer s.terminal.mu.Unlock()
 		return s.terminal.history[sid] != nil
