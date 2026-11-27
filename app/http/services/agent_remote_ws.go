@@ -329,6 +329,12 @@ func (s *AgentService) forceDisconnectRemote(reason string) {
 	// and is replayed on the next agent.registered. Without it the server keeps
 	// the run live and its stale sweeper later paints a false timed_out card.
 	s.ai.closeAllWithReason("connection_force_closed:" + normalizeAgentDisableReason(reason))
+	// 远程协助 P1(Task 4):连接被强制拆除=协助腿随之中断,活跃会话按
+	// device_restart 收口(spec §5/§14 坑 3)。此处的上行 assist.end 预期
+	// 就是失败的(writer 随连接一起失效)——本调用的目标是本地状态收敛
+	// (落定终态,重连后不复活),投递不是目标;云端由 device_offline/
+	// admin 侧超时自愈(spec §5 明文该语义)。
+	s.assistEndForConnectionDown()
 }
 
 func (s *AgentService) shouldPreserveDisabledStatus() bool {
@@ -360,6 +366,14 @@ func (s *AgentService) remoteLoopExitCleanup(recoverable bool) {
 		// keeps alive across transient reconnects.
 		s.terminal.closeAll()
 		s.ai.closeAllWithReason("connection_loop_exit")
+		// 远程协助 P1(Task 4):不可恢复循环终态(进程关闭/禁用兜底)与
+		// forceDisconnectRemote 同族——会话按 device_restart 收口,重连后
+		// 云端拉取终态即知,勿复活(spec §14 坑 3)。上行 assist.end 预期
+		// 失败(writer 已随连接拆除),目标同 forceDisconnectRemote:状态
+		// 收敛而非投递,云端 device_offline/admin_timeout 自愈。可恢复分支
+		// 刻意不动:瞬断丢帧由云侧语义兜底,本地会话跨重连存活(与 AI/
+		// 终端腿同语义)。
+		s.assistEndForConnectionDown()
 	}
 	s.wsMu.Lock()
 	s.wsConnecting = false
@@ -1077,6 +1091,12 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 		// create 异步离读循环/input·resize·close 保持 inline 的契约注释
 		// 见该函数)。本腿的 enabled 闸给 remoteTerminalEnabled。
 		s.setRemoteConnectionState(true, "online", "")
+		// assist- 前缀帧归协助腿(Task 5):前置门控,返回 true=本帧已被协助
+		// 腿处置(放行 input/resize 或拒绝),不得再走手机腿;false=无前缀帧
+		// 继续下方手机腿原路径(既有行为零改动)。
+		if s.handleAssistTerminalFrame(msg, writeJSON) {
+			return
+		}
 		// 手机腿无连接 sink 身份(nil):网页孤儿回收链不涉手机腿
 		s.DispatchTerminalFrame(msg, writeJSON, nil, s.remoteTerminalEnabled)
 	case models.AgentEventTerminalQuotaResolved:
@@ -1200,6 +1220,32 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 		// local pendingOption so a later stray response is ignored.
 		s.setRemoteConnectionState(true, "online", "")
 		s.ai.cancelOptions(msg)
+	case models.AgentEventAssistApproved, models.AgentEventAssistRejected,
+		models.AgentEventAssistEnd, models.AgentEventAssistState:
+		// 远程协助 P1(Task 4):云端协助信令分派。OnRemoteFrame 内聚全部
+		// 业务(状态机迁移+钩子+幂等吞帧),本臂保持薄分派;回帧经本连接
+		// writeJSON 上行——manager 分派路径不持 writer。错误(串会话/缺
+		// reason 等)转 error 帧上抛照 punch/terminal 家族语义(agent.error
+		// 载荷),读循环不受影响;enabled 门已在
+		// remoteAgentMessageRequiresEnabledDevice(禁用设备不接受协助)。
+		s.setRemoteConnectionState(true, "online", "")
+		reply, err := s.assist.OnRemoteFrame(msg)
+		if err != nil {
+			logger.Warn(fmt.Sprintf("[ASSIST] remote frame rejected type=%s error=%v", msgType, err))
+			_ = writeJSON(map[string]interface{}{
+				"type":  models.AgentEventError,
+				"error": fmt.Sprintf("assist: %v", err),
+			})
+			return
+		}
+		for _, frame := range reply {
+			// 回帧写失败不撕断读循环:状态迁移已提交,云端补帧/房间自愈兜底
+			// (punch 信令同款姿态)。
+			if err := writeJSON(frame); err != nil {
+				logger.Warn(fmt.Sprintf("[ASSIST] reply frame write failed type=%s error=%v", msgType, err))
+				return
+			}
+		}
 	case models.AgentEventError:
 		// Server rejected something. With the registration gate, business
 		// messages should never be sent before registration, but surface the
@@ -1264,7 +1310,13 @@ func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 		models.AgentEventPeerLanListen,
 		models.AgentEventPeerLanPushListen,
 		models.AgentEventPeerPunchSession,
-		models.AgentEventPeerPunchCandidates:
+		models.AgentEventPeerPunchCandidates,
+		// 远程协助 P1(Task 4):云端协助信令(approved/rejected/end/state)是
+		// 控制面能力,与 terminal/AI 同族——禁用设备不接受协助。
+		models.AgentEventAssistApproved,
+		models.AgentEventAssistRejected,
+		models.AgentEventAssistEnd,
+		models.AgentEventAssistState:
 		return true
 	default:
 		// tools.list 是元 RPC（非注册表工具项），显式门控；注册表命中的工具事件

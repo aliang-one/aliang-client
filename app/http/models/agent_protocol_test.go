@@ -129,3 +129,20 @@ func TestAgentToolAskCancelReasons(t *testing.T) {
 		t.Fatalf("cancel json = %s", data)
 	}
 }
+
+func TestAssistFrameTypeConstants(t *testing.T) {
+	// 锚定字符串本身:云端/平台侧按契约实现,字符串漂移=跨仓断链
+	cases := map[string]string{
+		AgentEventAssistRequestUp: "assist.request",
+		AgentEventAssistCancel:    "assist.cancel",
+		AgentEventAssistApproved:  "assist.approved",
+		AgentEventAssistRejected:  "assist.rejected",
+		AgentEventAssistEnd:       "assist.end",
+		AgentEventAssistState:     "assist.state",
+	}
+	for got, want := range cases {
+		if got != want {
+			t.Fatalf("assist frame constant drift: got %q want %q", got, want)
+		}
+	}
+}

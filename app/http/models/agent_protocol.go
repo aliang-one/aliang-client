@@ -179,6 +179,18 @@ const (
 	AgentEventTerminalQuotaResolved          = "terminal.quota.resolved"           // server → agent: challenge granted; clears the pending challenge (an unanswered one kills the session at the next checkpoint)
 )
 
+// 远程协助帧族(remote-assist P1)。终端面复用既有 terminal.* 帧族
+// (session_id 带 assist- 前缀即路由 assist 门控),本族只承载会话信令。
+// 独立成块照 punch/TerminalQuota 块先例(避免上方主块整体重排空白)。
+const (
+	AgentEventAssistRequestUp = "assist.request"  // 设备→云端:申请协助(带留言)
+	AgentEventAssistCancel    = "assist.cancel"   // 设备→云端:撤销申请/结束会话
+	AgentEventAssistApproved  = "assist.approved" // 云端→设备:admin 已批准(带 session_id)
+	AgentEventAssistRejected  = "assist.rejected" // 云端→设备:admin 已拒绝
+	AgentEventAssistEnd       = "assist.end"      // 双向:任一侧结束(带 reason,见 assistEndReason)
+	AgentEventAssistState     = "assist.state"    // 云端→设备:房间状态镜像(预留,P1 仅记录日志)
+)
+
 type AgentProtocolContract struct {
 	Version   string                   `json:"version"`
 	HTTP      []AgentProtocolHTTPRoute `json:"http"`

@@ -13,6 +13,11 @@ const (
 	CodeForbidden    = 102
 	CodeNotFound     = 103
 	CodeConflict     = 104
+	// CodeTooManyRequests 远程协助申请冷却等限频面(2026-11-26 remote-assist
+	// Task 6):plan 明文「冷却中 429 语义」,业务码表原无 4xx 限频位,补一个
+	// 让 common.Error 信封能表达真实 429(前端凭 code=105 区分冷却,可倒计时
+	// 重试提示)。
+	CodeTooManyRequests = 105
 
 	// Logger errors (110-119)
 	CodeInvalidLogLevel       = 110
@@ -75,6 +80,8 @@ func ErrorCodeToHTTPStatus(code int) int {
 			return http.StatusNotFound
 		case CodeConflict:
 			return http.StatusConflict
+		case CodeTooManyRequests:
+			return http.StatusTooManyRequests
 		default:
 			return http.StatusBadRequest
 		}
@@ -106,6 +113,8 @@ func ErrorCodeToMessage(code int) string {
 		return "not found"
 	case CodeConflict:
 		return "conflict"
+	case CodeTooManyRequests:
+		return "too many requests"
 
 	// Logger errors
 	case CodeInvalidLogLevel:
