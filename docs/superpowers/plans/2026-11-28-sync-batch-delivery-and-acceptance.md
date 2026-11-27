@@ -30,8 +30,8 @@
 
 | 仓库 | 分支 | 提交 | 远端 |
 |---|---|---|---|
-| alianggate（Go agent + 网页） | master | `4b35a1dc` | 已推送；tag `v1.1.130` 构建成功并发布；门禁改动待下个 tag 生效 |
-| AliangPhoneServer | main | `1e2bfbf` | 已推送，线上 `nursor/aliang-phone-agent-server` 已滚动更新 |
+| alianggate（Go agent + 网页） | master | `47d0fd1a` | 已推送；`v1.1.133` 构建发布成功，新门禁首次全程通过 |
+| AliangPhoneServer | main | `9d51dc3` | 已推送；线上跑 `sync-all-r2`（不含重启裁决，见 §5.5） |
 | AliangVibeCodingPhone（RN） | main | `1b139df` | 已推送，iOS 1.0.10 (42) 已装到 iPhone 16 Pro |
 
 PhoneServer 的 k8s 部署已完成（见 §5.1）。真实服务名是
