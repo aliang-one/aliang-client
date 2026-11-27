@@ -920,6 +920,12 @@ func TestAgentServiceSyncDoesNotResurrectAfterLogoutWithoutForwardedJwt(t *testi
 // authenticated the user again) MUST still clear the sticky logout state and
 // re-register. Otherwise the logout fix would also break re-login.
 func TestAgentServiceSyncReRegistersAfterLogoutWithForwardedJwt(t *testing.T) {
+	// 本用例验证的是「转发的 JWT 清掉 sticky logout 并重新注册」——转发凭证是
+	// user-agent 进程的概念(非 user-agent 运行时 resolveForwardedUserContextLocked
+	// 不记忆显式传入的 header,EnsureRemoteConnection 随后读不到它)。此前测试
+	// 没声明这个前提,靠前面用例泄漏的 AgentRuntimeEnv 才通过;单跑或在 Linux CI
+	// 上(顺序不同)就失败。
+	t.Setenv(AgentRuntimeEnv, "1")
 	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
 	t.Setenv("ALIANG_CACHE_DIR", t.TempDir())
 	cache.ResetCacheDirForTest()
