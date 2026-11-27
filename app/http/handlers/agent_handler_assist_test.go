@@ -708,6 +708,11 @@ func TestHandleAssistAuditLanding(t *testing.T) {
 	if strings.Count(text, `"tool":"assist.request"`) != 1 || strings.Count(text, `"tool":"assist.cancel"`) != 1 {
 		t.Fatalf("审计行数量不符(request/cancel 各一): %s", text)
 	}
+	// Task 11:开关翻转留痕——夹具的 SetRemoteAssistEnabled(true) 恰落一行
+	// gates 行(无启动期调用,不产生第二行)。
+	if strings.Count(text, `"tool":"assist.gates"`) != 1 || !strings.Contains(text, "enabled=true") {
+		t.Fatalf("开关翻转应落 assist.gates 审计行恰一行(enabled=true): %s", text)
+	}
 	if strings.Contains(text, "assist.session") {
 		t.Fatalf("session 轮询不得产生审计行: %s", text)
 	}

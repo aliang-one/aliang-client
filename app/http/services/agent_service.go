@@ -2824,6 +2824,11 @@ func (s *AgentService) SetRemoteAssistEnabled(enabled bool) {
 		logger.Warn(fmt.Sprintf("[ASSIST] persist remote_assist_enabled=%t failed error=%v", enabled, err))
 	}
 	s.mu.Unlock()
+	// 审计(plan Task 11:每次生效的 enabled 设置留痕(含同值重写);锁外
+	// 执行——持锁区禁调会取 s.mu 的函数,本审计虽不取 s.mu,纪律上仍随
+	// 联动体一并出锁)。仅 handler 调用面(门禁 PUT),无启动期调用,不产生
+	// 引导期审计噪声。
+	s.RemoteAssistAudit("gates", fmt.Sprintf("enabled=%t", enabled))
 	if !enabled {
 		s.assistEndForDisable()
 	}
@@ -2928,9 +2933,10 @@ func (s *AgentService) AssistEnd() (string, error) {
 // 时不用混在终端审计里翻。
 const remoteAssistJournalSession = "remote-assist"
 
-// RemoteAssistAudit 落 assist_request/assist_cancel/assist_end 审计行(handler
-// 层调,同 WebTerminalAuditFS 家族理由:真源 origin 只有 HTTP 层可见;session
-// 轮询刻意不审——plan Task 6「不审 session 轮询」)。摘要不落留言内容(隐私
+// RemoteAssistAudit 落 assist.* 审计行(handler 层 request/cancel/end,
+// service 层 terminal.create/terminal.close/gates;同 WebTerminalAuditFS
+// 家族理由:真源 origin 只有 HTTP 层可见;session 轮询刻意不审——plan
+// Task 6「不审 session 轮询」)。摘要不落留言内容(隐私
 // +噪声,spec §审计「不落键击与 rrweb 内容」同纪律),只落长度。
 // nil-safe(ai/coreJournal 为空时静默跳过,同 webTerminalJournalAudit)。
 func (s *AgentService) RemoteAssistAudit(action, summary string) {

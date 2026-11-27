@@ -869,6 +869,8 @@ func (s *AgentService) assistOnActivated(sessionID string) {
 	// ——createWithSink 本体是阻塞调用(shell 解析/cwd 解析/进程起跑),本钩
 	// 子跑在 WS 读循环与懒扫路径上,不得内联。顺序保持:激活与终态钩子的同
 	// 一会话竞态由 close 路径的 waitForCreate 兜(见 assistCloseTerminal)。
+	// 审计(plan Task 11:PTY 生命周期留痕;放 headroom 闸后=只记真建):
+	s.RemoteAssistAudit("terminal.create", fmt.Sprintf("session=%s", sessionID))
 	release := s.terminal.beginCreate(sessionID)
 	safeGo("assist.terminal.create", func() {
 		defer release()
@@ -945,6 +947,9 @@ func (s *AgentService) assistKillTerminal(sid string) {
 	if s.terminal.get(sid) == nil {
 		return
 	}
+	// 审计(plan Task 11):放 get 闸后=只记真关(从未激活/PTY 已自然退出
+	// 的终态不产生误导性 close 行;同步/后台续等两条收敛路径都经此单点)。
+	s.RemoteAssistAudit("terminal.close", fmt.Sprintf("session=%s", sid))
 	s.terminal.close(map[string]interface{}{
 		"type":       models.AgentEventTerminalClose,
 		"session_id": sid,

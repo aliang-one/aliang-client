@@ -45,14 +45,42 @@ import (
 // 64KiB 上限让超限帧立即断连,防对端把内存任意挥霍给本只读面。
 const assistViewReadLimit = 64 * 1024
 
-// assistViewReadWindow / assistViewWriteDeadline 读活窗与写期限
-// (agentRemoteReadWindow/agentRemoteWriteTimeout 同族语义):读窗每帧刷新
-// (静默对端超窗断连,不挂死 socket);每帧写期限 10s 防半死观看端把
-// 扇出腿无限期拖住(远端 writer 同款惯例)。
-const (
-	assistViewReadWindow    = 90 * time.Second
-	assistViewWriteDeadline = 10 * time.Second
-)
+// assistViewWriteDeadline 每帧写期限 10s 防半死观看端把扇出腿无限期拖住
+// (远端 writer 同款惯例;ping 控制帧写期限同款)。
+const assistViewWriteDeadline = 10 * time.Second
+
+// assistViewReadWindow 读活窗(agentRemoteReadWindow 同族语义):读窗每帧
+// 刷新(静默对端超窗断连,不挂死 socket)。var 非 const 同
+// agentTerminalCreateWaitTimeout 惯例:测试缩短以触达「无 ping 静默断连 /
+// 有 ping 存活」对照行为(Task 11 保活钉测)。
+var assistViewReadWindow = 90 * time.Second
+
+// assistViewPingInterval 服务端 ping 周期(var 非 const 同上,测试缩短)。
+// 30s = 读窗 90s 的三分之一:两个错过的 pong 仍有一个 pong 落在窗内续期,
+// 单次丢包/调度抖动不致断连(agentRemoteHeartbeatInterval 同款余量思路)。
+var assistViewPingInterval = 30 * time.Second
+
+// assistViewPingLoop 观看连接的服务端 ping 保活循环(Task 11):requested
+// 等待模式服务端→观看端零流量,浏览器无协议层 ping API(观看端无法自我
+// 保活),读窗无人刷新即 90s 静默断连——唯一解=服务端定时 ping,浏览器
+// 自动 pong,SetPongHandler 随之续读窗。WriteControl 契约可与其他写方法
+// 并发;v1.5.3 实现与普通写同把 c.mu,但取锁自带写期限(select 超时返
+// errWriteTimeout),不会无限期卡在扇出写后面——不经 view.mu,应用层锁序
+// 不受影响;写期限沿用 10s 惯例。独立成函数供钉测直驱(启停节奏可观测)。
+func assistViewPingLoop(conn *websocket.Conn, interval time.Duration, done <-chan struct{}) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			// 错误忽略:读窗是活性权威,失败自愈。
+			_ = conn.WriteControl(websocket.PingMessage, nil,
+				time.Now().Add(assistViewWriteDeadline))
+		case <-done:
+			return
+		}
+	}
+}
 
 // assistViewConn 观看连接的写出口:writeMu 与回放共用同一把(见文件头
 // 顺序铁律)——live 扇出、回放块、终帧全部经它串行化。
@@ -177,6 +205,13 @@ func (h *AgentHandler) HandleAssistStream(w http.ResponseWriter, r *http.Request
 		resetReadDeadline()
 		return nil
 	})
+	// 服务端 ping 保活(Task 11):等待模式零流量缺口的唯一解,见
+	// assistViewPingLoop 文档。done 随 handler 任何 return 路径关闭——
+	// defer LIFO,close(done) 先于更早注册的注销/关连接 defer 执行,保活
+	// 循环收摊信号同步(实际退出 ≤10s 写期限封顶),零 goroutine 泄漏。
+	done := make(chan struct{})
+	defer close(done)
+	go assistViewPingLoop(conn, assistViewPingInterval, done)
 	for {
 		_, _, err := conn.ReadMessage()
 		if err != nil {
