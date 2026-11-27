@@ -346,7 +346,7 @@ import SystemRunModeSettings from './settings/SystemRunModeSettings.vue';
 import AppearanceSettings from './settings/AppearanceSettings.vue';
 import AgentPage from './settings/agent/AgentPage.vue';
 import SectionHeader from './settings/SectionHeader.vue';
-import { normalizeAgentCoreLLMConfig, applyAgentCoreLLMClearing, normalizeAgentCoreTuning, normalizePeerMCPConfig } from '../utils/agentCoreSettings';
+import { normalizeAgentCoreLLMConfig, applyAgentCoreLLMClearing, normalizeAgentCoreTuning, normalizePeerMCPConfig, normalizeOpenVikingConfig } from '../utils/agentCoreSettings';
 import { useNavigation } from '../composables/useNavigation';
 import { useEscLayer } from '../composables/useEscStack';
 import { openTutorialDocs } from '../composables/useTutorialDocs';
@@ -473,6 +473,10 @@ function normalizeCustomerConfig(payload = {}) {
   // 三态布尔:显式布尔才产出 peer_mcp 键(缺键/非布尔不进 patch 与回显,
   // 后端 nil 视为开启)。漏挂此键 = 保存 200 但永不落盘(验收缺陷①同族)。
   const peerMcp = normalizePeerMCPConfig(payload?.peer_mcp);
+  // openviking 白名单透传(与 peer_mcp 同族三态):漏挂 = OpenViking 卡
+  // 保存 200 但永不落盘 + GET 回显丢段(2026-11-26 对抗评审坐实的 Phase2
+  // 预存缺口,默认开翻转后随批修复)。
+  const openViking = normalizeOpenVikingConfig(payload?.openviking);
   const rawPoolSize = payload?.proxy?.pool_size;
   return {
     proxy: {
@@ -502,7 +506,8 @@ function normalizeCustomerConfig(payload = {}) {
     // 同款注释;normalizeMeshConfig 恒产出显式布尔,默认值与 GET 回显同构,
     // 未改动不产生伪 patch)
     mesh: normalizeMeshConfig(payload?.mesh),
-    ...(peerMcp ? { peer_mcp: peerMcp } : {})
+    ...(peerMcp ? { peer_mcp: peerMcp } : {}),
+    ...(openViking ? { openviking: openViking } : {})
   };
 }
 

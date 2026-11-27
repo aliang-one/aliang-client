@@ -43,6 +43,9 @@
       <p class="mt-3 text-[10px] leading-4 text-slate-500 dark:text-slate-400">
         {{ t('peerGates_rebindHint') }}
       </p>
+      <p class="mt-1 text-[10px] leading-4 text-slate-500 dark:text-slate-400">
+        {{ t('peerGates_defaultFlipHint') }}
+      </p>
     </div>
   </div>
 </template>

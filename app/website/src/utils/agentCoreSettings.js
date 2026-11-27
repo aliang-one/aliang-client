@@ -143,6 +143,26 @@ export function normalizePeerMCPConfig(source) {
   return Object.keys(out).length ? out : undefined;
 }
 
+// ---- customer.openviking(OpenViking 跨设备记忆面) ----
+// 白名单透传:已知四键(enabled 布尔/mode/endpoint/api_key 字符串)显式才产出,
+// 缺键/非布尔不进 patch(后端 nil=默认开,2026-11-26 与 types.go 翻转同步)。
+// ⚠️ 必须在 SettingsPage.normalizeCustomerConfig 挂键——2026-11-26 对抗评审
+// 坐实 Phase2 卡片保存因白名单漏 openviking 恒被剥,「保存 200 但永不落盘、
+// GET 回显丢段」(2026-10-31 验收缺陷①同族),默认开翻转后新文案不可达。
+export function normalizeOpenVikingConfig(source) {
+  if (!source || typeof source !== 'object' || Array.isArray(source)) {
+    return undefined;
+  }
+  const out = {};
+  if (typeof source.enabled === 'boolean') out.enabled = source.enabled;
+  if (typeof source.mode === 'string' && source.mode.trim()) {
+    out.mode = source.mode.trim().toLowerCase();
+  }
+  if (typeof source.endpoint === 'string') out.endpoint = source.endpoint.trim();
+  if (typeof source.api_key === 'string') out.api_key = source.api_key;
+  return Object.keys(out).length ? out : undefined;
+}
+
 // 表单值('' 或数字字符串)→ 校验。返回 ''(合法)或 i18n 键。空串与 0 都是
 // 「用默认」,合法;正整数上限 50 与后端 Validate 对齐。
 export function validateAgentCoreTuning(maxTurns) {

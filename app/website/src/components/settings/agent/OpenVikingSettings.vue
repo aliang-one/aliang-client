@@ -174,8 +174,9 @@ export default {
   methods: {
     formFromConfig(cfg) {
       const ov = cfg?.openviking || {};
-      // 显式 enabled 才视为开(后端契约默认关);历史数据 mode 缺省按 managed。
-      const enabled = ov.enabled === true;
+      // 显式 false 才视为关(后端契约默认开,2026-11-26 与 types.go 翻转同步);
+      // 未配置段/未设 enabled 一律镜像后端默认开。mode 缺省按 managed。
+      const enabled = ov.enabled !== false;
       const rawMode = typeof ov.mode === 'string' && ov.mode.trim() ? ov.mode.trim().toLowerCase() : 'managed';
       const mode = !enabled ? 'off' : (rawMode === 'byo' ? 'byo' : 'managed');
       return {
@@ -207,7 +208,8 @@ export default {
       const on = this.form.mode !== 'off';
       const payload = {
         enabled: on,
-        // off 保留最近非 off 模式:回开不丢 BYO 输入(前端便利,后端默认关语义不变)
+        // off 保留最近非 off 模式:回开不丢 BYO 输入(前端便利;保存恒显式落
+        // enabled 布尔,后端 nil=默认开语义不受影响)
         mode: this.form.mode === 'off' ? this.lastOnMode : this.form.mode,
         endpoint: on && this.form.mode === 'byo' ? this.form.byoEndpoint : '',
         api_key: on && this.form.mode === 'byo' ? this.form.byoApiKey : ''

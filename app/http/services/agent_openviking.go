@@ -111,8 +111,19 @@ func fetchOpenVikingCredential(cfg *config.Config) (apiKey, endpoint string, err
 	if err != nil {
 		return "", "", err
 	}
+	// 凭据与身份头必须与注册路径同源(2026-11-26 默认开翻转对抗评审两个
+	// critical 的修复):①转发凭据槽优先(user-agent 内存里最新鲜),回落
+	// 磁盘态 auth store(effectiveAgentRegisterAuthHeader)——boot 时刻转发
+	// 槽尚空(owner 就绪后才推送),只读转发槽=首装/首登周期铸 key 必 401;
+	// ②credential 端点走 requireAgentIdentity(requestDeviceId),裸
+	// Authorization 缺 X-Aliang-Device-ID 必 400 device_id_required。
 	if tok := strings.TrimSpace(GetSharedAgentService().UserAccessToken()); tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
+	} else if authHeader := effectiveAgentRegisterAuthHeader(""); authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
+	if deviceID := strings.TrimSpace(GetSharedAgentService().currentDeviceID()); deviceID != "" {
+		req.Header.Set("X-Aliang-Device-ID", deviceID)
 	}
 	resp, err := client.Do(req)
 	if err != nil {

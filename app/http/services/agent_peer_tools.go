@@ -11,7 +11,8 @@ package services
 // 审批取舍（v1 拍板，记录在案——写工具免逐次审批，但各工具真实门禁不同，
 // 注释必须如实区分，不得笼统写成「ACL+开关三层」）：
 //   - peer_exec：服务端 peer ACL（同账号隐式允许+全量审计）+ 设备级
-//     peer_exec_enabled 开关（默认关）。三层缓解成立。
+//     peer_exec_enabled 开关（默认开,2026-11-26 产品拍板,显式关才拒）。
+//     三层缓解成立。
 //   - peer_fetch_file：同账号 + 目标设备 file_transfer_v1 能力位（服务端编排
 //     校验链），无 peer ACL、无设备开关；走既有 transfer 审计。
 //   - device_note：同账号（JWT 归属校验）即可写，无设备开关无 ACL；审计靠
@@ -1335,8 +1336,8 @@ func inputIntField(input map[string]interface{}, key string) int {
 // 复用与 LLM 工具完全相同的实现与脱敏，不另开代码路径。认证三层（零新增凭据）：
 // ① stdio 子进程由 CLI 自己拉起——同用户同进程身份即信任；② 本地路由只在
 // 56433 loopbackOnly 红线内可达；③ 出网凭据（用户 JWT + 设备身份）由本进程
-// 持有，CLI/LLM 全程接触不到。目标机门禁（peer_exec_enabled 默认关 + 云端
-// peer ACL + 全量审计）对 MCP 路径同样生效。
+// 持有，CLI/LLM 全程接触不到。目标机门禁（peer_exec_enabled 默认开(2026-11-26
+// 产品拍板,显式关才拒) + 云端 peer ACL + 全量审计）对 MCP 路径同样生效。
 
 func (s *AgentService) PeerExecLocal(ctx context.Context, deviceID, command string, timeoutMs int, workdir string) (string, error) {
 	return s.peerExecCall(ctx, deviceID, command, timeoutMs, workdir)

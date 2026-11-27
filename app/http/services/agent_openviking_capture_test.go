@@ -119,12 +119,12 @@ func TestOpenVikingCaptureDisabledSilent(t *testing.T) {
 	st, srv := startOpenVikingCaptureStub(t)
 	home := t.TempDir()
 	setOpenVikingRegistryEntry(t, home, srv.URL, nil)
-	setOpenVikingGlobal(t, nil) // 未启用
+	setOpenVikingGlobal(t, &config.OpenVikingConfig{Enabled: boolPtr(false)}) // 显式关
 	if err := openvikingCaptureRun(context.Background(), "s", "u", "a"); err != nil {
 		t.Fatal(err)
 	}
 	if got := atomic.LoadInt32(&st.calls); got != 0 {
-		t.Fatalf("未启用不得上传, got %d", got)
+		t.Fatalf("显式关闭不得上传, got %d", got)
 	}
 }
 
@@ -183,11 +183,11 @@ func TestOpenVikingProbeTickTransitions(t *testing.T) {
 	openVikingProbeFails.Store(0)
 	openVikingProbeOK.Store(false)
 
-	// 未启用:复位跳过
-	setOpenVikingGlobal(t, nil)
+	// 显式关:复位跳过
+	setOpenVikingGlobal(t, &config.OpenVikingConfig{Enabled: boolPtr(false)})
 	openvikingProbeTick()
 	if openVikingProbeOK.Load() {
-		t.Fatal("未启用不得置健康")
+		t.Fatal("显式关闭不得置健康")
 	}
 
 	// 启用+健康:置健康、清零

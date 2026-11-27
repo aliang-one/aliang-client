@@ -724,6 +724,7 @@ export default {
   settings_peerTransferTitle: '文件传输',
   settings_peerTransferDesc: '允许其他设备发起文件传输、拉取本机文件的设备级门禁。',
   peerGates_rebindHint: '本机生效，换设备不同步；重新配对（换绑）后开关会回落为关闭，需重新开启。',
+  peerGates_defaultFlipHint: '2026-11-26 起两项门禁默认开启；此前显式关闭过的设备会在服务端升级时一次性放开，之后以这里的开关为准。',
   peerGates_loadFailed: '读取失败',
   peerGates_saveFailed: '保存失败',
   // 界面偏好（从系统设置抽出）
@@ -759,7 +760,7 @@ export default {
   peerMcp_saving: '保存中…',
   openViking_title: 'OpenViking 跨设备记忆',
   openViking_managed: '平台托管',
-  openViking_description: '开启后，你的对话与排查知识会沉淀到 OpenViking 账户，跨设备检索共享。默认关，开启并保存即对齐。',
+  openViking_description: '默认开启（托管模式）：你的对话与排查知识会沉淀到 OpenViking 账户，跨设备检索共享。选择「关闭」并保存即自动移除托管条目。',
   openViking_mode: '接入模式',
   openViking_modeManaged: '托管（推荐）',
   openViking_modeManagedDesc: '密钥由平台铸发，只写本机注册表，不落配置文件。',

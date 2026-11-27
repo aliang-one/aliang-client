@@ -99,8 +99,9 @@ func StartLocalServer() error {
 	// services.EnsurePeerMCPMatchesConfig。
 	services.EnsurePeerMCPMatchesConfig()
 	// OpenViking 跨设备记忆面自愈(spec Phase2 §7.2):按 customer.openviking
-	// 对齐注册表+claude.json+codex 托管块。默认关=清理对齐;managed 凭据端点
-	// 未就绪时按增强层失败语义跳过本 boot。只 Warn 不阻断启动。
+	// 对齐注册表+claude.json+codex 托管块。默认开(2026-11-26 产品拍板;
+	// 显式 false=清理对齐);managed 凭据端点未就绪时按增强层失败语义跳过
+	// 本 boot。只 Warn 不阻断启动。
 	services.EnsureOpenVikingMatchesConfig()
 	// OpenViking 心跳拨测(spec Phase2 §7.5):每 10 分钟轻探 /health,连续
 	// 3 次失败置「不可达」状态(仪表盘卡消费)。进程级一次;不做自动关停。

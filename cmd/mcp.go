@@ -9,8 +9,8 @@ package cmd
 //  2. 本命令只打 user agent 的 56433 loopback 路由（loopbackOnly+零 token 是
 //     agentruntime 刻意红线，只有本机同用户够得着）；
 //  3. 出网凭据（用户 JWT + X-Aliang-Device-ID）由常驻 agent 进程持有，CLI/
-//     LLM 全程接触不到；目标机门禁（peer_exec_enabled 默认关 + 云端 peer
-//     ACL + 全量审计）对 MCP 路径同样生效。
+//     LLM 全程接触不到；目标机门禁（peer_exec_enabled 默认开(2026-11-26 产品拍板,
+//     显式关才拒) + 云端 peer ACL + 全量审计）对 MCP 路径同样生效。
 //
 // 协议：JSON-RPC 2.0 over stdio（MCP 2024-11-05）。只实现 initialize /
 // notifications·initialized / tools/list / tools/call / ping；一切日志走

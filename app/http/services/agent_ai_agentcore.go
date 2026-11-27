@@ -1650,7 +1650,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		// 桥同款宿主注入。桥内共享注册表 handler 实现（POST 编排），自带
 		// journal 落行。审批取舍（v1）：写工具免逐次审批，不挂 kernelApprove。
 		// 各工具真实门禁不同（agent_peer_tools.go 文件头）：peer_exec=服务端
-		// peer ACL + 设备级 peer_exec_enabled 开关（默认关）+ 审计；peer_fetch_
+		// peer ACL + 设备级 peer_exec_enabled 开关（默认开,显式关才拒）+ 审计；peer_fetch_
 		// file=同账号 + 目标 file_transfer_v1（无 ACL/开关）；device_note=同账号
 		// 即可写（无开关无 ACL，审计靠 metadata updated_by）。readOnly run
 		// 剥离（与 MCP 同判据）。

@@ -872,12 +872,12 @@ func (c *Config) EffectivePeerMCPCodexEnabled() bool {
 }
 
 // OpenVikingConfig 控制 OpenViking 跨设备记忆面(customer.openviking,Phase2
-// spec §6)。Enabled 默认关:与 peer_mcp(默认开)相反——OpenViking 是新增
-// 增强层,装了不等于要用,显式开启才接线;关闭=托管条目自动移除(spec §2
+// spec §6)。Enabled 默认开(2026-11-26 产品拍板:托管记忆面出厂即接线,与
+// peer_mcp(默认开)同向);显式 false 才关,关闭=托管条目自动移除(spec §2
 // 干净卸载语义)。
 type OpenVikingConfig struct {
-	// Enabled 总开关:开启后 boot 自愈按 Mode 对齐三处(注册表/claude.json/
-	// codex 托管块)。
+	// Enabled 总开关:nil=默认开;显式 false 后 boot 自愈做清理对齐。开启时
+	// boot 自愈按 Mode 对齐三处(注册表/claude.json/codex 托管块)。
 	Enabled *bool `json:"enabled,omitempty"`
 	// Endpoint MCP 入口;空=平台默认。BYO 自带部署可覆盖。仅 http 形态。
 	Endpoint string `json:"endpoint,omitempty"`
@@ -896,32 +896,34 @@ const (
 	OpenVikingModeBYO     = "byo"
 )
 
-// effectiveOpenViking 返回启用态配置段;未启用(nil/Enabled 未设/显式关)
-// 返回 nil。
+// effectiveOpenViking 返回显式配置段;段缺省(nil)时返回 nil,读点按全默认
+// (开/平台端点/managed)处理。是否启用由 EffectiveOpenVikingEnabled 单独判。
 func (c *Config) effectiveOpenViking() *OpenVikingConfig {
 	if c == nil || c.Customer == nil || c.Customer.OpenViking == nil {
-		return nil
-	}
-	if c.Customer.OpenViking.Enabled == nil || !*c.Customer.OpenViking.Enabled {
 		return nil
 	}
 	return c.Customer.OpenViking
 }
 
-// EffectiveOpenVikingEnabled OpenViking 跨设备记忆面总开关。默认关(nil=关),
-// 显式 enabled=true 才生效——方向与 peer_mcp 相反,理由见 OpenVikingConfig。
+// EffectiveOpenVikingEnabled OpenViking 跨设备记忆面总开关。默认开(nil=开,
+// 2026-11-26 产品默认翻转,理由见 OpenVikingConfig);显式 enabled=false 才关。
+// BYO 凭据缺不缺由 ensure 路径自校验(byo api_key 空 → 跳过本 boot)。
 func (c *Config) EffectiveOpenVikingEnabled() bool {
-	return c.effectiveOpenViking() != nil
+	if c == nil || c.Customer == nil || c.Customer.OpenViking == nil ||
+		c.Customer.OpenViking.Enabled == nil {
+		return true
+	}
+	return *c.Customer.OpenViking.Enabled
 }
 
-// EffectiveOpenVikingEndpoint trim 后的 MCP 入口;未配置回落平台默认。
+// EffectiveOpenVikingEndpoint trim 后的 MCP 入口;未配置(含段缺省)回落平台
+// 默认——默认开语义下启用路径必须在无段配置时也有可用入口。
 func (c *Config) EffectiveOpenVikingEndpoint() string {
 	ov := c.effectiveOpenViking()
-	if ov == nil {
-		return ""
-	}
-	if ep := strings.TrimSpace(ov.Endpoint); ep != "" {
-		return ep
+	if ov != nil {
+		if ep := strings.TrimSpace(ov.Endpoint); ep != "" {
+			return ep
+		}
 	}
 	return OpenVikingDefaultEndpoint
 }

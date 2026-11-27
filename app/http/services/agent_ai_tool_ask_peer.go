@@ -13,7 +13,7 @@ package services
 //   peer.device_note     ↔ peer_device_note ↔ device_note
 //
 // handler 复用注册表路径同一批 payload 函数(agent_peer_tools.go:828-916),
-// 门禁不变:目标设备 peer_exec_enabled(默认关)+ 云端 peer ACL + 全量审计;
+// 门禁不变:目标设备 peer_exec_enabled(默认开,显式关才拒)+ 云端 peer ACL + 全量审计;
 // 出网凭据留在 agent 进程,CLI/LLM 接触不到。readOnly/goal-fork 回合本就不
 // 注入 bridge(agent_ai.go 注入点门控),与内核「readOnly 剥离 peer 工具」
 // 口径一致。

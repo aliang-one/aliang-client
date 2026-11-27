@@ -62,27 +62,44 @@ func openVikingClaudeEntryFrom(t *testing.T, home string) (map[string]interface{
 	return e, ok
 }
 
-// 默认关:enabled 未设=整层关。无既有条目 → 三处都不落。
-func TestOpenVikingDisabledByDefault(t *testing.T) {
+// 默认开(2026-11-26 产品拍板):enabled 未设=整层开。managed 模式铸 key
+// 端点未就绪 → 诚实报错走跳过语义,三处都不落(不静默半接线)。
+func TestOpenVikingEnabledByDefaultManagedSkips(t *testing.T) {
 	home := t.TempDir()
 	setOpenVikingGlobal(t, nil)
+	err := ensureOpenVikingLocked(home)
+	if err == nil || !strings.Contains(err.Error(), "managed 铸 key 未就绪") {
+		t.Fatalf("默认开+managed 未就绪必须返回跳过语义错误: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".aliang", "mcp.json")); !os.IsNotExist(err) {
+		t.Fatalf("铸 key 未就绪不得创建注册表文件: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".claude.json")); !os.IsNotExist(err) {
+		t.Fatalf("铸 key 未就绪不得创建 claude.json: %v", err)
+	}
+}
+
+// 显式 false=整层关:无既有条目 → 三处都不落(清理对齐为幂等 no-op)。
+func TestOpenVikingExplicitlyDisabledCreatesNothing(t *testing.T) {
+	home := t.TempDir()
+	setOpenVikingGlobal(t, &config.OpenVikingConfig{Enabled: boolPtr(false)})
 	if err := EnsureOpenVikingMatchesConfigForTest(home); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(home, ".aliang", "mcp.json")); !os.IsNotExist(err) {
-		t.Fatalf("默认关不得创建注册表文件: %v", err)
+		t.Fatalf("显式关不得创建注册表文件: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(home, ".claude.json")); !os.IsNotExist(err) {
-		t.Fatalf("默认关不得创建 claude.json: %v", err)
+		t.Fatalf("显式关不得创建 claude.json: %v", err)
 	}
 }
 
-// 默认关 + 外来 claude 条目(BYO 异形)→ 保留不劫持。
+// 显式关 + 外来 claude 条目(BYO 异形)→ 保留不劫持。
 func TestOpenVikingDisabledKeepsForeignClaudeEntry(t *testing.T) {
 	home := t.TempDir()
 	foreign := `{"mcpServers":{"openviking":{"type":"http","url":"https://my-own.example/mcp","headers":{"Authorization":"Bearer mine"}}}}`
 	writeOpenVikingClaudeRaw(t, home, foreign)
-	setOpenVikingGlobal(t, nil)
+	setOpenVikingGlobal(t, &config.OpenVikingConfig{Enabled: boolPtr(false)})
 	if err := EnsureOpenVikingMatchesConfigForTest(home); err != nil {
 		t.Fatal(err)
 	}
@@ -309,19 +326,31 @@ func TestOpenVikingManagedMintsViaCredentialEndpoint(t *testing.T) {
 	}
 }
 
-// 生效助手:默认关、端点缺省回落、mode 归一(未知值按 managed)。
+// 生效助手:默认开(2026-11-26 翻转)、显式 false 才关、端点缺省回落、mode
+// 归一(未知值按 managed)。
 func TestEffectiveOpenVikingHelpers(t *testing.T) {
 	var nilCfg *config.Config
-	if nilCfg.EffectiveOpenVikingEnabled() {
-		t.Fatal("nil config 必须默认关")
+	if !nilCfg.EffectiveOpenVikingEnabled() {
+		t.Fatal("nil config 必须默认开")
+	}
+	if ep := nilCfg.EffectiveOpenVikingEndpoint(); ep != config.OpenVikingDefaultEndpoint {
+		t.Fatalf("nil config 端点必须回落平台默认: %q", ep)
 	}
 	setOpenVikingGlobal(t, nil)
 	cfg := config.GetGlobalConfig()
-	if cfg.EffectiveOpenVikingEnabled() {
-		t.Fatal("Enabled 缺省必须关")
+	if !cfg.EffectiveOpenVikingEnabled() {
+		t.Fatal("Enabled 缺省必须开")
+	}
+	if ep := cfg.EffectiveOpenVikingEndpoint(); ep != config.OpenVikingDefaultEndpoint {
+		t.Fatalf("段缺省端点必须回落平台默认: %q", ep)
 	}
 	if m := cfg.EffectiveOpenVikingMode(); m != "managed" {
 		t.Fatalf("缺省 mode 必须 managed, got %q", m)
+	}
+	setOpenVikingGlobal(t, &config.OpenVikingConfig{Enabled: boolPtr(false)})
+	cfg = config.GetGlobalConfig()
+	if cfg.EffectiveOpenVikingEnabled() {
+		t.Fatal("显式 false 必须关")
 	}
 	setOpenVikingGlobal(t, &config.OpenVikingConfig{Enabled: boolPtr(true), Mode: "BYO"})
 	cfg = config.GetGlobalConfig()
