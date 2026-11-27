@@ -408,8 +408,8 @@ func newDurationAtom(v time.Duration) *atomicDuration {
 // them to exercise the dead-peer path quickly.
 var (
 	agentRemoteHeartbeatInterval = newDurationAtom(10 * time.Second)
-	agentRemotePingInterval      = newDurationAtom(30 * time.Second)
-	agentRemoteReadWindow        = newDurationAtom(90 * time.Second)
+	agentRemotePingInterval      = newDurationAtom(5 * time.Second)
+	agentRemoteReadWindow        = newDurationAtom(15 * time.Second)
 	agentRemoteWriteTimeout      = newDurationAtom(10 * time.Second)
 	// 旧工具臂(file.list/file.read/git.status/env.info)分发入口。包级变量
 	// 便于测试注入 panic 假实现(agentToolsRegistry 同款注入模式),钉"旧臂
@@ -512,7 +512,6 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn, accounts ...s
 	resetReadDeadline := func() {
 		_ = conn.SetReadDeadline(time.Now().Add(agentRemoteReadWindow.Load()))
 	}
-	resetReadDeadline()
 	// 单帧读上限（spec §5.1/§8.4）：连接级一次设置，超限帧让 ReadJSON 立即
 	// 报错断连重连，而不是把内存交给对端任意挥霍。
 	conn.SetReadLimit(agentRemoteMaxFrameBytes)
@@ -524,6 +523,7 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn, accounts ...s
 	if err := s.sendAgentHello(rawWriter, "connect"); err != nil {
 		return err
 	}
+	resetReadDeadline()
 
 	defer s.terminal.markAllDetached()
 	// NOTE: AI sessions AND terminal PTYs are intentionally NOT closed here. A
@@ -719,6 +719,9 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn, accounts ...s
 			continue
 		}
 		s.handleRemoteAgentMessage(sessionCtx, msg, writeJSON)
+		// Time in a synchronous local handler is not silence on the wire.
+		// The next read gets a fresh window to consume buffered pongs.
+		resetReadDeadline()
 	}
 }
 
@@ -1299,6 +1302,11 @@ func (s *AgentService) DispatchLocalAI(msg map[string]interface{}, writeJSON fun
 	}
 	msgType := strings.TrimSpace(fmt.Sprint(msg["type"]))
 	switch msgType {
+	case "presence.ping":
+		nonce, ok := msg["nonce"].(string)
+		if ok && nonce != "" && len(nonce) <= 96 {
+			_ = writeJSON(map[string]interface{}{"type": "presence.pong", "nonce": nonce})
+		}
 	case models.AgentEventAISessionCreate:
 		s.ai.create(msg, writeJSON)
 	case models.AgentEventAIMessage:

@@ -1582,3 +1582,123 @@ func TestTUITurnStartWatchUncorrelated(t *testing.T) {
 		t.Fatalf("uncorrelated 起跑未被识别（超时）")
 	}
 }
+
+// TestTUITurnHeldWatchEarlyExitOnEcho 锁死 SYNC-12 的核心行为：本回合回显
+// 已出现在 transcript 时，held 观测必须立即放行——消息已被 dequeue 执行，
+// held 不可能再发生；固定等满窗口只会给健康回合白加延迟。
+func TestTUITurnHeldWatchEarlyExitOnEcho(t *testing.T) {
+	origPoll := tuiTurnPollInterval
+	tuiTurnPollInterval = 20 * time.Millisecond
+	defer func() { tuiTurnPollInterval = origPoll }()
+
+	home := t.TempDir()
+	path := writeTranscriptFixture(t, home, "sess-1")
+	// offset 取在回显追加之前：观测窗从注入时刻的 transcript 末尾开始，
+	// 回显是窗内的「新」行。
+	offset := mustSize(t, path)
+	content := "手机消息"
+	appendTranscriptLine(t, path, `{"type":"system","subtype":"informational","content":"noise"}`)
+	appendTranscriptLine(t, path, `{"type":"user","uuid":"echo","isMeta":false,"message":{"role":"user","content":`+jsonString(content)+`}}`)
+
+	start := time.Now()
+	held := tuiTurnHeldWatch(context.Background(), path, offset, 5*time.Second, ownEchoMatcher(content))
+	elapsed := time.Since(start)
+	if held {
+		t.Fatal("回合已起跑（有本回合回显）却判成 held")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("回显在场仍等满窗口：耗时 %v，want 立即放行", elapsed)
+	}
+}
+
+// TestTUITurnHeldWatchDetectsHeldLine 锁死 held 判据本身：观测中途出现
+// "Held peer message" 行必须报 held（行为与 ccPeerWatchHeld 一致）。
+func TestTUITurnHeldWatchDetectsHeldLine(t *testing.T) {
+	origPoll := tuiTurnPollInterval
+	tuiTurnPollInterval = 20 * time.Millisecond
+	defer func() { tuiTurnPollInterval = origPoll }()
+
+	home := t.TempDir()
+	path := writeTranscriptFixture(t, home, "sess-1")
+	offset := mustSize(t, path) // fixture 单行起观测
+
+	// Activity from another turn must not cause us to miss the refusal.
+	appendTranscriptLine(t, path, `{"type":"assistant","uuid":"other","message":{"content":[{"type":"text","text":"Other turn"}]}}`)
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- tuiTurnHeldWatch(context.Background(), path, offset, 5*time.Second, ownEchoMatcher("手机消息"))
+	}()
+	time.Sleep(50 * time.Millisecond)
+	appendTranscriptLine(t, path, `{"type":"system","subtype":"informational","content":"Held peer message — not delivered to Claude"}`)
+	select {
+	case held := <-done:
+		if !held {
+			t.Fatal("Held peer message 行在场却未判 held")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("held 行未被识别（超时）")
+	}
+}
+
+// TestTUITurnHeldWatchTimeout 锁死窗口上限：零活动时仍按窗口放行（false），
+// best-effort 语义与 ccPeerWatchHeld 一致——不能提前放行变成永等。
+func TestTUITurnHeldWatchTimeout(t *testing.T) {
+	origPoll := tuiTurnPollInterval
+	tuiTurnPollInterval = 20 * time.Millisecond
+	defer func() { tuiTurnPollInterval = origPoll }()
+
+	home := t.TempDir()
+	path := writeTranscriptFixture(t, home, "sess-1")
+	offset := mustSize(t, path)
+
+	start := time.Now()
+	held := tuiTurnHeldWatch(context.Background(), path, offset, 150*time.Millisecond, ownEchoMatcher("手机消息"))
+	if held {
+		t.Fatal("无 held 标记却判 held")
+	}
+	if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
+		t.Fatalf("窗口被提前放弃：耗时 %v，want ≥窗口", elapsed)
+	}
+}
+
+// TestTUITurnHeldWatchCtxCancel 锁死退出守卫：ctx 取消必须立即返回 false，
+// 停止路径不能被观测窗拖住（调用方随后查 runCtx 收尾）。
+func TestTUITurnHeldWatchCtxCancel(t *testing.T) {
+	origPoll := tuiTurnPollInterval
+	tuiTurnPollInterval = 20 * time.Millisecond
+	defer func() { tuiTurnPollInterval = origPoll }()
+
+	home := t.TempDir()
+	path := writeTranscriptFixture(t, home, "sess-1")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	start := time.Now()
+	if held := tuiTurnHeldWatch(ctx, path, 0, 5*time.Second, ownEchoMatcher("手机消息")); held {
+		t.Fatal("ctx 已取消却判 held")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("取消后仍阻塞：耗时 %v", elapsed)
+	}
+}
+
+func TestReadTranscriptFromWaitsForTheRestOfAPartialLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "turn.jsonl")
+	prefix := `{"type":"assistant",`
+	if err := os.WriteFile(path, []byte(prefix), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lines, offset, err := readTranscriptFrom(path, 0)
+	if err != nil || len(lines) != 0 || offset != 0 {
+		t.Fatalf("partial record was consumed: %v %d %v", lines, offset, err)
+	}
+	line := prefix + `"uuid":"fixture"}`
+	if err := os.WriteFile(path, []byte(line+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lines, offset, err = readTranscriptFrom(path, offset)
+	if err != nil || len(lines) != 1 || string(lines[0]) != line || offset != int64(len(line)+1) {
+		t.Fatalf("completed record not recovered: %v %d %v", lines, offset, err)
+	}
+}

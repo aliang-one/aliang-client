@@ -250,6 +250,72 @@ func TestShellProgressCannotClaimAnotherRunOrUnrelatedTask(t *testing.T) {
 	}
 }
 
+func TestShellProgressStageVocabularyIsBoundedAndPrivate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		service := AgentService{state: agentState{RegisteredUser: "test-account"}}
+		service.progress.supported.Store(true)
+		var updates []map[string]interface{}
+		service.setCurrentRemoteWriter(func(payload interface{}) error {
+			frame := payload.(map[string]interface{})
+			if frame["action"] == "update" {
+				updates = append(updates, frame)
+			}
+			service.progress.acceptAck(map[string]interface{}{
+				"request_id": frame["request_id"], "status": "accepted", "operation_id": "op_shell",
+			})
+			return nil
+		})
+		progress := newAgentProgressTool(&service, "session-shell", "run-shell")
+		var outputBytes atomic.Int64
+		finish := progress.shellObserver()("Bash", "", outputBytes.Load)
+		// Wait past the start delay so the byte observer is running.
+		time.Sleep(time.Second)
+		outputBytes.Store(100)
+		time.Sleep(time.Second)
+		synctest.Wait()
+		// Three quiet ticks demote the card to waiting exactly once.
+		time.Sleep(3 * time.Second)
+		synctest.Wait()
+		// Staying quiet must not keep ticking the cloud.
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		outputBytes.Store(200)
+		time.Sleep(time.Second)
+		synctest.Wait()
+		finish(agentcore.ShellCompleted)
+		progress.close()
+		synctest.Wait()
+
+		if len(updates) != 3 {
+			t.Fatalf("want streaming, waiting, resumed-streaming updates: %#v", updates)
+		}
+		allowed := map[string]bool{
+			"type": true, "session_id": true, "run_id": true, "agent_instance_id": true,
+			"request_id": true, "source_sequence": true, "action": true,
+			"operation_id": true, "current": true, "unit": true, "phase": true, "step": true,
+		}
+		want := []struct {
+			phase, step string
+			current     int64
+		}{
+			{"running", "receiving command output", 100},
+			{"waiting", "waiting for command output", 100},
+			{"running", "receiving command output", 200},
+		}
+		for i, frame := range updates {
+			for key := range frame {
+				if !allowed[key] {
+					t.Fatalf("update %d carried unexpected field %q", i, key)
+				}
+			}
+			if frame["phase"] != want[i].phase || frame["step"] != want[i].step ||
+				frame["current"] != want[i].current || frame["unit"] != "bytes" {
+				t.Fatalf("update %d = %#v, want %+v", i, frame, want[i])
+			}
+		}
+	})
+}
+
 func TestAgentCoreSubagentBridgesCarryShellObserver(t *testing.T) {
 	// SYNC-16 首片接线（2026-11-27）：子 run 复用主 run 传入的同一份 ToolEnv
 	// ——子 agent 里的长命令（构建/测试/下载）此前对操作进度通道完全静默。

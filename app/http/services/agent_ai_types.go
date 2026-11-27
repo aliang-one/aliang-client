@@ -363,7 +363,7 @@ type agentAIRun struct {
 	threadBusyHandled bool
 	prompt            string
 	freshPrompt       string
-	attachments             []agentAIAttachment
+	attachments       []agentAIAttachment
 	// 服务端下发的附件下载白名单（SSRF 围栏），空则回落到环境变量。
 	attachmentAllowedHosts []string
 	cancel                 context.CancelFunc
@@ -433,14 +433,16 @@ type agentAIAttachment struct {
 // after it. Holding the mutex through write preserves event_seq wire order.
 
 type agentAIRunEmitter struct {
-	mu         sync.Mutex
-	runID      string
-	nextSeq    int64
-	startedAt  time.Time
-	firstText  bool
-	terminal   bool
-	write      agentTerminalWriter
-	onTerminal func(map[string]interface{}) error
+	mu               sync.Mutex
+	runID            string
+	requestOrigin    string
+	requestMessageID string
+	nextSeq          int64
+	startedAt        time.Time
+	firstText        bool
+	terminal         bool
+	write            agentTerminalWriter
+	onTerminal       func(map[string]interface{}) error
 	// onSubagentTerminalDrop 在子 agent 终态帧写出失败时触发（2026-11-10 P2 #4：
 	// WS 断窗内 ai.subagent terminal 帧被 `_ =` 吞掉=行永卡 started/progress）。
 	// 宿主接 manager 暂存表，重连 hello 后补发；非终态子 agent 帧不进暂存
@@ -467,6 +469,8 @@ func newAgentAIRunEmitter(run agentAIRun, write agentTerminalWriter) *agentAIRun
 	}
 	return &agentAIRunEmitter{
 		runID:                  runID,
+		requestOrigin:          agentCoreJournalOriginFor(run.originSocketID, run.surface),
+		requestMessageID:       run.messageID,
 		write:                  write,
 		goalIdentity:           cloneGoalIdentity(run.goalIdentity),
 		goalRequiredCheckCount: run.goalRequiredCheckCount,
@@ -524,6 +528,12 @@ func (e *agentAIRunEmitter) emit(value interface{}) error {
 		if e.startedAt.IsZero() {
 			e.startedAt = time.Now()
 			payload["agent_emitted_at_ms"] = e.startedAt.UnixMilli()
+			if e.requestOrigin == "dashboard" {
+				payload["request_origin"] = e.requestOrigin
+				if e.requestMessageID != "" {
+					payload["user_message_id"] = e.requestMessageID
+				}
+			}
 		}
 	case models.AgentEventAIDelta:
 		delta := remoteString(payload, "delta")
