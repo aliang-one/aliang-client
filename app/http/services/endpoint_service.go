@@ -490,9 +490,18 @@ func (s *EndpointService) ReportFailure(id string, status int, errMsg string, un
 			RateLimitedUntil: e.RateLimitedUntil,
 			LastErr:          errMsg,
 		}
-		// threshold<=0 不摘除:0 的「连续失败 0 次就摘」是退化语义,会形成
-		// 失败→摘除→秒恢复的循环;用户要立即摘除应设 threshold=1。
-		if policy.FailureThreshold > 0 && failures >= policy.FailureThreshold {
+		// 已锁存行(disabled + cooldown=0,401/402 终态)必须保持锁存:计数路径
+		// 若给它赋冷却,cooldown>0 就不再满足「锁存」特征,到期会被 recoverIfNeeded
+		// 自愈回 ok,违反「永不自愈」。可达场景=锁存落地时已在途的请求、出口/显式
+		// 行(selectExplicit 不受健康态拦)。仍照常 bump 计数、更新 last_error。
+		if e.HealthStatus != "ok" && e.CooldownUntil <= 0 {
+			u.Status = "disabled"
+			u.CooldownUntil = 0
+			logger.Warn(fmt.Sprintf("endpoint: %s 已锁存(status=%s)收到失败 status=%d,保持锁存(不赋冷却) err=%q",
+				id, e.HealthStatus, status, errMsg))
+		} else if policy.FailureThreshold > 0 && failures >= policy.FailureThreshold {
+			// threshold<=0 不摘除:0 的「连续失败 0 次就摘」是退化语义,会形成
+			// 失败→摘除→秒恢复的循环;用户要立即摘除应设 threshold=1。
 			u.Status = "disabled"
 			u.CooldownUntil = now + int64(policy.CooldownSec)
 			logger.Warn(fmt.Sprintf("endpoint: %s 连续失败 %d 次(阈值 %d)摘除,冷却至 %d status=%d err=%q",
@@ -529,7 +538,8 @@ func (s *EndpointService) bumpCounters(id string, totalDelta, failedDelta int64,
 
 // ReportSuccess 成功全清(spec §6.2 最后一行)+ 计数 +1(total+1, failed+0)。
 // 请求真实走通是它可用的最强证据,也是 401/402 锁存的恢复路径之一(另一条是
-// 手动「重置健康」)。池模式下只记计数并清 last_error,不写健康四列(不变量 6)。
+// 手动「重置健康」)。池模式下只记计数并清 last_error,不碰 health_status 等
+// 健康列(不变量 6)——因此池模式下锁存的唯一恢复路径是 ResetHealth。
 func (s *EndpointService) ReportSuccess(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

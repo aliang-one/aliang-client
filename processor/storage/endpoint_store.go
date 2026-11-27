@@ -266,8 +266,9 @@ type HealthUpdate struct {
 	// ---- 二期计数列(spec 2026-11-27 §5.7)----
 	// TotalDelta/FailedDelta 是「事件」不是快照:ReportSuccess/ReportFailure
 	// 的语义是 +1,落库走 SQL 侧原子累加(total_requests = total_requests + ?),
-	// 调用方不读行也记得准,0 = 不动。绝对清零(重置健康/激活迁移)不属于增量
-	// 语义,由后续任务的专用窄写缝承担,不走负增量对账。
+	// 调用方不读行也记得准,0 = 不动。重置健康/激活迁移只清健康列(状态/连续
+	// 失败/两路冷却/last_error),生命周期计数永不归零——因此这里没有、也不需要
+	// 负增量来做绝对清零。
 	TotalDelta  int64 // 本次新增的请求计数(成功与计数路径失败各 +1)
 	FailedDelta int64 // 本次新增的失败计数(计数路径失败 +1)
 	// LastUsedAt 显式打点(unix 秒);0 = 不动——unix 秒恒 >0,合法打点值不可能

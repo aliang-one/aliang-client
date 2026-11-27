@@ -538,6 +538,71 @@ func TestEndpointService_ReportFailureLatchBypassesPoolMode(t *testing.T) {
 	}
 }
 
+// 回归(quality-fix Important 1):锁存落地后,计数路径(5xx/连接失败/403)不得给
+// 锁存行赋冷却——否则 cooldown>0 就不再满足「锁存」特征,冷却到期会被
+// recoverIfNeeded 自愈回 ok,违反不变量「永不自愈」。可达场景=锁存落地时已在途
+// 的请求、出口/显式行(selectExplicit 不受健康态拦)。
+func TestEndpointService_LatchedRowSurvivesFailureCountPath(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+	createEndpoint(t, store, anthropicEP("ep-latch-5xx", 10))
+
+	// 401 锁存。
+	svc.ReportFailure("ep-latch-5xx", 401, "bad key", 0)
+	// 锁存后连续 3 次 5xx(达默认阈值 3):必须仍保持 disabled+cooldown=0。
+	for i := 0; i < 3; i++ {
+		svc.ReportFailure("ep-latch-5xx", 500, "late in-flight", 0)
+	}
+
+	got := mustGet(t, store, "ep-latch-5xx")
+	if got.HealthStatus != "disabled" || got.CooldownUntil != 0 {
+		t.Fatalf("锁存行经计数路径后应仍保持 disabled+cooldown=0: %+v", got)
+	}
+	// 仍不自愈:Select 不返回它(回落 builtin),且 Select 不得改状态。
+	sel, err := svc.Select("anthropic", "", "")
+	if err != nil {
+		t.Fatalf("锁存行不应可被选中(应回落 builtin): %v", err)
+	}
+	if sel.ID != storage.BuiltinEndpointID {
+		t.Fatalf("锁存行经计数路径后不得被选中, got %s", sel.ID)
+	}
+	got = mustGet(t, store, "ep-latch-5xx")
+	if got.HealthStatus != "disabled" || got.CooldownUntil != 0 {
+		t.Fatalf("Select 后锁存态不得自愈: %+v", got)
+	}
+	// 计数照记:1 次 401 + 3 次 500 = total 4 / failed 4。
+	if got.TotalRequests != 4 || got.FailedRequests != 4 {
+		t.Fatalf("计数应照记 total=4 failed=4, got total=%d failed=%d", got.TotalRequests, got.FailedRequests)
+	}
+}
+
+// 401 锁存后的 ResetHealth 清零断言(Minor 4):与 500 熔断的 ResetHealth 测试区分,
+// 确认锁存终态同样可经手动重置恢复。
+func TestEndpointService_ResetHealthClearsLatch(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+	createEndpoint(t, store, anthropicEP("ep-reset-latch", 10))
+
+	svc.ReportFailure("ep-reset-latch", 401, "bad key", 0)
+	if got := mustGet(t, store, "ep-reset-latch"); got.HealthStatus != "disabled" {
+		t.Fatalf("前置:401 应已锁存, got %s", got.HealthStatus)
+	}
+
+	if err := svc.ResetHealth("ep-reset-latch"); err != nil {
+		t.Fatalf("reset health: %v", err)
+	}
+	got := mustGet(t, store, "ep-reset-latch")
+	if got.HealthStatus != "ok" || got.CooldownUntil != 0 ||
+		got.RateLimitedUntil != 0 || got.LastError != "" {
+		t.Fatalf("ResetHealth 应清回锁存态: %+v", got)
+	}
+	sel, err := svc.Select("anthropic", "", "")
+	if err != nil {
+		t.Fatalf("重置后应可选: %v", err)
+	}
+	if sel.ID != "ep-reset-latch" {
+		t.Fatalf("重置后应选中 ep-reset-latch, got %s", sel.ID)
+	}
+}
+
 // 403 归计数路径(语义歧义按普通失败计):连续失败累加,达阈值摘除。
 func TestEndpointService_ReportFailure403CountPath(t *testing.T) {
 	svc, store := newEndpointTestHarness(t)
