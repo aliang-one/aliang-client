@@ -182,23 +182,22 @@ func registerAllRoutes() {
 // This function was causing duplicate initialization of the singleton rule engine
 // See: cmd/start.go for the new centralized initialization
 
-// registerStaticFiles 注册静态文件服务（使用 embed 嵌入的文件）
-func registerStaticFiles() {
-	websiteRoot, rootPath, err := resolveWebsiteRoot()
-	if err != nil {
-		logger.Warn(fmt.Sprintf("Failed to access embedded website files: %v", err))
-		return
-	}
-
-	// 注册 assets 路径处理器
-	mux.HandleFunc("/assets/", func(w http.ResponseWriter, r *http.Request) {
-		setAssetsCacheHeaders(w)
-
+// assetsFileHandler 返回 /assets/ 的嵌入资产处理器。
+//
+// 缓存语义(2026-11-27 面板白屏残留根因修复):immutable 只允许出现在
+// **命中**的响应上。此前 setAssetsCacheHeaders 在进入任何 miss 判定之前
+// 就已设好,404/400 带着一年期 immutable 出门——浏览器按规范合法负缓存,
+// 而资产 URL 是内容寻址(修复版前端引用同一 URL),缓存的 404 永远压着
+// 真文件,白屏自愈无门(本机实证:修复装机后用户浏览器仍白,无缓存
+// 上下文却正常)。miss 一律 no-store:404 永远不值得缓存。
+func assetsFileHandler(websiteRoot fs.FS) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		// 移除前导 /assets/
 		filePath := strings.TrimPrefix(r.URL.Path, "/assets/")
 
 		// 安全检查：确保没有目录遍历
 		if strings.Contains(filePath, "..") {
+			setNoStore(w)
 			http.Error(w, "Invalid path", http.StatusBadRequest)
 			return
 		}
@@ -206,6 +205,7 @@ func registerStaticFiles() {
 		// 尝试打开文件
 		file, err := websiteRoot.Open("assets/" + filePath)
 		if err != nil {
+			setNoStore(w)
 			http.NotFound(w, r)
 			return
 		}
@@ -214,9 +214,13 @@ func registerStaticFiles() {
 		// 获取文件信息
 		info, err := file.Stat()
 		if err != nil {
+			setNoStore(w)
 			http.NotFound(w, r)
 			return
 		}
+
+		// 命中才谈缓存:内容寻址资产一年 immutable
+		setAssetsCacheHeaders(w)
 
 		// 设置 Content-Type
 		setContentType(w, filePath)
@@ -228,7 +232,19 @@ func registerStaticFiles() {
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size()))
 			io.Copy(w, file)
 		}
-	})
+	}
+}
+
+// registerStaticFiles 注册静态文件服务（使用 embed 嵌入的文件）
+func registerStaticFiles() {
+	websiteRoot, rootPath, err := resolveWebsiteRoot()
+	if err != nil {
+		logger.Warn(fmt.Sprintf("Failed to access embedded website files: %v", err))
+		return
+	}
+
+	// 注册 assets 路径处理器
+	mux.HandleFunc("/assets/", assetsFileHandler(websiteRoot))
 
 	// 注册根路径处理器，支持 SPA 路由
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -275,6 +291,7 @@ func registerStaticFiles() {
 		// SPA fallback to index.html.
 		indexFile, err := websiteRoot.Open("index.html")
 		if err != nil {
+			setNoStore(w)
 			http.NotFound(w, r)
 			return
 		}
@@ -314,6 +331,13 @@ func setNoCacheHTMLHeaders(w http.ResponseWriter) {
 
 func setAssetsCacheHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+}
+
+// setNoStore 未命中路径的缓存封条:404/400 一律禁止缓存(含负缓存)。
+// 404 带长效缓存头出门时,浏览器对同 URL(内容寻址资产修复后 URL 不变)
+// 的毒缓存永不自愈,只能用户手清——2026-11-27 本机实证。
+func setNoStore(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
 }
 
 // setContentType 根据文件扩展名设置 Content-Type
