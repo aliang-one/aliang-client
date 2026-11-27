@@ -99,8 +99,8 @@ func (h *launcherHarness) firePendingRetry(t *testing.T) {
 		t.Fatalf("无挂起重拉可触发")
 	}
 	s := h.scheduled[len(h.scheduled)-1]
-	if s.delay != panelCrashRetryDelay {
-		t.Fatalf("重拉延迟 = %v, want %v", s.delay, panelCrashRetryDelay)
+	if s.delay != time.Second {
+		t.Fatalf("重拉延迟 = %v, want %v", s.delay, time.Second)
 	}
 	s.fire()
 }
@@ -407,6 +407,69 @@ func TestPanelLauncherClickDuringPendingRetrySupersedes(t *testing.T) {
 	h.scheduled[0].fire() // 迟到的到期动作:已有面板,让位
 	if h.spawnCalls != 2 {
 		t.Fatalf("已作废的重拉仍二次 spawn:calls=%d", h.spawnCalls)
+	}
+}
+
+// TestPanelLauncherStaleRetryAfterClickOpenCloseYields 幽灵重拉窗口闭合:崩溃
+// 排 1s 重拉 → Click 抢先开面板(作废挂起重拉)→ 面板 1s 内又被正常关闭 →
+// 迟到的旧到期动作让位。此序列里 phase=normal 且 child==nil,既有的二次校验
+// 挡不住——必须靠「作废=置 pendingRetry nil」的真登记机制,否则无人请求也
+// 会幽灵 spawn。
+func TestPanelLauncherStaleRetryAfterClickOpenCloseYields(t *testing.T) {
+	h := newLauncherHarness()
+	h.launcher.Click()
+	h.crashExit(200 * time.Millisecond) // 崩 → 排 1s 重拉
+	if len(h.scheduled) != 1 {
+		t.Fatalf("前置崩溃未排重拉")
+	}
+	h.launcher.Click() // 重拉窗内点击:立即 spawn 并作废挂起重拉
+	if h.spawnCalls != 2 {
+		t.Fatalf("重拉窗内 Click 未立即 spawn:calls=%d", h.spawnCalls)
+	}
+	h.launcher.childExited(0, 300*time.Millisecond, false) // 面板 1s 内失焦自退关闭
+	h.scheduled[0].fire()                                  // 迟到的旧到期动作:已作废,让位
+	if h.spawnCalls != 2 {
+		t.Fatalf("已作废的旧重拉到期仍幽灵 spawn:calls=%d", h.spawnCalls)
+	}
+	if h.focusCloses != 1 {
+		t.Fatalf("前置失焦自退未分派 onFocusFallback:focus=%d", h.focusCloses)
+	}
+	if len(h.scheduled) != 1 {
+		t.Fatalf("让位不应新增重拉调度:scheduled=%d", len(h.scheduled))
+	}
+}
+
+// TestPanelLauncherSpawnPanicBecomesCrash spawn panic 兜底:转崩溃计数 + 1s
+// 重拉,状态机不挂死也不外漏 panic(锁随 defer 释放);重拉到期 spawn 恢复
+// 后正常开面板,后续 Click 仍可收起(证明状态机存活)。
+func TestPanelLauncherSpawnPanicBecomesCrash(t *testing.T) {
+	h := newLauncherHarness()
+	boom := errors.New("boom")
+	h.launcher.spawn = func(opts SpawnOpts) (ChildProcess, error) {
+		h.spawnCalls++
+		if h.spawnCalls == 1 {
+			panic(boom)
+		}
+		h.liveChild = newFakeChild()
+		return h.liveChild, nil
+	}
+	h.launcher.Click() // 首次 spawn panic:兜底转崩溃计数
+	if len(h.scheduled) != 1 {
+		t.Fatalf("spawn panic 未转崩溃排重拉:scheduled=%d", len(h.scheduled))
+	}
+	if h.fallbacks != 0 {
+		t.Fatalf("单次 panic 不应兜底:fallback=%d", h.fallbacks)
+	}
+	if h.lastChild() != nil {
+		t.Fatalf("panic 后不应有 child")
+	}
+	h.firePendingRetry(t) // 1s 重拉到期:spawn 已恢复 → 正常开面板
+	if h.spawnCalls != 2 || h.lastChild() == nil {
+		t.Fatalf("panic 后重拉未恢复开面板:calls=%d", h.spawnCalls)
+	}
+	h.launcher.Click() // 状态机未挂死:再点 = 收起
+	if h.lastChild().kills != 1 {
+		t.Fatalf("panic 后状态机挂死:kills=%d", h.lastChild().kills)
 	}
 }
 

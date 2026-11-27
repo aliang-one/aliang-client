@@ -1,6 +1,7 @@
 package tray
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -31,8 +32,10 @@ import (
 //     进入正常态时即清零——「连败再满 3 次」从 Retry 起独立计数,不受旧
 //     滑窗残留影响。
 //  2. 重拉 1s 延迟窗内视为「未开」:Click 允许立即 spawn,并作废挂起的
-//     重拉;迟到的到期动作经 retryNow 二次校验(兜底态 / 已有面板即让位),
-//     不二次 spawn。
+//     重拉。作废=置 pendingRetry=nil 是真机制——调度重拉时锁内真登记
+//     (pendingRetry=retryNow),被作废的迟到到期动作见 nil 即让位;仅此
+//     不够,retryNow 另保留二次校验(兜底态 / 已有面板即让位),不二次
+//     spawn。
 //  3. 兜底态进入即作废滑窗与挂起重拉:兜底是「停拉」终态,一切自动重拉
 //     停摆,恢复只认 RetryFromFallback。
 //
@@ -44,9 +47,12 @@ import (
 //     killedByUs),alive 用 time.Since(spawn 起点),killedByUs 取
 //     exitReport() 的有意收起标记;
 //   - 并发面:Click(托盘点击 goroutine)/ childExited(退出转投)/
-//     RetryFromFallback(菜单点击)互并发,mu 保护全部状态;spawn、opts、
-//     on* 回调与 scheduleRetry 钩子一律在锁外触发,且回调不得同步回调本
-//     状态机任何方法(否则自锁——Go 非重入锁)。
+//     RetryFromFallback(菜单点击)互并发,mu 保护全部状态。spawn/opts
+//     在锁内调用、有意设计(消灭 Click/retryNow 双 spawn 间隙):装配层
+//     注入的实现禁同步回调本状态机任何方法(否则自锁——Go 非重入锁,含
+//     经日志等间接回呼状态机方法);本状态机对二者 panic 兜底转崩溃计数
+//     (见 spawnAttempt),不外漏。on* 回调与 scheduleRetry 钩子一律在
+//     锁外触发。
 //
 // 纯逻辑、无构建标签、GOOS 无关:不 import internal/panelwin(其无 Linux
 // 形态,app/tray 引用会破 Linux 依赖闭包闸,见 cmd/panel.go 闭包纪律),
@@ -107,8 +113,10 @@ const (
 	phaseFallback
 )
 
-// PanelLauncher 托盘面板 launcher 状态机;零值不可用,由 Task 15 装配
-// spawn/opts/on* 后使用。字段语义见文件头。
+// PanelLauncher 托盘面板 launcher 状态机;零值不可用,由 Task 15 装配后
+// 使用。必装清单:spawn/onFallback 必装(onFallback 缺失会困死兜底态零
+// 可见);onFocusFallback/onQuitRequested 可空(缺省零动作);opts/now/
+// scheduleRetry 有缺省形态。字段语义见文件头。
 type PanelLauncher struct {
 	mu sync.Mutex
 
@@ -135,7 +143,7 @@ type PanelLauncher struct {
 	child        ChildProcess     // 存活面板(nil=未开/重拉窗/兜底)
 	spawnedAt    time.Time        // 存活起点(接线层算 alive 用)
 	killedByUs   bool             // 点图标有意收起标记(Click 打标,exitReport 取走)
-	pendingRetry func()           // 挂起的重拉到期动作(作废即置 nil)
+	pendingRetry func()           // 挂起的重拉到期动作真登记(调度重拉时置 retryNow);nil=无挂起,迟到的旧 fire 见 nil 即让位(作废=Click/兜底/Retry 置 nil)
 	crashTimes   []time.Time      // 崩溃滑窗(入窗即 prune)
 }
 
@@ -167,7 +175,7 @@ func (l *PanelLauncher) Click() {
 
 // childExited 子进程退出转投口(接线层把 child.Wait() 的退出码转投至此,
 // 签名即计划原文契约)。分诊:有意收起与 code=0 = 正常关闭(零惩罚;存活
-// ≥60s 顺带清零滑窗);code=60 = quit 意图分派;其余 = 崩溃(计 1 次 +
+// >60s 顺带清零滑窗);code=60 = quit 意图分派;其余 = 崩溃(计 1 次 +
 // 1s 重拉,滑窗满 3 → 兜底停拉)。
 func (l *PanelLauncher) childExited(code int, alive time.Duration, killedByUs bool) {
 	var (
@@ -183,19 +191,23 @@ func (l *PanelLauncher) childExited(code int, alive time.Duration, killedByUs bo
 	if l.phase != phaseFallback { // 兜底态:一切退出报告让位(停拉终态)
 		switch {
 		case killedByUs || code == 0:
-			// 正常关闭:点图标收起 / 失焦自退——零惩罚零重拉;存活 ≥60s
-			// 的成功会话清零失败滑窗(60s 内的正常关闭不动滑窗,拍板 1
+			// 正常关闭:点图标收起 / 失焦自退——零惩罚零重拉;存活 >60s
+			// 的成功会话清零失败滑窗(≤60s 的正常关闭不动滑窗,拍板 1
 			// 只按崩溃计数,普通关闭不奖不罚)
-			if alive >= panelLongSessionClear {
+			if alive > panelLongSessionClear {
 				l.crashTimes = nil
 			}
 			focusClose = !killedByUs && code == 0
 		case code == panelExitCodeQuit:
-			// quit 退出意图分派:不计数不重拉(退出闸归 Task 15)
+			// quit 退出意图分派:不计数不重拉(退出闸归 Task 15);quit
+			// 结束的长会话不清零(清零仅挂正常关闭分支,拍板 1 口径)
 			quit = true
 		default:
 			// 崩溃(含 kill -9 信号死亡 exit −1):记失败 + 重拉/兜底
 			retryDelay, retry = l.recordCrashLocked()
+			if retry {
+				l.pendingRetry = l.retryNow // 挂起重拉真登记(作废=Click 置 nil,裁定 2)
+			}
 			fallbackNow = !retry // 滑窗满 3:本次转投内已切兜底态
 		}
 	}
@@ -231,8 +243,9 @@ func (l *PanelLauncher) RetryFromFallback() {
 }
 
 // exitReport 供接线层在 child.Wait() 返回后取转投 childExited 所需的存活
-// 时长与有意收起标记(标记取即清零,防旧标记污染下一轮)。与 spawnAttempt
-// 写入的 spawnedAt 同锁读取。
+// 时长与有意收起标记(标记取即清零,防旧标记污染下一轮)。须先于
+// childExited 调用——childExited 会清 spawnedAt,错序则 alive 恒 0 静默
+// 失效。与 spawnAttempt 写入的 spawnedAt 同锁读取。
 func (l *PanelLauncher) exitReport() (alive time.Duration, killedByUs bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -244,40 +257,16 @@ func (l *PanelLauncher) exitReport() (alive time.Duration, killedByUs bool) {
 	return alive, killedByUs
 }
 
-// spawnAttempt 执行一次 spawn:成功记 child 与存活起点;失败(fork/exec 错)
-// = 崩溃 1 次,同一滑窗计数 + 1s 重拉,滑窗满 3 直接兜底。已有面板(手动
-// Click 抢先)或已进兜底态时让位。锁内调用 spawn/opts,故二者不得同步回调
-// 本状态机(契约见文件头)。
+// spawnAttempt 执行一次 spawn:成功记 child 与存活起点;失败(fork/exec 错,
+// 含 opts/spawn panic 兜底转崩溃)= 崩溃 1 次,同一滑窗计数 + 1s 重拉,滑窗
+// 满 3 直接兜底。已有面板(手动 Click 抢先)或已进兜底态时让位。spawn/opts
+// 锁内调用、有意设计(契约见文件头),本状态机对二者 panic 兜底转崩溃计数;
+// 其余 on* 回调 panic 契约同 panel_bridge.go(回调体自带 recover)。
 func (l *PanelLauncher) spawnAttempt() {
-	var (
-		retryDelay time.Duration
-		retry      bool
-	)
-	l.mu.Lock()
-	if l.phase == phaseFallback || l.child != nil {
-		l.mu.Unlock()
-		return
+	retryDelay, retry, spawned := l.spawnAttemptLocked()
+	if spawned {
+		return // 成功开面板或让位:无锁外动作
 	}
-	if l.spawn == nil {
-		// 装配缺陷守卫:未装配 spawn 不崩状态机也不计失败(Task 15 必装)
-		l.mu.Unlock()
-		return
-	}
-	var opts SpawnOpts
-	if l.opts != nil {
-		opts = l.opts()
-	}
-	child, err := l.spawn(opts)
-	if err == nil {
-		l.child = child
-		l.spawnedAt = l.nowFn()
-		l.killedByUs = false
-		l.mu.Unlock()
-		return
-	}
-	retryDelay, retry = l.recordCrashLocked()
-	l.mu.Unlock()
-
 	if retry {
 		l.scheduleRetryFn(retryDelay, l.retryNow)
 	} else {
@@ -285,10 +274,71 @@ func (l *PanelLauncher) spawnAttempt() {
 	}
 }
 
-// retryNow 挂起重拉的到期动作:延迟窗内状态可能已变(Click 已抢先 spawn /
-// 已进兜底态),二次校验后让位(裁定 2),随后交 spawnAttempt 三重校验。
+// spawnAttemptLocked spawnAttempt 的持锁段:defer Unlock 形态——opts/spawn
+// panic 至少释放锁,半更新态 = spawn 未成功语义等价。返回值:spawned=成功
+// 开面板或让位(无锁外动作);retry=true 携延迟待锁外排重拉(挂起重拉已
+// 真登记,作废=Click 置 nil),false 即兜底待锁外分派 onFallback。
+func (l *PanelLauncher) spawnAttemptLocked() (retryDelay time.Duration, retry, spawned bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.phase == phaseFallback || l.child != nil {
+		spawned = true // 让位
+		return
+	}
+	if l.spawn == nil {
+		// 装配缺陷守卫:未装配 spawn 不崩状态机也不计失败(Task 15 必装)
+		spawned = true
+		return
+	}
+	var opts SpawnOpts
+	var spawnErr error
+	if l.opts != nil {
+		opts, spawnErr = func() (o SpawnOpts, err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("panel launcher opts panic: %v", r)
+				}
+			}()
+			return l.opts(), nil
+		}()
+	}
+	if spawnErr == nil {
+		child, err := func() (c ChildProcess, err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("panel launcher spawn panic: %v", r)
+				}
+			}()
+			return l.spawn(opts)
+		}()
+		if err == nil {
+			l.child = child
+			l.spawnedAt = l.nowFn()
+			l.killedByUs = false
+			spawned = true
+			return
+		}
+		spawnErr = err
+	}
+	// 失败(fork/exec 错 / opts·spawn panic 兜底)= 崩溃 1 次,同罪同窗
+	retryDelay, retry = l.recordCrashLocked()
+	if retry {
+		l.pendingRetry = l.retryNow // 挂起重拉真登记(作废=Click 置 nil,裁定 2)
+	}
+	return
+}
+
+// retryNow 挂起重拉的到期动作:先验真登记——被 Click 作废(置 nil)的迟到
+// fire 即便此时 phase=normal 且 child==nil 也无人请求,必须让位(闭合「幽灵
+// 重拉」窗口);仍在册再看兜底态 / 已有面板二次校验(裁定 2),随后交
+// spawnAttempt 三重校验。
 func (l *PanelLauncher) retryNow() {
 	l.mu.Lock()
+	if l.pendingRetry == nil {
+		// 已作废(作废=置 nil 是真机制,非死字段):让位
+		l.mu.Unlock()
+		return
+	}
 	if l.phase == phaseFallback || l.child != nil {
 		l.mu.Unlock()
 		return
