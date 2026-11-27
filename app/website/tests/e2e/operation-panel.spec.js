@@ -83,3 +83,17 @@ test('shell activity shows the scope of Stop and keeps one terminal record', asy
   await expect(taskRow).toContainText(/Cancelled/i);
   await expect(scope).toHaveCount(0);
 });
+
+test('shell output count grows in the same task row without a percentage', async ({ page }) => {
+  const running = { ...task, title: 'Bash', kind: 'shell',
+    progress: { current: 321, unit: 'bytes' } };
+  await push(page, running);
+  await page.getByTestId('chat-operation-entry').last().click();
+  const drawer = page.getByTestId('chat-operation-panel');
+  const row = drawer.getByRole('button', { name: /^Bash/ });
+  await expect(row).toContainText('321 bytes');
+  await push(page, { ...running, revision: 2, progress: { current: 654, unit: 'bytes' } });
+  await expect(row).toContainText('654 bytes');
+  await expect(row).toHaveCount(1);
+  await expect(drawer.getByRole('progressbar')).toHaveCount(0);
+});

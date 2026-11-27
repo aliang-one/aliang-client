@@ -57,6 +57,9 @@
               <span v-if="item.step" class="block truncate text-xs text-slate-600 dark:text-slate-400">{{ item.step }}</span>
               <progress v-if="operationPercent(item) !== null" :value="operationPercent(item)" max="100" :aria-label="item.title"
                 class="mt-2 block h-1 w-full accent-primary"></progress>
+              <span v-else-if="item.progress" class="mt-1 block text-xs tabular-nums text-slate-600 dark:text-slate-400">
+                {{ progressLabel(item.progress) }}
+              </span>
             </button>
           </div>
         </div>
