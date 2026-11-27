@@ -1,0 +1,230 @@
+//go:build darwin
+
+package panelwin
+
+import (
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"slices"
+	"strings"
+	"testing"
+)
+
+// panelwin_darwin.m 的结构断言(实现计划 Task 13;写法照
+// app/tray/systray_darwin_patch_test.go 先例——本包不依赖那个包,辅助函数
+// 就地复制)。钉住的是「壳的物理形态」四件事:
+//
+//  1. 失焦即退链路:windowDidResignKey → exit(0)(不激活则永不触发,所以
+//     激活面 makeKeyAndOrderFront + NSApp activate 也一并钉住);
+//  2. 毛玻璃归系统材质层:NSVisualEffectView(behindWindow)铺底 +
+//     WKWebView drawsBackground=false(KVC 私有面)+ NSPanel opaque=false
+//     ——前端 hosted 态只画半透明底(Task 7 评审固化),壳不透明底色会
+//     盖住材质、验收必挂;
+//  3. WebMessage 通道:addScriptMessageHandler 的 handler 名必须为
+//     "panel"(与前端 messageHandlers.panel 对齐);quit→exit(60)、
+//     open→NSWorkspace openURL、未知类型默认忽略;
+//  4. 内存纪律:每个可被 Go goroutine 直接调到的 C 入口,函数体整体包一层
+//     @autoreleasepool(cgo 调用跑在调用者线程上,Go 运行时线程没有
+//     autorelease pool——同款泄漏先例见 third_party/systray/systray_darwin.m
+//     与 PATCH_NOTES);全文件零裸 autorelease 消息(ARC 下对象生命周期
+//     确定性,面板进程存活即对象存活,不需要手工 autorelease)。
+
+func TestPanelwinDarwinShellStructure(t *testing.T) {
+	src := panelwinDarwinSource(t)
+
+	t.Run("失焦即退与激活面", func(t *testing.T) {
+		for _, want := range []string{
+			"windowDidResignKey",                     // NSWindowDelegate 失焦回调
+			"exit(0)",                                // 失焦自退(退出码契约 0)
+			"exit(60)",                               // quit 消息退出码 60
+			"makeKeyAndOrderFront",                   // 不取焦点则失焦即退永不触发
+			"activateIgnoringOtherApps:YES",          // 同上:程序化激活(12.0 可用,14 起弃用仍有效)
+			"NSWindowStyleMaskNonactivatingPanel",    // 不抢宿主焦点
+			"NSApplicationActivationPolicyAccessory", // 无 Dock 图标
+		} {
+			if !strings.Contains(src, want) {
+				t.Errorf("panelwin_darwin.m 缺少 %q(失焦即退/激活链路不完整)", want)
+			}
+		}
+	})
+
+	t.Run("毛玻璃材质层与透明底", func(t *testing.T) {
+		for _, want := range []string{
+			"NSVisualEffectView",                     // 系统材质层铺底
+			"NSVisualEffectBlendingModeBehindWindow", // behindWindow 混合
+			"drawsBackground",                        // WKWebView 私有 KVC 面
+			"@NO",                                    // drawsBackground=false 的赋值形态
+			"opaque = NO",                            // NSPanel 不透明底关掉
+		} {
+			if !strings.Contains(src, want) {
+				t.Errorf("panelwin_darwin.m 缺少 %q(材质层/透明底形态不完整,毛玻璃验收必挂)", want)
+			}
+		}
+		// drawsBackground 必须是 setValue:forKey: 的 KVC 面(plan 口径:
+		// 私有面,公证探针随 Task 16 同批)——不许写成属性点语法误装公有。
+		if !strings.Contains(src, `forKey:@"drawsBackground"`) {
+			t.Errorf("panelwin_darwin.m 的 drawsBackground 必须经 setValue:forKey:@NO 的 KVC 形态(私有 API 口径)")
+		}
+	})
+
+	t.Run("WebMessage 通道与协议冻结", func(t *testing.T) {
+		// handler 名必须为 "panel":前端 messageHandlers.panel 逐字对齐,
+		// 改名即静默断裂(postMessageHost 落回无宿主降级)。
+		if !strings.Contains(src, `addScriptMessageHandler`) || !strings.Contains(src, `name:@"panel"`) {
+			t.Errorf("panelwin_darwin.m 缺少 addScriptMessageHandler name:@\"panel\"(与前端 messageHandlers.panel 对齐)")
+		}
+		// open 分派:kind → 对应 URL,经 NSWorkspace 开默认浏览器后驻留。
+		for _, want := range []string{
+			`@"dashboard"`, // kind=dashboard → 仪表盘 URL
+			`@"peer"`,      // kind=peer → 设备互访 URL
+			"openURL",      // NSWorkspace openURL
+		} {
+			if !strings.Contains(src, want) {
+				t.Errorf("panelwin_darwin.m 缺少 %q(open 分派不完整)", want)
+			}
+		}
+		// 未知类型默认忽略:协议冻结(quit/open 两类型),handler 必须有
+		// 显式忽略分支(注释锚点),不得崩。
+		if !strings.Contains(src, "未知类型") {
+			t.Errorf("panelwin_darwin.m 缺少「未知类型」忽略分支(协议冻结:未知 type 必须忽略不崩)")
+		}
+	})
+
+	t.Run("导航白名单", func(t *testing.T) {
+		// decidePolicyFor 仅放行回环白名单 origin(调研 §6.3 不变量)。
+		for _, want := range []string{
+			"decidePolicyForNavigationAction",
+			"WKNavigationActionPolicyCancel",
+		} {
+			if !strings.Contains(src, want) {
+				t.Errorf("panelwin_darwin.m 缺少 %q(导航白名单不完整)", want)
+			}
+		}
+	})
+
+	t.Run("autoreleasepool 纪律", func(t *testing.T) {
+		defs := cFunctionDefs(src)
+		if len(defs) == 0 {
+			t.Fatal("未匹配到任何 C 函数定义,正则已失效")
+		}
+		for _, fn := range poolWrappedEntries {
+			body := strings.TrimSpace(panelwinCFunctionBody(t, src, fn))
+			const poolOpen = "@autoreleasepool {"
+			if !strings.HasPrefix(body, poolOpen) {
+				t.Errorf("%s 的函数体没有包在 @autoreleasepool 里(cgo 入口跑在 Go goroutine 线程上,无 pool 即泄漏):\n%s", fn, body)
+				continue
+			}
+			if close := matchingBraceIdx(body, strings.Index(body, "{")); close != len(body)-1 {
+				t.Errorf("%s 的 @autoreleasepool 只包住了函数体的一部分(pool 闭合于 %d,函数体长 %d):\n%s", fn, close, len(body), body)
+			}
+		}
+		// 无裸 autorelease 创建点:ARC 下全文件不允许手写 autorelease 消息
+		// ——手工 autorelease 只会引入对 pool 的隐性依赖;对象生命周期=
+		// 进程存活(面板是叶子进程),显式管理无意义。
+		if idx := strings.Index(src, "autorelease]"); idx >= 0 {
+			t.Errorf("panelwin_darwin.m 出现裸 autorelease 消息(ARC 纪律:不手写 autorelease),位置 %d 附近:\n%s",
+				idx, lineAround(src, idx))
+		}
+	})
+
+	t.Run("C 入口清单完备", func(t *testing.T) {
+		// 每个顶格 C 函数定义都必须归类:会被 Go goroutine 直接调到的进
+		// poolWrappedEntries(函数体整体包 @autoreleasepool);只被
+		// pool 包住的入口内部调用的静态辅助进 noOwnPoolNeeded(同
+		// systray_darwin_patch_test.go 的两清单归类思路)。
+		got := cFunctionDefs(src)
+		if !slices.Contains(got, "panelwin_run") {
+			t.Errorf("panelwin_darwin.m 缺少 C 入口 panelwin_run")
+		}
+		for _, fn := range got {
+			if slices.Contains(poolWrappedEntries, fn) || slices.Contains(noOwnPoolNeeded, fn) {
+				continue
+			}
+			t.Errorf("panelwin_darwin.m 出现未归类的 C 函数 %q:请判断它是否会被 Go goroutine 直接调用并登记到对应清单", fn)
+		}
+	})
+}
+
+// poolWrappedEntries — 会被 Go goroutine 所在线程直接调到的 C 入口:
+// 函数体必须整体包一层 @autoreleasepool(结构测试逐个校验)。
+var poolWrappedEntries = []string{"panelwin_run"}
+
+// noOwnPoolNeeded — 不需要自持 pool 的静态辅助函数:只被已包 pool 的
+// 入口内部调用,其 autoreleased 结果在调用方的 pool 里排空。
+var noOwnPoolNeeded = []string{"originOfURL"}
+
+// panelwinDarwinSource 读取本包的 ObjC 壳源码。
+func panelwinDarwinSource(t *testing.T) string {
+	t.Helper()
+
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller: 无法定位测试文件")
+	}
+	src, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "panelwin_darwin.m"))
+	if err != nil {
+		t.Fatalf("读取 panelwin_darwin.m: %v", err)
+	}
+	return string(src)
+}
+
+// cFunctionDefs 列出顶格书写的 C 函数定义名(不含 ObjC 方法)。
+func cFunctionDefs(src string) []string {
+	def := regexp.MustCompile(`(?m)^[A-Za-z_][A-Za-z0-9_ *]*?\b([A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*\{`)
+
+	var names []string
+	for _, m := range def.FindAllStringSubmatch(src, -1) {
+		names = append(names, m[1])
+	}
+	return names
+}
+
+// panelwinCFunctionBody 返回 name 对应 C 函数最外层花括号之间的正文。
+func panelwinCFunctionBody(t *testing.T, src, name string) string {
+	t.Helper()
+
+	def := regexp.MustCompile(`(?m)^[A-Za-z_][A-Za-z0-9_ *]*?\b` + regexp.QuoteMeta(name) + `\s*\([^;{}]*\)\s*\{`)
+	loc := def.FindStringIndex(src)
+	if loc == nil {
+		t.Fatalf("panelwin_darwin.m 里找不到 C 函数 %s 的定义", name)
+	}
+	close := matchingBraceIdx(src, loc[1]-1)
+	if close < 0 {
+		t.Fatalf("panelwin_darwin.m 里 C 函数 %s 的花括号不闭合", name)
+	}
+	return src[loc[1]:close]
+}
+
+// matchingBraceIdx 返回 s[open] 这个 '{' 对应的 '}' 的下标。
+func matchingBraceIdx(s string, open int) int {
+	depth := 0
+	for i := open; i < len(s); i++ {
+		switch s[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// lineAround 返回位置 idx 附近的行,用于失败信息定位。
+func lineAround(src string, idx int) string {
+	start := strings.LastIndexByte(src[:idx], '\n')
+	if start < 0 {
+		start = 0
+	}
+	end := strings.IndexByte(src[idx:], '\n')
+	if end < 0 {
+		end = len(src)
+	} else {
+		end += idx
+	}
+	return src[start:end]
+}
