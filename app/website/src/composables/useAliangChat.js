@@ -1529,6 +1529,8 @@ export function useAliangChat() {
   // token-by-token and carries the running -> done status transitions.
   let aiSocket = null;
   let aiSocketPromise = null;
+  let probeAISocket;
+  let clearAISocketProbe;
   // 挂起中建连 Promise 的 settle 句柄（2026-11-20 审计②）：onclose/onopen
   // 之外的出口此前只有构造器 throw——「CONNECTING 即断」时 Promise 永不落定，
   // await 方（审批/发送/停止/插话）永久挂死，审批卡卡死 responding、输入区
@@ -2651,7 +2653,10 @@ export function useAliangChat() {
 
   function ensureAISocket() {
     if (chatDisposed) return Promise.reject(new Error('chat-disposed'));
-    if (aiSocket && aiSocket.readyState === WebSocket.OPEN) return Promise.resolve();
+    if (aiSocket && aiSocket.readyState === WebSocket.OPEN) {
+      probeAISocket?.();
+      return Promise.resolve();
+    }
     if (aiSocket && aiSocket.readyState === WebSocket.CONNECTING && aiSocketPromise) return aiSocketPromise;
 
     aiSocketPromise = new Promise((resolve, reject) => {
@@ -2664,6 +2669,32 @@ export function useAliangChat() {
         return;
       }
       aiSocket = sock;
+      let presenceSupported = false;
+      let presenceTimer;
+      let lastTrafficAt = -Infinity;
+      let closed = false;
+      const clearProbe = () => {
+        clearTimeout(presenceTimer);
+        presenceTimer = undefined;
+      };
+      clearAISocketProbe?.();
+      clearAISocketProbe = clearProbe;
+      const recoverFromSilence = () => {
+        clearProbe();
+        if (aiSocket !== sock || closingIntentionally) return;
+        // A half-open socket can never deliver its asynchronous close event.
+        handleClose({ code: 1006, reason: 'presence_timeout' });
+        try { sock.close(); } catch (_) { /* already closed */ }
+      };
+      probeAISocket = () => {
+        if (!presenceSupported || presenceTimer !== undefined || now() - lastTrafficAt < 1000) return;
+        presenceTimer = setTimeout(recoverFromSilence, 4000);
+        try {
+          sock.send(JSON.stringify({ type: 'presence.ping', nonce: generateId() }));
+        } catch (_) {
+          recoverFromSilence();
+        }
+      };
       aiSocketSettle = { sock, resolve, reject };
       // timer 用 wrapper 挂属主：迟到 close 不得拆新连接的保险丝（2026-11-20
       // 评审 should——超时 reject+close() 到 close 事件送达之间存在空窗，空窗
@@ -2707,6 +2738,7 @@ export function useAliangChat() {
         resolve();
       };
       sock.onmessage = (ev) => {
+        if (closed || aiSocket !== sock) return;
         let parsed = null;
         try {
           parsed = JSON.parse(ev.data);
@@ -2714,6 +2746,13 @@ export function useAliangChat() {
           // ignore malformed frames
         }
         if (parsed && parsed.type) {
+          lastTrafficAt = now();
+          clearProbe();
+          if (parsed.type === 'presence.ready') {
+            presenceSupported = true;
+            return;
+          }
+          if (parsed.type === 'presence.pong') return;
           // 帧级跟踪默认关闭：ai.delta 高频逐帧打日志在 DevTools 打开时显著
           // 拖慢流式渲染（2026-11-26 审计）。需要定位流问题时设
           // globalThis.__CHAT_DEBUG__ = true 后重载页面再开。
@@ -2729,7 +2768,10 @@ export function useAliangChat() {
       sock.onerror = (e) => {
         console.warn('[aliang-chat] ws error', e);
       };
-      sock.onclose = (e) => {
+      function handleClose(e) {
+        if (closed) return;
+        closed = true;
+        clearProbe();
         console.log('[aliang-chat] ws close code=', e.code, 'reason=', e.reason);
         // 本 socket 的超时保险丝自己拆（属主校验——2026-11-20 评审 should：
         // 迟到 close 不得拆空窗里重建的新连接的 timer）。
@@ -2748,7 +2790,11 @@ export function useAliangChat() {
           pending.reject(err);
         }
         const stale = !!aiSocket && aiSocket !== sock;
-        if (aiSocket === sock) aiSocket = null;
+        if (aiSocket === sock) {
+          aiSocket = null;
+          probeAISocket = undefined;
+          clearAISocketProbe = undefined;
+        }
         // 挂起 Promise 句柄只在非陈旧 close 上落位：迟到 close 清掉的是新
         // 连接的 CONNECTING 去重闸（2026-11-20 评审 should），新连接将失去
         // 超时保护并重造永久挂死的 awaiter。
@@ -2766,7 +2812,7 @@ export function useAliangChat() {
         const affected = conversations.value.filter(
           (c) => findRunningAssistant(c) || (c.id === activeId.value && sending.value)
         );
-        if (!affected.length) return;
+        if (!affected.length && e.reason !== 'presence_timeout') return;
         // 断线自愈（后台静默运行）：先重连 + 重订阅拿快照对账——socket 断了
         // run 并没停，立即把 running 气泡画成 error 是假中断。重连失败（构造
         // 异常）或连上又立刻断（下轮 onclose 超限）才回落「中断」画法。
@@ -2825,7 +2871,8 @@ export function useAliangChat() {
           return;
         }
         markRunsInterrupted(affected, e.code);
-      };
+      }
+      sock.onclose = handleClose;
     });
     return aiSocketPromise;
   }
@@ -4704,6 +4751,7 @@ export function useAliangChat() {
       aiSocketConnectTimer = null;
     }
     closingIntentionally = true;
+    clearAISocketProbe?.();
     try { if (aiSocket) aiSocket.close(); } catch (_) {}
     aiSocket = null;
     aiSocketSettle = null;

@@ -140,6 +140,8 @@ func TestRunRemoteAgentSession_EndsWhenPeerGoesSilent(t *testing.T) {
 	// silent-peer termination, so a hello failure can't masquerade as a pass.
 	select {
 	case <-helloReceived:
+	case err := <-sessionDone:
+		t.Fatalf("agent session ended before hello: %v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("agent never sent hello within 5s")
 	}
@@ -149,5 +151,27 @@ func TestRunRemoteAgentSession_EndsWhenPeerGoesSilent(t *testing.T) {
 		// Expected: the read deadline fired on the silent peer and the session ended.
 	case <-time.After(4 * time.Second):
 		t.Fatal("runRemoteAgentSession did not end within 4s against a silent peer; read-deadline/ping liveness is not working")
+	}
+}
+
+func TestAgentRemoteProbeBudget(t *testing.T) {
+	if window := agentRemoteReadWindow.Load(); window > 15*time.Second ||
+		window < 3*agentRemotePingInterval.Load() {
+		t.Fatalf("remote read window must allow three probes within 15s: ping=%s window=%s",
+			agentRemotePingInterval.Load(), window)
+	}
+}
+
+func TestDashboardPresencePingRepliesOnTheOriginSocket(t *testing.T) {
+	var replies []map[string]interface{}
+	s := &AgentService{}
+	write := func(payload interface{}) error {
+		replies = append(replies, payload.(map[string]interface{}))
+		return nil
+	}
+	s.DispatchLocalAI(map[string]interface{}{"type": "presence.ping", "nonce": "probe-42"}, write)
+	s.DispatchLocalAI(map[string]interface{}{"type": "presence.ping", "nonce": 42}, write)
+	if len(replies) != 1 || replies[0]["type"] != "presence.pong" || replies[0]["nonce"] != "probe-42" {
+		t.Fatalf("expected only the valid probe acknowledgement, got %#v", replies)
 	}
 }

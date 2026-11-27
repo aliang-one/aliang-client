@@ -578,7 +578,9 @@ func (m *agentAIManager) runTUITurn(ctx context.Context, session *agentAISession
 		return
 	}
 	// held 检测：bypass 门会静默扣留且不弹任何提示，transcript 是唯一观测点。
-	if ccPeerWatchHeld(plan.JSONLPath, plan.JSONLOffset, ccPeerHeldWatchWindow) {
+	// 用回合专用观测（见 tuiTurnHeldWatch）：回合已起跑即提前放行，健康回合
+	// 不再白等满固定窗口。
+	if tuiTurnHeldWatch(runCtx, plan.JSONLPath, plan.JSONLOffset, ccPeerHeldWatchWindow, ownEchoMatcher(content)) {
 		fail(agentTUIErrHeld, "终端会话拒绝了这条消息，请在终端中处理")
 		return
 	}
@@ -798,6 +800,48 @@ const (
 	tuiTurnTranscriptGone                                 // transcript 读错误 → 让位 tail 桥上报
 )
 
+// tuiTurnHeldWatch 是 TUI 回合专用的 held 观测。判据与窗口上限与
+// ccPeerWatchHeld 完全一致（transcript 出现 "Held peer message" 即扣留；
+// 窗口耗尽按「未扣留」放行——best-effort 语义不变），但多一条提前放行：
+// 只有观察到本次消息的回显才可以提早离开。其他回合的活动可能与本次
+// 注入被扣留同时发生，仍要保留完整观测窗。
+//
+// ctx 取消立即返回 false——调用方（runTUITurn）随后查 runCtx 走停止收尾，
+// 与旧路径的退出守卫逐一对齐。
+func tuiTurnHeldWatch(ctx context.Context, jsonlPath string, offset int64, window time.Duration, isOwnEcho func([]byte) bool) bool {
+	jsonlPath = strings.TrimSpace(jsonlPath)
+	if jsonlPath == "" || offset < 0 {
+		return false
+	}
+	deadline := time.Now().Add(window)
+	seen := offset
+	for {
+		lines, newOffset, err := readTranscriptFrom(jsonlPath, seen)
+		if err == nil {
+			for _, line := range lines {
+				if bytes.Contains(line, []byte("Held peer message")) {
+					return true
+				}
+				if isOwnEcho != nil && isOwnEcho(line) {
+					return false
+				}
+			}
+			seen = newOffset
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(tuiTurnPollInterval):
+		}
+	}
+}
+
 // tuiTurnStartWatch 阻塞观察注入后的「本回合起跑」信号，分层判定：
 //
 //   - 本回合注入消息的 user 回显（isOwnEcho）→ (tuiTurnStarted, 该 echo 行之后
@@ -825,16 +869,19 @@ func tuiTurnStartWatch(ctx context.Context, jsonlPath string, offset int64, wind
 			// tail 桥首轮上报，绝不在这里干等窗口把错误顶成 tui_no_turn。
 			return tuiTurnTranscriptGone, offset
 		}
+		uncorrelatedActivity := false
 		for _, line := range lines {
 			if isOwnEcho(line) {
 				return tuiTurnStarted, seen + int64(len(line)+1)
 			}
 			if classifyTranscriptLine(line) != transcriptIgnore {
-				// 他人回合/回显形态漂移：按旧语义立即起跑，不拖窗口。锚点回到
-				// 原始 offset——tail 桥重读全部活动行（delta 一个不吞），与旧
-				// 行为逐字节一致；只有认得出本回合 echo 时才跳到 echo 之后。
-				return tuiTurnStartedUncorrelated, offset
+				uncorrelatedActivity = true
 			}
+			seen += int64(len(line) + 1)
+		}
+		if uncorrelatedActivity {
+			// 回显形态无法识别时，沿用完整转录尾窗，从注入点开始桥接。
+			return tuiTurnStartedUncorrelated, offset
 		}
 		seen = newOffset
 		if ctx.Err() != nil {
@@ -870,13 +917,11 @@ func readTranscriptFrom(path string, offset int64) ([][]byte, int64, error) {
 		return nil, offset, err
 	}
 	buf := make([]byte, info.Size()-offset)
-	if _, err := io.ReadFull(f, buf); err != nil && err != io.ErrUnexpectedEOF {
+	n, err := io.ReadFull(f, buf)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
 		return nil, offset, err
 	}
-	end := int64(len(buf))
-	if idx := bytes.LastIndexByte(buf, '\n'); idx >= 0 {
-		end = int64(idx) + 1 // 只消费完整行
-	}
+	end := int64(bytes.LastIndexByte(buf[:n], '\n')) + 1
 	if end <= 0 {
 		return nil, offset, nil
 	}
