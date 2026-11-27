@@ -4,7 +4,7 @@ import (
 	"embed"
 )
 
-//go:embed website/dist
+//go:embed all:website/dist
 var WebsiteFS embed.FS
 
 // MeshRunbookSKILL 组网诊断 runbook 技能源真值(mesh-runbook 自愈安装 D-9):
