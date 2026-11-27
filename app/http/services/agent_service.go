@@ -46,6 +46,14 @@ const (
 	agentLogoutTimeout     = 2 * time.Second
 	agentStatusSyncPath    = "/api/agent/status"
 	AgentRuntimeEnv        = "ALIANG_USER_AGENT_RUNTIME"
+	// CoreProcessEnv 由 cmd core 入口（runCoreWithContext）显式置 1 标记
+	// 「本进程是 core 守护形态（SCM 服务 / macOS root daemon）」。核心用途
+	// 是把 ensureAgentAfterAuth 的「core 永不 spawn user agent」守卫从
+	// os.Geteuid()==0（Windows 恒 -1，守卫失效，LocalSystem core 会在登录
+	// 事件后 spawn root 身份 agent 与用户 agent 抢 56433/flock 互杀，
+	// 2026-11-27 客户案定案）迁到跨平台可靠的进程角色判据。spawn agent
+	// 时该标记被 userAgentEnv 剥离（blocked 名单），不会漏进子进程。
+	CoreProcessEnv = "ALIANG_CORE_PROCESS"
 	// SessionOwnerAddrEnv 由 owner 进程在 spawn agent 子进程时注入
 	// （见 agentruntime.userAgentEnv），指向 owner dashboard 的基地址；
 	// agent 凭据被远端拒绝时沿此地址通知 owner 触发恢复链。
@@ -208,6 +216,11 @@ type AgentService struct {
 	// 服务级以跨重连存活,sendAgentHello 单一咽喉刷新基线。
 	remoteHello agentRemoteHelloGate
 
+	// helloDelta 驱动 hello 增量协议(sync_mode full/delta/heartbeat,见
+	// agent_hello_delta.go):段指纹+会话哈希基线+自愈计数,跨重连存活;
+	// connect/server_requested 锚点在 plan() 内强制全量并经 commit 重建基线。
+	helloDelta agentHelloDeltaState
+
 	// remoteWriter holds the live remote-connection writer. AI (and terminal)
 	// events are emitted through currentRemoteWriter() rather than a closure
 	// captured at message-arrival time, so a reconnect reattaches in-flight AI
@@ -311,6 +324,13 @@ func NewAgentService() *AgentService {
 
 func IsUserAgentRuntime() bool {
 	return strings.TrimSpace(os.Getenv(AgentRuntimeEnv)) == "1"
+}
+
+// IsCoreProcess 报告本进程是否 core 守护形态（cmd core 入口置的进程内
+// 标记；见 CoreProcessEnv 注释）。与 IsUserAgentRuntime 对称：一个标记
+// runtime 子进程，一个标记 core 守护进程，用于 spawn/代理等角色分派。
+func IsCoreProcess() bool {
+	return strings.TrimSpace(os.Getenv(CoreProcessEnv)) == "1"
 }
 
 func UserAgentBaseURL() string {
@@ -856,6 +876,12 @@ func (s *AgentService) SyncNowWithUserContext(authHeader string, userKey string)
 	s.mu.Unlock()
 	if authChanged {
 		s.PushSessionRefresh()
+		// OpenViking 托管接线补跑(2026-11-26 默认开翻转):boot 挂点
+		// (agentruntime/server.go)早于 owner 推送凭据,user-agent 首个登录
+		// 周期内 boot ensure 必然空手而归;凭据落地后补一次,「出厂即接线」
+		// 才对从未手动保存过卡片的设备成立。只 Warn 不阻断 sync;幂等
+		// (ensure 注册表对齐,managed 铸 key lazy-mint 铸一次存一次)。
+		go EnsureOpenVikingMatchesConfig()
 	}
 	if !registered || !enabled {
 		logger.Info(fmt.Sprintf("[AGENT-BOOT] sync_now complete remote_connection=skipped reason=not_registered_or_disabled device_id=%s registered=%t enabled=%t", deviceID, registered, enabled))

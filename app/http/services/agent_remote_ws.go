@@ -723,6 +723,9 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn, accounts ...s
 }
 
 func (s *AgentService) sendAgentHello(writeJSON func(interface{}) error, reason string) error {
+	// 增量协议三步(plan→apply→commit)必须串行:并发 reason 交叉簿记会把段
+	// 指纹/会话基线记到对方的帧上。写路径本就按连接串行,这里显式加序。
+	defer s.helloDelta.beginSequence()()
 	// 先取指纹再构建 payload:noteSent 的基线应与本次 hello 覆盖的状态对齐。
 	// 所有 reason 的成功 hello 都在此刷新 gate(单一咽喉),rename/periodic 后
 	// 不会紧跟一次重复的 digest hello(见 agent_vibe_hello_gate.go)。
@@ -740,20 +743,41 @@ func (s *AgentService) sendAgentHello(writeJSON func(interface{}) error, reason 
 	if dirs, ok := hello["authorized_directories"].([]string); ok {
 		dirCount = len(dirs)
 	}
-	logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection sending_hello reason=%s device_id=%s platform=%s projects=%d vibe_sessions=%d dirs=%d",
+	framePlan := s.helloDelta.plan(reason, hello)
+	wire := s.helloDelta.applyPlan(hello, framePlan)
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection sending_hello reason=%s sync_mode=%s device_id=%s platform=%s projects=%d vibe_sessions=%d dirs=%d session_changes=%d session_removed=%d%s",
 		strings.TrimSpace(reason),
-		hello["device_id"],
-		hello["platform"],
+		framePlan.mode,
+		wire["device_id"],
+		wire["platform"],
 		projectCount,
 		vibeSessionCount,
 		dirCount,
+		len(framePlan.sessionChanges),
+		len(framePlan.sessionRemoved),
+		framePlanLogSuffix(framePlan),
 	))
-	if err := writeJSON(hello); err != nil {
+	if err := writeJSON(wire); err != nil {
 		return err
 	}
+	// 基线从全量构建结果推进(full 帧线==全量;delta 只吸收变化段;heartbeat 不动),
+	// 失败路径不进 commit=基线不动,下个 tick 重试(与 gate 既有范式一致)。
+	s.helloDelta.commit(&framePlan, hello)
 	s.remoteHello.noteSent(sentDigest, time.Now())
-	logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection hello_sent reason=%s", strings.TrimSpace(reason)))
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection hello_sent reason=%s sync_mode=%s", strings.TrimSpace(reason), framePlan.mode))
 	return nil
+}
+
+// framePlanLogSuffix 把降档动因带进日志(全量锚点的触发原因排障必需)。
+func framePlanLogSuffix(plan agentHelloFramePlan) string {
+	switch {
+	case plan.forceReason != "":
+		return " force=" + plan.forceReason
+	case plan.selfHeal:
+		return " force=self_heal"
+	default:
+		return ""
+	}
 }
 
 func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[string]interface{}, writeJSON func(interface{}) error) {
@@ -774,6 +798,13 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 		s.applyCloudOperation(account, msg)
 	case models.AgentEventRegistered:
 		logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection registered_ack server_device_id=%s", strings.TrimSpace(fmt.Sprint(msg["device_id"]))))
+		// 增量协议轻对账(零新协议):agent.registered 每帧必回且携带服务端当前
+		// vibe 会话数。服务端归零而基线非零 = 内存态丢失信号(PG flush 回滚类
+		// 残余窗口),升格下帧 full;重启类丢失由拓扑兜底(重启必杀 socket→
+		// connect 全量),这里只封尾部窗口。
+		if serverSessions, ok := msg["vibe_session_count"].(float64); ok {
+			s.helloDelta.reconcileRegisteredServerSessions(int(serverSessions))
+		}
 		s.mu.Lock()
 		// device_id is permanent and client-owned: ignore the id the server
 		// acknowledges and re-pin our own installation identity.
