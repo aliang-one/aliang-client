@@ -110,8 +110,11 @@ func TestPanelwinDarwinShellStructure(t *testing.T) {
 		// 「未知形态忽略不崩」。type/kind 的每处提取(NSDictionary 直取与
 		// JSON 字符串兜底解析,共两段×两键)都必须先过
 		// isKindOfClass:[NSString class] 闸,非 NSString 一律走「未知忽略」。
-		if got := strings.Count(src, "isKindOfClass:[NSString class]"); got < 4 {
-			t.Errorf("panelwin_darwin.m 的 type/kind 提取缺 isKindOfClass:[NSString class] 守卫(需 ≥4 处,现 %d 处):畸形 payload {\"type\":123} 会 unrecognized selector 崩",
+		// 计数基线 = 6:4 处真守卫(两段×两键)+ 1 处预存的 body 整体判型
+		// + 1 处协议注释里的字面量。锚 6 而非 4,是为了拆掉 1~2 个守卫
+		// 仍会红——锚 4 时拆一个守卫恰好还绿,守卫会静默流失。
+		if got := strings.Count(src, "isKindOfClass:[NSString class]"); got < 6 {
+			t.Errorf("panelwin_darwin.m 的 type/kind 提取缺 isKindOfClass:[NSString class] 守卫(需 ≥6 处=4 真守卫+1 预存 body 判型+1 注释,现 %d 处):畸形 payload {\"type\":123} 会 unrecognized selector 崩",
 				got)
 		}
 	})

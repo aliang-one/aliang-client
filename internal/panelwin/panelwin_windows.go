@@ -43,7 +43,8 @@ const (
 	wmActivate = 0x0006
 	waInactive = 0
 	wmDestroy  = 0x0002
-	wmQuit     = 0x0012
+	// 注:WM_QUIT(0x0012)不再声明常量——退出码协议已收进自建消息循环的
+	// WM_QUIT 分支(GetMessageW 返回 0 时直接读 wParam),见下方消息循环注释。
 
 	swShow        = 5
 	swpNoZOrder   = 0x0004

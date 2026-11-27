@@ -378,16 +378,16 @@ func (l *PanelLauncher) RetryFromFallback()
 
 ### Task 16: 打包、文档与验收收口
 
-- [ ] **Linux 排除门终验**：`GOOS=linux CGO_ENABLED=1 go list -deps ./cmd/aliang | grep -cE "webview2|panelwin|wails"`（期望 0）；`GOOS=linux CGO_ENABLED=0 go build ./cmd/...`
-- [ ] 全量测试：`go test ./app/tray/ ./internal/ipc/ ./internal/singleinstance/ ./cmd/ ./internal/panelwin/ ./app/http/services/ -count=1` + `cd app/website && npm run test -- src/panel`
-- [ ] PATCH_NOTES 登记 Task 3/4 补丁（重放锚点清单）；调研文档随本批提交入库
-- [ ] 出包：macOS `VERSION=v1.1.129-local bash scripts/build-pkg.sh` 装机；Windows 走 MSI 链
-- [ ] **验收走查（spec §9 + 调研 §7 探针）**：macOS 26/27 各一台七态逐项 + 深浅色 + 失焦 + 锚定 + 崩溃演练 + `footprint` 对照 + **毛玻璃材质可见**；Windows 11 真机（4070）：同清单 + GDI 平坦（GetGuiResources）+ 溢出区锚定回退 + DPI 125%/150%（CSS 视口宽必须恒 340）+ **亚克力/圆角实机探针**（不生效→回退纯半透明并回写 spec §7）+ **WKWebView 透明底公证探针**
+- [x] **Linux 排除门终验**：`GOOS=linux CGO_ENABLED=1 go list -deps ./cmd/aliang | grep -cE "webview2|panelwin|wails"`（期望 0）；`GOOS=linux CGO_ENABLED=0 go build ./cmd/...`。**实作备注（Task 16 收口批,2026-11-28）**：依赖闭包命中 = 0 ✓;`CGO_ENABLED=0` build 败于 `app/http/storage/quick_setup_combo_store.go:29 undefined: sqlite3.ErrConstraint`——**预存非本批引入**（与分支基点 7345756b 的同文件逐字节一致,mattn/go-sqlite3 纯 cgo 在 CGO_ENABLED=0 下无符号可用,`cmd/`→storage 依赖在基点已存在）,按门禁字面如实记录不强行修;真 Linux 构建走 CGO_ENABLED=1 通道。
+- [x] 全量测试：`go test ./app/tray/ ./internal/ipc/ ./internal/singleinstance/ ./cmd/ ./internal/panelwin/ ./app/http/services/ -count=1` + `cd app/website && npx vitest run src/panel`。**实作备注（Task 16 收口批,2026-11-28）**：Go 六包全绿（tray 1.118s / ipc 2.877s / singleinstance 2.290s / cmd 47.721s / panelwin 4.165s+编辑后复跑 0.878s / services 255.824s,EXIT=0,两已知预存 flake 未触发）;vitest 10 文件 193/193 全绿（基线 193 一致）。
+- [x] PATCH_NOTES 登记 Task 3/4 补丁（重放锚点清单）；调研文档随本批提交入库。**实作备注（Task 16 收口批）**：登记已随 M1/M2 前序批次完成（systray.go 1 锚 / systray_windows.go 12 锚 / darwin.m 18 锚 / darwin.go 2 / nonwindows.go 1 / systray.h 2,与文件实测逐一对上）;本批复核发现 windows 节编号引用漂移（「钉住 4~11」为增锚前旧值）已修正并消歧条目号/锚点号;调研文档两份已随 11f6768e / c53cefb9 入库,与主仓原件逐字节一致。
+- [ ] 出包：macOS `VERSION=v1.1.129-local bash scripts/build-pkg.sh` 装机；Windows 走 MSI 链。**（待主控收口批后执行,本批红线不出包）**
+- [ ] **验收走查（spec §9 + 调研 §7 探针）**：macOS 26/27 各一台七态逐项 + 深浅色 + 失焦 + 锚定 + 崩溃演练 + `footprint` 对照 + **毛玻璃材质可见**；Windows 11 真机（4070）：同清单 + GDI 平坦（GetGuiResources）+ 溢出区锚定回退 + DPI 125%/150%（CSS 视口宽必须恒 340）+ **亚克力/圆角实机探针**（不生效→回退纯半透明并回写 spec §7）+ **WKWebView 透明底公证探针**。**（待装机走查;材质探针结论已在 spec §10 先行占位）**
 - [ ] **M2 接线评审挂账（2026-11-27 评审判定 Needs fixes→本批收口余项，随本任务出包走查定夺）**：
   - **M-5**：M1 形态 `panel_bridge.go` 的 `installPanelBridge`/`uninstallPanelBridge`/`panelClickCallback` 失去生产调用方（仅测试引用）——出包走查时拍板去留（删码须同步裁撤对应测试）。
   - **M-6**：reanchor side 判别两边界：①Win10 垂直任务栏误判（视觉错位级）；②`SM_CYFULLSCREEN` 主屏归属对副屏锚定坐标可能反向误判——根治=壳内 `MonitorFromPoint`+`GetMonitorInfo` 取真实工作区，随实机走查定夺。
-- [ ] spec 回写备注（豁免项：错误行跳日志、设备互访 v1=仪表盘根页、§7 材质探针结论）
-- [ ] Commit（`新增:托盘面板 M2 收口——壳验收与文档`）
+- [x] spec 回写备注（豁免项：错误行跳日志、设备互访 v1=仪表盘根页、§7 材质探针结论）。**实作备注（Task 16 收口批）**：已落 spec 文档尾新增「§10 M2 实现备注（2026-11-28）」——①豁免项定案（两处 v1 均开仪表盘根页）;②材质探针结论占位待装机回填 §7;③组头 g-current 瞬切已实现、淡入留样式打磨。
+- [x] Commit（`文档:M2 收口——全量门禁绿+PATCH_NOTES 补登+调研报告入库+panelwin nit 清理`）
 
 ---
 

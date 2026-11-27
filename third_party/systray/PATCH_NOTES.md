@@ -33,7 +33,7 @@ Apache-2.0(LICENSE 原样保留)。本目录的 go.mod 保持上游 module path 
    次数无上限堆积)、可能并发执行(串行化归接线层)、panic 会终止整个进程
    (无 recover 的 goroutine)。
 
-### systray_windows.go(12 处;1~3=2026-11-20 GDI 修复,4~12=2026-11-26 面板胶水)
+### systray_windows.go(12 处;条目 1~3=2026-11-20 GDI 修复,条目 4~8=2026-11-26 面板胶水——下文条目号指本清单编号,「12 处」与「锚点 4~12」指注释锚点计数:GDI 占 3、面板胶水占 9)
 
 1. proc 表新增 `pDeleteObject = g32.NewProc("DeleteObject")`。
 2. `iconToBitmap`:`pDrawIconEx` 失败路径上游直接 `return 0`,已创建的
@@ -68,8 +68,10 @@ Apache-2.0(LICENSE 原样保留)。本目录的 go.mod 保持上游 module path 
    图标弹不出。(两处锚点)
 
 结构测试:`app/tray/systray_windows_patch_test.go` 的
-`TestSystrayWindowsPanelPatch` 钉住 4~11 的形态(含 cbSize 禁止字面常量、
-两参 Call、只认 S_OK 三条「照做必错」红线),同步上游漏重放即红。
+`TestSystrayWindowsPanelPatch` 钉住面板胶水条目 4/6/7/8 的形态(含 cbSize
+禁止字面常量、两参 Call、只认 S_OK 三条「照做必错」红线);条目 5 的 `Rect`
+结构由 TrayRect 用例间接引用,条目 1~3 的 GDI 补丁语义直白归审阅层覆盖。
+同步上游漏重放即红。
 
 ### systray_darwin.m(9 处,2026-11-26)
 
