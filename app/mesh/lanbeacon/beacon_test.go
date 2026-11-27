@@ -32,6 +32,7 @@ func pickUDPPort(t *testing.T) int {
 // 供用例缩短 TTL 等时序旋钮(写字段必须发生在 goroutine 起来之前)。
 func startBeaconPair(t *testing.T, tune func(a, b *Beacon)) (*Beacon, *Beacon) {
 	t.Helper()
+	requireGlobalBroadcastLoopback(t)
 	const (
 		aID = "dev-a"
 		bID = "dev-b"
@@ -58,6 +59,40 @@ func startBeaconPair(t *testing.T, tune func(a, b *Beacon)) (*Beacon, *Beacon) {
 	}
 	t.Fatalf("startBeaconPair: 6 次尝试均未能同绑端口")
 	return nil, nil
+}
+
+// requireGlobalBroadcastLoopback 在起双实例前探测本机是否具备本文件头部
+// 约定的能力:255.255.255.255 的 UDP 全局广播会回环投递到同端口全部 listener。
+//
+// 该能力取决于本机默认路由:默认路由走 VPN 隧道(utun)时,全局广播发不出去
+// (实测 write 直接报错),双实例互见的断言必然超时——这是环境限制而非回归。
+// 探测失败即 Skip 并写明原因,让用例在正常有线/WiFi 环境与 CI 上照常生效,
+// 在 VPN 环境下不再误报。
+func requireGlobalBroadcastLoopback(t *testing.T) {
+	t.Helper()
+	port := pickUDPPort(t)
+	rx, err := beaconListenConfig.ListenPacket(context.Background(), "udp4", fmt.Sprintf(":%d", port))
+	if err != nil {
+		t.Skipf("无法绑定探测端口 :%d,跳过广播回环用例: %v", port, err)
+		return
+	}
+	defer rx.Close()
+	tx, err := beaconListenConfig.ListenPacket(context.Background(), "udp4", ":0")
+	if err != nil {
+		t.Skipf("无法绑定发送端口,跳过广播回环用例: %v", err)
+		return
+	}
+	defer tx.Close()
+	probe := []byte("aliang-beacon-loopback-probe")
+	if _, werr := tx.WriteTo(probe, &net.UDPAddr{IP: net.IPv4bcast, Port: port}); werr != nil {
+		t.Skipf("本机默认路由下 255.255.255.255 全局广播不可写(常见于默认路由走 VPN 隧道),跳过广播回环用例: %v", werr)
+		return
+	}
+	_ = rx.SetReadDeadline(time.Now().Add(1500 * time.Millisecond))
+	buf := make([]byte, len(probe))
+	if _, _, rerr := rx.ReadFrom(buf); rerr != nil {
+		t.Skipf("本机 255.255.255.255 全局广播未回环到同端口 listener(常见于默认路由走 VPN 隧道),跳过广播回环用例: %v", rerr)
+	}
 }
 
 // poll 轮询直到 fn 为真或超时(收包异步,固定 sleep 必然 flake)。

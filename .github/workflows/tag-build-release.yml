@@ -98,11 +98,75 @@ jobs:
           path: website-dist.tar.gz
           if-no-files-found: error
 
+  # DEBT-07 第二步:AI 关键回归纳入发布门禁。
+  #
+  # 为什么单独成 job 而不是塞进 build 的矩阵:app/http/services 单包全量
+  # 本地约 4 分钟,五个平台 job 各跑一遍既慢又重复;且其中部分用例依赖
+  # CLI 冷探测等本机环境,放进签名/打包 job 会让失败归因混在一起。
+  #
+  # 带一次重试的原因:该包存在测试间全局状态泄漏导致的偶发串扰(单独跑
+  # 均通过,见 docs/superpowers/plans/2026-11-28-sync-batch-delivery-and-
+  # acceptance.md §4),串扰清零前用「失败重试一次」区分稳定回归与偶发,
+  # 既不让真回归漏过,也不让偶发把所有出包随机挡死。
+  ai-regression:
+    name: AI critical regression
+    needs:
+      - guard
+      - frontend
+    if: needs.guard.outputs.on_master == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download frontend dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: website-dist
+          path: .
+
+      - name: Restore frontend dist into repository
+        shell: bash
+        run: |
+          rm -rf app/website/dist
+          tar -C app/website -xzf website-dist.tar.gz
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Prepare Go modules for CI
+        shell: bash
+        run: |
+          if grep -q 'replace github.com/elazarl/goproxy v1.7.2 => ../goproxy' go.mod && [ ! -d ../goproxy ]; then
+            go mod edit -dropreplace=github.com/elazarl/goproxy
+          fi
+          go mod download
+
+      # app/http/services 与 handlers 是 AI 回合、远程 WS、审批、TUI 注入的
+      # 权威实现;app 是 go:embed 的编译面(缺 dist 会直接编译失败);
+      # app/mesh 是组网(搭桥/打洞/信标)的权威实现。显式列目录而非 ./app/...,
+      # 因为 app/tray 在 Linux 不编译(见下方 build job 的同类注释)。
+      # 失败重试一次,重试仍失败才算回归。
+      - name: Run AI critical regression
+        shell: bash
+        run: |
+          set -o pipefail
+          pkgs="./app ./app/agentcore/... ./app/agentruntime/... ./app/http/... ./app/mesh/... ./app/tools/... ./app/tunnel/..."
+          if ! go test -count=1 -timeout 20m $pkgs; then
+            echo "::warning::AI critical regression failed on first attempt, retrying once (known flaky test-order interference)"
+            go test -count=1 -timeout 20m $pkgs
+          fi
+
   build:
     name: Build ${{ matrix.asset_name }}
     needs:
       - guard
       - frontend
+      - ai-regression
     if: needs.guard.outputs.on_master == 'true'
     runs-on: ${{ matrix.runner }}
     # Hard ceiling for the whole build job: a hung codesign/keychain state
