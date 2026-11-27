@@ -78,7 +78,7 @@
 
 ## 风险
 
-- 两次 PUT 非原子 → 服务层组合方法一次落库已消除
+- **激活落库是 N+1 次独立 `store.Update`（一次 List + 组内逐行整行写穿），无事务无锁**——不存在「组合方法一次落库」的原子性。实际形态：互斥写序=先关同组其余 enabled 行、最后钉目标行，**目标行写库即激活语义的提交点**；失败可重试（幂等：拒绝闸零副作用，重复执行收敛到同一终态）。半程失败窗口=组内已关行未回滚，组内全关、selectAuto 回落 builtin 兜底——可自查可恢复，不产生配置损坏（详见 `ActivateInGroup` 注释与挂账①）
 - radio 激活改变 auto 池（N 候选→1）——这正是产品语义（cc-switch 式）；manager UI 可随时恢复多候选
 - 互斥会把同组其余 enabled 行（含 cooldown/health=disabled）翻成 enabled=0，后者失去懒恢复自愈通道（等效手动停用）——钉选持久性的必要代价，已在 `ActivateInGroup` 注释与测试中钉死
 
@@ -92,17 +92,22 @@
 | Task 3 | `7c24c904` | 面板 radio 真激活（api.activateEndpoint/乐观勾移/回读确认/单飞/deriveOnKey）+ 测试改写 |
 | 评审增益（前端） | `a9cfba82` | 已选行空操作早退（防互斥连带关停）+ 四条变异红护栏（乐观勾移/引用比对/errorBodyMsg 默认关/builtin rank0 fixture）+ 单飞提示 + toast 组名（spec §6-6）+ 注释精确化 |
 | Task 4 | 本文档提交 | 文档回写（M1 计划 Task 6/10/Step 5 + 样式 spec §4.4/§6-6）+ 全量门禁 |
+| 终审修复批 | 本批提交 | activate 来源闸改「回环 ∥ dashboard 会话」双闸（面板免 cookie 可用，终审坐实的 important）+ toast 组名对齐 §6-6（g.name）+ rank=0 闸文案中性化 + humanize 401 防御 + 风险段 N+1 写窗如实化 + 挂账补四条（部分失败窗/并发 activate 交错/双 toggle 连带/X-Endpoint-Id 连带）+ M1 计划与样式 spec 语义精确化 |
 
 **终门禁（2026-11-27）**：`go test ./app/http/services/`（241.99s，复跑绿；首次失败为预存 TempDir 清理 flake `TestSteerReviveViaMessageRestoresSession`，测试本体 PASS、单跑 3 连绿）、`./app/http/routes/ ./app/http/handlers/ ./app/tray/ ./internal/ipc/` 全 ok、`go build ./...` OK、`go vet` 四包干净、`gofmt -l` 改动文件干净、panel vitest 10 文件/192 用例全绿、`npm run build` OK、`check-dist` 双入口通过、Linux 闭包 `GOOS=linux go list -deps` 0 GUI 依赖。
 
 ## 挂账（非阻塞，走查/后续批次处理）
 
-- **rank 池 ≠ selectAuto 池缝隙（产品待对齐）**：`tray_summary.go:388` 只给 `auto_group ∧ priority>0` 授 rank，而 `selectAuto` 池只看 `enabled ∧ auto_group`。`priority=0 ∧ auto_group=1` 的行是真实调度候选但 rank=0，面板本地闸会拒绝并给「不在 auto 调度池」文案（后端本会接受）。与 M1 计划打磨清单的 priority=0 缝隙同源，需产品对齐后统一 rank 语义。
+- **rank 池 ≠ selectAuto 池缝隙（产品待对齐）**：`tray_summary.go:388` 只给 `auto_group ∧ priority>0` 授 rank，而 `selectAuto` 池只看 `enabled ∧ auto_group`。`priority=0 ∧ auto_group=1` 的行是真实调度候选但 rank=0，面板本地闸会拒绝（后端本会接受）。终审修复批已把该行文案改中性（「该行不支持在面板钉选，请在仪表盘操作」，不再指认「不在 auto 调度池」——对该场景失真）。与 M1 计划打磨清单的 priority=0 缝隙同源，需产品对齐后统一 rank 语义。
 - **cooldown 行视觉与 disabled 行同为 `.off` 置灰**：可点/不可点无法从外观区分（spec §4.4 已回写「可激活」，视觉打磨留手工走查定）。
 - **组头 g-current 无淡入过渡**：瞬切，样式打磨项（spec §6-6 已注记）。
 - **回读确认的轮询第二写者窗口**：2s 轮询与 `refresh` 并发时，先发后到的旧快照可能被当作激活后的 `after`，低概率误报「激活结果未确认」并回滚，下一轮轮询自愈。
 - **humanizeActionError 与 TransportRow 本地重复**：面板组件自含纪律下的两份实现，规则一致、文案前缀不同；如需统一可后续抽 `panel/errors.js`。
 - **在途单飞跨组提示**：另一协议组在途点击会提示「激活进行中，请稍候」而非静默丢弃。
+- **激活落库部分失败窗口（终审修复批补记）**：`ActivateInGroup` 是 N+1 次独立 `store.Update`（无事务无锁），互斥关同行与钉目标行之间失败 → 组内已关行不回滚，组内全关、selectAuto 回落 builtin；失败可重试（幂等收敛），但半程态下托盘操作者看到的是「组全灭勾、current=builtin」，须自查仪表盘。
+- **并发 activate 交错（跨客户端，终审修复批补记）**：面板单飞闸只挡单个面板内的并发；直连 API 调用/第二台设备开的面板不受限——两个 activate 交错执行（各自 List→逐行 Update）可打破「组内恰一 enabled」不变量，终态出现双 enabled 行（后写者未必赢：交错窗口内互斥关停可能发生在对方钉选之前）。管理面 PUT 与 activate 的并发窗口同理（风险段已述，此处专指 activate 之间）。
+- **双协议 toggle 行被另一组钉选连带关停（终审修复批补记）**：enabled 是行级全局开关。一个 `protocol_anthropic ∧ protocol_openai` 双 toggle 行若 enabled=1，从 OpenAI 组钉选别的行会把它一并置 0（互斥关停只按协议过滤），该行随之从 Anthropic 组的调度池消失——Anthropic 组在无其他候选时回落 builtin。托盘 OpenAI 操作者对 Anthropic 组的连带效应零提示。
+- **X-Endpoint-Id 显式点名被连带关停（终审修复批补记）**：显式点名的行若恰在同组内且 enabled=1，钉选别的行会把它置 0；此后 `selectExplicit` 对该行 404「已停用」——这等价于 dashboard 手动停用的预存语义，但托盘操作者发起的是「钉 A」却顺带弄停了点名链路，无任何提示。
 
 ## 任务勾选
 
