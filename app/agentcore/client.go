@@ -206,6 +206,9 @@ func WithRetryNotice(fn func(RetryNotice)) StreamOption {
 // 直连绕过路由层，401/402 又不可重试（旧 OnRetry 从不触发），于是内核流量的
 // 锁存/限流/计数永远不落地。回调的 headers 可能是 nil（连接层失败、2xx 体内
 // 错误信封），status 为 0 表示没有可观测的 HTTP 状态。
+//
+// 调用方主动终止（ctx 取消/事件中止）不回调——用户取消不算 endpoint 失败，
+// 不应进 ReportFailure 计数。
 func WithRequestError(fn func(status int, headers http.Header)) StreamOption {
 	return func(o *streamOptions) { o.onRequestError = fn }
 }
