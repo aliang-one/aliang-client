@@ -455,6 +455,10 @@ var tuiTurnCeiling = resolveEnvDuration("ALIANG_TUI_TURN_CEILING", 4*time.Hour)
 // 由服务端决定重试。
 func (m *agentAIManager) runTUITurn(ctx context.Context, session *agentAISession, run agentAIRun, content string, plan *tuiTurnPlan, emitter *agentAIRunEmitter) {
 	write := agentTerminalWriter(emitter.emit)
+	// 入口快照轮询间隔：本函数在后台 goroutine 里跑，循环中若每次都读包级
+	// 变量，会与测试 teardown 还原它形成数据竞争（-race 报警）。测试在启动
+	// 回合前就已设好值，快照语义等价。
+	pollInterval := tuiTurnPollInterval
 	fail := func(code, msg string) {
 		logger.Info(fmt.Sprintf("ai.tui.turn: %s session=%s native=%s", code, session.id, plan.NativeSessionID))
 		_ = write(agentAIErrorPayload(session.id, run.messageID, newAgentTUITurnError(code, msg)))
@@ -766,7 +770,7 @@ tail:
 		case <-runCtx.Done():
 			emitStopStatus()
 			return
-		case <-time.After(tuiTurnPollInterval):
+		case <-time.After(pollInterval):
 		}
 	}
 
@@ -813,6 +817,8 @@ func tuiTurnHeldWatch(ctx context.Context, jsonlPath string, offset int64, windo
 	if jsonlPath == "" || offset < 0 {
 		return false
 	}
+	// 同 runTUITurn：后台 goroutine 里循环读包级变量会与测试 teardown 竞争。
+	pollInterval := tuiTurnPollInterval
 	deadline := time.Now().Add(window)
 	seen := offset
 	for {
@@ -837,7 +843,7 @@ func tuiTurnHeldWatch(ctx context.Context, jsonlPath string, offset int64, windo
 		select {
 		case <-ctx.Done():
 			return false
-		case <-time.After(tuiTurnPollInterval):
+		case <-time.After(pollInterval):
 		}
 	}
 }
@@ -860,6 +866,8 @@ func tuiTurnStartWatch(ctx context.Context, jsonlPath string, offset int64, wind
 	if isOwnEcho == nil {
 		isOwnEcho = func([]byte) bool { return false }
 	}
+	// 同 runTUITurn：后台 goroutine 里循环读包级变量会与测试 teardown 竞争。
+	pollInterval := tuiTurnPollInterval
 	deadline := time.Now().Add(window)
 	seen := offset
 	for {
@@ -893,7 +901,7 @@ func tuiTurnStartWatch(ctx context.Context, jsonlPath string, offset int64, wind
 		select {
 		case <-ctx.Done():
 			return tuiTurnNotStarted, offset
-		case <-time.After(tuiTurnPollInterval):
+		case <-time.After(pollInterval):
 		}
 	}
 }

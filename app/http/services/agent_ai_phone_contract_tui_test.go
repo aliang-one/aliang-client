@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"aliang.one/nursorgate/app/http/models"
 )
 
 // 2026-10-27 收窄后的口径：手机行为契约只随「注入正在运行的 TUI」的文本下发，
@@ -103,7 +105,17 @@ func TestRunUserMessageTUIInjectionCarriesPhoneContract(t *testing.T) {
 	pid := os.Getpid()
 	origPoll := tuiTurnPollInterval
 	tuiTurnPollInterval = 20 * time.Millisecond
-	defer func() { tuiTurnPollInterval = origPoll }()
+	// runTUITurn 跑在 context.Background() 的后台 goroutine 里(手机断线不杀
+	// TUI 回合),测试返回时它可能还在 tuiTurnHeldWatch 循环里读轮询间隔。
+	// 还原前必须等它发出终态,否则 -race 报 teardown 写/循环读竞争。
+	turnDone := make(chan struct{}, 1)
+	defer func() {
+		select {
+		case <-turnDone:
+		case <-time.After(5 * time.Second):
+		}
+		tuiTurnPollInterval = origPoll
+	}()
 
 	home := t.TempDir()
 	sock := ccPeerShortSocketPath(t)
@@ -120,6 +132,12 @@ func TestRunUserMessageTUIInjectionCarriesPhoneContract(t *testing.T) {
 	m := newAgentAIManager()
 	var mu sync.Mutex
 	write := func(v any) error {
+		if p, ok := v.(map[string]any); ok && p["type"] == models.AgentEventAIStatus {
+			select {
+			case turnDone <- struct{}{}:
+			default:
+			}
+		}
 		mu.Lock()
 		defer mu.Unlock()
 		return nil

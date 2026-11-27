@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/logger"
 )
 
@@ -469,7 +470,17 @@ func TestRunUserMessageRoutesToTUIWhenIdle(t *testing.T) {
 	pid := os.Getpid()
 	origPoll := tuiTurnPollInterval
 	tuiTurnPollInterval = 20 * time.Millisecond
-	defer func() { tuiTurnPollInterval = origPoll }()
+	// runTUITurn 跑在 context.Background() 的后台 goroutine 里,测试返回时它
+	// 可能还在 tuiTurnHeldWatch 循环里读轮询间隔;还原前等终态,避免 -race
+	// 报 teardown 写/循环读竞争。
+	turnDone := make(chan struct{}, 1)
+	defer func() {
+		select {
+		case <-turnDone:
+		case <-time.After(5 * time.Second):
+		}
+		tuiTurnPollInterval = origPoll
+	}()
 
 	home := t.TempDir()
 	sock := ccPeerShortSocketPath(t)
@@ -488,6 +499,12 @@ func TestRunUserMessageRoutesToTUIWhenIdle(t *testing.T) {
 	var mu sync.Mutex
 	var events []map[string]any
 	write := func(v any) error {
+		if p, ok := v.(map[string]any); ok && p["type"] == models.AgentEventAIStatus {
+			select {
+			case turnDone <- struct{}{}:
+			default:
+			}
+		}
 		mu.Lock()
 		defer mu.Unlock()
 		if p, ok := v.(map[string]any); ok {
