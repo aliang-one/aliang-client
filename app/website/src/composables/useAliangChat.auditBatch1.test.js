@@ -129,6 +129,23 @@ it('checks an advertised idle socket and recovers an unresponsive one', async ()
   }
 });
 
+it('leaves a dashboard connected when the Agent does not advertise probes', async () => {
+  localStorage.clear();
+  FakeWebSocket.instances.length = 0;
+  vi.stubGlobal('WebSocket', FakeWebSocket);
+  vi.useFakeTimers();
+  try {
+    const { chat, sock } = await mountRunningSession();
+    await chat.stopRun();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sock.sent.map(JSON.parse).some(frame => frame.type === 'presence.ping')).toBe(false);
+    expect(sock.readyState).toBe(FakeWebSocket.OPEN);
+  } finally {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  }
+});
+
 function sentTypes(sock) {
   return sock.sent.map((raw) => {
     try {
