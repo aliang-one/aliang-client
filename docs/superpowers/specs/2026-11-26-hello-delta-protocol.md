@@ -52,9 +52,13 @@ hello = {
 - 指纹无变化 → periodic 60s 的 hello **降级为心跳帧**(sync_mode=heartbeat,
   只带时间戳,~200B);
 - 任一段指纹变化 → 立即 delta 帧(受既有 30s 闸);
-- **全量帧时机**:(a) WS (重)连首帧;(b) 收到 server_requested(服务端重启后点名,
-  既有机制);(c) agent 本地快照缓存失效(冷扫描完成后);(d) delta 连续 3 次后
-  周期性回全量一次(自愈锚点,防指纹漂移)。
+- **全量帧时机**:(a) WS (重)连首帧(侦察 2026-11-27:服务端重启必杀 socket,
+  agent 2s 重拨即 connect 全量,拓扑自愈已兜底);(b) 连续 delta 达自愈阈值
+  (=3,封底 PG flush 回滚类残余窗口);(c) registered 轻对账不符:
+  agent.registered 每帧必回且带服务端当前 vibe 会话数,服务端归零而基线非零即
+  升格 full(零新协议);(d) 无基线(首个 periodic 早于 connect 的边态)。
+  侦察纠偏:server_requested 全仓唯一生产者是手机「重扫电脑」按钮
+  (projects.ts:413-437),并非服务端重启点名机制——原稿 (b) 前提有误,实施未依赖它。
 
 ### 3.3 服务端变更(PhoneServer)
 
