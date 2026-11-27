@@ -116,21 +116,42 @@ func writeStartupTestConfigFile(t *testing.T, dir string, fileName string, conte
 	return path
 }
 
-func TestApplyStartupConfig_UsesExplicitConfigPathOverLocalConfigNewJSON(t *testing.T) {
+// startupConfigTempWorkspace 创建临时工作目录并切入,返回其路径。
+//
+// 清理按 Windows 安全顺序注册(t.Cleanup 为 LIFO):
+//  1. 最先注册、最后执行:best-effort 删除临时目录;
+//  2. 其次:resetConfigPipelineStateForTest 的 cleanup 关闭全局配置/缓存/DB 句柄;
+//  3. 最晚注册、最先执行:切回原目录。
+//
+// 启动配置流程会初始化日志/缓存/DB,句柄可能在本用例结束时仍未释放;Windows
+// 上 t.TempDir 的清理遇到共享冲突会把清理失败误判成用例失败(2026-11-27
+// v1.1.126 CI 首跑实证:TestApplyStartupConfig* 全部栽在 TempDir RemoveAll),
+// 故删除采用 best-effort(忽略错误),不改变任何产品行为。
+func startupConfigTempWorkspace(t *testing.T) string {
+	t.Helper()
+	tempDir, err := os.MkdirTemp("", "aliang-startup-config-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(tempDir)
+	})
 	resetConfigPipelineStateForTest(t)
-
 	originalWd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("failed to get working directory: %v", err)
 	}
-	t.Cleanup(func() {
-		_ = os.Chdir(originalWd)
-	})
-
-	tempDir := t.TempDir()
 	if err := os.Chdir(tempDir); err != nil {
 		t.Fatalf("failed to change working directory: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = os.Chdir(originalWd)
+	})
+	return tempDir
+}
+
+func TestApplyStartupConfig_UsesExplicitConfigPathOverLocalConfigNewJSON(t *testing.T) {
+	tempDir := startupConfigTempWorkspace(t)
 
 	writeStartupTestConfigFile(t, tempDir, "config.json", `{"api_server":`)
 	explicitPath := writeStartupTestConfigFile(t, tempDir, "explicit.json", `{
@@ -160,20 +181,7 @@ func TestApplyStartupConfig_UsesExplicitConfigPathOverLocalConfigNewJSON(t *test
 }
 
 func TestApplyStartupConfig_UsesConfigNewJSONWhenNoExplicitPath(t *testing.T) {
-	resetConfigPipelineStateForTest(t)
-
-	originalWd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("failed to get working directory: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = os.Chdir(originalWd)
-	})
-
-	tempDir := t.TempDir()
-	if err := os.Chdir(tempDir); err != nil {
-		t.Fatalf("failed to change working directory: %v", err)
-	}
+	tempDir := startupConfigTempWorkspace(t)
 	t.Setenv("HOME", tempDir)
 
 	writeStartupTestConfigFile(t, tempDir, "config.json", `{
@@ -203,20 +211,7 @@ func TestApplyStartupConfig_UsesConfigNewJSONWhenNoExplicitPath(t *testing.T) {
 }
 
 func TestApplyStartupConfig_UsesEmbeddedDefaultWhenNoExplicitAndNoConfigNewJSON(t *testing.T) {
-	resetConfigPipelineStateForTest(t)
-
-	originalWd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("failed to get working directory: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = os.Chdir(originalWd)
-	})
-
-	tempDir := t.TempDir()
-	if err := os.Chdir(tempDir); err != nil {
-		t.Fatalf("failed to change working directory: %v", err)
-	}
+	tempDir := startupConfigTempWorkspace(t)
 	t.Setenv("HOME", tempDir)
 
 	if err := ApplyStartupConfig(""); err != nil {
@@ -233,24 +228,11 @@ func TestApplyStartupConfig_UsesEmbeddedDefaultWhenNoExplicitAndNoConfigNewJSON(
 }
 
 func TestApplyStartupConfig_FailsFastWhenConfigNewJSONExistsButInvalid(t *testing.T) {
-	resetConfigPipelineStateForTest(t)
-
-	originalWd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("failed to get working directory: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = os.Chdir(originalWd)
-	})
-
-	tempDir := t.TempDir()
-	if err := os.Chdir(tempDir); err != nil {
-		t.Fatalf("failed to change working directory: %v", err)
-	}
+	tempDir := startupConfigTempWorkspace(t)
 
 	writeStartupTestConfigFile(t, tempDir, "config.json", `{"api_server":`)
 
-	err = ApplyStartupConfig("")
+	err := ApplyStartupConfig("")
 	if err == nil {
 		t.Fatalf("expected fail-fast error when config.json exists but is invalid")
 	}
@@ -260,23 +242,10 @@ func TestApplyStartupConfig_FailsFastWhenConfigNewJSONExistsButInvalid(t *testin
 }
 
 func TestApplyStartupConfigForMode_UsesRuntimeConfigInDaemonMode(t *testing.T) {
-	resetConfigPipelineStateForTest(t)
-
-	originalWd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("failed to get working directory: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = os.Chdir(originalWd)
-	})
-
-	tempDir := t.TempDir()
+	tempDir := startupConfigTempWorkspace(t)
 	runtimeDir := filepath.Join(tempDir, "runtime")
 	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
 		t.Fatalf("failed to create runtime directory: %v", err)
-	}
-	if err := os.Chdir(tempDir); err != nil {
-		t.Fatalf("failed to change working directory: %v", err)
 	}
 	t.Setenv("HOME", "")
 	t.Setenv("ALIANG_DATA_DIR", runtimeDir)
