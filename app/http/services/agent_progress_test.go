@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -189,5 +190,36 @@ func TestProgressToolViaClaudeMCP(t *testing.T) {
 	}
 	if len(frames) != 3 || frames[1]["session_id"] != "local-claude" || frames[1]["run_id"] != "run-claude" {
 		t.Fatalf("unexpected cloud frames: %#v", frames)
+	}
+}
+
+func TestAgentCoreSubagentBridgesCarryShellObserver(t *testing.T) {
+	// SYNC-16 首片接线（2026-11-27）：子 run 复用主 run 传入的同一份 ToolEnv
+	// ——子 agent 里的长命令（构建/测试/下载）此前对操作进度通道完全静默。
+	setTestAgentHome(t)
+	writeSubagentDef(t, os.Getenv("HOME"), "researcher.md",
+		"---\nname: researcher\ndescription: 调研任务\n---\n你是调研员。")
+
+	env := &agentcore.ToolEnv{ProjectPath: t.TempDir()}
+	env.OnShellStart = func(tool string) func(agentcore.ShellOutcome) {
+		return func(agentcore.ShellOutcome) {}
+	}
+	m := newAgentAIManager()
+	tools := m.agentCoreSubagentTools(agentAIRun{sessionID: "s-obs", projectPath: t.TempDir()},
+		agentcore.NewClient(agentCoreBaseURL()), env, nil, nil, nil, nil, nil)
+	if len(tools) != 1 || tools[0].Name() != "task" {
+		t.Fatalf("应为唯一 task 工具, got %+v", tools)
+	}
+	router, ok := tools[0].(*agentCoreSubagentTaskRouter)
+	if !ok {
+		t.Fatalf("tools[0] 不是 task router: %T", tools[0])
+	}
+	if len(router.bridges) == 0 {
+		t.Fatal("无桥可验证")
+	}
+	for name, b := range router.bridges {
+		if b.env != env || b.env.OnShellStart == nil {
+			t.Fatalf("桥 %q 未携带主 run 的 shell 观察者", name)
+		}
 	}
 }

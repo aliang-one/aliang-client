@@ -1609,6 +1609,13 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		registry.Register(progressTool)
 		defer progressTool.close()
 	}
+	// 主 run 与子 agent run 共用这份环境（SYNC-16 首片，2026-11-27）：shell
+	// 观察者必须随 env 进入子 run——子 agent 里的长命令（构建/测试/下载）此前
+	// 对操作进度通道完全静默，用户在手机上看到的是「派完子 agent 就没动静」。
+	mainToolEnv := *kernelEnv
+	if progressTool != nil {
+		mainToolEnv.OnShellStart = progressTool.shellObserver()
+	}
 	approvalGate := newAgentCoreApprovalGate()
 	kernelApprove := approvalGate.wrap(m.agentCoreApprove(run, writeJSON))
 	// 内核不 import 日志包，这里把宿主 logger 包一层递进去（签名不同：
@@ -1629,7 +1636,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// 否则自我报告错位且不主动派发（vm459 实测 2026-11-08）。
 	subagentPrompt := ""
 	if !run.readOnly {
-		if router := m.agentCoreSubagentTaskTool(run, kernelClient, kernelEnv, kernelApprove, kernelLogf, mcpTools, subagentMirror, subagentControl); router != nil {
+		if router := m.agentCoreSubagentTaskTool(run, kernelClient, &mainToolEnv, kernelApprove, kernelLogf, mcpTools, subagentMirror, subagentControl); router != nil {
 			registry.Register(router)
 			subagentPrompt = agentCoreSubagentMechanismSuffix(router)
 		}
@@ -1669,10 +1676,6 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		registry.Register(tool)
 	}
 
-	mainToolEnv := *kernelEnv
-	if progressTool != nil {
-		mainToolEnv.OnShellStart = progressTool.shellObserver()
-	}
 	cfg := &agentcore.Config{
 		Client: kernelClient,
 		Model:  model,
