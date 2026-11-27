@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -54,6 +55,10 @@ type CompanionApp struct {
 	// MenuItem.SetIcon 每次新建 HBITMAP 不销毁的泄漏(~83min 耗尽 10k 配额)。
 	lastViewKey string
 	done        chan struct{}
+	// quitOnce 退出承诺点护栏(M2 评审 M-2):panelQuitInvoker 引入首个
+	// 并发触发点(forwardPanelExit goroutine 的 code=60 转投可与托盘菜单
+	// quit 并发),护 close(done) 恰一次,防两次退出交叠 double close panic。
+	quitOnce sync.Once
 }
 
 func NewCompanionApp() *CompanionApp {
@@ -484,10 +489,20 @@ func (a *CompanionApp) quit() bool {
 		return false
 	}
 
-	select {
-	case <-a.done:
-	default:
+	// 双触发护栏(M2 评审 M-2):panelQuitInvoker(M2)引入首个并发触发点
+	// ——forwardPanelExit goroutine 的 code=60 转投可与托盘菜单 quit 并发
+	// (G1 卡在阻塞式 MessageBoxW 确认窗期间用户再触发),旧 select 判废
+	// 形态下两次触发可同时走到 default 分支 → double close(done) panic。
+	// Once 护承诺点:仅首次过闸的触发 close done 并走完整退出序列,并发
+	// 迟到者直接返回 false 让位(收尾归首次触发);确认窗取消路径在 Once
+	// 之前返回、不消费护栏,下次触发照常重试——首次触发语义不变。
+	committed := false
+	a.quitOnce.Do(func() {
+		committed = true
 		close(a.done)
+	})
+	if !committed {
+		return false
 	}
 
 	_, _ = a.ipcClient.Send(ipc.ActionStopHTTP, nil)

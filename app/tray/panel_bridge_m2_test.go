@@ -354,9 +354,38 @@ func TestPanelM2QuitGateWiring(t *testing.T) {
 	}
 }
 
-// TestPanelM2ForwardExitChain 退出转投链:forwardPanelExit 把 child.Wait()
-// 的退出码经 exitReport(先于 childExited,错序 alive 恒 0 静默失效)转投
-// childExited——用崩溃码验证转投真的走到状态机(排 1s 重拉,截获)。
+// TestPanelM2QuitDoubleTriggerGuard 结构:两平台 quit() 的承诺点(close
+// done)必须经 quitOnce 护栏——M2 的 panelQuitInvoker 引入首个并发触发点
+// (forwardPanelExit goroutine),两次 code=60 退出交叠(如 G1 卡在阻塞式
+// MessageBoxW 确认窗期间用户再触发)在旧 select 判废形态下 double close
+// panic(M2 评审 M-2)。
+func TestPanelM2QuitDoubleTriggerGuard(t *testing.T) {
+	for _, tc := range []struct{ name, file string }{
+		{"macOS", "companion.go"},
+		{"Windows", "companion_windows.go"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := goFuncBody(t, trayFileSource(t, tc.file), "quit")
+			doIdx := strings.Index(body, "a.quitOnce.Do(")
+			if doIdx < 0 {
+				t.Fatalf("%s quit() 缺 quitOnce 双触发护栏(退出承诺点未互斥):\n%s", tc.name, body)
+			}
+			closeIdx := strings.Index(body, "close(a.done)")
+			if closeIdx < 0 {
+				t.Fatalf("%s quit() 未 close done:\n%s", tc.name, body)
+			}
+			if closeIdx < doIdx {
+				t.Fatalf("%s quit() 的 close(done) 必须在 quitOnce 护栏之内:\n%s", tc.name, body)
+			}
+		})
+	}
+}
+
+// TestPanelM2ForwardExitChain 退出转投链:spawn 闭包起的 forwardPanelExit
+// goroutine 把 child.Wait() 的退出码经 exitReport(先于 childExited,错序
+// alive 恒 0 静默失效)转投 childExited——测试只送码进 Wait 通道,以重拉
+// 调度被触发为「真实闭包链路确曾走到状态机」的到达信号(select+超时等待,
+// 防双读者竞态挂死)。
 func TestPanelM2ForwardExitChain(t *testing.T) {
 	restorePanelM2Seams(t)
 
@@ -373,17 +402,28 @@ func TestPanelM2ForwardExitChain(t *testing.T) {
 
 	a := &CompanionApp{httpURL: "http://127.0.0.1:56789"}
 	a.installPanelLauncher()
-	retries := make([]func(), 0, 2)
-	a.panelLauncher.scheduleRetry = func(_ time.Duration, fn func()) { retries = append(retries, fn) }
+	// 重拉调度截获走通知通道:到达方是转投 goroutine,主 goroutine 不得
+	// 无同步直读计数切片(-race 面),通道通知 + 超时等待替代。
+	retryArrived := make(chan struct{}, 1)
+	a.panelLauncher.scheduleRetry = func(_ time.Duration, _ func()) {
+		select {
+		case retryArrived <- struct{}{}:
+		default: // 已通知过:幂等
+		}
+	}
 	registered() // 开面板
 
 	child := a.panelLauncher.child
 	// fakeChild 的 Wait 通道带缓冲:测试直投退出码(真实形态由
-	// osExecChild 的 goroutine 在进程退出后送达)。
+	// osExecChild 的 goroutine 在进程退出后送达)。⚠️ 不再手工调
+	// forwardPanelExit——spawn 闭包已起 go a.forwardPanelExit(child),
+	// 再手工调一次即双读者竞抢缓冲 1 的通道,竞输方永久阻塞(go test
+	// 10 分钟超时挂死面);这里只送码,断言交给真实闭包链路。
 	child.(*fakeChild).wait <- 1
-	a.forwardPanelExit(child) // 接线层转投
-	if len(retries) != 1 {
-		t.Fatalf("崩溃退出码未经理线转投到状态机:retries=%d", len(retries))
+	select {
+	case <-retryArrived:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("崩溃退出码未经理线转投到状态机(2s 内重拉调度未触发)")
 	}
 }
 

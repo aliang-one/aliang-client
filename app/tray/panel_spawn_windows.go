@@ -77,8 +77,9 @@ const (
 
 // readPanelTrayAnchor Windows 锚定采样:TrayRect(物理像素)+ 主屏尺寸 +
 // GetCursorPos 光标点。TrayRect 失败/托盘未初始化时 OK=false(接线层判废后
-// 走光标兜底);溢出区两态(Win10 S_FALSE+箭头矩形 / Win11 屏外坐标)由
-// systray 原样透传、接线层 panelAnchorUsable 判废(同型判废口)。
+// 走光标兜底);溢出区形态(Win10 S_FALSE+箭头矩形 / Win11 屏外坐标)经
+// TrayRect 的错误路径拦截(ret != S_OK 一律返回错误 → OK=false → 短路走
+// 光标兜底),panelAnchorUsable 只兜屏上的非法形态(占位矩形/超界矩形)。
 func readPanelTrayAnchor() panelAnchorSample {
 	s := panelAnchorSample{}
 	if panelProcGetSystemMetrics.Find() == nil {
@@ -156,8 +157,11 @@ func attachPanelJob(pid uint32) {
 
 // resumePanelProcess 放行挂起面板:CreateToolhelp32Snapshot 枚举线程,
 // 属本进程的线程逐个 ResumeThread(挂起创建的进程恰好一条主线程,全量
-// Resume 等价于放行;尽力而为,失败=面板冻在挂起态=launcher 崩溃计数,
-// 下轮重拉自愈,不阻断 spawn 返回)。
+// Resume 等价于放行;尽力而为,不阻断 spawn 返回)。⚠️ 放行失败的后果
+// 不是 launcher 崩溃计数——挂起进程永不退出,Wait 不返回,既无崩溃计数
+// 也无自动重拉,面板冻在挂起态;真实恢复路径=下次托盘点击 Kill
+// (killedByUs 零惩罚,launcher 换新面板),attach 成功时冻住的面板随
+// companion 死亡被 Job 收割,attach 也失败则孤儿至注销/重启。
 func resumePanelProcess(pid uint32) {
 	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
 	if err != nil {

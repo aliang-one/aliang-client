@@ -383,6 +383,9 @@ func (l *PanelLauncher) RetryFromFallback()
 - [ ] PATCH_NOTES 登记 Task 3/4 补丁（重放锚点清单）；调研文档随本批提交入库
 - [ ] 出包：macOS `VERSION=v1.1.129-local bash scripts/build-pkg.sh` 装机；Windows 走 MSI 链
 - [ ] **验收走查（spec §9 + 调研 §7 探针）**：macOS 26/27 各一台七态逐项 + 深浅色 + 失焦 + 锚定 + 崩溃演练 + `footprint` 对照 + **毛玻璃材质可见**；Windows 11 真机（4070）：同清单 + GDI 平坦（GetGuiResources）+ 溢出区锚定回退 + DPI 125%/150%（CSS 视口宽必须恒 340）+ **亚克力/圆角实机探针**（不生效→回退纯半透明并回写 spec §7）+ **WKWebView 透明底公证探针**
+- [ ] **M2 接线评审挂账（2026-11-27 评审判定 Needs fixes→本批收口余项，随本任务出包走查定夺）**：
+  - **M-5**：M1 形态 `panel_bridge.go` 的 `installPanelBridge`/`uninstallPanelBridge`/`panelClickCallback` 失去生产调用方（仅测试引用）——出包走查时拍板去留（删码须同步裁撤对应测试）。
+  - **M-6**：reanchor side 判别两边界：①Win10 垂直任务栏误判（视觉错位级）；②`SM_CYFULLSCREEN` 主屏归属对副屏锚定坐标可能反向误判——根治=壳内 `MonitorFromPoint`+`GetMonitorInfo` 取真实工作区，随实机走查定夺。
 - [ ] spec 回写备注（豁免项：错误行跳日志、设备互访 v1=仪表盘根页、§7 材质探针结论）
 - [ ] Commit（`新增:托盘面板 M2 收口——壳验收与文档`）
 

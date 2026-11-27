@@ -27,10 +27,12 @@ package tray
 // 方位、参数组装、兜底切换、退出对接),测试经下方注入口零真实进程/托盘。
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
 
+	"aliang.one/nursorgate/common/logger"
 	"github.com/getlantern/systray"
 )
 
@@ -247,8 +249,14 @@ func (a *CompanionApp) installPanelLauncher() {
 // forwardPanelExit 子进程退出转投(接线层契约,panel_launcher.go 文件头):
 // child.Wait() 的退出码 → exitReport(必须先于 childExited——childExited
 // 清 spawnedAt,错序则 alive 恒 0 静默失效)→ childExited(code, alive,
-// killedByUs)。
+// killedByUs)。跑在 spawn 闭包的裸 go goroutine 上(状态机不防御回调
+// panic),整体包 recover 留痕——转投链异常不得炸托盘 companion。
 func (a *CompanionApp) forwardPanelExit(child ChildProcess) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error(fmt.Sprintf("panel exit forward panicked (recovered): %v", r))
+		}
+	}()
 	code := <-child.Wait()
 	alive, killedByUs := a.panelLauncher.exitReport()
 	a.panelLauncher.childExited(code, alive, killedByUs)

@@ -7,6 +7,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"aliang.one/nursorgate/app/agentruntime"
@@ -52,6 +53,10 @@ type CompanionApp struct {
 	// companion_dashboard_revive.go)。
 	dashReviveGate dashboardReviveGate
 	done           chan struct{}
+	// quitOnce 退出承诺点护栏(M2 评审 M-2):panelQuitInvoker 引入首个
+	// 并发触发点(forwardPanelExit goroutine 的 code=60 转投可与托盘菜单
+	// quit 并发),护 close(done) 恰一次,防两次退出交叠 double close panic。
+	quitOnce sync.Once
 }
 
 // NewCompanionApp creates a new CompanionApp with IPC client.
@@ -533,10 +538,19 @@ func (a *CompanionApp) openDashboard() {
 }
 
 func (a *CompanionApp) quit() {
-	select {
-	case <-a.done:
-	default:
+	// 双触发护栏(M2 评审 M-2):panelQuitInvoker(M2)引入首个并发触发点
+	// ——forwardPanelExit goroutine 的 code=60 转投可与托盘菜单 quit 并发,
+	// 旧 select 判废形态下两次触发可同时走到 default 分支 → double
+	// close(done) panic。Once 护承诺点:仅首次触发 close done 并走完整
+	// 退出序列,并发迟到者直接返回(macOS 退出序列无取消路径,Once 消费
+	// 即必然退出);首次触发语义不变。
+	committed := false
+	a.quitOnce.Do(func() {
+		committed = true
 		close(a.done)
+	})
+	if !committed {
+		return
 	}
 
 	// 1. Stop proxy if running

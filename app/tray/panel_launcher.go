@@ -262,7 +262,8 @@ func (l *PanelLauncher) exitReport() (alive time.Duration, killedByUs bool) {
 // 含 opts/spawn panic 兜底转崩溃)= 崩溃 1 次,同一滑窗计数 + 1s 重拉,滑窗
 // 满 3 直接兜底。已有面板(手动 Click 抢先)或已进兜底态时让位。spawn/opts
 // 锁内调用、有意设计(契约见文件头),本状态机对二者 panic 兜底转崩溃计数;
-// 其余 on* 回调 panic 契约同 panel_bridge.go(回调体自带 recover)。
+// 其余 on* 回调 panic 契约:状态机不防御,接线层 goroutine(forwardPanelExit)
+// 自带 recover,面板回调沿用 panel_bridge.go 的 recover 惯例。
 func (l *PanelLauncher) spawnAttempt() {
 	retryDelay, retry, spawned := l.spawnAttemptLocked()
 	if spawned {
