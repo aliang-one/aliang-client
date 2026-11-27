@@ -1,4 +1,5 @@
 import { computed, onMounted, onUnmounted, shallowRef, ref } from 'vue';
+import { assistPrefix } from '../services/assistPrefix';
 import { isActiveOperation, mergeOperation } from '../utils/operationActivity';
 
 export function useOperationActivity() {
@@ -9,7 +10,8 @@ export function useOperationActivity() {
 
   onMounted(() => {
     if (typeof EventSource === 'undefined') return;
-    source = new EventSource('/api/agent/operations/events');
+    // SSE 走 HTTP,同构代理镜像挂载(/assist/service/)下过前缀即可送达。
+    source = new EventSource(assistPrefix() + '/api/agent/operations/events');
     source.onmessage = (event) => {
       let snapshot;
       try { snapshot = JSON.parse(event.data); } catch { return; }

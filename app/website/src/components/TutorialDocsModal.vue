@@ -58,6 +58,7 @@
 <script setup>
 import { computed, ref, watch } from 'vue';
 import { useI18n } from '../i18n';
+import { assistPrefix } from '../services/assistPrefix';
 import { showErrorDialog } from '../composables/useErrorDialog';
 
 const props = defineProps({
@@ -119,7 +120,7 @@ async function loadDoc(docId) {
   markdown.value = '';
 
   try {
-    const response = await fetch(`/api/docs/tutorials?locale=${tutorialLocale.value}&doc=${encodeURIComponent(docId)}`);
+    const response = await fetch(`${assistPrefix()}/api/docs/tutorials?locale=${tutorialLocale.value}&doc=${encodeURIComponent(docId)}`);
     if (!response.ok) {
       throw new Error(t('tutorialDocs_loadFailed'));
     }

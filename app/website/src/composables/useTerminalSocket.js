@@ -15,6 +15,8 @@ export function createTerminalSocket({ token, sessionId, rows, cols, onFrame, on
   let connectTimer = null;
 
   function terminalUrl() {
+    // 已知限制(P2 预裁决):WS 刻意不走 assistPrefix——镜像 iframe 内终端
+    // 功能降级为已知限制,勿当 bug 追;根挂载(仪表盘真身)不受影响。
     const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
     return `${proto}://${window.location.host}/api/agent/web-terminal/stream`;
   }

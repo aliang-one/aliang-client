@@ -277,6 +277,7 @@
 <script>
 import { useI18n } from '../../i18n';
 import { showErrorDialog } from '../../composables/useErrorDialog';
+import { assistPrefix } from '../../services/assistPrefix';
 
 function normalizeStringList(items) {
   return Array.isArray(items)
@@ -460,7 +461,7 @@ export default {
     async loadHostkey() {
       this.hostkey = { loading: true, failed: false, notStarted: false, info: null };
       try {
-        const res = await fetch('/api/proxy/ssh-ingress/hostkey', { credentials: 'same-origin' });
+        const res = await fetch(assistPrefix() + '/api/proxy/ssh-ingress/hostkey', { credentials: 'same-origin' });
         if (res.status === 404) {
           this.hostkey = { loading: false, failed: false, notStarted: true, info: null };
           return;
@@ -550,7 +551,7 @@ export default {
       this.localError = '';
       this.keygenInFlight = true;
       try {
-        const res = await fetch('/api/proxy/ssh-ingress/keygen', { method: 'POST', credentials: 'same-origin' });
+        const res = await fetch(assistPrefix() + '/api/proxy/ssh-ingress/keygen', { method: 'POST', credentials: 'same-origin' });
         const json = await res.json().catch(() => null);
         const key = json && json.data ? json.data.key : null;
         if (!res.ok || !key || !key.public_key || !key.private_key) {

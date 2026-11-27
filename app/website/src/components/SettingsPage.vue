@@ -332,6 +332,7 @@
 // Agent 子组件收拢在 settings/agent/AgentPage.vue；设备级杂项已于 2026-11-05
 // 迁出：运行模式→代理设置首卡，系统状态/文件访问授权→仪表盘侧栏紧凑卡。
 import { computed } from 'vue';
+import { assistPrefix } from '../services/assistPrefix';
 import RulesSettings from './settings/RulesSettings.vue';
 import SshIngressSettings, { normalizeSSHIngressConfig } from './settings/SshIngressSettings.vue';
 import MeshSettings from './settings/MeshSettings.vue';
@@ -782,7 +783,7 @@ export default {
 
       // Direct fetch — avoids relying on window.customerConfigGetProviders being injected
       try {
-        const res = await fetch('/api/config/customer/providers');
+        const res = await fetch(assistPrefix() + '/api/config/customer/providers');
         if (res.ok) {
           const json = await res.json();
           const providers = json?.data?.providers;
@@ -803,7 +804,7 @@ export default {
       this.customerConfigSuccess = '';
 
       try {
-        const res = await fetch('/api/config/customer');
+        const res = await fetch(assistPrefix() + '/api/config/customer');
         if (!res.ok) throw new Error(this.t('settings_configLoadFailed'));
         const json = await res.json();
         const data = json?.data || json;
@@ -835,7 +836,7 @@ export default {
           return;
         }
 
-        const res = await fetch('/api/config/customer', {
+        const res = await fetch(assistPrefix() + '/api/config/customer', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ customer: cloneCustomerConfig(patch) })

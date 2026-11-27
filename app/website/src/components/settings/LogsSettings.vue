@@ -474,6 +474,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useI18n } from '../../i18n';
 import { showErrorDialog } from '../../composables/useErrorDialog';
+import { assistPrefix } from '../../services/assistPrefix';
 import { blockIngressSession, getIngressSessions, getStatusConnections, getStatusSummary, kickIngressSession as kickSessionApi, unblockIngressSession } from '../../services/statusApi';
 import SshChainCanvas from './SshChainCanvas.vue';
 
@@ -948,7 +949,7 @@ async function loadLogs() {
 
   try {
     const levelQuery = selectedLevel.value !== 'all' ? `&level=${encodeURIComponent(selectedLevel.value.toUpperCase())}` : '';
-    const response = await fetch(`/api/logs?limit=${frontEndLogsFetchLimit}${levelQuery}`);
+    const response = await fetch(`${assistPrefix()}/api/logs?limit=${frontEndLogsFetchLimit}${levelQuery}`);
     const payload = await response.json().catch(() => ({}));
     if (!response.ok || payload?.code !== 0) {
       throw new Error(payload?.msg || payload?.message || `Request failed (${response.status})`);
@@ -968,7 +969,7 @@ async function loadLogs() {
 async function clearLogs() {
   logsError.value = '';
   try {
-    const response = await fetch('/api/logs/clear', { method: 'POST' });
+    const response = await fetch(assistPrefix() + '/api/logs/clear', { method: 'POST' });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok || payload?.code !== 0) {
       throw new Error(payload?.msg || payload?.message || `Request failed (${response.status})`);

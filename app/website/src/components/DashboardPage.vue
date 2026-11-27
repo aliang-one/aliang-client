@@ -1078,6 +1078,7 @@
 
 <script setup>
 import { computed, ref, onMounted, onUnmounted, watch, nextTick } from 'vue';
+import { assistPrefix } from '../services/assistPrefix';
 import OnboardingGuide from './OnboardingGuide.vue';
 import { useEscLayer } from '../composables/useEscStack';
 import ScanLoginPanel from './settings/ScanLoginPanel.vue';
@@ -2224,7 +2225,9 @@ async function toggleProxyPower() {
       openTunStartModal();
     }
 
-    const endpoint = wasRunning ? '/api/run/stop' : '/api/run/start';
+    // 远程协助 P2:镜像前缀挂载(/assist/service/)下 start/stop 也要过前缀,
+    // 否则 POST 打在管理端 origin 上(代理不剥)→ 404 静默失败。
+    const endpoint = assistPrefix() + (wasRunning ? '/api/run/stop' : '/api/run/start');
     const actionText = wasRunning ? 'stop' : 'start';
     const response = await fetch(endpoint, {
       method: 'POST',
@@ -2525,7 +2528,7 @@ async function loadTunStartLogs() {
   }
 
   try {
-    const response = await fetch(`/api/logs?limit=${frontEndLogsFetchLimit}`);
+    const response = await fetch(`${assistPrefix()}/api/logs?limit=${frontEndLogsFetchLimit}`);
     const payload = await response.json().catch(() => ({}));
     if (!response.ok || payload?.code !== 0) {
       throw new Error(payload?.msg || payload?.message || `Request failed (${response.status})`);
@@ -2557,7 +2560,7 @@ async function loadTunStartupBackendStatus() {
   }
 
   try {
-    const response = await fetch('/api/run/tun/status', {
+    const response = await fetch(assistPrefix() + '/api/run/tun/status', {
       method: 'GET',
       cache: 'no-store'
     });

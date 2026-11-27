@@ -248,6 +248,7 @@
 // 宿主:仪表盘侧栏「系统状态」紧凑卡的弹窗(spec §4.2A)。
 import { useI18n } from '../../i18n';
 import { showErrorDialog } from '../../composables/useErrorDialog';
+import { assistPrefix } from '../../services/assistPrefix';
 import { useCertStatus } from '../../composables/useCertStatus';
 
 export default {
@@ -414,7 +415,7 @@ export default {
     },
     async downloadCurrentCertificate() {
       try {
-        const response = await fetch('/api/cert/download?cert_type=mitm-ca');
+        const response = await fetch(assistPrefix() + '/api/cert/download?cert_type=mitm-ca');
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const url = URL.createObjectURL(await response.blob());
         const anchor = document.createElement('a');
@@ -428,7 +429,7 @@ export default {
       }
     },
     async requestJSON(url, options = {}) {
-      const res = await fetch(url, options);
+      const res = await fetch(assistPrefix() + url, options);
       const payload = await res.json().catch(() => ({}));
       if (!res.ok || payload?.code !== 0) {
         const msg = payload?.msg || payload?.message || `Request failed (${res.status})`;

@@ -196,6 +196,7 @@
 <script>
 import { useI18n } from '../../i18n';
 import { showErrorDialog } from '../../composables/useErrorDialog';
+import { assistPrefix } from '../../services/assistPrefix';
 
 // 与后端 agentCoreMemoryContentCap（services/agent_ai_agentcore_memory.go）
 // 同源：500 字符（Go 按 rune 计，前端 String.length 按 UTF-16 码元计，CJK
@@ -218,7 +219,7 @@ export function memoryChoiceFromConfig(raw) {
 // code!==0 抛 Error(msg)。记忆端点是纯本机 CRUD，不需要 agentApi 的鉴权
 // 失败联动（handleAuthenticationFailure），故不新增 agentApi 导出。
 export async function memoryApiRequest(path, options = {}) {
-  const response = await fetch(path, {
+  const response = await fetch(assistPrefix() + path, {
     credentials: 'same-origin',
     ...options,
     headers: {

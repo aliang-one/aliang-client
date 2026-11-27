@@ -73,9 +73,11 @@ export { DEVICE_SESSION_DETAIL_TTL_MS };
 
 export function chatAttachmentUrl(refId) {
   if (!refId) return '';
-  return '/api/agent/ai/attachment?ref=' + encodeURIComponent(refId);
+  // 该 URL 落进 <img src>(DOM 属性),镜像前缀挂载(/assist/service/)下同样要过前缀。
+  return assistPrefix() + '/api/agent/ai/attachment?ref=' + encodeURIComponent(refId);
 }
 import { getAgentIntegrations, getAgentSessionDetail } from '../services/agentApi';
+import { assistPrefix } from '../services/assistPrefix';
 import { useDeviceSessions, DEVICE_SESSION_DETAIL_TTL_MS, isTerminalPrefixedSessionId } from './useDeviceSessions';
 import {
   normalizeDeviceProvider,
@@ -2645,6 +2647,8 @@ export function useAliangChat() {
   // --- Local agent AI streaming over WebSocket ---
 
   function aiSocketUrl() {
+    // 已知限制(P2 预裁决):WS 刻意不走 assistPrefix——镜像 iframe 内聊天流
+    // 降级为已知限制,勿当 bug 追;根挂载(仪表盘真身)不受影响。
     const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
     return `${proto}://${window.location.host}/api/agent/ai/stream`;
   }

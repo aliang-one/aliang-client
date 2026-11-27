@@ -1,4 +1,5 @@
 import { computed, reactive, readonly, toRefs } from 'vue';
+import { assistPrefix } from '../services/assistPrefix';
 import {
   AuthRequestError,
   activateScanLogin as activateScanLoginRequest,
@@ -234,7 +235,8 @@ export function connectSessionEvents() {
   if (typeof window === 'undefined' || typeof window.EventSource === 'undefined') return;
 
   const generation = ++sessionEventSourceGeneration;
-  const source = new window.EventSource('/api/session/events');
+  // SSE 走 HTTP,同构代理镜像挂载(/assist/service/)下过前缀即可送达。
+  const source = new window.EventSource(assistPrefix() + '/api/session/events');
   sessionEventSource = source;
   source.onopen = () => {
     if (generation === sessionEventSourceGeneration) state.connectionStatus = 'connected';

@@ -460,8 +460,10 @@
                 <p class="mt-1 text-xs text-slate-500 dark:text-slate-400">{{ t('user_apiKeyDocsDesc') }}</p>
               </div>
               <div class="flex items-center gap-2">
+                <!-- 文档相对引用:根挂载解析 /docs/…;镜像挂载(/assist/service/)
+                     解析 /assist/service/docs/…→代理剥前缀→/docs/…,双语境同真身。 -->
                 <a
-                  href="/docs/sub2api-apikey-api-reference.md"
+                  href="docs/sub2api-apikey-api-reference.md"
                   target="_blank"
                   rel="noreferrer"
                   class="inline-flex min-h-10 items-center justify-center rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-100 dark:hover:bg-slate-800"
@@ -507,6 +509,7 @@
 <script setup>
 import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { useAuthStore } from '../../stores/auth';
+import { assistPrefix } from '../../services/assistPrefix';
 import { useI18n } from '../../i18n';
 import {
   getUserCenterAPIKeys,
@@ -830,7 +833,7 @@ async function openAPIKeyDocs() {
   apiKeyDocsError.value = '';
 
   try {
-    const response = await fetch(API_KEY_DOCS_PATH, {
+    const response = await fetch(assistPrefix() + API_KEY_DOCS_PATH, {
       credentials: 'same-origin'
     });
     if (!response.ok) {

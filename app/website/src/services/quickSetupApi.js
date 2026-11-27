@@ -1,5 +1,6 @@
 import { markDashboardSessionRequired, syncUnauthenticatedAuthState } from '../stores/auth';
 import { handleAuthenticationFailure } from './authFailure';
+import { assistPrefix } from './assistPrefix';
 
 function extractOuterEnvelope(json) {
   const payload = json && typeof json === 'object' ? json : {};
@@ -33,7 +34,7 @@ function handleSessionFailure(responseStatus, envelope) {
 }
 
 async function rawRequest(path, options = {}) {
-  const response = await fetch(path, {
+  const response = await fetch(assistPrefix() + path, {
     credentials: 'same-origin',
     ...options,
     headers: {

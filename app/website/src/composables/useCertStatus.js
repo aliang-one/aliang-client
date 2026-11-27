@@ -1,8 +1,10 @@
 import { ref } from 'vue';
 import { handleAuthenticationFailure } from '../services/authFailure';
+import { assistPrefix } from '../services/assistPrefix';
 import { syncUnauthenticatedAuthState } from '../stores/auth';
 
-const API_BASE = '/api';
+// 远程协助 P2:镜像前缀挂载(/assist/service/)下证书状态轮询也要过前缀。
+const API_BASE = assistPrefix() + '/api';
 const CERT_TYPE = 'mitm-ca';
 
 const certStatus = ref(null);

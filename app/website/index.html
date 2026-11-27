@@ -4,10 +4,12 @@
     <meta charset="utf-8" />
     <meta content="width=device-width, initial-scale=1.0" name="viewport" />
     <title>ALiang Gateway Dashboard</title>
-    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <!-- 远程协助 P2:静态引用一律相对——任意前缀挂载(/assist/service/ 镜像)
+         下由浏览器相对解析,代理剥前缀后命中同一真身;根挂载解析结果不变。 -->
+    <link rel="icon" type="image/svg+xml" href="icon.svg" />
     <script src="tailwind3.4.js"></script>
-    <link rel="preload" href="/fonts/material-symbols-outlined-400.ttf" as="font" type="font/ttf" crossorigin />
-    <link rel="stylesheet" href="/fonts.css" />
+    <link rel="preload" href="fonts/material-symbols-outlined-400.ttf" as="font" type="font/ttf" crossorigin />
+    <link rel="stylesheet" href="fonts.css" />
     <link href="assets/styles.css" rel="stylesheet" />
     <script id="tailwind-config">
       tailwind.config = {

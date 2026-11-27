@@ -135,6 +135,7 @@ import { useI18n } from '../../i18n';
 // 动作失败反馈走全局报错弹窗(2026-11-17 定案);status 是成功/失败共用的
 // 单一渲染节点,行内渲染按改动最小方案保留(报错弹窗+行内短暂并存,可接受)
 import { showErrorDialog } from '../../composables/useErrorDialog';
+import { assistPrefix } from '../../services/assistPrefix';
 import { copyText } from '../../utils/clipboard';
 
 const { t } = useI18n();
@@ -174,7 +175,7 @@ function normalizeApi(payload) {
 }
 
 async function request(path, options = {}) {
-  const resp = await fetch(`/api${path}`, {
+  const resp = await fetch(`${assistPrefix()}/api${path}`, {
     headers: {
       'Content-Type': 'application/json',
       ...(options.headers || {}),

@@ -193,6 +193,8 @@ function createAssistState() {
   }
 
   function assistStreamUrl() {
+    // 已知限制(P2 预裁决):WS 刻意不走 assistPrefix——观看页宿主直连本机
+    // agent(根挂载),不经镜像;镜像 iframe 内的 WS 视为降级,勿当 bug 追。
     const proto = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss' : 'ws';
     const host = typeof window !== 'undefined' ? window.location.host : '';
     const sid = sessionId.value ? `?session_id=${encodeURIComponent(sessionId.value)}` : '';
