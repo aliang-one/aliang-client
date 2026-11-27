@@ -554,8 +554,8 @@ const agentCoreMemoryExtractMaxTokens = 4096
 // 测试注入假身。返回(纯文本, stopReason, err)。
 type agentCoreMemoryStreamFn func(ctx context.Context, req *agentcore.MessagesRequest) (string, string, error)
 
-func (m *agentAIManager) agentCoreMemoryRealStream(ctx context.Context, req *agentcore.MessagesRequest) (string, string, error) {
-	client := agentcore.NewClient(agentCoreBaseURL()).WithAPIKey(agentCoreAuthToken())
+// agentCoreMemoryStreamCollect 聚合一次流式提取调用(纯文本/停止原因/错误)。
+func agentCoreMemoryStreamCollect(ctx context.Context, client *agentcore.Client, req *agentcore.MessagesRequest) (string, string, error) {
 	var b strings.Builder
 	stopReason := ""
 	err := client.Stream(ctx, req, func(ev agentcore.StreamEvent) error {
@@ -578,10 +578,20 @@ func (m *agentAIManager) agentCoreMemoryRealStream(ctx context.Context, req *age
 // agentCoreMemoryExtractCall 同端点同模型提取(spec §5):effort 首选 low,被拒
 // 降归一后 run.effort,再拒无 effort;锁存后直用。非 effort 拒绝的错误不重试。
 // max_tokens 截断定性报错(拒绝半截 JSON,沿 compact.go:324 先例)。
-func (m *agentAIManager) agentCoreMemoryExtractCall(ctx context.Context, model, runEffort, system, user string) (string, error) {
-	stream := m.agentCoreMemoryRealStream
-	if m.coreMemoryCallForTest != nil {
-		stream = m.coreMemoryCallForTest
+// projectPath 是出口解析的粘性键(spec 二期 §5.0 第 4 调用点:同项目黏同一
+// endpoint——记忆提取与该项目的对话 run 落在同一上游)。
+func (m *agentAIManager) agentCoreMemoryExtractCall(ctx context.Context, projectPath, model, runEffort, system, user string) (string, error) {
+	stream := m.coreMemoryCallForTest
+	if stream == nil {
+		// 真身:第四调用点解析一次(粘性键=projectPath)。解析失败/出口限流
+		// 降级 nil → 继承链(agentCoreResolveEndpointRow 契约)——记忆提取是
+		// 收尾旁路,不因出口限流拒绝工作。测试注入 coreMemoryCallForTest 时
+		// 完全绕过解析,现状不变。
+		row := agentCoreResolveEndpointRow(projectPath, model)
+		client := agentcore.NewClient(agentCoreBaseURLFromRow(row)).WithAPIKey(agentCoreAuthTokenFromRow(row))
+		stream = func(ctx context.Context, req *agentcore.MessagesRequest) (string, string, error) {
+			return agentCoreMemoryStreamCollect(ctx, client, req)
+		}
 	}
 	// 候选档:锁存优先;否则 low → 归一(run.effort) → 无,归一后去重保序。
 	var candidates []string
@@ -782,7 +792,7 @@ func (m *agentAIManager) agentCoreMemoryExtractAsync(projectPath, model, runEffo
 		user := "本轮用户消息:\n" + u + "\n\n本轮助手结论:\n" + a
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		text, err := m.agentCoreMemoryExtractCall(ctx, model, runEffort, system, user)
+		text, err := m.agentCoreMemoryExtractCall(ctx, projectPath, model, runEffort, system, user)
 		if err != nil {
 			logger.Warn(fmt.Sprintf("agentcore-memory: 提取调用失败(放弃本次): %v", err))
 			return

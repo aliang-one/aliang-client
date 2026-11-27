@@ -129,7 +129,9 @@ type LoopHooks struct {
 	// status=0 表示没有可观测的 HTTP 状态（连接层失败/2xx 体内错误信封），
 	// headers 可能为 nil。nil=不启用；回调不得阻塞。调用方主动终止（ctx
 	// 取消/事件中止）不回调——用户取消不算 endpoint 失败，不应进
-	// ReportFailure 计数。
+	// ReportFailure 计数。已下发过事件后的 ctx 取消同样不回调（Stream 仍会
+	// 返回 ctx.Err()，只是失败上报缝不触发——4a 评审 Finding 1 根治在
+	// client.go Stream 的 delivered 分支）。
 	OnRequestError func(status int, headers http.Header)
 
 	// OnToolCall 在每个**实际执行到 executeOne 的**工具调用处触发一次（内置

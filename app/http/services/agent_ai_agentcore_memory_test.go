@@ -315,7 +315,7 @@ func TestAgentCoreMemoryExtractEffortFallback(t *testing.T) {
 	stream, calls := memorySeamForTest(t, func(eff string) bool { return eff == "low" }, agentcore.StopReasonEndTurn)
 	m.coreMemoryCallForTest = stream
 	eff := agentcore.NormalizeEffortLevel("ultracode") // = "max"
-	text, err := m.agentCoreMemoryExtractCall(context.Background(), "m1", eff, "sys", "usr")
+	text, err := m.agentCoreMemoryExtractCall(context.Background(), "", "m1", eff, "sys", "usr")
 	if err != nil || text != `{"ops":[]}` {
 		t.Fatalf("low 被拒不降档则失败: %q %v", text, err)
 	}
@@ -327,7 +327,7 @@ func TestAgentCoreMemoryExtractEffortFallback(t *testing.T) {
 		t.Fatalf("成功档必须锁存: set=%v %q", set, eff)
 	}
 	// 第二次调用直接用锁存档,不再试 low
-	_, _ = m.agentCoreMemoryExtractCall(context.Background(), "m1", eff, "sys", "usr")
+	_, _ = m.agentCoreMemoryExtractCall(context.Background(), "", "m1", eff, "sys", "usr")
 	if got := calls(); len(got) != 3 || got[2] != "max" {
 		t.Fatalf("锁存后不得再试 low: %q", got)
 	}
@@ -339,7 +339,7 @@ func TestAgentCoreMemoryExtractMaxTokensGuard(t *testing.T) {
 	m := &agentAIManager{}
 	stream, calls := memorySeamForTest(t, func(eff string) bool { return false }, agentcore.StopReasonMaxTokens)
 	m.coreMemoryCallForTest = stream
-	_, err := m.agentCoreMemoryExtractCall(context.Background(), "m1", "", "sys", "usr")
+	_, err := m.agentCoreMemoryExtractCall(context.Background(), "", "m1", "", "sys", "usr")
 	if err == nil || !strings.Contains(err.Error(), "截断") {
 		t.Fatalf("max_tokens 截断必须定性报错: %v", err)
 	}
@@ -360,7 +360,7 @@ func TestAgentCoreMemoryExtractEffortBranches(t *testing.T) {
 		m := &agentAIManager{}
 		stream, calls := memorySeamForTest(t, func(eff string) bool { return eff == "low" }, agentcore.StopReasonEndTurn)
 		m.coreMemoryCallForTest = stream
-		if _, err := m.agentCoreMemoryExtractCall(context.Background(), "m1", "", "sys", "usr"); err != nil {
+		if _, err := m.agentCoreMemoryExtractCall(context.Background(), "", "m1", "", "sys", "usr"); err != nil {
 			t.Fatalf("无 effort 终试应成功: %v", err)
 		}
 		if got := calls(); len(got) != 2 || got[0] != "low" || got[1] != "" {
@@ -370,7 +370,7 @@ func TestAgentCoreMemoryExtractEffortBranches(t *testing.T) {
 			// 空串哨兵不可表达「未锁存」——Set 位才是锁存标志
 			t.Fatalf("空串终档也必须置 Set 位锁存: set=%v %q", set, eff)
 		}
-		_, _ = m.agentCoreMemoryExtractCall(context.Background(), "m1", "", "sys", "usr")
+		_, _ = m.agentCoreMemoryExtractCall(context.Background(), "", "m1", "", "sys", "usr")
 		if got := calls(); len(got) != 3 || got[2] != "" {
 			t.Fatalf("锁存后不得再试 low: %q", got)
 		}
@@ -381,7 +381,7 @@ func TestAgentCoreMemoryExtractEffortBranches(t *testing.T) {
 		m := &agentAIManager{}
 		stream, calls := memorySeamForTest(t, func(eff string) bool { return eff == "low" }, agentcore.StopReasonEndTurn)
 		m.coreMemoryCallForTest = stream
-		if _, err := m.agentCoreMemoryExtractCall(context.Background(), "m1", "bogus-effort", "sys", "usr"); err != nil {
+		if _, err := m.agentCoreMemoryExtractCall(context.Background(), "", "m1", "bogus-effort", "sys", "usr"); err != nil {
 			t.Fatalf("终档成功: %v", err)
 		}
 		if got := calls(); len(got) != 2 || got[0] != "low" || got[1] != "" {
@@ -394,7 +394,7 @@ func TestAgentCoreMemoryExtractEffortBranches(t *testing.T) {
 		m := &agentAIManager{}
 		stream, calls := memorySeamForTest(t, func(eff string) bool { return eff == "low" }, agentcore.StopReasonEndTurn)
 		m.coreMemoryCallForTest = stream
-		if _, err := m.agentCoreMemoryExtractCall(context.Background(), "m1", "low", "sys", "usr"); err != nil {
+		if _, err := m.agentCoreMemoryExtractCall(context.Background(), "", "m1", "low", "sys", "usr"); err != nil {
 			t.Fatalf("终档成功: %v", err)
 		}
 		if got := calls(); len(got) != 2 || got[0] != "low" || got[1] != "" {
@@ -407,7 +407,7 @@ func TestAgentCoreMemoryExtractEffortBranches(t *testing.T) {
 		m := &agentAIManager{}
 		stream, calls := memorySeamForTest(t, func(eff string) bool { return eff == "low" || eff == "max" }, agentcore.StopReasonEndTurn)
 		m.coreMemoryCallForTest = stream
-		text, err := m.agentCoreMemoryExtractCall(context.Background(), "m1", agentcore.NormalizeEffortLevel("ultracode"), "sys", "usr")
+		text, err := m.agentCoreMemoryExtractCall(context.Background(), "", "m1", agentcore.NormalizeEffortLevel("ultracode"), "sys", "usr")
 		if err != nil || text != `{"ops":[]}` {
 			t.Fatalf("无 effort 终试应成功: %q %v", text, err)
 		}
@@ -424,7 +424,7 @@ func TestAgentCoreMemoryExtractEffortBranches(t *testing.T) {
 		m := &agentAIManager{}
 		stream, calls := memorySeamForTest(t, func(eff string) bool { return true }, agentcore.StopReasonEndTurn)
 		m.coreMemoryCallForTest = stream
-		if _, err := m.agentCoreMemoryExtractCall(context.Background(), "m1", agentcore.NormalizeEffortLevel("ultracode"), "sys", "usr"); err == nil {
+		if _, err := m.agentCoreMemoryExtractCall(context.Background(), "", "m1", agentcore.NormalizeEffortLevel("ultracode"), "sys", "usr"); err == nil {
 			t.Fatal("三档全拒必须报错(Warn 放弃路径)")
 		}
 		if got := calls(); len(got) != 3 {
@@ -447,7 +447,7 @@ func TestAgentCoreMemoryExtractEffortBranches(t *testing.T) {
 			mu.Unlock()
 			return "", "", plainErr
 		}
-		_, err := m.agentCoreMemoryExtractCall(context.Background(), "m1", agentcore.NormalizeEffortLevel("ultracode"), "sys", "usr")
+		_, err := m.agentCoreMemoryExtractCall(context.Background(), "", "m1", agentcore.NormalizeEffortLevel("ultracode"), "sys", "usr")
 		if err == nil || !errors.Is(err, plainErr) {
 			t.Fatalf("非 effort 拒绝必须原样返回: %v", err)
 		}

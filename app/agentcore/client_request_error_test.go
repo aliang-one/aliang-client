@@ -101,3 +101,37 @@ func TestStreamOnRequestErrorNotFiredOnSuccess(t *testing.T) {
 		t.Fatalf("OnRequestError 次数 = %d, want 0", n)
 	}
 }
+
+// 已下发事件后的 ctx 取消（用户停止/watchdog 超时）不算 endpoint 失败：错误
+// 没有（0, nil）以外的上游状态可携带，触发 OnRequestError 会把一次用户取消
+// 记进 ReportFailure（4a 评审 Finding 1，根治在 Stream 的 delivered 分支）。
+// 变异守卫：删掉 delivered 分支里的 ctx.Err() 守卫，本条即红。
+func TestStreamOnRequestErrorNotFiredOnDeliveredCtxCancel(t *testing.T) {
+	// 服务端先发两帧（保证 delivered=true），再挂住直到客户端取消断连。
+	srv := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		writeSSE(w,
+			`{"type":"message_start","message":{"id":"msg_cancel","model":"x"}}`,
+			`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`,
+		)
+		<-r.Context().Done()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls int32
+	err := NewClient(srv.URL).Stream(ctx, &MessagesRequest{Model: "x"}, func(ev StreamEvent) error {
+		if ev.Kind == EventText {
+			// 收到首个 delta 即取消：对应用户在流式中途点停止。
+			cancel()
+		}
+		return nil
+	}, WithRequestError(func(status int, headers http.Header) {
+		atomic.AddInt32(&calls, 1)
+	}))
+	if err == nil {
+		t.Fatal("取消后的流应返回错误（ctx.Err() 语义不变）")
+	}
+	if n := atomic.LoadInt32(&calls); n != 0 {
+		t.Fatalf("OnRequestError 次数 = %d, want 0（用户取消不算 endpoint 失败）", n)
+	}
+}

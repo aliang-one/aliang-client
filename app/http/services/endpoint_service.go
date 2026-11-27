@@ -536,6 +536,16 @@ func (s *EndpointService) bumpCounters(id string, totalDelta, failedDelta int64,
 	}
 }
 
+// MarkUsed 是 last_used_at 的专用窄写(spec 二期 §5.7):内核出口解析命中即
+// 打点,只动打点列,不碰健康/计数/冷却。刻意不开在 Select 里——Select 与
+// 56432 路由层共享,路由层没有粘性/run 语义,内核打点只发生在 resolver 命中
+// (宿主 agentCoreRunEgress,含 builtin 兜底行)。失败只记日志,不影响路由。
+func (s *EndpointService) MarkUsed(id string) {
+	if err := s.store.MarkUsed(id); err != nil {
+		logger.Warn(fmt.Sprintf("endpoint: %s 打点(last_used_at)失败: %v", id, err))
+	}
+}
+
 // ReportSuccess 成功全清(spec §6.2 最后一行)+ 计数 +1(total+1, failed+0)。
 // 请求真实走通是它可用的最强证据,也是 401/402 锁存的恢复路径之一(另一条是
 // 手动「重置健康」)。池模式下只记计数并清 last_error,不碰 health_status 等

@@ -35,8 +35,10 @@ import (
 //     按 priority 分层,顶层内选 in-flight 最少者(并列随机)→ 选中并重黏;
 //     全空回落 builtin(复用 svc.Select 的兜底路径,必打日志),兜底行不黏。
 //
-// MarkUsed/ReportFailure/Acquire 的调用时机都归宿主(4b),本层只提供选择与
-// Acquire 包装,不碰计数列——路由层共享的 Select 不能被内核打点污染。
+// MarkUsed/ReportFailure/Acquire 的调用时机都归宿主(4b 已接线:agentCoreRunEgress
+// 每 run Acquire 一次 + MarkUsed 打点,OnRequestError 闭包按行 id ReportFailure),
+// 本层只提供选择与 Acquire 包装,不碰计数列——路由层共享的 Select 不能被内核
+// 打点污染。
 
 // kernelEndpointProtocol 内核只说 anthropic 协议(出口行的 Validate 双层守卫
 // 也只允许 anthropic 行设出口,processor/config/endpoint.go §Validate)。
@@ -141,11 +143,19 @@ var _ kernelEndpointSvc = (*EndpointService)(nil)
 
 // Resolve 按 §5.0 伪码解析内核出口。sessionID 是粘性键(内存 extract 路径用
 // projectPath、compact 用 session.id,由 4b 决定);model 为空表示跳过模型
-// 过滤。失败时错误分三类:ErrKernelEgressRateLimited(出口限流,本地错误不
+// 过滤。excludeIDs 是本回合排除的行(4b 宿主:Acquire 排队超时 exclude 后
+// 重选,§5.2「满/超时在解析层重选而非 run 内等待」;不计失败不动健康)。
+// 失败时错误分三类:ErrKernelEgressRateLimited(出口限流,本地错误不
 // failover)、ErrNoEndpoint(池空且 builtin 也不可用)、wrapped raw(注册表读
 // 挂,服务端故障)。
-func (r *kernelEndpointResolver) Resolve(sessionID, model string) (kernelEndpointResolution, error) {
+func (r *kernelEndpointResolver) Resolve(sessionID, model string, excludeIDs ...string) (kernelEndpointResolution, error) {
 	now := r.now().Unix()
+	excluded := map[string]bool{}
+	for _, id := range excludeIDs {
+		if id != "" {
+			excluded[id] = true
+		}
+	}
 
 	// 1) 出口指定行。
 	eg, err := r.egressRow()
@@ -153,6 +163,12 @@ func (r *kernelEndpointResolver) Resolve(sessionID, model string) (kernelEndpoin
 		// 读出口行失败降级为「无出口」继续走 auto:出口是路由优化不是硬依赖,
 		// auto 池里的 ListEndpoints 会以同样的方式失败并自然报错,这里不吞。
 		logger.Warn(fmt.Sprintf("endpoint: kernel resolver 读出口指定行失败,按无出口处理: %v", err))
+		eg = nil
+	}
+	if eg != nil && excluded[eg.ID] {
+		// 出口行被宿主排除(排队超时重选):本回合当无出口,落 auto;下一 run
+		// 不带 exclude 时出口恢复首选。
+		logger.Info(fmt.Sprintf("endpoint: kernel resolver 出口 %s 被排除(并发排队超时重选),本回合走 auto", eg.ID))
 		eg = nil
 	}
 	if eg != nil {
@@ -177,9 +193,10 @@ func (r *kernelEndpointResolver) Resolve(sessionID, model string) (kernelEndpoin
 		}
 	}
 
-	// 2) auto 调度:黏性优先。
+	// 2) auto 调度:黏性优先。黏住的行被排除(排队超时重选)时视同未黏——
+	// 落到下方首黏路径重新选择并覆写绑定。
 	if sessionID != "" {
-		if id, ok := r.stickyLookup(sessionID, now); ok {
+		if id, ok := r.stickyLookup(sessionID, now); ok && !excluded[id] {
 			ep, gerr := r.svc.GetEndpoint(id)
 			if gerr == nil && r.kernelEndpointCandidate(ep, model, now) {
 				// 命中且行仍满足候选闸:直接用,重刷 TTL(§5.1)。
@@ -191,7 +208,7 @@ func (r *kernelEndpointResolver) Resolve(sessionID, model string) (kernelEndpoin
 			// 旧绑定,重黏次优并覆写;选不出(池空/兜底/读挂)时不覆写,即等效
 			// 「保留旧绑定」——旧行恢复后仍优先回黏。
 			reason := kernelStickyUnusableReason(ep, gerr, model, now)
-			res, serr := r.resolveAuto(model, id)
+			res, serr := r.resolveAuto(model, id, excludeIDs...)
 			if serr == nil && res.Endpoint != nil && !res.Endpoint.Builtin {
 				logger.Info(fmt.Sprintf("endpoint: kernel resolver 会话 %s 重黏 %s→%s(原因: %s)",
 					sessionID, id, res.Endpoint.ID, reason))
@@ -202,7 +219,7 @@ func (r *kernelEndpointResolver) Resolve(sessionID, model string) (kernelEndpoin
 	}
 	// 首黏:session 带键且选中池内行才写绑定。builtin 兜底刻意不黏——黏上
 	// 兜底行会让 BYO 恢复后该会话仍被钉在兜底行一整个 TTL。
-	res, serr := r.resolveAuto(model, "")
+	res, serr := r.resolveAuto(model, "", excludeIDs...)
 	if serr == nil && sessionID != "" && res.Endpoint != nil && !res.Endpoint.Builtin {
 		r.stickyBind(sessionID, res.Endpoint.ID, now)
 	}
@@ -211,9 +228,23 @@ func (r *kernelEndpointResolver) Resolve(sessionID, model string) (kernelEndpoin
 
 // resolveAuto 无粘性上下文(或重黏)时的调度:候选枚举 → priority 分层 →
 // 层内 in-flight 最少(并列随机)→ 池空复用 svc.Select 的 builtin 兜底。
-// stuckID 非空时排除黏住的旧行(重黏语义:选出的必是另一行)。
-func (r *kernelEndpointResolver) resolveAuto(model, stuckID string) (kernelEndpointResolution, error) {
+// stuckID 非空时排除黏住的旧行(重黏语义:选出的必是另一行);excludeIDs
+// 是宿主传的本回合排除集(Acquire 排队超时重选,§5.2),同样作用于兜底的
+// svc.Select(排除集非空时 builtin 兜底是唯一落点)。
+func (r *kernelEndpointResolver) resolveAuto(model, stuckID string, excludeIDs ...string) (kernelEndpointResolution, error) {
 	now := r.now().Unix()
+	excluded := map[string]bool{}
+	for _, id := range excludeIDs {
+		if id != "" {
+			excluded[id] = true
+		}
+	}
+	// 兜底 Select 的排除集 = 宿主排除集 + 重黏的旧行(Select 的变参尾部语义)。
+	fallbackExclude := make([]string, 0, len(excludeIDs)+1)
+	fallbackExclude = append(fallbackExclude, excludeIDs...)
+	if stuckID != "" {
+		fallbackExclude = append(fallbackExclude, stuckID)
+	}
 	list, err := r.svc.ListEndpoints()
 	if err != nil {
 		return kernelEndpointResolution{}, fmt.Errorf("endpoint: kernel resolver 读注册表失败: %w", err)
@@ -226,6 +257,9 @@ func (r *kernelEndpointResolver) resolveAuto(model, stuckID string) (kernelEndpo
 		if stuckID != "" && e.ID == stuckID { // 重黏:排除刚失效的旧行
 			continue
 		}
+		if excluded[e.ID] { // 宿主排除(排队超时重选):本回合不再入选
+			continue
+		}
 		if !r.kernelEndpointCandidate(e, model, now) {
 			continue
 		}
@@ -235,8 +269,8 @@ func (r *kernelEndpointResolver) resolveAuto(model, stuckID string) (kernelEndpo
 		// 池空(或只剩被排除的旧行)→ builtin 兜底:直接走 svc.Select——
 		// 它对空池回落 fallbackBuiltin(enabled/协议/健康过滤 + 必打日志),
 		// 与路由层共享同一条兜底路径,不在这里复刻内置行的判定。
-		if stuckID != "" {
-			ep, serr := r.svc.Select(kernelEndpointProtocol, model, "", stuckID)
+		if len(fallbackExclude) > 0 {
+			ep, serr := r.svc.Select(kernelEndpointProtocol, model, "", fallbackExclude...)
 			if serr != nil {
 				return kernelEndpointResolution{}, serr
 			}
@@ -374,8 +408,9 @@ func (r *kernelEndpointResolver) stickyBind(sessionID, endpointID string, now in
 
 // Acquire 包装 svc.Acquire(§5.0:计数作用域=每 run 一次,run 内多次 LLM 请求
 // 共享一个槽位;release 挂 run 终结 defer 全路径)。maxConcurrency<=0 时以
-// 行上 max_concurrency 为准(仍 0=不限并发)。实际接线在 4b;排队超限返回
-// ErrQueueTimeout,调用方 exclude 该行重选而非在 run 内等待(§5.2)。
+// 行上 max_concurrency 为准(仍 0=不限并发)。宿主 agentCoreRunEgress 每 run
+// 调用一次;排队超限返回 ErrQueueTimeout,调用方 exclude 该行重选而非在
+// run 内等待(§5.2)。
 func (r *kernelEndpointResolver) Acquire(ep *config.LLMEndpoint, maxConcurrency int) (func(), error) {
 	if ep == nil {
 		return nil, ErrNoEndpoint

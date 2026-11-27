@@ -208,7 +208,9 @@ func WithRetryNotice(fn func(RetryNotice)) StreamOption {
 // 错误信封），status 为 0 表示没有可观测的 HTTP 状态。
 //
 // 调用方主动终止（ctx 取消/事件中止）不回调——用户取消不算 endpoint 失败，
-// 不应进 ReportFailure 计数。
+// 不应进 ReportFailure 计数。细节：已下发过事件后的 ctx 取消仍会让 Stream
+// 返回错误（ctx.Err() 语义），但**不**触发本回调——那条路径的错误没有上游
+// 状态可携带（(0, nil)），通知宿主只会把用户取消记成上游失败。
 func WithRequestError(fn func(status int, headers http.Header)) StreamOption {
 	return func(o *streamOptions) { o.onRequestError = fn }
 }
@@ -310,6 +312,16 @@ func (c *Client) Stream(ctx context.Context, req *MessagesRequest, onEvent func(
 		// （upstreamError）可能出现在事件中途——那种情况下重试同样会缝内容，
 		// delivered 判定先拦住是对的。
 		if delivered {
+			// 已下发事件后的 ctx 取消（用户停止 / watchdog 超时）不是上游失败：
+			// 这里的错误多半是 io 管道/读流被取消撕裂，requestErrorFields 会给
+			// (0, nil)，宿主闭包会把一次用户取消当成 endpoint 失败记账（4a 评审
+			// Finding 1）。ctx 已取消时不通知、错误原样返回——返回值语义不变
+			// （调用方仍按 ctx 取消归类），只是失败上报缝不再触发。代价是「真实
+			// 上游失败与取消同时发生」这一竞态窗口少记一次失败：宁可少记，不把
+			// 用户取消记成上游劣化。
+			if ctx.Err() != nil {
+				return err
+			}
 			// 已下发过事件后不再重试：这是本次调用的最终失败，通知宿主。
 			notifyRequestError(err)
 			return err

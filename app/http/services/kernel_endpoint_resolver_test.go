@@ -371,6 +371,72 @@ func TestKernelEndpointResolverEmptyModelSkipsModelFilter(t *testing.T) {
 	}
 }
 
+// ---- exclude（4b 宿主:Acquire 排队超时 exclude 重选,§5.2）--------------------
+
+// exclude 命中 auto 池行:被排除行本回合不再入选,改选下一候选;粘性键对被排除
+// 行视同未黏(落到首黏路径并覆写绑定)。
+func TestKernelEndpointResolverExcludeSkipsRowAndSticky(t *testing.T) {
+	r, _, store := newKernelResolverHarness(t)
+	createEndpoint(t, store, anthropicEP("ex-a", 1))
+	createEndpoint(t, store, anthropicEP("ex-b", 2))
+
+	// 先黏 ex-a(最高优先级,自然首黏)。
+	if res, err := r.Resolve("sess-ex", "m"); err != nil || res.Endpoint.ID != "ex-a" {
+		t.Fatalf("首解析应黏 ex-a, got %+v err=%v", res, err)
+	}
+	// 排除 ex-a 重选:改选 ex-b,粘性覆写。
+	res, err := r.Resolve("sess-ex", "m", "ex-a")
+	if err != nil || res.Endpoint.ID != "ex-b" {
+		t.Fatalf("排除 ex-a 应改选 ex-b, got %+v err=%v", res, err)
+	}
+	if ent := stickySnapshot(r)["sess-ex"]; ent.endpointID != "ex-b" {
+		t.Fatalf("粘性应覆写为 ex-b, 实际 %+v", stickySnapshot(r))
+	}
+	// 不带 exclude 的下一次解析:黏回重黏后的 ex-b(TTL 内)。
+	again, err := r.Resolve("sess-ex", "m")
+	if err != nil || again.Endpoint.ID != "ex-b" {
+		t.Fatalf("覆写后应黏 ex-b, got %+v err=%v", again, err)
+	}
+}
+
+// exclude 命中出口指定行:本回合当无出口落 auto(下一 run 不带 exclude 时出口
+// 恢复首选);出口行自身不被写入粘性。
+func TestKernelEndpointResolverExcludeSkipsEgressRow(t *testing.T) {
+	r, _, store := newKernelResolverHarness(t)
+	createEgressRow(t, store, "eg-ex", 99, true)
+	createEndpoint(t, store, anthropicEP("plain", 5))
+
+	res, err := r.Resolve("sess-eg", "m", "eg-ex")
+	if err != nil || res.Endpoint.ID != "plain" {
+		t.Fatalf("出口被排除应落 auto plain, got %+v err=%v", res, err)
+	}
+	if res.Egress {
+		t.Fatal("排除出口后 res.Egress 应为 false")
+	}
+	// 不带 exclude:出口恢复首选。
+	res, err = r.Resolve("sess-eg", "m")
+	if err != nil || res.Endpoint.ID != "eg-ex" || !res.Egress {
+		t.Fatalf("出口应恢复首选, got %+v err=%v", res, err)
+	}
+}
+
+// 全部候选被排除 → 池空 → svc.Select 兜底(exclude 集透传,builtin 为唯一落点)。
+func TestKernelEndpointResolverExcludeAllFallsToBuiltin(t *testing.T) {
+	r, _, store := newKernelResolverHarness(t)
+	createEndpoint(t, store, anthropicEP("only-ex", 5))
+
+	res, err := r.Resolve("sess-all", "m", "only-ex")
+	if err != nil {
+		t.Fatalf("排除唯一候选应回落 builtin 而非报错: %v", err)
+	}
+	if res.Endpoint == nil || !res.Endpoint.Builtin {
+		t.Fatalf("应兜底 builtin 行, got %+v", res.Endpoint)
+	}
+	if ent, ok := stickySnapshot(r)["sess-all"]; ok {
+		t.Fatalf("兜底行不写粘性, 实际 %+v", ent)
+	}
+}
+
 // ---- builtin 兜底 -----------------------------------------------------------
 
 // auto 池全空 → builtin 兜底(照旧),兜底行不写粘性(避免 BYO 恢复后会话
