@@ -705,8 +705,8 @@ export default {
 
   // -- SettingsPage --
   settings_title: 'ALiang Gateway',
-  settings_tabSettings: '代理设置',
-  settings_subProxy: '代理设置',
+  settings_tabSettings: '网络设置',
+  settings_subProxy: '网络设置',
   settings_subIngress: '入口与组网',
   settings_tabUserCenter: '用户',
   settings_tabLogs: '状态',
@@ -1124,7 +1124,7 @@ export default {
   egress_title: '规则分流实际出口',
   egress_desc: '展示代理规则命中后实际走哪条出口的运行态编译结果，并提供开关。这里显示的是数据面真值，与规则页的配置意图可能不一致。',
   egress_switchLabel: '命中代理规则的流量走客户代理',
-  egress_guardProxyMissing: '客户代理未启用或未配置服务器地址，无法开启——请先在上方代理设置完成配置并保存，否则开关会在下次保存代理设置时被自动翻回关闭。',
+  egress_guardProxyMissing: '客户代理未启用或未配置服务器地址，无法开启——请先在上方网络设置完成配置并保存，否则开关会在下次保存网络设置时被自动翻回关闭。',
   egress_guardTypeUnsupported: '客户代理类型不在支持范围（http/socks5/ssh），无法开启。',
   egress_rulesHeading: '已编译的代理规则',
   egress_rulesEmpty: '尚无已编译的代理规则——在规则页保存代理规则后，这里才会出现各条规则的实际出口。',
@@ -1785,24 +1785,16 @@ export default {
   customEnv_saving: '保存中…',
 
   // -- AgentCoreSettings --
-  agentCore_title: '内核端点（连到哪）',
-  agentCore_description: '决定 AliangCode 连接哪个 LLM 端点（Anthropic Messages 兼容）。模型本身在聊天页按会话选择，这里只管「连到哪」。未启用时沿用 Claude Code 的默认配置与平台代理。',
-  agentCore_enable: '启用自定义 LLM 端点',
-  agentCore_baseUrl: 'Base URL',
-  agentCore_baseUrlPlaceholder: '例如 https://your-gateway.example.com',
-  agentCore_apiKey: 'API Key',
-  agentCore_apiKeyPlaceholder: '非回环地址必填',
-  agentCore_showKey: '显示',
-  agentCore_hideKey: '隐藏',
-  agentCore_hint: '保存后下一个回合生效，无需重启。仅支持 Anthropic Messages 兼容端点；非回环地址必须填写 API Key。',
+  // endpoint 二期 Task 8:卡片改名「内核调优」,端点半卡(enable/base_url/
+  // api_key 及其错误键)退役删除,出网端点由「LLM 端点管理」接管。
+  agentCore_title: '内核调优',
+  agentCore_description: 'AliangCode 内核行为调优（无进展守卫阈值）。出网端点的连接与调度由「LLM 端点管理」接管，此处不再配置内核端点。',
+  agentCore_hint: '保存后下一个回合生效，无需重启。',
+  agentCore_legacyHint: '检测到旧版内核端点配置，已忽略；出网由 endpoint 管理接管。',
   agentCore_guardTitle: '无进展守卫阈值（连续相同工具调用轮数）',
   agentCore_guardPlaceholder: '留空使用默认（5）',
   agentCore_guardHint: 'AliangCode 连续多轮发起完全相同的工具调用（名字+参数一致）时，内核判定为原地打转并收尾终止，防止无限空转。留空用默认 5；范围 1–50。',
   agentCore_error_guardInvalid: '无进展守卫阈值必须是 1–50 的整数（留空使用默认）',
-  agentCore_error_urlRequired: '启用时必须填写 Base URL',
-  agentCore_error_urlInvalid: 'Base URL 必须是合法 URL（含协议与主机名）',
-  agentCore_error_keyRequired: '非回环地址必须填写 API Key',
-  agentCore_error_scheme: '仅支持 http/https 协议',
   agentCore_save: '保存',
   agentCore_saving: '保存中…',
 

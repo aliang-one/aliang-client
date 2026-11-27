@@ -71,6 +71,7 @@
               :saving="saving"
               :error="error"
               :success-message="successMessage"
+              :legacy-agentcore-llm="legacyAgentCoreLLM"
               @save="emitSave"
             />
             <OpenVikingSettings
@@ -183,7 +184,10 @@ export default {
     loading: { type: Boolean, default: false },
     saving: { type: Boolean, default: false },
     error: { type: String, default: '' },
-    successMessage: { type: String, default: '' }
+    successMessage: { type: String, default: '' },
+    // 旧版内核端点配置只读检测位,透传给 AgentCoreSettings 灰字提示
+    // (endpoint 二期 Task 8;真值源在 SettingsPage 的 GET 原始响应)。
+    legacyAgentCoreLLM: { type: Boolean, default: false }
   },
   emits: ['save'],
   setup() {

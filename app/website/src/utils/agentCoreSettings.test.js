@@ -1,99 +1,105 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+// SettingsPage.vue 求值连带 i18n loadLocale()(node 环境无 DOM),mock 掉该
+// 依赖(t 原样回键,断言不硬编码文案;MeshSettings.test.js 同范式)。
+vi.mock('../i18n', () => ({ useI18n: () => ({ t: (k) => k }) }));
+
+import * as agentCoreSettingsModule from './agentCoreSettings';
 import {
   agentCoreTuningToLineFormat,
-  applyAgentCoreLLMClearing,
-  normalizeAgentCoreLLMConfig,
   normalizeAgentCoreTuning,
   normalizePeerMCPConfig,
-  validateAgentCoreLLMConfig,
   validateAgentCoreTuning,
 } from './agentCoreSettings';
+import { buildCustomerSavePatch } from '../components/SettingsPage.vue';
+import zh from '../i18n/zh';
+import en from '../i18n/en';
 
-describe('validateAgentCoreLLMConfig', () => {
-  it('未启用不校验', () => {
-    expect(validateAgentCoreLLMConfig({ enable: false, baseUrl: '', apiKey: '' })).toBe('');
+// —— endpoint 二期 Task 8 退役:agentcore_llm(端点)层前端纯函数全删 ——
+// spec §7.3/§9:出网端点由 endpoint 管理接管,Go POST 白名单保留接受该键
+// (值被忽略避免 403),前端归一链同步摘键。
+describe('agentcore_llm 前端纯函数退役', () => {
+  it('三函数不再导出(若有活引用此处红——先摘引用再删)', () => {
+    expect(agentCoreSettingsModule.normalizeAgentCoreLLMConfig).toBeUndefined();
+    expect(agentCoreSettingsModule.validateAgentCoreLLMConfig).toBeUndefined();
+    expect(agentCoreSettingsModule.applyAgentCoreLLMClearing).toBeUndefined();
   });
 
-  it('启用+URL 空', () => {
-    expect(validateAgentCoreLLMConfig({ enable: true, baseUrl: '  ', apiKey: '' }))
-      .toBe('agentCore_error_urlRequired');
-  });
-
-  it('启用+URL 畸形', () => {
-    expect(validateAgentCoreLLMConfig({ enable: true, baseUrl: 'not a url', apiKey: 'k' }))
-      .toBe('agentCore_error_urlInvalid');
-  });
-
-  it('启用+回环+无 key 合法', () => {
-    expect(validateAgentCoreLLMConfig({ enable: true, baseUrl: 'http://127.0.0.1:8082', apiKey: '' }))
-      .toBe('');
-    expect(validateAgentCoreLLMConfig({ enable: true, baseUrl: 'http://localhost:8082', apiKey: '' }))
-      .toBe('');
-  });
-
-  it('启用+远端+无 key 拒', () => {
-    expect(validateAgentCoreLLMConfig({ enable: true, baseUrl: 'https://gw.example.com', apiKey: '' }))
-      .toBe('agentCore_error_keyRequired');
-  });
-
-  it('启用+远端+有 key 合法', () => {
-    expect(validateAgentCoreLLMConfig({ enable: true, baseUrl: 'https://gw.example.com', apiKey: 'sk-x' }))
-      .toBe('');
-  });
-
-  it('启用+非 http/https 协议拒', () => {
-    expect(validateAgentCoreLLMConfig({ enable: true, baseUrl: 'ftp://gw.example.com', apiKey: 'k' }))
-      .toBe('agentCore_error_scheme');
+  it('行为调优/peer_mcp 四函数仍导出(退役只摘端点层,不动调优层)', () => {
+    expect(typeof agentCoreSettingsModule.normalizeAgentCoreTuning).toBe('function');
+    expect(typeof agentCoreSettingsModule.normalizePeerMCPConfig).toBe('function');
+    expect(typeof agentCoreSettingsModule.validateAgentCoreTuning).toBe('function');
+    expect(typeof agentCoreSettingsModule.agentCoreTuningToLineFormat).toBe('function');
   });
 });
 
-describe('normalizeAgentCoreLLMConfig', () => {
-  it('脏输入安全回落默认', () => {
-    expect(normalizeAgentCoreLLMConfig(undefined)).toEqual({ enabled: false, base_url: '', api_key: '' });
-    expect(normalizeAgentCoreLLMConfig('x')).toEqual({ enabled: false, base_url: '', api_key: '' });
+// —— 保存链不再读写 customer.agentcore_llm ——
+// GET /api/config/customer 仍回显旧键(Go 白名单保留),前端归一链摘键后:
+// 回显不再进 config 态(无伪 diff),patch 永不带该键(后端 deep-merge 保持
+// 旧值不动,前端不再有能力写它——spec §9 评审修正⑥接受的终态)。
+describe('agentcore_llm 保存链退役(SettingsPage normalize 链)', () => {
+  const legacyCurrent = {
+    agentcore_llm: { enabled: true, base_url: 'https://old.example.com', api_key: 'sk-old' },
+    agentcore: { max_identical_tool_turns: 5 }
+  };
+
+  it('GET 回显携带旧键,归一化后不产出 diff(无改动的保存 patch 为 undefined)', () => {
+    expect(buildCustomerSavePatch({}, legacyCurrent)).toBeUndefined();
   });
 
-  it('读服务端线格式 enabled,输出保持线格式(可直进 patch)', () => {
-    expect(normalizeAgentCoreLLMConfig({ enabled: true, base_url: ' https://a.b ', api_key: 'sk=1 2' }))
-      .toEqual({ enabled: true, base_url: ' https://a.b ', api_key: 'sk=1 2' });
-  });
-
-  it('线格式守卫:输出键必须是 enabled,绝不含 enable', () => {
-    const out = normalizeAgentCoreLLMConfig({ enable: true });
-    expect(out.enabled).toBe(false);
-    expect(Object.keys(out)).not.toContain('enable');
-  });
-});
-
-describe('applyAgentCoreLLMClearing', () => {
-  it('next 空且 current 非空 → 显式写空值', () => {
-    const patch = {};
-    applyAgentCoreLLMClearing(patch, { base_url: '', api_key: '' }, { base_url: 'https://a.b', api_key: 'sk-x' });
-    expect(patch.agentcore_llm).toEqual({ base_url: '', api_key: '' });
-  });
-
-  it('next 有值 → 只清空空的那维', () => {
-    const patch = {};
-    applyAgentCoreLLMClearing(patch, { base_url: 'https://c.d', api_key: '' }, { base_url: 'https://a.b', api_key: 'sk-x' });
-    expect(patch.agentcore_llm).toEqual({ api_key: '' });
-  });
-
-  it('双方都空 → 不产生键', () => {
-    const patch = {};
-    applyAgentCoreLLMClearing(patch, { base_url: '', api_key: '' }, { base_url: '', api_key: '' });
+  it('载荷携带旧键(旧前端/手改载荷)时 patch 也不带 agentcore_llm 键', () => {
+    const patch = buildCustomerSavePatch(
+      { agentcore_llm: { enabled: false, base_url: '', api_key: '' }, agentcore: { max_identical_tool_turns: 9 } },
+      legacyCurrent
+    );
+    expect(patch.agentcore).toEqual({ max_identical_tool_turns: 9 });
     expect(patch.agentcore_llm).toBeUndefined();
+    expect('agentcore_llm' in patch).toBe(false);
+  });
+});
+
+// —— i18n:「代理设置」→「网络设置」改名 + agentCore 端点键退役 ——
+describe('Task 8 i18n 改名与退役键', () => {
+  it('代理设置→网络设置(tab/子 tab/出口守卫提示语,zh/en 成对)', () => {
+    expect(zh.settings_tabSettings).toBe('网络设置');
+    expect(zh.settings_subProxy).toBe('网络设置');
+    expect(en.settings_tabSettings).toBe('Network');
+    expect(en.settings_subProxy).toBe('Network');
+    expect(zh.egress_guardProxyMissing).toContain('网络设置');
+    expect(zh.egress_guardProxyMissing).not.toContain('代理设置');
+    expect(en.egress_guardProxyMissing).toContain('network settings');
+    expect(en.egress_guardProxyMissing).not.toContain('proxy settings');
   });
 
-  it('与既有 patch.agentcore_llm 合并而非覆盖', () => {
-    const patch = { agentcore_llm: { enabled: true } };
-    applyAgentCoreLLMClearing(patch, { base_url: '', api_key: '' }, { base_url: 'https://a.b', api_key: 'sk-x' });
-    expect(patch.agentcore_llm).toEqual({ enabled: true, base_url: '', api_key: '' });
+  it('端点半卡退役的 i18n 键两边同删(parity 同步)', () => {
+    const retired = [
+      'agentCore_enable',
+      'agentCore_baseUrl',
+      'agentCore_baseUrlPlaceholder',
+      'agentCore_apiKey',
+      'agentCore_apiKeyPlaceholder',
+      'agentCore_showKey',
+      'agentCore_hideKey',
+      'agentCore_error_urlRequired',
+      'agentCore_error_urlInvalid',
+      'agentCore_error_keyRequired',
+      'agentCore_error_scheme'
+    ];
+    for (const key of retired) {
+      expect(key in zh).toBe(false);
+      expect(key in en).toBe(false);
+    }
   });
 
-  it('纯空白 next 值视为空(trim 语义)', () => {
-    const patch = {};
-    applyAgentCoreLLMClearing(patch, { base_url: '   ', api_key: '' }, { base_url: 'https://a.b', api_key: 'sk-x' });
-    expect(patch.agentcore_llm).toEqual({ base_url: '', api_key: '' });
+  it('卡片改名「内核调优」+ 新增旧配置灰字键,守卫阈值键保留', () => {
+    expect(zh.agentCore_title).toBe('内核调优');
+    expect(en.agentCore_title).toBe('Kernel tuning');
+    expect(typeof zh.agentCore_legacyHint).toBe('string');
+    expect(zh.agentCore_legacyHint.length).toBeGreaterThan(0);
+    expect(typeof en.agentCore_legacyHint).toBe('string');
+    expect(en.agentCore_legacyHint.length).toBeGreaterThan(0);
+    expect(typeof zh.agentCore_guardTitle).toBe('string');
+    expect(typeof en.agentCore_guardHint).toBe('string');
   });
 });
 

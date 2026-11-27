@@ -707,8 +707,8 @@ export default {
 
   // -- SettingsPage --
   settings_title: 'ALiang Gateway',
-  settings_tabSettings: 'Proxy',
-  settings_subProxy: 'Proxy',
+  settings_tabSettings: 'Network',
+  settings_subProxy: 'Network',
   settings_subIngress: 'Ingress & Mesh',
   settings_tabUserCenter: 'User',
   settings_tabLogs: 'Status',
@@ -1123,7 +1123,7 @@ export default {
   egress_title: 'Rule egress (actual)',
   egress_desc: 'Shows the compiled runtime result of which egress each proxy rule actually takes, with a switch. What you see here is the data-plane truth and may differ from the intent shown on the rules page.',
   egress_switchLabel: 'Route proxy-rule traffic through the customer proxy',
-  egress_guardProxyMissing: 'The customer proxy is disabled or has no server configured, so the switch cannot be turned on — configure and save it in the proxy settings above first, otherwise the switch will be flipped back off on the next proxy-settings save.',
+  egress_guardProxyMissing: 'The customer proxy is disabled or has no server configured, so the switch cannot be turned on — configure and save it in the network settings above first, otherwise the switch will be flipped back off on the next network-settings save.',
   egress_guardTypeUnsupported: 'The customer proxy type is not supported (http/socks5/ssh); the switch cannot be turned on.',
   egress_rulesHeading: 'Compiled proxy rules',
   egress_rulesEmpty: 'No compiled proxy rules yet — save proxy rules on the rules page and their actual egress will appear here.',
@@ -1785,24 +1785,17 @@ export default {
   customEnv_saving: 'Saving...',
 
   // -- AgentCoreSettings --
-  agentCore_title: 'Kernel endpoint (where it connects)',
-  agentCore_description: 'Decides which LLM endpoint AliangCode connects to (Anthropic Messages compatible). The model itself is chosen per conversation on the chat page — this setting only controls "where to connect". When disabled, the Claude Code default configuration and platform proxy are used.',
-  agentCore_enable: 'Enable custom LLM endpoint',
-  agentCore_baseUrl: 'Base URL',
-  agentCore_baseUrlPlaceholder: 'e.g. https://your-gateway.example.com',
-  agentCore_apiKey: 'API Key',
-  agentCore_apiKeyPlaceholder: 'Required for non-loopback endpoints',
-  agentCore_showKey: 'Show',
-  agentCore_hideKey: 'Hide',
-  agentCore_hint: 'Takes effect on the next turn after saving — no restart needed. Only Anthropic Messages compatible endpoints are supported; API Key is required for non-loopback endpoints.',
+  // Endpoint phase-2 Task 8: card renamed to "Kernel tuning"; the endpoint
+  // half-card (enable/base_url/api_key and its error keys) is retired —
+  // outbound endpoints are managed by "LLM Endpoint Management".
+  agentCore_title: 'Kernel tuning',
+  agentCore_description: 'AliangCode kernel behaviour tuning (no-progress guard threshold). Outbound endpoint connection and scheduling are managed by LLM Endpoint Management; kernel endpoints are no longer configured here.',
+  agentCore_hint: 'Takes effect on the next turn after saving — no restart needed.',
+  agentCore_legacyHint: 'Legacy kernel endpoint configuration detected and ignored; outbound traffic is managed by endpoint management.',
   agentCore_guardTitle: 'No-progress guard threshold (identical tool-call turns)',
   agentCore_guardPlaceholder: 'Leave empty for default (5)',
   agentCore_guardHint: 'When AliangCode issues the exact same tool call (name + identical arguments) for several turns in a row, the kernel judges it as spinning in place and wraps up the run to prevent unbounded idle work. Leave empty for the default of 5; range 1–50.',
   agentCore_error_guardInvalid: 'No-progress guard threshold must be an integer between 1 and 50 (leave empty for default)',
-  agentCore_error_urlRequired: 'Base URL is required when enabled',
-  agentCore_error_urlInvalid: 'Base URL must be a valid URL (including scheme and hostname)',
-  agentCore_error_keyRequired: 'API Key is required for non-loopback endpoints',
-  agentCore_error_scheme: 'Only http/https protocols are supported',
   agentCore_save: 'Save',
   agentCore_saving: 'Saving...',
 

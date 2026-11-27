@@ -10,53 +10,7 @@
       </div>
     </div>
 
-    <label class="mt-5 flex min-h-11 cursor-pointer items-center justify-between gap-3 border-y border-slate-100 py-3 text-sm text-slate-700 dark:border-slate-800 dark:text-slate-200">
-      <span class="block text-xs font-semibold">{{ t('agentCore_enable') }}</span>
-      <input
-        type="checkbox"
-        class="h-4 w-4 shrink-0 rounded border-slate-300 text-primary focus:ring-primary/20 dark:border-slate-600 dark:bg-slate-900"
-        :checked="form.enable"
-        :disabled="loading || saving"
-        @change="form.enable = $event.target.checked"
-      />
-    </label>
-
-    <div class="mt-4 flex flex-col gap-3">
-      <label class="min-w-0 text-[10px] font-bold uppercase text-slate-400">
-        <span>{{ t('agentCore_baseUrl') }}</span>
-        <input
-          v-model="form.baseUrl"
-          type="text"
-          :placeholder="t('agentCore_baseUrlPlaceholder')"
-          :disabled="loading || saving"
-          class="mt-1.5 h-10 w-full rounded-lg border border-slate-200 bg-white px-3 font-mono text-xs font-normal text-slate-800 outline-none transition-colors focus:border-primary focus:ring-2 focus:ring-primary/10 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-        />
-      </label>
-      <label class="min-w-0 text-[10px] font-bold uppercase text-slate-400">
-        <span>{{ t('agentCore_apiKey') }}</span>
-        <span class="relative mt-1.5 block">
-          <input
-            v-model="form.apiKey"
-            :type="showKey ? 'text' : 'password'"
-            autocomplete="off"
-            :placeholder="t('agentCore_apiKeyPlaceholder')"
-            :disabled="loading || saving"
-            class="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 pr-16 font-mono text-xs font-normal text-slate-800 outline-none transition-colors focus:border-primary focus:ring-2 focus:ring-primary/10 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-          />
-          <button
-            type="button"
-            class="absolute right-2 top-1/2 -translate-y-1/2 text-[11px] font-medium text-slate-400 hover:text-primary"
-            :aria-pressed="showKey"
-            :disabled="loading || saving"
-            @click="showKey = !showKey"
-          >
-            {{ showKey ? t('agentCore_hideKey') : t('agentCore_showKey') }}
-          </button>
-        </span>
-      </label>
-    </div>
-
-    <label class="mt-3 min-w-0 text-[10px] font-bold uppercase text-slate-400">
+    <label class="mt-5 min-w-0 text-[10px] font-bold uppercase text-slate-400">
       <span>{{ t('agentCore_guardTitle') }}</span>
       <input
         v-model="form.maxTurns"
@@ -76,8 +30,19 @@
     <div v-if="localError" class="mt-3 text-xs text-red-600 dark:text-red-400" role="status">{{ localError }}</div>
     <div v-else-if="successMessage" class="mt-3 text-xs text-emerald-600 dark:text-emerald-400" role="status">{{ successMessage }}</div>
 
+    <!-- 旧版内核端点配置(agentcore_llm)灰字提示(endpoint 二期 Task 8):
+         卡片已删端点半卡,后端 POST 白名单仍接受该键但值被忽略(spec §9);
+         GET /api/config/customer 现有读取链回显该字段,SettingsPage 从原始
+         响应取 enabled 传 prop——只读检测,不新增 API,不改写配置。 -->
+    <p
+      v-if="legacyAgentCoreLLM"
+      data-agentcore-legacy-hint
+      class="mt-3 text-[11px] leading-4 text-slate-400 dark:text-slate-500"
+    >{{ t('agentCore_legacyHint') }}</p>
+
     <button
       type="button"
+      data-agentcore-save
       class="mt-auto inline-flex h-11 self-end items-center gap-1.5 rounded-lg bg-primary px-4 text-xs font-bold text-white transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 disabled:opacity-50"
       :disabled="loading || saving || !!localError"
       @click="save"
@@ -93,8 +58,6 @@ import { useI18n } from '../../i18n';
 import { showErrorDialog } from '../../composables/useErrorDialog';
 import {
   agentCoreTuningToLineFormat,
-  normalizeAgentCoreLLMConfig,
-  validateAgentCoreLLMConfig,
   validateAgentCoreTuning,
 } from '../../utils/agentCoreSettings';
 
@@ -109,23 +72,20 @@ export default {
     loading: { type: Boolean, default: false },
     saving: { type: Boolean, default: false },
     error: { type: String, default: '' },
-    successMessage: { type: String, default: '' }
+    successMessage: { type: String, default: '' },
+    // 旧版内核端点配置(customer.agentcore_llm.enabled=true)只读检测位,
+    // 由 SettingsPage 从 GET /api/config/customer 原始响应取值传入——
+    // 端点半卡退役后仅剩灰字提示职责,本卡不再读写该键。
+    legacyAgentCoreLLM: { type: Boolean, default: false }
   },
   emits: ['save'],
   data() {
     return {
-      form: this.formFromConfig(this.config),
-      showKey: false
+      form: this.formFromConfig(this.config)
     };
   },
   computed: {
     localError() {
-      const llmKey = validateAgentCoreLLMConfig({
-        enable: this.form.enable,
-        baseUrl: this.form.baseUrl,
-        apiKey: this.form.apiKey
-      });
-      if (llmKey) return this.t(llmKey);
       const guardKey = validateAgentCoreTuning(this.form.maxTurns);
       return guardKey ? this.t(guardKey) : '';
     }
@@ -150,14 +110,11 @@ export default {
   },
   methods: {
     formFromConfig(config) {
-      const llm = normalizeAgentCoreLLMConfig(config?.agentcore_llm);
       const guard = config?.agentcore?.max_identical_tool_turns;
-      // llm 是线格式(enabled);面板表单内部状态键用 enable。
       // 守卫阈值:0/缺省 = 未配置,表单显示空串(placeholder 提示默认值)。
+      // agentcore_llm(端点)已退役:本卡不读该键,旧配置提示走
+      // legacyAgentCoreLLM prop(SettingsPage 从原始 GET 响应取值)。
       return {
-        enable: llm.enabled,
-        baseUrl: llm.base_url,
-        apiKey: llm.api_key,
         maxTurns: typeof guard === 'number' && guard > 0 ? String(guard) : ''
       };
     },
@@ -165,19 +122,13 @@ export default {
       if (this.localError) return;
       const nextConfig = {
         ...(this.config || {}),
-        agentcore_llm: {
-          // 线格式开关键是 enabled(Go tag);面板内部状态键是 enable,见
-          // utils/agentCoreSettings.js 的注释。发错键会被 encoding/json 静默
-          // 丢弃,层永远激活不了。
-          enabled: !!this.form.enable,
-          base_url: String(this.form.baseUrl || ''),
-          api_key: String(this.form.apiKey || '')
-        },
         agentcore: {
           // 线格式键 max_identical_tool_turns(Go tag)。空串/0 归一成 0 =
           // 用内核默认;清空语义经数字比较天然可达(0≠旧值进 patch)。
           max_identical_tool_turns: agentCoreTuningToLineFormat(this.form.maxTurns)
         }
+        // ⚠️ 不再写 agentcore_llm(endpoint 二期 Task 8):后端 POST 白名单
+        // 保留接受该键但值被忽略,前端保存链不再读写它。
       };
       this.$emit('save', nextConfig);
     }
