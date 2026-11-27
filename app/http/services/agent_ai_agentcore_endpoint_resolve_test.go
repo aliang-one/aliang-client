@@ -24,9 +24,9 @@ import (
 
 // ---- agentCoreResolveEndpointRow ------------------------------------------------
 
-// 不变量 9：旧字段 EffectiveAgentCoreLLM 配置命中时 registry 整体不参与——
-// 即便池里有完美候选也返回 nil（出网由 FromRow(nil) 落旧字段）。
-func TestAgentCoreResolveRowOldFieldSkipsRegistry(t *testing.T) {
+// spec 二期 §9：旧字段 EffectiveAgentCoreLLM 已硬退役——即便 enabled+base_url
+// 配齐，registry 照常参与解析（选中 BYO 整行），旧字段零影响。
+func TestAgentCoreResolveRowOldFieldIgnoredRegistryDrives(t *testing.T) {
 	isolateAgentCoreRegistryEnv(t)
 	store := newAgentCoreEndpointRegistryStore(t)
 	createEndpoint(t, store, byoEndpoint("ep-byo", "http://127.0.0.1:9101", "sk-byo"))
@@ -34,12 +34,13 @@ func TestAgentCoreResolveRowOldFieldSkipsRegistry(t *testing.T) {
 		Enabled: true, BaseURL: "https://gw.example.com", APIKey: "sk-old",
 	})
 
-	if row := agentCoreResolveEndpointRow("sess", "claude-x"); row != nil {
-		t.Fatalf("旧字段命中时 registry 不应参与, got row %s", row.ID)
+	row := agentCoreResolveEndpointRow("sess", "claude-x")
+	if row == nil || row.ID != "ep-byo" {
+		t.Fatalf("旧字段在场 registry 仍应解析出 ep-byo, got %+v", row)
 	}
-	// 出网地址由兼容壳链路落旧字段（FromRow(nil) 读旧字段）。
-	if got := agentCoreBaseURL(); got != "https://gw.example.com" {
-		t.Errorf("agentCoreBaseURL → %q, want 旧字段地址", got)
+	// 兼容壳链路同样只认 registry 行（旧字段地址不再出现）。
+	if got := agentCoreBaseURL(); got != "http://127.0.0.1:9101" {
+		t.Errorf("agentCoreBaseURL → %q, want registry BYO 地址", got)
 	}
 }
 
@@ -267,18 +268,29 @@ func TestAgentCoreRunEgressRateLimitedHardFails(t *testing.T) {
 	}
 }
 
-// 不变量 9:旧字段命中 → run egress 完全不参与 registry(无槽位无打点无错误)。
-func TestAgentCoreRunEgressOldFieldSkipsRegistry(t *testing.T) {
-	_, store := newRunEgressHarness(t)
+// spec 二期 §9:旧字段已退役 → run egress 照常参与 registry(命中行+槽位+打点),
+// 旧字段零影响。
+func TestAgentCoreRunEgressOldFieldIgnoredRegistryDrives(t *testing.T) {
+	svc, store := newRunEgressHarness(t)
 	createEndpoint(t, store, byoEndpoint("ep-byo", "http://127.0.0.1:9101", "sk-byo"))
 	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
 		Enabled: true, BaseURL: "https://gw.example.com", APIKey: "sk-old",
 	})
 
 	row, release, err := agentCoreRunEgress("sess-old", "")
-	if err != nil || row != nil || release != nil {
-		t.Fatalf("旧字段命中应 (nil,nil,nil), got row=%v release=%v err=%v", row, release != nil, err)
+	if err != nil {
+		t.Fatalf("旧字段在场 run egress 不应失败: %v", err)
 	}
+	if row == nil || row.ID != "ep-byo" {
+		t.Fatalf("应照常命中 ep-byo, got %+v", row)
+	}
+	if release == nil {
+		t.Fatal("命中行应返回 release")
+	}
+	if n := svc.Inflight()["ep-byo"]; n != 1 {
+		t.Fatalf("run 级槽位应占用 1, got %d", n)
+	}
+	release()
 }
 
 // builtin 兜底行命中同样 Acquire + 打点(spec §5.7:builtin 可为选中行)。
@@ -428,5 +440,79 @@ func TestAgentCoreMemoryExtractResolvesWithProjectPathKey(t *testing.T) {
 	snap = stickySnapshot(r)
 	if _, ok := snap["/tmp/proj-fake"]; ok {
 		t.Fatalf("假缝注入不应触发解析, 实际 %+v", snap)
+	}
+}
+
+// ---- 第四调用点:/compact 粘性键 = session.id(4b 评审 Finding 5 补调用点测试)----
+
+// compact 路径把粘性键绑定写在 session.id 上(仿 memory 测试模式,dead-port
+// harness):摘要与对话 run 黏同一行(spec §5.0 第四调用点)——摘要的账记在对话
+// 实际用的 endpoint 上。解析先于探测/摘要,上游死端口使后续步骤失败,不影响
+// 粘性绑定已写入;projectPath 不作为 compact 的粘性键出现。
+func TestAgentCoreManualCompactBindsStickyToSessionID(t *testing.T) {
+	isolateAgentCoreRegistryEnv(t)
+	store := newAgentCoreEndpointRegistryStore(t)
+	createEndpoint(t, store, byoEndpoint("ep-compact", "http://127.0.0.1:9", "sk-compact")) // 死端口:探测必败
+
+	m := newAgentAIManager()
+	sess := &agentAISession{
+		id:          "conv-compact-sticky",
+		mode:        "vibe",
+		projectPath: t.TempDir(),
+		provider:    "agentcore",
+		model:       "glm-5.2",
+		runSeq:      1,
+		history: []agentAIMessage{
+			{Role: "user", Content: "第一轮问题", CreatedAt: time.Now().UTC()},
+			{Role: "assistant", Content: "第一轮回答", CreatedAt: time.Now().UTC()},
+		},
+		activity: newAgentAIActivity(),
+	}
+	m.mu.Lock()
+	m.sessions[sess.id] = sess
+	m.mu.Unlock()
+
+	m.handleAgentCoreCompactCommand(sess, "msg-compact-sticky", func(interface{}) error { return nil })
+
+	r := kernelEndpointResolverFn()
+	if r == nil {
+		t.Fatal("resolver 应可用")
+	}
+	snap := stickySnapshot(r)
+	if ent, ok := snap["conv-compact-sticky"]; !ok || ent.endpointID != "ep-compact" {
+		t.Fatalf("粘性键应为 session.id(conv-compact-sticky→ep-compact), 实际 %+v", snap)
+	}
+	if _, ok := snap[sess.projectPath]; ok {
+		t.Fatalf("compact 不应以 projectPath 为粘性键, 实际 %+v", snap)
+	}
+}
+
+// ---- 轻量调用点限流降级措辞(4b 评审 Finding 4)----------------------------------
+
+// 出口限流不是解析失败:agentCoreResolveEndpointRow 吞 ErrKernelEgressRateLimited
+// 回落继承链时,Warn 必须措辞区分(「出口限流中」而非「解析失败」),行为仍是
+// 降级 nil 不拒工作;run 主路径硬失败行为不受影响(§5.4,另测)。
+func TestAgentCoreResolveRowRateLimitedFallsBackWithDistinctWarn(t *testing.T) {
+	_, store := newRunEgressHarness(t)
+	eg := anthropicEP("eg-rl-light", 99)
+	eg.EgressKernel = true
+	createEndpoint(t, store, eg)
+	markHealth(t, store, "eg-rl-light", storage.HealthUpdate{
+		RateLimitedUntil: time.Now().Add(2 * time.Hour).Unix(),
+	})
+
+	msgs := &[]string{}
+	orig := agentCoreResolveWarnFn
+	agentCoreResolveWarnFn = func(msg string) { *msgs = append(*msgs, msg) }
+	t.Cleanup(func() { agentCoreResolveWarnFn = orig })
+
+	if row := agentCoreResolveEndpointRow("sess-rl-light", ""); row != nil {
+		t.Fatalf("出口限流应降级 nil 继承链, got %+v", row)
+	}
+	if len(*msgs) != 1 {
+		t.Fatalf("应恰好一条降级 Warn, got %v", *msgs)
+	}
+	if !strings.Contains((*msgs)[0], "出口限流中") || strings.Contains((*msgs)[0], "解析失败") {
+		t.Fatalf("限流降级措辞应区分「出口限流中」而非「解析失败」, got %q", (*msgs)[0])
 	}
 }

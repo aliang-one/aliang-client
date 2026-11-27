@@ -2,10 +2,11 @@ package services
 
 // 内核三解析点接 endpoint registry(spec 2026-11-25 §8 / Task 5)。
 //
-// 不变量 9:EffectiveAgentCoreLLM(旧 customer.agentcore_llm)仍最高优先,
-// registry 只在其未配置时驱动出网。GetEndpointService 单例 sync.Once 构造
-// 失败会缓存 nil(测试无法重置),故经 agentCoreGetEndpointServiceFn 注入
-// 独立 service(形状对齐 agentCoreGetUserAPIKeysFn)。
+// 旧字段 EffectiveAgentCoreLLM(customer.agentcore_llm)已硬退役(spec 二期
+// §9):出网只认 registry 出口解析,旧字段零影响,首次解析打一条幂等 Warn。
+// GetEndpointService 单例 sync.Once 构造失败会缓存 nil(测试无法重置),故经
+// agentCoreGetEndpointServiceFn 注入独立 service(形状对齐
+// agentCoreGetUserAPIKeysFn)。
 
 import (
 	"context"
@@ -44,8 +45,9 @@ func isolateAgentCoreRegistryEnv(t *testing.T) {
 
 // ---- agentCoreBaseURL --------------------------------------------------------
 
-// 不变量 9:显式 agentcore_llm 命中时 registry 完全不参与。
-func TestAgentCoreBaseURLOldFieldBeatsRegistry(t *testing.T) {
+// spec 二期 §9:旧字段已硬退役——enabled+base_url 配齐也不驱动出网,出网仍走
+// registry 解析(选中 BYO 行 base_url),旧字段零影响。
+func TestAgentCoreBaseURLOldFieldIgnoredRegistryDrives(t *testing.T) {
 	isolateAgentCoreRegistryEnv(t)
 	store := newAgentCoreEndpointRegistryStore(t)
 	createEndpoint(t, store, byoEndpoint("ep-byo", "http://127.0.0.1:9101", "sk-byo"))
@@ -53,8 +55,8 @@ func TestAgentCoreBaseURLOldFieldBeatsRegistry(t *testing.T) {
 	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
 		Enabled: true, BaseURL: "https://gw.example.com", APIKey: "sk-x",
 	})
-	if got := agentCoreBaseURL(); got != "https://gw.example.com" {
-		t.Errorf("→ %q, want 显式旧字段优先(不变量 9)", got)
+	if got := agentCoreBaseURL(); got != "http://127.0.0.1:9101" {
+		t.Errorf("→ %q, want registry BYO base_url(旧字段被忽略)", got)
 	}
 }
 
@@ -93,21 +95,22 @@ func TestAgentCoreBaseURLNilServiceDegradesToInherited(t *testing.T) {
 
 // ---- agentCoreAuthToken ------------------------------------------------------
 
-// 不变量 9:显式 key 最优先,registry BYO key 不参与。
-func TestAgentCoreAuthTokenOldFieldBeatsRegistry(t *testing.T) {
+// spec 二期 §9:旧字段 key 已退役——registry BYO key 驱动出网,旧 key 零影响
+// (也不经它短路 user-center)。
+func TestAgentCoreAuthTokenOldFieldIgnoredRegistryDrives(t *testing.T) {
 	isolateAgentCoreRegistryEnv(t)
 	store := newAgentCoreEndpointRegistryStore(t)
-	createEndpoint(t, store, byoEndpoint("ep-byo", "http://127.0.0.1:9101", "sk-byo"))
+	createEndpoint(t, store, byoEndpoint("ep-byo", "http://127.0.0.1:9101", " sk-byo "))
 	stubAgentCoreUserAPIKeys(t, func() ([]auth.UserAPIKey, error) {
-		t.Error("显式 key 存在时不该打 user-center")
+		t.Error("BYO key 命中时不该打 user-center")
 		return nil, nil
 	})
 
 	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
 		Enabled: true, BaseURL: "https://gw.example.com", APIKey: " sk-old ",
 	})
-	if got := agentCoreAuthToken(); got != "sk-old" {
-		t.Errorf("→ %q, want sk-old(不变量 9)", got)
+	if got := agentCoreAuthToken(); got != "sk-byo" {
+		t.Errorf("→ %q, want sk-byo(旧字段 key 被忽略,registry BYO 优先)", got)
 	}
 }
 
@@ -214,19 +217,19 @@ func TestAgentCoreEnsureUpstreamRegistryBYOProbe(t *testing.T) {
 	})
 }
 
-// 不变量 9:旧字段显式端点优先于 registry BYO(旧字段只做 TCP 拨测)。
-func TestAgentCoreEnsureUpstreamOldFieldBeatsRegistry(t *testing.T) {
+// spec 二期 §9:旧字段已退役——registry BYO(活服务)被探测,旧字段(死端口)
+// 零影响:若旧字段仍被探测必报错,断言通过即证明被忽略。
+func TestAgentCoreEnsureUpstreamOldFieldIgnoredRegistryDrives(t *testing.T) {
 	isolateAgentCoreRegistryEnv(t)
 	store := newAgentCoreEndpointRegistryStore(t)
-	// registry BYO 指向死端口:若被探测必报错——断言通过即证明未走 registry。
-	createEndpoint(t, store, byoEndpoint("ep-dead", "http://127.0.0.1:1", "sk-x"))
-
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer srv.Close()
-	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{Enabled: true, BaseURL: srv.URL})
+	createEndpoint(t, store, byoEndpoint("ep-live", srv.URL, "sk-live"))
+
+	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{Enabled: true, BaseURL: "http://127.0.0.1:1"})
 
 	if err := agentCoreEnsureUpstream(context.Background()); err != nil {
-		t.Fatalf("旧字段显式端点应被探测(可达),不应落到 registry BYO: %v", err)
+		t.Fatalf("registry BYO 应被探测(可达),旧字段死端口不应参与: %v", err)
 	}
 }
 
@@ -257,6 +260,59 @@ func TestAgentCoreEnsureUpstreamNilServiceDegrades(t *testing.T) {
 		t.Fatalf("nil service 应走原自愈链且探针可达: %v", err)
 	}
 	expectProbeDialed(t, accepted, "nil service 降级探针")
+}
+
+// ---- 旧字段退役告警(spec 二期 §9)----------------------------------------------
+
+// newLegacyLLMWarnCapture 换上告警观测缝并复位幂等闸,返回消息收集器;
+// cleanup 恢复生产缝与闸。
+func newLegacyLLMWarnCapture(t *testing.T) *[]string {
+	t.Helper()
+	resetAgentCoreLegacyLLMWarnForTest()
+	msgs := &[]string{}
+	orig := agentCoreLegacyLLMWarnHook
+	agentCoreLegacyLLMWarnHook = func(msg string) { *msgs = append(*msgs, msg) }
+	t.Cleanup(func() {
+		agentCoreLegacyLLMWarnHook = orig
+		resetAgentCoreLegacyLLMWarnForTest()
+	})
+	return msgs
+}
+
+// 幂等:旧字段在配置里时首次解析打一条 Warn,同进程后续解析(任一解析点)不再
+// 重复——防每 run 刷屏。
+func TestAgentCoreLegacyLLMWarnFiresOncePerProcess(t *testing.T) {
+	isolateAgentCoreRegistryEnv(t)
+	newAgentCoreEndpointRegistryStore(t)
+	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
+		Enabled: true, BaseURL: "https://gw.example.com", APIKey: "sk-old",
+	})
+	msgs := newLegacyLLMWarnCapture(t)
+
+	_ = agentCoreBaseURL()   // 首次解析:触发
+	_ = agentCoreBaseURL()   // 同解析点重复:静默
+	_ = agentCoreAuthToken() // 另一解析点:静默
+
+	if len(*msgs) != 1 {
+		t.Fatalf("Warn 应只打一次, got %d: %v", len(*msgs), *msgs)
+	}
+	if !strings.Contains((*msgs)[0], "已忽略") || !strings.Contains((*msgs)[0], "endpoint") {
+		t.Fatalf("文案应说明「旧内核端点配置已忽略，出网走 endpoint 管理」, got %q", (*msgs)[0])
+	}
+}
+
+// 未配置旧字段 → 不告警,且幂等闸不被消耗(中途清掉再配回来仍会提醒一次)。
+func TestAgentCoreLegacyLLMNoWarnWithoutOldField(t *testing.T) {
+	isolateAgentCoreRegistryEnv(t)
+	newAgentCoreEndpointRegistryStore(t)
+	msgs := newLegacyLLMWarnCapture(t)
+
+	_ = agentCoreBaseURL()
+	_ = agentCoreAuthToken()
+
+	if len(*msgs) != 0 {
+		t.Fatalf("无旧字段不应告警, got %v", *msgs)
+	}
 }
 
 // ---- Select 返回错误 → 三处解析点全部回落继承链 -------------------------------

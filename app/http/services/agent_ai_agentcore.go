@@ -115,13 +115,17 @@ const (
 // agentCoreGetUserAPIKeysFn）。
 var agentCoreGetEndpointServiceFn = GetEndpointService
 
-// ---- 内核出口解析（spec 二期 2026-11-27 §5.0：每 run 单次解析）---------------
+// ---- 内核出口解析（spec 二期 2026-11-27 §5.0：每 run 单次解析；§9：旧字段硬退役）----
 //
 // 一期的形态是三个解析点（BaseURL/AuthToken/EnsureUpstream）各自调
 // agentCoreSelectEndpoint（4+ 个独立 Select 调用点）；二期收拢为「run 开始解析
 // 一次拿整行」：agentCoreRunEgress → Acquire per-run → 行经
 // agentCoreBaseURLFromRow / agentCoreAuthTokenFromRow / agentCoreEnsureUpstreamForRow
 // 传给出网构造，OnRequestError 闭包按行 id 上报失败（§5.3a）。
+//
+// 旧字段 customer.agentcore_llm（一期显式端点层）在 4c 硬退役（§9）：出网只认
+// registry 出口解析，旧字段永不驱动出网（新不变量 17）；存量配置命中时首次
+// 解析打一条幂等 Warn（agentCoreWarnLegacyLLMIgnored）。
 //
 // 无参旧函数（agentCoreBaseURL / agentCoreAuthToken / agentCoreEnsureUpstream）
 // 保留为兼容壳：内部自行解析一次（粘性键空串、无 run 级副作用），供存量测试
@@ -158,30 +162,76 @@ var kernelEndpointResolverFn = func() *kernelEndpointResolver {
 
 // agentCoreResolveEndpointRow 解析一次并返回整行——无并发闸/打点等 run 级副作用
 // 的轻量形态，供 /compact、memory extract 与兼容壳使用：
-//   - 旧字段 EffectiveAgentCoreLLM 配置命中（不变量 9：旧字段优先，registry
-//     整体不参与；4c 退役旧字段后删此早返回）；
 //   - registry 缺失 / 解析失败 → nil，调用方落继承链（与一期 Select 失败降级
 //     同语义）。ErrKernelEgressRateLimited（出口限流）在这里同样降级为 nil +
 //     继承链：它是 run 路径的硬错误（agentCoreRunEgress 透传），轻量调用点
-//     （摘要/记忆提取）不该因出口限流拒绝工作。
+//     （摘要/记忆提取）不该因出口限流拒绝工作——限流不是失败，Warn 措辞
+//     单独区分（4b 评审 Finding 4），避免误读成解析故障。
 //
 // stickyKey 是粘性键：对话 run 与 /compact 用 session id（同会话黏同一行），
 // memory extract 用 projectPath（spec §5.0 第 4 调用点：同项目黏同一行）；空串
 // 跳过粘性。model 为空表示跳过模型过滤（探测/摘要先于模型抽取的合法形态）。
 func agentCoreResolveEndpointRow(stickyKey, model string) *config.LLMEndpoint {
-	if custom := config.GetGlobalConfig().EffectiveAgentCoreLLM(); custom != nil {
-		return nil
-	}
+	agentCoreWarnLegacyLLMIgnored()
 	r := kernelEndpointResolverFn()
 	if r == nil {
 		return nil
 	}
 	res, err := r.Resolve(stickyKey, model)
 	if err != nil {
-		logger.Warn(fmt.Sprintf("agentcore: 内核出口解析失败(%v)，出网回落 env/settings 继承链", err))
+		if errors.Is(err, ErrKernelEgressRateLimited) {
+			agentCoreResolveWarnFn("agentcore: 出口限流中，轻量调用回落继承链（" + err.Error() + "）")
+			return nil
+		}
+		agentCoreResolveWarnFn(fmt.Sprintf("agentcore: 内核出口解析失败(%v)，出网回落 env/settings 继承链", err))
 		return nil
 	}
 	return res.Endpoint
+}
+
+// agentCoreResolveWarnFn 轻量解析降级告警出口（测试替换观测；生产=logger.Warn）。
+var agentCoreResolveWarnFn = func(msg string) { logger.Warn(msg) }
+
+// ---- 旧内核端点配置退役告警（spec 二期 §9）------------------------------------
+//
+// customer.agentcore_llm（一期显式端点层）已硬退役：出网只认 endpoint registry
+// 出口解析，该字段不再有任何行为影响。存量用户配置里可能还留着 enabled=true
+// ——首次任一解析点被触达时打一条 Warn 告知「已忽略」，幂等（进程内只打一次，
+// 防每 run 刷屏）。配置清除后 Warn 自然停发；一期起 UI 卡片删除后用户无 UI
+// 手段清空旧值（spec §9 评审修正⑥：接受存量 Warn 长期存在，仅日志噪音）。
+
+// agentCoreLegacyLLMWarnMsg 退役告警文案（用户可读懂「为什么配置不生效了」）。
+const agentCoreLegacyLLMWarnMsg = "agentcore: 旧内核端点配置已忽略，出网走 endpoint 管理（customer.agentcore_llm 已退役）"
+
+// agentCoreLegacyLLMWarnHook 告警出口（测试替换观测；生产=logger.Warn）。
+var agentCoreLegacyLLMWarnHook = func(msg string) { logger.Warn(msg) }
+
+var (
+	agentCoreLegacyLLMWarnMu     sync.Mutex
+	agentCoreLegacyLLMWarnedOnce bool
+)
+
+// agentCoreWarnLegacyLLMIgnored 解析点进门检查：旧字段仍在配置里 → 打一次
+// Warn（幂等）。未配置时不消耗幂等闸——用户中途清掉再配回来仍会提醒一次，
+// 语义正确（配置回来了就该再提醒一次）。
+func agentCoreWarnLegacyLLMIgnored() {
+	if config.GetGlobalConfig().EffectiveAgentCoreLLM() == nil {
+		return
+	}
+	agentCoreLegacyLLMWarnMu.Lock()
+	defer agentCoreLegacyLLMWarnMu.Unlock()
+	if agentCoreLegacyLLMWarnedOnce {
+		return
+	}
+	agentCoreLegacyLLMWarnedOnce = true
+	agentCoreLegacyLLMWarnHook(agentCoreLegacyLLMWarnMsg)
+}
+
+// resetAgentCoreLegacyLLMWarnForTest 仅供测试：复位幂等闸。
+func resetAgentCoreLegacyLLMWarnForTest() {
+	agentCoreLegacyLLMWarnMu.Lock()
+	defer agentCoreLegacyLLMWarnMu.Unlock()
+	agentCoreLegacyLLMWarnedOnce = false
 }
 
 // agentCoreEgressAcquireAttempts 是 Acquire 排队超时后的重选上限（§5.2：满/
@@ -197,13 +247,11 @@ const agentCoreEgressAcquireAttempts = 4
 // 返回 (row, release, err)：
 //   - err 非空 = 出口限流（§5.4 本地错误，含恢复时刻，不 failover 不硬打）或
 //     全部候选并发排队超时——宿主终止 run，错误透传给用户；
-//   - row == nil（旧字段命中/registry 缺失/解析失败）→ 继承链，release 恒 nil；
+//   - row == nil（registry 缺失/解析失败）→ 继承链，release 恒 nil；
 //   - 成功时 release 非 nil，宿主必须 defer（run 终结全路径：成功/失败/取消/
 //     panic——defer 语义）。
 func agentCoreRunEgress(sessionID, model string) (*config.LLMEndpoint, func(), error) {
-	if custom := config.GetGlobalConfig().EffectiveAgentCoreLLM(); custom != nil {
-		return nil, nil, nil // 不变量 9：旧字段优先，registry 整体不参与
-	}
+	agentCoreWarnLegacyLLMIgnored()
 	r := kernelEndpointResolverFn()
 	if r == nil {
 		return nil, nil, nil
@@ -274,16 +322,13 @@ func agentCoreRequestErrorReporter(row *config.LLMEndpoint) func(int, http.Heade
 }
 
 // agentCoreBaseURLFromRow 读已解析行的出网地址（§5.0：解析一次，行随调用链
-// 传递，各解析点不再各自 Select）。旧字段 EffectiveAgentCoreLLM 在此早返回
-// （不变量 9）；row == nil 或 builtin（空 base_url = 平台隧道）落继承链
-// （env 回环 → 默认），与一期行为逐字对齐——只有 BYO 行才把出网地址从
-// 56432 改写出去。
+// 传递，各解析点不再各自 Select）。旧字段 EffectiveAgentCoreLLM 已退役
+// （spec 二期 §9：旧字段永不驱动出网，新不变量 17）；row == nil 或 builtin
+// （空 base_url = 平台隧道）落继承链（env 回环 → 默认），与一期行为逐字
+// 对齐——只有 BYO 行才把出网地址从 56432 改写出去。
 func agentCoreBaseURLFromRow(row *config.LLMEndpoint) string {
-	// 显式设置(仪表盘 customer.agentcore_llm)最优先:回环/远端都放行——
-	// 用户显式担责,回环闸只拦继承链里意外带进来的远端地址。
-	if custom := config.GetGlobalConfig().EffectiveAgentCoreLLM(); custom != nil {
-		return custom.BaseURL
-	}
+	// 回环闸只拦**继承链**里意外带进来的远端地址;registry BYO 行是用户在
+	// 仪表盘里显式登记的,远端属知情行为(Validate 白名单)。
 	if row != nil && !row.Builtin {
 		if base := strings.TrimSpace(row.BaseURL); base != "" {
 			return base
@@ -301,20 +346,13 @@ func agentCoreBaseURLFromRow(row *config.LLMEndpoint) string {
 	return agentCoreDefaultBaseURL
 }
 
-// agentCoreAuthTokenFromRow 读已解析行的用户 API key。取值顺序：旧字段显式
-// key → 已解析 BYO 行的 api_key（builtin 行空 key = 平台隧道走登录态，落继承
-// 链）→ ANTHROPIC_AUTH_TOKEN（子进程 env → ~/.claude/settings.json）→
-// user-center key 列表（带缓存）。回环 BYO 行允许空 key（Validate 口径）：
-// 凭据落继承链。两条链都拿不到返回空串，内核照旧出网（见 agentCoreAuthToken
-// 旧注释：为什么必须带用户 key）。
+// agentCoreAuthTokenFromRow 读已解析行的用户 API key。取值顺序：已解析 BYO 行
+// 的 api_key（builtin 行空 key = 平台隧道走登录态，落继承链）→
+// ANTHROPIC_AUTH_TOKEN（子进程 env → ~/.claude/settings.json）→ user-center
+// key 列表（带缓存）。旧字段显式 key 已退役（spec 二期 §9），不再参与取值。
+// 回环 BYO 行允许空 key（Validate 口径）：凭据落继承链。两条链都拿不到返回
+// 空串，内核照旧出网（见 agentCoreAuthToken 旧注释：为什么必须带用户 key）。
 func agentCoreAuthTokenFromRow(row *config.LLMEndpoint) string {
-	// 显式 key 最优先;不进 token 缓存(改配置下一回合立即生效,无需等 TTL)。
-	if custom := config.GetGlobalConfig().EffectiveAgentCoreLLM(); custom != nil {
-		if custom.APIKey != "" {
-			return custom.APIKey
-		}
-		// 回环+空 key 是合法形态:key 落继承链(URL 已显式)。
-	}
 	if row != nil && !row.Builtin {
 		if key := strings.TrimSpace(row.APIKey); key != "" {
 			return key
@@ -484,29 +522,12 @@ func agentCoreDialHost(u *url.URL) string {
 // 配时才生效）。用 ...ForRun 会在「什么都没配」这个最常见的场景下探测空地址、
 // 直接放行，于是 56432 没起时用户看到的仍是裸的 Connection refused。
 func agentCoreEnsureUpstreamForRow(ctx context.Context, row *config.LLMEndpoint) error {
-	// 显式端点(customer.agentcore_llm)最优先(不变量 9):没有「自愈」概念
-	// (不是我们的进程,POST /api/run/start 拉不活它),只做同款 2s TCP 拨测,
-	// 失败给可自查的文案。registry 在其未配置时才生效(下方分支)。
-	if custom := config.GetGlobalConfig().EffectiveAgentCoreLLM(); custom != nil {
-		logger.Info("agentcore: 使用自定义 LLM 端点 " + custom.BaseURL)
-		u, err := url.Parse(custom.BaseURL)
-		if err != nil || u.Host == "" {
-			return nil // 形态已被 Effective/Validate 挡住;探测逻辑自身不挂 run
-		}
-		d := net.Dialer{Timeout: 2 * time.Second}
-		conn, err := d.DialContext(ctx, "tcp", agentCoreDialHost(u))
-		if err != nil {
-			return fmt.Errorf("自定义 LLM 端点不可达(%s: %v)——请检查地址与服务状态后重试", custom.BaseURL, err)
-		}
-		conn.Close()
-		return nil
-	}
-	// endpoint registry(不变量 9:仅旧字段未配置时生效):已解析 BYO 行做
-	// HTTP 探测(GET /v1/models;200/401/403 都算可达——链路通,key 问题
-	// 留给请求本身报),没有「自愈」概念(不是我们的进程,POST /api/run/start
-	// 拉不活它),失败给可自查的文案;builtin 行(空 base_url = 平台隧道)与
-	// row == nil(registry 不可用/解析失败降级)落下方 MeshDelegateActive
-	// 跳过 + 自愈链(原样不动)。
+	// endpoint registry(旧字段已退役,spec 二期 §9:出网只认 registry 出口解析):
+	// 已解析 BYO 行做 HTTP 探测(GET /v1/models;200/401/403 都算可达——链路通,
+	// key 问题留给请求本身报),没有「自愈」概念(不是我们的进程,POST
+	// /api/run/start 拉不活它),失败给可自查的文案;builtin 行(空 base_url =
+	// 平台隧道)与 row == nil(registry 不可用/解析失败降级)落下方
+	// MeshDelegateActive 跳过 + 自愈链(原样不动)。
 	if row != nil && !row.Builtin {
 		base := strings.TrimSpace(row.BaseURL)
 		logger.Info("agentcore: 使用 endpoint registry 自定义端点 " + row.ID + " " + base)
@@ -1798,7 +1819,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// 否则自我报告错位且不主动派发（vm459 实测 2026-11-08）。
 	subagentPrompt := ""
 	if !run.readOnly {
-		if router := m.agentCoreSubagentTaskTool(run, kernelClient, kernelEnv, kernelApprove, kernelLogf, mcpTools, subagentMirror, subagentControl); router != nil {
+		if router := m.agentCoreSubagentTaskTool(run, kernelClient, kernelEnv, kernelApprove, kernelLogf, mcpTools, subagentMirror, subagentControl, row); router != nil {
 			registry.Register(router)
 			subagentPrompt = agentCoreSubagentMechanismSuffix(router)
 		}
