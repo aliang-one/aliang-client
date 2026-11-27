@@ -1057,3 +1057,123 @@ func TestEndpointService_ReportFailureDeletedID(t *testing.T) {
 		t.Fatalf("ReportFailure/ReportSuccess 不得重建已删行")
 	}
 }
+
+// ---- 组内互斥激活(托盘钉选,plan 2026-11-27 endpoint-pin-activation Task 2)--
+
+// TestEndpointService_ActivateInGroupExclusive 正常互斥:目标 enabled=1、
+// 同 protocol 组内其余 auto 行 enabled=0;builtin 行、auto_group=0 行、
+// 其他 protocol 组的行一律不动。激活后 selectAuto 只剩目标行可用——
+// 钉选即调度面生效(auto 池准入=enabled ∧ auto_group,plan 已定语义)。
+func TestEndpointService_ActivateInGroupExclusive(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+
+	createEndpoint(t, store, anthropicEP("ep-a", 10)) // anthropic 组,当前启用
+	createEndpoint(t, store, anthropicEP("ep-b", 20)) // anthropic 组,待钉选目标
+	epO := anthropicEP("ep-o", 15)
+	epO.ProtocolAnthropic = false
+	epO.ProtocolOpenAI = true // openai 组,不得被波及
+	createEndpoint(t, store, epO)
+	epM := anthropicEP("ep-m", 30)
+	epM.AutoGroup = false // 非池行,不在互斥写集里
+	createEndpoint(t, store, epM)
+
+	if err := svc.ActivateInGroup("anthropic", "ep-b"); err != nil {
+		t.Fatalf("activate ep-b: %v", err)
+	}
+
+	if got := mustGet(t, store, "ep-b"); !got.Enabled {
+		t.Fatalf("目标行 ep-b 应 enabled=1")
+	}
+	if got := mustGet(t, store, "ep-a"); got.Enabled {
+		t.Fatalf("同组其他行 ep-a 应 enabled=0(组内互斥)")
+	}
+	if got := mustGet(t, store, "ep-o"); !got.Enabled {
+		t.Fatalf("openai 组行 ep-o 不应被波及(protocol 过滤), got enabled=%v", got.Enabled)
+	}
+	if got := mustGet(t, store, "ep-m"); !got.Enabled {
+		t.Fatalf("auto_group=0 行 ep-m 不在互斥写集, got enabled=%v", got.Enabled)
+	}
+	if got := mustGet(t, store, storage.BuiltinEndpointID); !got.Enabled {
+		t.Fatalf("builtin 行 enabled 恒不动(兜底行不参与互斥), got enabled=%v", got.Enabled)
+	}
+
+	got, err := svc.Select("anthropic", "", "")
+	if err != nil || got.ID != "ep-b" {
+		t.Fatalf("激活后 anthropic select = %v, %v, want ep-b(唯一启用行)", got, err)
+	}
+}
+
+// TestEndpointService_ActivateInGroupCooldownAllowed 冷却行允许激活:激活不清零
+// 冷却(v1 明确语义,行内徽标持续到懒恢复);健康列不在 Update 的配置列白名单,
+// 天然不被本写路径 clobber。「激活顺带迁移清零」是二期 §5.6,一期刻意不做。
+func TestEndpointService_ActivateInGroupCooldownAllowed(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+
+	createEndpoint(t, store, anthropicEP("ep-a", 10))
+	createEndpoint(t, store, anthropicEP("ep-b", 20))
+	markHealth(t, store, "ep-b", storage.HealthUpdate{
+		Status: "cooldown", Failures: 2, CooldownUntil: 1900000000, RateLimitedUntil: 1900000000, LastErr: "boom",
+	})
+
+	if err := svc.ActivateInGroup("anthropic", "ep-b"); err != nil {
+		t.Fatalf("冷却行应允许激活: %v", err)
+	}
+	got := mustGet(t, store, "ep-b")
+	if !got.Enabled {
+		t.Fatalf("冷却行激活后应 enabled=1")
+	}
+	if got.HealthStatus != "cooldown" || got.CooldownUntil != 1900000000 ||
+		got.RateLimitedUntil != 1900000000 || got.ConsecutiveFailures != 2 {
+		t.Fatalf("激活不得清零冷却/计数: %+v", got)
+	}
+	if got := mustGet(t, store, "ep-a"); got.Enabled {
+		t.Fatalf("同组 ep-a 应被互斥关闭")
+	}
+}
+
+// TestEndpointService_ActivateInGroupRejections 拒绝分支逐条钉死:
+// 不存在/protocol 不匹配 → not-found 哨兵(404 语义);
+// 已摘除/builtin/非池行 → 激活拒绝哨兵(400 语义)。拒绝零副作用。
+func TestEndpointService_ActivateInGroupRejections(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+
+	epA := anthropicEP("ep-a", 10)
+	createEndpoint(t, store, epA)
+	epO := anthropicEP("ep-o", 15)
+	epO.ProtocolAnthropic = false
+	epO.ProtocolOpenAI = true
+	createEndpoint(t, store, epO)
+	epM := anthropicEP("ep-m", 30)
+	epM.AutoGroup = false
+	createEndpoint(t, store, epM)
+	epD := anthropicEP("ep-d", 40)
+	createEndpoint(t, store, epD)
+	markHealth(t, store, "ep-d", storage.HealthUpdate{
+		Status: "disabled", Failures: 3, CooldownUntil: 1900000000, LastErr: "boom x3",
+	})
+
+	cases := []struct {
+		name     string
+		protocol string
+		id       string
+		wantErr  error
+	}{
+		{"行不存在", "anthropic", "nope", ErrEndpointNotAvailable},
+		{"protocol 不匹配", "anthropic", "ep-o", ErrEndpointNotAvailable},
+		{"已摘除行", "anthropic", "ep-d", ErrEndpointNotActivatable},
+		{"builtin 行", "anthropic", storage.BuiltinEndpointID, ErrEndpointNotActivatable},
+		{"非池行", "anthropic", "ep-m", ErrEndpointNotActivatable},
+	}
+	for _, tc := range cases {
+		if err := svc.ActivateInGroup(tc.protocol, tc.id); !errors.Is(err, tc.wantErr) {
+			t.Fatalf("%s: err = %v, want %v", tc.name, err, tc.wantErr)
+		}
+	}
+	// 拒绝路径零写库副作用:其他组/非池行 enabled 原样。
+	if got := mustGet(t, store, "ep-o"); !got.Enabled {
+		t.Fatalf("拒绝路径不得写库: ep-o 被误关")
+	}
+	if got := mustGet(t, store, "ep-m"); !got.Enabled {
+		t.Fatalf("拒绝路径不得写库: ep-m 被误关")
+	}
+}

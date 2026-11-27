@@ -522,3 +522,53 @@ func idFromPath(w http.ResponseWriter, r *http.Request) string {
 	}
 	return id
 }
+
+// endpointActivateRequest 是 POST /api/endpoints/activate 的请求体:协议组 +
+// 目标行 id(托盘 summary items 的 id 字段,plan 2026-11-27 Task 1 透传)。
+type endpointActivateRequest struct {
+	Protocol string `json:"protocol"`
+	ID       string `json:"id"`
+}
+
+// HandleEndpointActivate POST /api/endpoints/activate — 托盘组内互斥激活
+// (cc-switch 式 radio 钉选,plan 2026-11-27 Task 2)。方法闸/来源闸/降级
+// 照本文件既有端点惯例(405 → RequireDashboardSession → service nil 走
+// endpointServiceUnavailable 业务码 201,同族九个 handler 一致);
+// 错误映射:ErrEndpointNotAvailable(不存在/协议不匹配)→404,
+// ErrEndpointNotActivatable(builtin/非池行/已摘除)→400 且文案透传面板
+// toast,其余(读/写库失败)→500。成功回 200 信封回显 protocol/id。
+func (h *EndpointHandler) HandleEndpointActivate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !endpointRequireSession(w, r) {
+		return
+	}
+	if h.service == nil {
+		endpointServiceUnavailable(w)
+		return
+	}
+	var req endpointActivateRequest
+	if !endpointDecodeBody(w, r, &req) {
+		return
+	}
+	protocol := strings.TrimSpace(req.Protocol)
+	id := strings.TrimSpace(req.ID)
+	if protocol == "" || id == "" {
+		common.ErrorBadRequest(w, "protocol 与 id 均必填", nil)
+		return
+	}
+	if err := h.service.ActivateInGroup(protocol, id); err != nil {
+		switch {
+		case errors.Is(err, services.ErrEndpointNotAvailable):
+			common.ErrorNotFound(w, err.Error())
+		case errors.Is(err, services.ErrEndpointNotActivatable):
+			common.ErrorBadRequest(w, err.Error(), nil)
+		default:
+			common.ErrorInternalServer(w, "激活 endpoint 失败", map[string]interface{}{"error": err.Error()})
+		}
+		return
+	}
+	common.Success(w, map[string]interface{}{"protocol": protocol, "id": id})
+}

@@ -12,6 +12,7 @@ import (
 	"aliang.one/nursorgate/app/http/common"
 	"aliang.one/nursorgate/app/http/middleware"
 	"aliang.one/nursorgate/app/http/services"
+	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/storage"
 )
 
@@ -99,6 +100,8 @@ func endpointDo(t *testing.T, h *EndpointHandler, cookie *http.Cookie, method, p
 		h.HandleFetchModels(rec, r)
 	case strings.HasSuffix(path, "/probe-models"):
 		h.HandleProbeModels(rec, r)
+	case strings.HasSuffix(path, "/activate"):
+		h.HandleEndpointActivate(rec, r)
 	case strings.HasSuffix(path, "/reset-health"):
 		h.HandleResetHealth(rec, r)
 	case method == http.MethodGet && strings.HasSuffix(path, "/api/endpoints"):
@@ -627,5 +630,80 @@ func TestEndpointHandlerProbeModels(t *testing.T) {
 		fmt.Sprintf(`{"base_url":%q,"api_key":"sk-wrong"}`, upstream.URL))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("key 被拒应 400, got %d", rec.Code)
+	}
+}
+
+// ---- POST /api/endpoints/activate(托盘组内互斥激活,plan 2026-11-27 Task 2)--
+
+// TestEndpointHandlerActivateContract activate 全状态码契约:
+// 200 成功信封(服务层真互斥落库)/ 404 行不存在 / 400 拒绝类(builtin)/
+// 405 非 POST / 503 registry 降级。来源闸(401)由家族既有测试覆盖
+// (TestEndpointHandlerRequiresDashboardSession 同族惯例)。
+func TestEndpointHandlerActivateContract(t *testing.T) {
+	svc, h, cookie := newEndpointHandlerHarnessSvc(t)
+	for _, e := range []*config.LLMEndpoint{
+		{ID: "ep-act-a", Name: "act-a", BaseURL: "http://127.0.0.1:9/a",
+			ProtocolAnthropic: true, AutoGroup: true, Enabled: true, Priority: 10, Models: "[]"},
+		{ID: "ep-act-b", Name: "act-b", BaseURL: "http://127.0.0.1:9/b",
+			ProtocolAnthropic: true, AutoGroup: true, Enabled: true, Priority: 20, Models: "[]"},
+	} {
+		if err := svc.CreateEndpoint(e); err != nil {
+			t.Fatalf("create %s: %v", e.ID, err)
+		}
+	}
+
+	// 成功:200 信封 + 服务层真互斥(目标 on、同组其他 off)。
+	rec := endpointDo(t, h, cookie, http.MethodPost, "/api/endpoints/activate", `{"protocol":"anthropic","id":"ep-act-b"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("activate code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	code, data := endpointDecode(t, rec)
+	if code != 0 || data["protocol"] != "anthropic" || data["id"] != "ep-act-b" {
+		t.Fatalf("成功信封 = code=%d data=%v, want code=0 且 protocol/id 回显", code, data)
+	}
+	if got, err := svc.GetEndpoint("ep-act-b"); err != nil || !got.Enabled {
+		t.Fatalf("目标行应 enabled=1: %v %+v", err, got)
+	}
+	if got, err := svc.GetEndpoint("ep-act-a"); err != nil || got.Enabled {
+		t.Fatalf("同组行应被互斥关闭: %v enabled=%v", err, got.Enabled)
+	}
+
+	// 404:目标行不存在(ErrEndpointNotAvailable 哨兵映射)。
+	rec = endpointDo(t, h, cookie, http.MethodPost, "/api/endpoints/activate", `{"protocol":"anthropic","id":"nope"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("行不存在应 404, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 400:拒绝类(builtin 兜底行不参与互斥,文案透传面板 toast)。
+	rec = endpointDo(t, h, cookie, http.MethodPost, "/api/endpoints/activate", `{"protocol":"anthropic","id":"builtin-aliang"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("builtin 拒绝应 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 405:非 POST(真 405,不得折成 400/500)。
+	req405 := httptest.NewRequest(http.MethodGet, "/api/endpoints/activate", nil)
+	req405.AddCookie(cookie)
+	rec405 := httptest.NewRecorder()
+	h.HandleEndpointActivate(rec405, req405)
+	if rec405.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET activate code=%d, want 405", rec405.Code)
+	}
+
+	// registry 降级(service nil):照本文件既有端点惯例(endpointService
+	// Unavailable → 业务码 201)。实况:CodeServiceUnavailable=201 经
+	// ErrorCodeToHTTPStatus 落 HTTP 500(本仓无字面 503 映射;托盘 Task 5
+	// 的降级惯例是 available=false 的 200 信封)——本家族九个 handler 在
+	// nil service 时行为一致,断言钉住家族真实契约而非任务文本的字面 503。
+	h503 := NewEndpointHandler(nil)
+	rec503 := endpointDo(t, h503, cookie, http.MethodPost, "/api/endpoints/activate", `{"protocol":"anthropic","id":"ep-act-b"}`)
+	code503, _ := endpointDecode(t, rec503)
+	if rec503.Code != http.StatusInternalServerError || code503 != 201 {
+		t.Fatalf("service nil 应降级响应(HTTP 500/业务码 201), got http=%d code=%d", rec503.Code, code503)
+	}
+
+	// 400:请求体缺字段(protocol/id 均必填)。
+	rec = endpointDo(t, h, cookie, http.MethodPost, "/api/endpoints/activate", `{"protocol":"anthropic"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("缺 id 应 400, got %d", rec.Code)
 	}
 }

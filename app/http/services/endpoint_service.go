@@ -40,6 +40,12 @@ var ErrEndpointNotAvailable = errors.New("endpoint: 指定 endpoint 不可用(�
 // 路由层映射 503 endpoint_queue_timeout。
 var ErrQueueTimeout = errors.New("endpoint: 并发排队超时或队列已满")
 
+// ErrEndpointNotActivatable 组内互斥激活的「拒绝类」错误(builtin 兜底行/
+// 非 auto 池行/已摘除行),托盘 handler 映射 400 且文案透传面板 toast。
+// 与 ErrEndpointNotAvailable 分开成两个哨兵:拒绝是「行存在、请求合法,
+// 但业务上不允许钉选」;not-found(不存在/协议不匹配)映射 404。
+var ErrEndpointNotActivatable = errors.New("endpoint: 该行不可激活")
+
 // 并发闸参数(spec §6.3:队列上限 32、等待上限 30s)与探测超时(§8/§11:2s)。
 const (
 	endpointMaxQueue     = 32
@@ -875,3 +881,87 @@ func (s *EndpointService) GetPolicy() (*config.EndpointGroupPolicy, error) {
 
 // SetPolicy 组策略写(组键恒 auto,store 归一)。管理面专用,数据面勿用。
 func (s *EndpointService) SetPolicy(p *config.EndpointGroupPolicy) error { return s.store.SetPolicy(p) }
+
+// ---- 组内互斥激活(托盘钉选,plan 2026-11-27 endpoint-pin-activation Task 2)--
+
+// ActivateInGroup 把目标行钉成同协议组内的唯一启用行(cc-switch 式 radio
+// 钉选):执行后组内其余 auto 行 enabled=0,selectAuto 的池(enabled ∧
+// auto_group)只剩目标行——面板勾移即调度面生效。
+//
+// 语义裁定(plan 已定,实现与注释同源,勿单方面改动):
+//   - 目标行不存在 / protocol 不匹配 → ErrEndpointNotAvailable(惯例同
+//     selectExplicit 的 wrapped 哨兵),handler 映射 404;
+//   - builtin 行(builtin flag;store 不变量 validateBuiltinInvariants 保证
+//     flag ⟺ 保留 id,单判 flag 即完备)→ 拒绝:builtin 是空候选时的回落
+//     兜底,不参与组内互斥,把它钉成「唯一启用」等于关掉所有 BYO 行还
+//     伪装成激活;
+//   - auto_group=0 行 → 拒绝:不在 selectAuto 候选池,钉选不产生任何调度
+//     效果,面板 radio 也不给这类行渲染(两者同因:激活无效);
+//   - 已摘除行(health_status='disabled')→ 拒绝:摘除是失败状态机的保护
+//     动作,托盘一勾就把摘除行翻回启用会绕开仪表盘的恢复闸——文案明确
+//     「请先在仪表盘恢复」;
+//   - 冷却行(cooldown/429)→ 允许:激活不清零冷却(v1 明确语义),行内
+//     徽标持续到懒恢复;健康列不在 Update 的配置列白名单(endpointConfig
+//     Columns)里,本写路径天然不 clobber 健康态。「激活顺带迁移清零」是
+//     二期 §5.6(与自动升级合入),一期刻意不做。
+//
+// 落库走管理面既有持久化路径(store.Update 白名单整行,Get→改列→Update,
+// 同 HandleUpdate 的写法):互斥只写配置列,健康列不被触碰。写序=先互斥关
+// 同组行、最后钉目标行——目标写是激活语义的提交点;中途失败返回 wrapped
+// raw error(handler 映射 500),半程状态组内全关、selectAuto 回落 builtin,
+// 可自查可重试。写路径不经 s.mu(只动配置列,与 HandleUpdate 同级并发面;
+// 健康态写仍只走 Report*/ResetHealth 的锁内 UpdateHealth)。
+func (s *EndpointService) ActivateInGroup(protocol, targetID string) error {
+	protocol = strings.ToLower(strings.TrimSpace(protocol))
+	targetID = strings.TrimSpace(targetID)
+	list, err := s.store.List()
+	if err != nil {
+		return fmt.Errorf("endpoint: 读注册表失败: %w", err)
+	}
+	var target *config.LLMEndpoint
+	for _, e := range list {
+		if e.ID == targetID {
+			target = e
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("%w: %s 不存在", ErrEndpointNotAvailable, targetID)
+	}
+	if !endpointProtocolMatch(target, protocol) {
+		return fmt.Errorf("%w: %s 未开启 %s 协议", ErrEndpointNotAvailable, targetID, protocol)
+	}
+	// 拒绝闸在写库之前全部完成:拒绝路径零副作用(测试钉死)。
+	if target.Builtin {
+		return fmt.Errorf("%w: builtin 为兜底行,激活无效", ErrEndpointNotActivatable)
+	}
+	if !target.AutoGroup {
+		return fmt.Errorf("%w: 该行不在 auto 调度池,激活无效", ErrEndpointNotActivatable)
+	}
+	if target.HealthStatus == "disabled" {
+		return fmt.Errorf("%w: 已摘除的行请先在仪表盘恢复", ErrEndpointNotActivatable)
+	}
+
+	// 互斥关同行:只动同组(auto_group=1 ∧ 非 builtin ∧ 同协议)且当前启用
+	// 的行;已是关闭态的不重复落库。
+	for _, e := range list {
+		if e.ID == target.ID || e.Builtin || !e.AutoGroup || !endpointProtocolMatch(e, protocol) {
+			continue
+		}
+		if !e.Enabled {
+			continue
+		}
+		peer := *e
+		peer.Enabled = false
+		if err := s.store.Update(&peer); err != nil {
+			return fmt.Errorf("endpoint: 互斥关闭 %s 失败: %w", e.ID, err)
+		}
+	}
+	target.Enabled = true
+	if err := s.store.Update(target); err != nil {
+		target.Enabled = false
+		return fmt.Errorf("endpoint: 激活 %s 失败: %w", target.ID, err)
+	}
+	logger.Info(fmt.Sprintf("endpoint: 托盘激活 id=%s protocol=%s(组内互斥,其余同组 auto 行已停用)", target.ID, protocol))
+	return nil
+}
