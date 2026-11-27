@@ -23,7 +23,10 @@ import FooterBar from './components/FooterBar.vue';
 
 // 数据层:启动即拉一次 + 2s 轮询;connLost 连续 2 次失败置位(§3 错误态)。
 // 仅本根壳调用一次;区块组件一律经 inject('panelData') 取同一份数据。
-const { summary, connLost } = useSummary();
+// refresh 同一 useSummary 管道的手动刷新(useSummary 内部就是 poll 本体),
+// 经 panelData 一并下发——EndpointZone 钉选激活的「回读确认」复用它,不得
+// 新开轮询定时器(纪律 M-4 的动作侧延伸)。
+const { summary, connLost, refresh } = useSummary();
 
 // 本地过渡态(Task 8):TransportRow 点启停/重启后写入('starting'/
 // 'stopping'/'restarting'),七态派生据此让过渡态优先于远端快照(spec §3)。
@@ -36,7 +39,7 @@ const panelState = computed(() =>
 
 // 注入给区块组件:同一份数据源,免逐层 props(panelState 含过渡覆盖;
 // 组件内需要「不含过渡的远端态」时自行 derivePanelState(..., null))。
-provide('panelData', { summary, connLost, panelState, localTransition });
+provide('panelData', { summary, connLost, panelState, localTransition, refresh });
 // toast 队列单例(接口 toast.show(msg, kind))也一并注入。
 const toast = useToast();
 provide('panelToast', toast);

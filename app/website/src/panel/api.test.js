@@ -8,7 +8,19 @@
 // 宿主对象用 vi.stubGlobal 打桩(jsdom 下 globalThis 即 window),fetch 用
 // stubGlobal + fake timers,测完恢复。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { getSummary, isHosted, postMessageHost, PROXY_ACTION_TIMEOUT_MS, restartProxy, setMode, startProxy, stopProxy, SUMMARY_TIMEOUT_MS } from './api';
+import {
+  activateEndpoint,
+  ENDPOINT_ACTIVATE_TIMEOUT_MS,
+  getSummary,
+  isHosted,
+  postMessageHost,
+  PROXY_ACTION_TIMEOUT_MS,
+  restartProxy,
+  setMode,
+  startProxy,
+  stopProxy,
+  SUMMARY_TIMEOUT_MS,
+} from './api';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -257,5 +269,80 @@ describe('动作链路(信封/启停/超时)', () => {
       })
     );
     await expect(setMode('http')).resolves.toEqual({ status: 'unchanged', current_mode: 'http' });
+  });
+});
+
+// ---- D. activateEndpoint(面板 radio 真激活,plan 2026-11-27 Task 3)--------
+// 本段直测【真实 api.js】(文件顶部无 mock):EndpointZone.test.js 的 vi.mock
+// 工厂只拦组件行为链路,对未来「改坏真实请求体/错误透传」零保护力——真
+// 契约(路径/body/三层判失败/超时档)必须打在真模块上。
+
+describe('activateEndpoint(真实模块:路径/body/三层判失败/超时档)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('① POST /api/endpoints/activate,body {protocol,id},成功透传 data', async () => {
+    const fetchMock = stubFetch(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ code: 0, msg: 'success', data: { protocol: 'anthropic', id: 'ep-1' } }),
+      })
+    );
+    const out = await activateEndpoint('anthropic', 'ep-1');
+    expect(out).toEqual({ protocol: 'anthropic', id: 'ep-1' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/endpoints/activate');
+    expect(fetchMock.mock.calls[0][1].method).toBe('POST');
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ protocol: 'anthropic', id: 'ep-1' });
+    expect(fetchMock.mock.calls[0][1].headers['Content-Type']).toBe('application/json');
+    // 超时闸确有挂上(时长由⑤用例钉死)
+    expect(fetchMock.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('② HTTP 错误层:非 2xx 的信封 body msg 透传(common.Error* 恒带人话,如摘除行 400)', async () => {
+    stubFetch(() =>
+      Promise.resolve({
+        ok: false,
+        status: 400,
+        json: () => Promise.resolve({ code: 400, msg: '已摘除的行请先在仪表盘恢复' }),
+      })
+    );
+    await expect(activateEndpoint('anthropic', 'ep-1')).rejects.toThrow('已摘除的行请先在仪表盘恢复');
+  });
+
+  it('③ HTTP 错误但 body 非信封(网关 HTML 错误页)→ 回落 HTTP 状态码文案', async () => {
+    stubFetch(() => Promise.resolve({ ok: false, status: 502, json: () => Promise.resolve('Bad Gateway') }));
+    await expect(activateEndpoint('anthropic', 'ep-1')).rejects.toThrow('HTTP 502');
+  });
+
+  it('④ 业务码层:200 信封 code≠0 → 抛错带服务端 msg(防御性,惯例对齐 getSummary)', async () => {
+    stubFetch(() =>
+      Promise.resolve({ ok: true, json: () => Promise.resolve({ code: 201, msg: 'endpoint registry 不可用' }) })
+    );
+    await expect(activateEndpoint('anthropic', 'ep-1')).rejects.toThrow('endpoint registry 不可用');
+  });
+
+  it('⑤ 传输层超时档 = 启停同款 10s(静态锚 + 超时转译)', async () => {
+    expect(ENDPOINT_ACTIVATE_TIMEOUT_MS).toBe(10000);
+    expect(ENDPOINT_ACTIVATE_TIMEOUT_MS).toBe(PROXY_ACTION_TIMEOUT_MS);
+    stubFetch(
+      (_path, opts) =>
+        new Promise((_resolve, reject) => {
+          opts.signal.addEventListener('abort', () => {
+            const err = new Error('The operation was aborted');
+            err.name = 'AbortError';
+            reject(err);
+          });
+        })
+    );
+    const pending = activateEndpoint('anthropic', 'ep-1');
+    // 拒绝断言先于推进时钟挂上(同⑥:消除 rejection 无 handler 窗口)
+    const assertion = expect(pending).rejects.toThrow(`超时(${ENDPOINT_ACTIVATE_TIMEOUT_MS}ms)`);
+    await vi.advanceTimersByTimeAsync(ENDPOINT_ACTIVATE_TIMEOUT_MS);
+    await assertion;
   });
 });
