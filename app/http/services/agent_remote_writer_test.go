@@ -138,12 +138,18 @@ func TestRunRemoteAgentSession_EndsWhenPeerGoesSilent(t *testing.T) {
 
 	// Confirm the session actually started (hello was sent) before requiring the
 	// silent-peer termination, so a hello failure can't masquerade as a pass.
+	//
+	// 首个 hello 要构建设备画像，其中 detectAgentTools 会对本机已安装的
+	// claude/codex 等 CLI 做一次冷启动版本探测(真实子进程，秒级，且
+	// lookPathInHomes 会扫到 /opt/homebrew/bin，与 HOME/PATH 隔离无关)。
+	// 本用例验证的是「对端静默→读超时断开」，与 CLI 探测无关，所以等待窗
+	// 必须容纳这次冷探测；sessionDone 先于超时就绪时仍会如实报出错误。
 	select {
 	case <-helloReceived:
 	case err := <-sessionDone:
 		t.Fatalf("agent session ended before hello: %v", err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("agent never sent hello within 5s")
+	case <-time.After(30 * time.Second):
+		t.Fatal("agent never sent hello within 30s (first hello cold-probes installed CLIs; check detectAgentTools)")
 	}
 
 	select {
