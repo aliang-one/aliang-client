@@ -216,8 +216,15 @@ func handleAIRequest(conn net.Conn, reader *bufio.Reader, req *http.Request, met
 			writeAIErrorBody(conn, http.StatusInternalServerError, "endpoint_config_invalid", "endpoint base_url is invalid")
 			return
 		case res.completed && res.status >= 400 && res.status != http.StatusTooManyRequests:
-			// 其它 4xx(400/403/404/413/422 等,不含已走 held 通道的 401/402/429):
-			// 已透传,不重试不计数(spec §6.2 不变量 5)。
+			// 其它 4xx(400/404/413/422 等,不含已走 held 通道的 401/402/429):
+			// 已透传,不重试(spec §6.2 不变量 5)。403 例外(二期 §9.1 不变量 5
+			// 修订):归计数路径——语义歧义(可能是凭据/权限问题)按普通失败
+			// 记 total/failed 与 last_error,与内核链对齐;但不切候选(已透传的
+			// 确定性客户端错误,切换=重打同族两枪)、不消费冷却(until=0)。
+			if res.status == http.StatusForbidden {
+				aiSelector.ReportFailure(id, res.status,
+					fmt.Sprintf("%d %s", res.status, http.StatusText(res.status)), 0)
+			}
 			logger.Info(fmt.Sprintf("ai route: 客户端错误透传 endpoint=%s status=%d protocol=%s", id, res.status, protocol))
 			return
 		case res.completed:

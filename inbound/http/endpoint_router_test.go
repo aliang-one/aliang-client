@@ -1415,3 +1415,65 @@ func TestAIPath401ExhaustedPassesLast401Through(t *testing.T) {
 		}
 	}
 }
+
+// 二期 spec §9.1 不变量 5 修订:403 归计数路径——路由链 completed 直通分支
+// 也必须把 403 报给 ReportFailure(与内核链对齐,评审 Finding 1),但**不重试
+// 不切换**(已透传给客户端的确定性错误,再切候选=重打同族两枪),客户端仍
+// 收到原样 403。
+func TestAIPath403ReportsFailureAndPassesThrough(t *testing.T) {
+	capture := &upstreamCapture{}
+	upstream := newFakeUpstream(t, capture, func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+		plainBody(w, stdhttp.StatusForbidden, `{"error":"permission denied"}`)
+	})
+
+	sel := &fakeAISelector{selectQueue: []selectResult{
+		{id: "byo-403", baseURL: upstream.URL, apiKey: "k403"},
+	}}
+	setAISelectorForTest(t, sel)
+
+	client, handled := serveRawRequest(t,
+		"POST /v1/messages HTTP/1.1\r\n"+
+			"Host: 127.0.0.1:56432\r\n"+
+			"Content-Length: "+fmt.Sprintf("%d", len(anthropicRequestBody))+"\r\n"+
+			"\r\n"+anthropicRequestBody)
+
+	select {
+	case <-handled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not finish")
+	}
+
+	_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	resp, err := stdhttp.ReadResponse(bufio.NewReader(client), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != stdhttp.StatusForbidden {
+		t.Fatalf("status = %d body=%q, want 403(透传照旧)", resp.StatusCode, string(respBody))
+	}
+	if !strings.Contains(string(respBody), "permission denied") {
+		t.Fatalf("body = %q, want the upstream 403 body", string(respBody))
+	}
+
+	calls, _, _, successes, failures := sel.snapshot()
+	// 不重试不切换:单候选单枪,Select 只调一次。
+	if len(calls) != 1 {
+		t.Fatalf("select calls = %d, want 1(403 不切候选)", len(calls))
+	}
+	if len(successes) != 0 {
+		t.Fatalf("successes = %v, want none(403 不是成功)", successes)
+	}
+	// 计数缝必须被调:status=403 原样透传(service 靠它进计数分支),until=0
+	// (403 不消费 429 冷却)。
+	if len(failures) != 1 {
+		t.Fatalf("failures = %+v, want single entry(路由链 403 必须上报计数缝)", failures)
+	}
+	if failures[0].id != "byo-403" || failures[0].status != 403 || failures[0].until != 0 {
+		t.Fatalf("failures[0] = %+v, want byo-403/403/until=0", failures[0])
+	}
+	if failures[0].errMsg == "" {
+		t.Fatalf("failures[0].errMsg 为空: 403 上报应带可读摘要(service 写 last_error)")
+	}
+}

@@ -1018,3 +1018,11 @@ func (s *EndpointService) GetPolicy() (*config.EndpointGroupPolicy, error) {
 
 // SetPolicy 组策略写(组键恒 auto,store 归一)。管理面专用,数据面勿用。
 func (s *EndpointService) SetPolicy(p *config.EndpointGroupPolicy) error { return s.store.SetPolicy(p) }
+
+// SetEgressKernel 出口指定换绑直通(store 事务方法,「全表至多一行=1」的唯一
+// 写入口;非 anthropic 拒、builtin 允许、不存在 404 的哨兵语义都在 store 层,
+// handler 原样映射)。管理面专用,数据面勿用——数据面出口是只读消费
+// (kernelEndpointResolver 读 egress_kernel=1 的行),永远不经本方法。
+func (s *EndpointService) SetEgressKernel(id string, set bool) error {
+	return s.store.SetEgressKernel(id, set)
+}

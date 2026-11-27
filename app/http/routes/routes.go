@@ -450,6 +450,9 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	// 按裸 base_url 探测模型(新建表单自动获取;行未落库没有 id)。
 	register("POST /api/endpoints/probe-models", h.Endpoint.HandleProbeModels, http.MethodPost)
 	register("POST /api/endpoints/{id}/reset-health", h.Endpoint.HandleResetHealth, http.MethodPost)
+	// 出口指定换绑(spec 2026-11-27 §8):事务换绑,全表至多一行=1;{id} 同族
+	// 方法前缀模式(防 ServeMux 双注册 panic)。
+	register("POST /api/endpoints/{id}/set-egress-kernel", h.Endpoint.HandleSetEgressKernel, http.MethodPost)
 	register("/api/endpoint-groups/auto/policy", h.Endpoint.HandlePolicy, http.MethodGet, http.MethodPut)
 
 	registerDocsRoutes(mux, catalog)

@@ -47,10 +47,17 @@ func NewEndpointHandler(service *services.EndpointService) *EndpointHandler {
 
 // endpointView 是 GET 列表/单条的出参形状:LLMEndpoint 的 JSON 视图 + 掩码
 // api_key + inflight(并发用量,来自 service.Inflight())。
+// 二期(spec 2026-11-27 §8):补 cooldown_until/rate_limited_until 两个 REST
+// 字段——store 结构体的 json:"-" 刻意把它们挡在三词徽标(停用/熔断恢复于
+// HH:MM/限流至 HH:MM)的 REST 面外,视图层显式补上(UI「恢复于 HH:MM」
+// tooltip 需要它们);egress_kernel/last_used_at/total_requests/failed_requests
+// 四个由嵌入结构体的 json tag 直接出面,此处不重复声明。
 type endpointView struct {
 	config.LLMEndpoint
-	APIKey   string `json:"api_key"`
-	Inflight int    `json:"inflight"`
+	APIKey           string `json:"api_key"`
+	Inflight         int    `json:"inflight"`
+	CooldownUntil    int64  `json:"cooldown_until"`
+	RateLimitedUntil int64  `json:"rate_limited_until"`
 }
 
 // maskAPIKey 前4+***+后4;长度≤8 全掩(短 key 泄露比例太高)。
@@ -73,9 +80,11 @@ func (h *EndpointHandler) endpointViews(list []*config.LLMEndpoint) []endpointVi
 	views := make([]endpointView, 0, len(list))
 	for _, e := range list {
 		views = append(views, endpointView{
-			LLMEndpoint: *e,
-			APIKey:      maskAPIKey(e.APIKey),
-			Inflight:    inflight[e.ID],
+			LLMEndpoint:      *e,
+			APIKey:           maskAPIKey(e.APIKey),
+			Inflight:         inflight[e.ID],
+			CooldownUntil:    e.CooldownUntil,
+			RateLimitedUntil: e.RateLimitedUntil,
 		})
 	}
 	return views
@@ -479,6 +488,56 @@ func (h *EndpointHandler) HandleResetHealth(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	common.Success(w, map[string]interface{}{"id": id})
+}
+
+// endpointSetEgressRequest 是 set-egress-kernel 的请求体(spec 二期 §8):
+// set 用 *bool 区分「未给」与显式值——设/取消语义相反,缺字段不猜默认值。
+type endpointSetEgressRequest struct {
+	Set *bool `json:"set"`
+}
+
+// HandleSetEgressKernel POST /api/endpoints/{id}/set-egress-kernel — 出口指定
+// 换绑(spec 二期 §8):set=true 经 store 事务方法换绑(全表至多一行=1,唯一
+// 写入口;builtin 行允许,停用行允许=出口「暂停保留」),set=false 取消(幂等)。
+// 错误映射:不存在 → 404(store 对 set 两方向一致做存在性检查);非 anthropic
+// → 400(ErrNotAnthropic 哨兵);其余 → 500。请求体没有该字段的普通 PUT 永远
+// 碰不到 egress_kernel(列白名单也不收),换绑只能走这里。
+func (h *EndpointHandler) HandleSetEgressKernel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !endpointRequireSession(w, r) {
+		return
+	}
+	if h.service == nil {
+		endpointServiceUnavailable(w)
+		return
+	}
+	id := idFromPath(w, r)
+	if id == "" {
+		return
+	}
+	var req endpointSetEgressRequest
+	if !endpointDecodeBody(w, r, &req) {
+		return
+	}
+	if req.Set == nil {
+		common.ErrorBadRequest(w, "set 字段必填(true=设为出口/false=取消)", nil)
+		return
+	}
+	if err := h.service.SetEgressKernel(id, *req.Set); err != nil {
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			common.ErrorNotFound(w, "endpoint "+id+" 不存在")
+		case errors.Is(err, storage.ErrNotAnthropic):
+			common.ErrorBadRequest(w, err.Error(), nil)
+		default:
+			common.ErrorInternalServer(w, "设置出口指定失败", map[string]interface{}{"error": err.Error()})
+		}
+		return
+	}
+	common.Success(w, map[string]interface{}{"id": id, "egress_kernel": *req.Set})
 }
 
 // HandlePolicy GET/PUT /api/endpoint-groups/auto/policy — 组策略读写。
