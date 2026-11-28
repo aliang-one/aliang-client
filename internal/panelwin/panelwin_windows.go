@@ -358,6 +358,14 @@ func runPanelWindow(opts Options) error {
 	if !chromium.Embed(hwnd) {
 		return fmt.Errorf("WebView2 初始化失败(运行时缺失或加载失败)")
 	}
+	// ⚠️ Controller IsVisible 默认 false:jchv Embed 不调 PutIsVisible(true)
+	// (上层 webview.go 由使用者 Show() 续命,裸壳漏了这句)——不可见的
+	// controller 永不渲染画面:JS 照跑、DOM 照建、resize 照收,唯独画面
+	// 永远是材质底色=「全灰色空白框」(2026-11-28 0.196 实机走查坐实,
+	// 0.196 内 fetch 200/last-height 写入全部正常唯独不画)。Embed 后
+	// 立即 Show()+Resize(),两句都是 WebView2 嵌入的必备最小集。
+	chromium.Show()
+	chromium.Resize()
 	// Embed 后补一次初始 Resize(jchv webview.go L343 同款惯例):controller
 	// bounds 与窗口物理尺寸首帧对齐,不调则首帧内容停在 CreateWindowExW 的
 	// 临时尺寸上;高度自适应链的后续跟随同走 Resize。
