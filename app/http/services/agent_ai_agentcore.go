@@ -1787,6 +1787,15 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		ScopeCheck:  agentCoreScopeCheck(run),
 		ShellPolicy: &agentCoreShellPolicy{run: run},
 	}
+	// 后台 shell 登记（2026-11-28 后台 shell 批）：登记处 manager 级（跨 run
+	// 存活），经 sessionView 绑定本 run 会话（裸 registry 只活在测试）。readOnly
+	// run 不注入（与 peer/子 agent 同判据——启动后台进程是写动作；Bash 的
+	// run_in_background 参数亦无登记处可用，内核层自报「不支持（请去掉
+	// run_in_background 改前台执行）」）。必须在 mainToolEnv 拷贝之前：子
+	// agent 桥拿的是拷贝，赋值晚于拷贝则子 run 的后台任务无登记处可落。
+	if !run.readOnly {
+		kernelEnv.BackgroundShells = m.ensureBackgroundShells().sessionView(run.sessionID)
+	}
 	// 审批串行门（agentCoreApprovalGate）：单卡语义要求同一时刻只有一张手机
 	// 审批卡在等。并行子 agent（内核 Parallelizable 批）会让多个 goroutine
 	// 并发进入审批闭包——不互斥既弹多张卡打架，也让 agentCoreApprove 闭包
@@ -1864,6 +1873,20 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// EffectiveEventListenersEnabled 默认开,显式 false = 零注入。
 	for _, tool := range m.agentCoreListenerTools(run) {
 		registry.Register(tool)
+	}
+
+	// 后台 shell 查询/终止工具（BashOutput/KillShell，2026-11-28 后台 shell
+	// 批）：共享构造 agentCoreBackgroundTools（子 agent 桥 bgTools 同一消费
+	// 面，主/子两处注入不漂移）；journal 落行与 peer 桥同约定（appendTool nil
+	// 接收者安全，coreJournal 为空的既有测试路径经闭包直达兜底，工具照常注
+	// 册）。readOnly run 不注入（kernelEnv.BackgroundShells 为 nil 的同一判
+	// 定）。桥侧用裸登记处指针即可：read/kill/list 以显式 sessionID
+	// （run.sessionID）判定归属，登记处内部强制会话校验；sessionView 适配器
+	// 只服务于内核 Begin 无会话参数的注入面（上方 kernelEnv）。
+	if !run.readOnly && kernelEnv.BackgroundShells != nil {
+		for _, tool := range m.agentCoreBackgroundTools(run) {
+			registry.Register(tool)
+		}
 	}
 
 	hooks := agentCoreLoopHooks(m, run, diag, writeJSON)

@@ -264,7 +264,9 @@ func (g *agentAIRunGuard) forceFinalize(reason string) {
 		return
 	}
 	g.finalizeOnce.Do(func() {
-		g.activity.setKillReason(reason)
+		// 兜底诊断用覆盖写：先因优先的 setKillReason 在这里会拒绝落账，而
+		// forceFinalize 的结论（宽限期内 run 没能自然返回）就是此刻的死因。
+		g.activity.forceSetKillReason(reason)
 		logger.Warn(fmt.Sprintf(
 			"[ai.run.force_finalize] session=%s runSeq=%d run=%s reason=%s runFor=%s idleFor=%s",
 			g.sessionID, g.runSeq, g.runID, reason,

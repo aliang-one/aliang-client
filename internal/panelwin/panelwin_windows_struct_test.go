@@ -63,6 +63,20 @@ func TestPanelwinWindowsSetWindowPosUsesReanchor(t *testing.T) {
 // panelwin_resize_test.go)→ SetWindowPos(swpNoZOrder|swpNoActivate)落窗
 // → chromium.Resize 同步 controller bounds → 局部跟踪矩形回写。
 // GOOS 无关,只读源码文本(同上)。
+func TestPanelwinWindowsWMSizeSyncsWebView2Bounds(t *testing.T) {
+	src := panelwinWindowsSource(t)
+	for _, want := range []string{
+		"wmSize     = 0x0005",
+		"case wmSize:",
+		"panelChromium.Resize()",
+		"panelChromium = chromium",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("panelwin_windows.go 缺少 %q(高度自适应 resize 后 WebView2 bounds 不同步=浅色空白框,2026-11-28 0.196 坐实)", want)
+		}
+	}
+}
+
 func TestPanelwinWindowsResizeFollowChain(t *testing.T) {
 	src := panelwinWindowsSource(t)
 
@@ -227,7 +241,7 @@ func TestPanelwinWindowsCloseOnDeactivate(t *testing.T) {
 
 	// ④ 反向锚:方案 B 常驻态的进程级状态与隐藏/切换动作已删——全文件
 	//    不得再引用已废除的符号。
-	for _, banned := range []string{"hidePanelWindow", "togglePanelWindow", "panelChromium", "panelHidden", "panelIdle", "swHide"} {
+	for _, banned := range []string{"hidePanelWindow", "togglePanelWindow", "panelHidden", "panelIdle", "swHide"} {
 		if strings.Contains(src, banned) {
 			t.Fatalf("panelwin_windows.go 仍引用已废除的方案 B 符号 %q(隐藏驻留/空闲回收/toggle 切换均已随撤销批删除)", banned)
 		}

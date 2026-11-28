@@ -63,6 +63,12 @@ type agentAIManager struct {
 	// manager), used to evaluate the device approval policy. nil for standalone
 	// test managers, which fall back to GetSharedAgentService().
 	service *AgentService
+	// backgroundShells 是后台 shell 登记处（2026-11-28 后台 shell 批，见
+	// agent_ai_background_shell.go）：跨 run 存活的进程归属地。惰性初始化
+	// （ensureBackgroundShells）；收口走 backgroundShellsCloseAll
+	// （AgentService.Shutdown 旁路）。⚠️ 方法名不得与字段撞名（Go 同类型禁止
+	// 字段与方法同名）。
+	backgroundShells *agentBackgroundShellRegistry
 	// scanOnce 保证 stale 扫描器每个 manager 只启动一条。
 	scanOnce sync.Once
 }

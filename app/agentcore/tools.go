@@ -87,6 +87,14 @@ type ToolEnv struct {
 	// 否则 GUI/systemd 启动的 agent 只有系统四件套 PATH，node/npm 等用户级
 	// 工具全部不可见——aliangcode「没有 nodejs」误报的执行层根因。
 	Env []string
+	// BackgroundShells 是宿主注入的后台 shell 登记处（ShellPolicy 同款模式：
+	// 管理器在 services 层，本包禁止 import services，故做成窄接口）。
+	// nil = 本会话不支持后台执行，Bash 的 run_in_background 参数报错。
+	//
+	// 生命周期归属：后台进程用内核自建的独立 ctx（defaultBackgroundShellLifetime
+	// 封顶），**不随 run ctx 取消而终止**——run 停止/dev server 继续跑是本
+	// 特性的存在意义。收口责任在宿主（会话管理器 closeAll/进程退出 Shutdown）。
+	BackgroundShells BackgroundShellRegistry
 }
 
 // ShellPolicy 是宿主注入的 shell 执行策略。
@@ -96,6 +104,33 @@ type ShellPolicy interface {
 	Resolve(kind string) (path string, baseArgs []string, err error)
 	// Allow 判定命令是否在白名单内。返回 (false, reason) 时拒绝执行。
 	Allow(command string) (bool, string)
+}
+
+// BackgroundShellRegistry 是宿主注入的后台 shell 登记处（窄接口）。
+type BackgroundShellRegistry interface {
+	// Begin 登记一条即将启动的后台 shell，返回句柄与唯一 id。内核在进程
+	// Start 前调用；Start 成功后 MarkRunning，输出持续 Write，结束调 Finished。
+	Begin(command string) (BackgroundShellHandle, string)
+}
+
+// BackgroundShellHandle 是一条后台 shell 的内核侧句柄。
+type BackgroundShellHandle interface {
+	// Write 合并接收 stdout/stderr（实现方必须并发安全：os/exec 对两根
+	// 管道各起一条拷贝 goroutine）。实现方须有界缓冲（如滚动环），不得
+	// 无界累积。
+	Write(p []byte) (int, error)
+	// SetCancel 装填终止闭包（直接组杀，不依赖 os/exec 的 Cancel 编排）。
+	// KillShell 类工具经宿主间接调用。armed 保持到进程树终了（bgCtx.Done）
+	// 之后的收尾点才解除，保证 KillShell 对 `&` 孙进程全程有效；解除后
+	// 实现方须安全忽略再调。
+	SetCancel(func())
+	// MarkRunning 在进程成功启动后调用，携带 PID（展示用）。
+	MarkRunning(pid int)
+	// Finished 报告终态，outcome 语义同 ShellOutcome；detail 是人类可读的
+	// 收尾说明（退出码/超时/被终止）。调用次数由内核侧保证恰好一次
+	// （runShellBackground 用 sync.Once 收敛 panic 兜底/终态 switch/启动失败
+	// 三条路径）；实现方仍应做幂等防御（以首次为准），不依赖调用方纪律。
+	Finished(outcome ShellOutcome, detail string)
 }
 
 // Tool 是一个可被模型调用的工具。
@@ -220,6 +255,10 @@ func DefaultRegistry() *Registry {
 // maxToolOutputBytes 是单次工具回填给模型的上限。超出即截断并明确标注——
 // 静默截断会让模型以为自己看完了全文。
 const maxToolOutputBytes = 64 * 1024
+
+// MaxToolOutputBytes 导出单次工具回填上限，services 侧桥工具（BashOutput 等）
+// 引用同一数字，避免手抄漂移。
+const MaxToolOutputBytes = maxToolOutputBytes
 
 // resolveToolPath 把工具入参里的路径解析成绝对路径。
 //
