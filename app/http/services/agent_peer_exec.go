@@ -259,14 +259,14 @@ func runPeerExecCommand(command, workdir string, timeout time.Duration) (int, st
 	runErr := cmd.Start()
 	if runErr == nil {
 		// Windows：立即入树，之后派生的全部子孙自动进 Job（组杀覆盖）；
-		// attach 之前已存在的孤儿子进程靠 WaitDelay 盖帽兜底。尽力而为：
+		// Attach 之前已存在的孤儿子进程靠 WaitDelay 盖帽兜底。尽力而为：
 		// 失败降级为直接子进程 kill + WaitDelay，不阻断主流程。
-		_ = procTree.attach(cmd)
+		_ = procTree.Attach(cmd)
 		runErr = cmd.Wait()
 	}
 	// 正常路径显式收尾；agent 进程异常退出时靠 KILL_ON_JOB_CLOSE 由内核兜底
-	// （Close 语义，见 command_windows.go）。
-	procTree.release()
+	// （Close 语义，见 agentcore/proctree_windows.go）。
+	procTree.Release()
 	durationMs := time.Since(started).Milliseconds()
 
 	exitCode, failReason := classifyPeerExecOutcome(runErr, ctx, killInitiated)
