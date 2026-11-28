@@ -69,6 +69,7 @@
 @property (copy) NSString* launchURL;      // --url,panel.html 完整地址
 @property (assign) NSRect contentRect;     // AppKit 全局左下原点的窗口 frame
 @property (assign) BOOL everKeyed;         // 曾成为 key(见 resignKey 守卫)
+- (void)verifyOnscreenRetry:(NSInteger)attempt forPanel:(NSPanel *)panel;
 @end
 
 @implementation PanelAppDelegate
@@ -294,18 +295,21 @@
     NSLog(@"panelwin: --url 解析为 nil,面板不加载内容(失焦即退链仍生效)");
   }
 
-  // 初始上屏:600ms 延迟 + orderFrontRegardless(2026-11-28 实机走查坐实的
-  // 「悬挂窗口」机制:companion 在托盘点击处理中途 spawn 子进程,子进程的
-  // 首次 orderFront 动作撞进系统 key/space 切换未稳定期(托盘点击的震荡期
-  // 约 1s 内),窗口进入「已注册但永不合成」的悬挂态——CGWindowList onscreen
-  // 永远查无此窗,后续信号也无法让它上屏(实测 7 分钟后的信号无效);系统
-  // 平静期同代码每次都正常上屏)。600ms 避开震荡期上屏;页面加载在等待期
-  // 照常进行,上屏时内容已就绪(加载感由快照预热消化)。⚠️ 刻意不 makeKey
-  // (撤销方案 B 失败模式③:makeKey 抢用户焦点→被夺回→resignKey 自动再
-  // 隐藏)——用户点面板内部一次后 becomeKey,失焦即退链随即激活。
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+  // 初始上屏(2026-11-28 二版):150ms 早屏 + 上屏自检重试。背景机制
+  // (2026-11-28 实机走查坐实的「悬挂窗口」):companion 在托盘点击处理中途
+  // spawn 子进程,首次 orderFront 撞进系统 key/space 切换未稳定期(震荡期
+  // 约 1s),窗口进入「已注册但永不合成」的悬挂态(CGWindowList onscreen
+  // 查无此窗,后续信号无效)。一版用 600ms 固定延迟硬躲——用户反馈「不跟手」。
+  // 二版改为【早屏+探测重试】:150ms 首次 orderFrontRegardless(多数点击
+  // 此刻已安全),随后 300/500/800/1200ms 自检「本窗是否真的合成到屏」
+  // (CGWindowList 按窗口号查 onscreen),未合成则再补一次 orderFrontRegardless
+  // ——震荡期结束后的重试必然成功。⚠️ 刻意不 makeKey(撤销方案 B 失败
+  // 模式③:makeKey 抢用户焦点→被夺回→resignKey 自动再隐藏)——用户点
+  // 面板内部一次后 becomeKey,失焦即退链随即激活。页面加载在等待期照常。
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
                  dispatch_get_main_queue(), ^{
     [panel orderFrontRegardless];
+    [self verifyOnscreenRetry:1 forPanel:panel];
   });
 
   // 原生圆角(2026-11-28 用户反馈:CSS 的 --panel-radius 只作用内层 .panel
@@ -347,6 +351,40 @@
           panel.isKeyWindow ? 1 : 0);
   });
 }
+
+// verifyOnscreenRetry:上屏合成自检+重试(「早屏+探测重试」二版;悬挂窗口
+// 机制见初始上屏处注释)。每次:查本窗口号是否在合成列表(CGWindowList
+// onscreen),已合成→确认收工;未合成→再补一次 orderFrontRegardless 并按
+// 150/350/600/950ms 递增间隔续检(累计 ~1.2s,越过托盘点击震荡期);5 次
+// 耗尽仍未合成→NSLog 留 Task 16 探针。用委托方法而非递归 block,避免
+// block 自捕获的 retain cycle。self=panelDelegate(仅主线程读,见文件头)。
+- (void)verifyOnscreenRetry:(NSInteger)attempt forPanel:(NSPanel *)panel {
+  if (!panel) {
+    return;
+  }
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                 dispatch_get_main_queue(), ^{
+    NSArray *onscreen = CFBridgingRelease(CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly, kCGNullWindowID));
+    NSNumber *winNum = @(panel.windowNumber);
+    BOOL comp = NO;
+    for (NSDictionary *w in onscreen) {
+      if ([w[(NSString *)kCGWindowNumber] isEqualToNumber:winNum]) { comp = YES; break; }
+    }
+    if (comp) {
+      NSLog(@"panelwin: 上屏合成确认(attempt %ld)", (long)attempt);
+      return;
+    }
+    if (attempt >= 5) {
+      NSLog(@"panelwin: 上屏重试耗尽仍未合成(留 Task 16 探针)");
+      return;
+    }
+    NSLog(@"panelwin: 未合成(attempt %ld),重试 orderFront", (long)attempt);
+    [panel orderFrontRegardless];
+    [self verifyOnscreenRetry:attempt + 1 forPanel:panel];
+  });
+}
+
 
 @end
 
