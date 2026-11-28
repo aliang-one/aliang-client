@@ -68,6 +68,46 @@
       </span>
     </div>
 
+    <!-- NET-01 验收⑤：换账号登录时的明确提示 + 换绑确认入口。
+         检测到 rebind_pending 说明当前登录身份与本机已绑定账号不一致，agent 已
+         停用等属主决策。不提示的话用户只会看到 agent 莫名其妙下线。 -->
+    <div
+      v-if="rebindPending"
+      class="border-t border-amber-200 bg-amber-50 px-5 py-4 dark:border-amber-500/30 dark:bg-amber-500/10 sm:px-6"
+      role="alert"
+    >
+      <div class="flex items-start gap-2">
+        <span class="material-symbols-outlined mt-0.5 text-base text-amber-700 dark:text-amber-300">warning</span>
+        <div class="min-w-0 flex-1">
+          <p class="text-[12px] font-semibold text-amber-900 dark:text-amber-200">
+            {{ t('agent_rebind_pendingTitle') }}
+          </p>
+          <p class="mt-1 text-[11px] leading-relaxed text-amber-800 dark:text-amber-300/90">
+            {{ t('agent_rebind_pendingBody', { bound: status?.registered_user || '', current: status?.pending_rebind_user || '' }) }}
+          </p>
+          <div class="mt-2.5 flex flex-wrap gap-2">
+            <button
+              type="button"
+              class="inline-flex min-h-9 items-center gap-1 rounded-lg bg-amber-600 px-3 text-[11px] font-semibold text-white transition-colors hover:bg-amber-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40 disabled:opacity-60"
+              :disabled="rebindBusy"
+              @click="confirmRebind"
+            >
+              {{ rebindBusy && rebindAction === 'confirm' ? t('agent_rebind_working') : t('agent_rebind_confirm') }}
+            </button>
+            <button
+              type="button"
+              class="inline-flex min-h-9 items-center gap-1 rounded-lg border border-amber-300 px-3 text-[11px] font-semibold text-amber-800 transition-colors hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40 disabled:opacity-60 dark:border-amber-500/40 dark:text-amber-200 dark:hover:bg-amber-500/20"
+              :disabled="rebindBusy"
+              @click="rejectRebind"
+            >
+              {{ rebindBusy && rebindAction === 'reject' ? t('agent_rebind_working') : t('agent_rebind_reject') }}
+            </button>
+          </div>
+          <p v-if="rebindError" class="mt-2 text-[11px] text-rose-600 dark:text-rose-300">{{ rebindError }}</p>
+        </div>
+      </div>
+    </div>
+
     <!-- 注册 / 连接健康度：正常一行摘要，出错才展开 -->
     <div v-if="healthVisible" class="border-t border-slate-100 px-5 py-4 dark:border-slate-800 sm:px-6">
       <template v-if="healthHasProblem">
@@ -284,6 +324,7 @@ import {
   disableAgent,
   launchAgentTool,
   enableAgent,
+  resolveAgentRebind,
 } from '../../services/agentApi';
 import { useI18n } from '../../i18n';
 import { useAgentStatus } from '../../composables/useAgentStatus';
@@ -306,6 +347,10 @@ export default {
       feedback: '',
       feedbackType: 'info',
       retrying: false,
+      rebindBusy: false,
+      /** @type {'' | 'confirm' | 'reject'} */
+      rebindAction: '',
+      rebindError: '',
     };
   },
   computed: {
@@ -446,6 +491,10 @@ export default {
         || this.status?.registration_state !== 'registered'
         || this.status?.connection_state !== 'connected';
     },
+    // NET-01 验收⑤:待换绑时提示并给出确认/拒绝入口。
+    rebindPending() {
+      return this.status?.sync_status === 'rebind_pending';
+    },
     syncTitle() {
       return this.status?.sync_message || this.syncLabel;
     },
@@ -504,6 +553,25 @@ export default {
       }
     },
     // 重试注册与「开启」同一接口（POST /api/agent/enable），仅出错态可见
+    async confirmRebind() {
+      await this.resolveRebind('confirm');
+    },
+    async rejectRebind() {
+      await this.resolveRebind('reject');
+    },
+    async resolveRebind(action) {
+      this.rebindBusy = true;
+      this.rebindAction = action;
+      this.rebindError = '';
+      try {
+        this.applyStatus(await resolveAgentRebind(action));
+      } catch (err) {
+        this.rebindError = err instanceof Error ? err.message : this.t('agent_rebind_failed');
+      } finally {
+        this.rebindBusy = false;
+        this.rebindAction = '';
+      }
+    },
     async retryRegistration() {
       this.retrying = true;
       try {

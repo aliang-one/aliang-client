@@ -42,6 +42,12 @@ export async function enableAgent() {
   return request('/api/agent/enable', { method: 'POST' });
 }
 
+// NET-01 验收②:换绑到不同账号须经本机属主确认。confirm 放行,reject 保持原绑定。
+export async function resolveAgentRebind(action) {
+  const path = action === 'confirm' ? '/api/agent/confirm-rebind' : '/api/agent/reject-rebind';
+  return request(path, { method: 'POST' });
+}
+
 export async function disableAgent(reason = 'manual') {
   return request('/api/agent/disable', {
     method: 'POST',
