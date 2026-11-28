@@ -87,6 +87,7 @@
             <ChatOptionCard
               v-else-if="item.type === 'card'"
               :card="item.ref"
+              :now-tick="nowTick"
               @respond="(payload) => emit(item.cardKind === 'toolAsk' ? 'tool-ask-respond' : 'option-respond', item.ref, payload)"
             />
           </template>

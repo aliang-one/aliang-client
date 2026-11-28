@@ -412,11 +412,12 @@ export default {
   // static fence card. Paired with zh.js (i18n.test.js key-set guard).
   chat_optionTitle: 'Choose an option',
   chat_optionSubmit: 'Confirm selection',
+  chat_optionExpired: 'Expired',
   chat_optionSelected: 'Selected',
   chat_optionCustom: 'Custom reply…',
   chat_optionMulti: 'Multi-select',
   chat_optionPreview: 'Preview',
-  chat_optionStaticHint: 'Pick below',
+  chat_optionStaticHint: 'Display only — to answer, send a new message or use your phone',
   chat_optionCancelled: 'Option selection expired',
   chat_optionCancelledReason: 'Option selection expired ({reason})',
   chat_optionSendFailed: 'Failed to send selection. Please retry.',

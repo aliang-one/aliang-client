@@ -9,7 +9,11 @@
       :class="msg.note === 'turn_failed'
         ? 'whitespace-pre-wrap break-words rounded-lg border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-800 dark:bg-rose-900/30 dark:text-rose-300'
         : 'rounded-full border-slate-200 bg-white/80 text-center text-slate-500 dark:border-slate-700 dark:bg-slate-800/80 dark:text-slate-400'"
-    >{{ msg.content }}</div>
+    >{{ msg.content }}<span
+      v-if="Number.isFinite(parseMsgTs(msg.ts))"
+      class="ml-2 opacity-70"
+      :title="absoluteTime(msg.ts)"
+    >{{ relativeTime(msg.ts) }}</span></div>
     <template v-else>
       <!-- eyebrow 行：角色名 + 相对时间（title 显绝对时间）+ assistant 状态 -->
       <div
@@ -177,6 +181,8 @@ function systemNoteTestId(note) {
   if (note === 'option_cancelled') return 'chat-option-cancelled-note';
   if (note === 'approval_not_found') return 'chat-approval-not-found-note';
   if (note === 'turn_failed') return 'chat-turn-failed-note';
+  if (note === 'option_resolved') return 'chat-option-resolved-note';
+  if (note === 'tool_ask_resolved') return 'chat-tool-ask-resolved-note';
   return 'chat-approval-cancelled-note';
 }
 

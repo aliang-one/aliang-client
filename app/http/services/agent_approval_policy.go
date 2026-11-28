@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"aliang.one/nursorgate/app/agentcore"
@@ -53,8 +54,11 @@ type approvalPolicyCacheFile struct {
 }
 
 // loadPolicyCache reads, unmarshals, and compiles every cached per-project
-// policy. It returns ok=false on absent, corrupt, or regex-invalid input so the
-// caller falls back to the built-in default per path rather than mis-evaluating.
+// policy. It returns ok=false on absent or corrupt input so the caller falls
+// back to the built-in default per path rather than mis-evaluating. An entry
+// with an uncompilable rule (e.g. a hand-edited bad regex) is skipped with a
+// warning instead of voiding the whole cache — rejecting everything would
+// knock every healthy project's policy back to the built-in default at once.
 func loadPolicyCache() (map[string]ApprovalPolicy, bool) {
 	path, err := approvalPolicyCachePath()
 	if err != nil {
@@ -74,12 +78,20 @@ func loadPolicyCache() (map[string]ApprovalPolicy, bool) {
 	out := make(map[string]ApprovalPolicy, len(file.ByPath))
 	for k, p := range file.ByPath {
 		if err := compileApprovalRules(&p); err != nil {
-			return nil, false
+			// 逐调用只告警一次（评审 nit）：loadPolicyCache 在每次审批求值路径
+			// 都会触发，坏条目残留期间逐调用 Warn 会刷屏。
+			if _, dup := approvalPolicySkipWarned.LoadOrStore(k, struct{}{}); !dup {
+				logger.Warn(fmt.Sprintf("[APPROVAL-POLICY] skip cached policy path=%s error=%v", k, err))
+			}
+			continue
 		}
 		out[normalizePolicyPath(k)] = p
 	}
 	return out, true
 }
+
+// approvalPolicySkipWarned 记录已告警过的坏缓存条目 key（进程级一次）。
+var approvalPolicySkipWarned sync.Map
 
 // savePolicyCache writes the whole by-path map atomically (temp file + rename)
 // so a torn write can never leave a half-written policy for the next run to

@@ -6,10 +6,14 @@ package services
 // 引用；网页经 /api/agent/ai/attachment?ref= 取图（Resolve 与端点双层
 // 穿越守卫）。
 //
-// 配额纪律：单文件 ≤10MiB（对齐手机协议；10-20MiB 带内的图能进内核但跳过
-// 持久化=有意降级，spec §3.1）、会话 ≤256MiB（写入拒绝）、全局 ≤1GiB
-// （agent 启动 sweep 按会话最旧驱逐整目录）。recall/truncateBefore 的孤儿
-// 文件不做即时删除，统一由全局 sweep 收敛。
+// 配额纪律：单文件 ≤20MiB（2026-11-28 起与下载腿对齐；spec §3.1 的
+// 「10-20MiB 带内跳过持久化」有意降级已收口。已知分叉：模型回喂腿仍受
+// claudeImageRawMaxBytes(7.5MiB)/claudeImageBase64MaxBytes(10MiB) 双闸
+// （agent_ai_claude_image.go）——7.5-20MiB 带内的图可展示但 resume 进
+// 模型上下文必拒，属展示/回喂两腿帽位系统性分叉（评审 nit 挂账，待
+// 回喂降级或帽位统一另批处理）、会话 ≤256MiB（写入拒绝）、
+// 全局 ≤1GiB（agent 启动 sweep 按会话最旧驱逐整目录）。recall/truncateBefore
+// 的孤儿文件不做即时删除，统一由全局 sweep 收敛。
 //
 // 与 TUI 缓存（agentAIAttachmentCacheDir，.aliang/attachments，临时性）的
 // 区别：本目录按会话键持久组织、journal 引用它、生命周期=会话历史本身。
@@ -28,8 +32,12 @@ import (
 )
 
 const (
-	agentAttachmentCacheDirName    = "aliang-attachments"
-	agentAttachmentFileMaxBytes    = 10 << 20
+	agentAttachmentCacheDirName = "aliang-attachments"
+	// 单文件帽与下载腿 attachmentDownloadMaxBytes（20MiB）对齐：旧 10MiB
+	// 帽把下载带内（10-20MiB）的图静默跳过（journal 无引用=网页/手机永不
+	// 显示），2026-11-28 收口消灭该带内降级。上传端点（经别名）与前端
+	// 预检同步放宽到带内；网页 UI 预检 10MiB 保持不变，仅影响 API 直传。
+	agentAttachmentFileMaxBytes    = 20 << 20
 	agentAttachmentSessionMaxBytes = 256 << 20
 	agentAttachmentGlobalMaxBytes  = 1 << 30
 )

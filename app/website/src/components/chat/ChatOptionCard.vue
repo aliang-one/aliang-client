@@ -33,6 +33,11 @@
         v-if="card.status === 'sending'"
         class="rounded-full bg-sky-100 px-2 py-0.5 text-[11px] font-medium text-sky-700 dark:bg-sky-900/60 dark:text-sky-200"
       >{{ t('chat_approvalResponding') }}</span>
+      <span
+        v-if="isExpired"
+        data-testid="chat-option-expired"
+        class="rounded-full bg-slate-200 px-2 py-0.5 text-[11px] font-medium text-slate-500 dark:bg-slate-700 dark:text-slate-300"
+      >{{ t('chat_optionExpired') }}</span>
     </div>
     <p
       v-if="card.sourceId"
@@ -52,7 +57,7 @@
           :class="isSelected(opt.id)
             ? 'border-primary bg-primary/10'
             : 'border-slate-200 bg-white hover:border-primary/50 dark:border-slate-700 dark:bg-slate-900'"
-          :disabled="card.status === 'sending'"
+          :disabled="card.status === 'sending' || isExpired"
           @click="toggle(opt.id)"
         >
           <span class="material-symbols-outlined mt-0.5 shrink-0 text-[16px] leading-none text-primary">
@@ -90,7 +95,7 @@
         v-model="localCustom"
         rows="2"
         :placeholder="t('chat_optionCustom')"
-        :disabled="card.status === 'sending'"
+        :disabled="card.status === 'sending' || isExpired"
         class="min-h-[40px] w-full resize-none rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 outline-none placeholder:text-slate-400 focus:border-primary dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500 md:min-h-0"
       ></textarea>
     </div>
@@ -120,10 +125,7 @@ import { useI18n } from '../../i18n';
 // （ChatApprovalCard）是兄弟不是改造：本地选中 ref 只承载高亮，提交发射
 // emit('respond', {selected, customText})，由上层 useAliangChat.respondOption
 // 发帧并在成功后置 card.status='answered'（终态渲染由状态驱动）。
-const props = defineProps({
-  card: { type: Object, required: true },
-});
-
+// props（card + nowTick）声明在过期置灰 computed 前（下方 F6 注释处）。
 const emit = defineEmits(['respond']);
 
 const { t } = useI18n();
@@ -150,8 +152,23 @@ function toggle(id) {
 // 无选中禁用提交（自定义文本只是选择的补充，不单独解锁——与 e2e/组件测
 // 试钉死的禁用语义一致）。sending 期一并锁死（respondOption 置位在先，这里
 // 双保险防重复发包）。
+// 过期置灰（2026-11-28 三审 F6）：expiresAt 此前只存不用——后端 SLA 定时
+// cancel 帧是清卡权威，但漏帧窗口内过期卡仍可提交，迟答被前端乐观置
+// answered 而服务端静默丢弃（UI/模型分叉）。过期锁死作答面+标「已过期」；
+// nowTick（上层 30s）驱动重算；无 expiresAt（ai.option 方案卡）永不过期。
+const props = defineProps({
+  card: { type: Object, required: true },
+  nowTick: { type: Number, default: 0 },
+});
+
+const isExpired = computed(() => {
+  const exp = Number(props.card.expiresAt) || 0;
+  if (exp <= 0) return false;
+  return (props.nowTick || Date.now()) > exp;
+});
+
 const canSubmit = computed(() =>
-  props.card.status === 'pending' && localSelected.value.length > 0
+  props.card.status === 'pending' && !isExpired.value && localSelected.value.length > 0
 );
 
 function submit() {
