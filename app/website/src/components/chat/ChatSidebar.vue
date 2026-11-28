@@ -74,6 +74,12 @@
                 class="inline-block h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-primary"
                 :title="t('chat_statusRunning')"
               ></span>
+              <span
+                v-else-if="conversationBackground(c)"
+                data-testid="device-session-background-dot"
+                class="inline-block h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-amber-500"
+                :title="t('chat_statusBackground')"
+              ></span>
               <button
                 v-if="canRenameConversation(c)"
                 type="button"
@@ -178,5 +184,13 @@ function conversationRunning(c) {
     if (msgs[i].role === 'assistant') return msgs[i].status === 'running';
   }
   return false;
+}
+
+// background 状态点(2026-11-28「后台中」批):设备壳清单/快照 status=
+// background(主回合收口但 subagent lane 仍在干活)。琥珀点与 running 绿点
+// 区分——细粒度产品拍板:后台干活不冒充「对话中」,也不误报空闲。本地草稿
+// 无此态(后台 lane 是设备侧概念),只看 c.background。
+function conversationBackground(c) {
+  return Boolean(c && c.background);
 }
 </script>

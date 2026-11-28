@@ -71,7 +71,7 @@
             <li
               v-for="s in group.sessions"
               :key="s.id"
-              v-memo="[s.id, s.updated_at, s.message_count, s.__running, expandedId === s.id]"
+              v-memo="[s.id, s.updated_at, s.message_count, s.__running, s.__background, expandedId === s.id]"
             >
               <button
                 type="button"
@@ -98,6 +98,13 @@
                 >
                   <span class="h-1 w-1 rounded-full bg-emerald-500 motion-safe:animate-pulse"></span>
                   {{ t('agent_activity_running') }}
+                </span>
+                <span
+                  v-else-if="s.__background"
+                  class="inline-flex shrink-0 items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[9px] font-bold text-amber-700 dark:bg-amber-500/15 dark:text-amber-300"
+                >
+                  <span class="h-1 w-1 rounded-full bg-amber-500 motion-safe:animate-pulse"></span>
+                  {{ t('agent_activity_background') }}
                 </span>
                 <span
                   class="material-symbols-outlined shrink-0 text-base text-slate-400 transition-transform duration-200 motion-reduce:transition-none"
@@ -264,15 +271,20 @@ export default {
         ...this.scopedSessions.map((session) => ({
           ...session,
           __running: this.runningIds.has(session.id),
+          // background(2026-11-28「后台中」批):claude 会话主回合收口但
+          // subagent lane 仍在干活——琥珀徽标。审计面是网页侧唯一呈现
+          // claude/codex 全量清单的地方(聊天侧栏按 2026-10-30 拍板只认
+          // agentcore,评审 F1:background 发射端与侧栏 provider 不相交)。
+          __background: session.status === 'background',
         })),
       ];
     },
-    // 单一列表：运行中会话置顶，其余按 updated_at 原序
+    // 单一列表:运行中/后台中会话置顶,其余按 updated_at 原序
     mergedSessions() {
       const running = [];
       const rest = [];
       for (const session of this.decoratedSessions) {
-        (session.__running ? running : rest).push(session);
+        (session.__running || session.__background ? running : rest).push(session);
       }
       return [...running, ...rest];
     },

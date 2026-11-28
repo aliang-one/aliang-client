@@ -323,6 +323,20 @@ func (d *agentHelloDeltaState) commit(plan *agentHelloFramePlan, fullPayload map
 	d.lastSessionsCount = len(d.sessionHashes)
 }
 
+// registeredServerSessionCount 从 agent.registered 回包读「服务端会话总量」。
+// rank3(2026-11-28):优先 server_session_count(真实总量);缺失(老服务端)
+// 回落 vibe_session_count——其语义是本帧变更条数,delta/heartbeat 帧恒 0,
+// 拿它当总量对账曾造成强制全量永动,仅作兼容回退。
+func registeredServerSessionCount(msg map[string]interface{}) (int, bool) {
+	if v, ok := msg["server_session_count"].(float64); ok {
+		return int(v), true
+	}
+	if v, ok := msg["vibe_session_count"].(float64); ok {
+		return int(v), true
+	}
+	return 0, false
+}
+
 // forceFull 由外部信号(registered 对账等)要求下一帧回全量。
 func (d *agentHelloDeltaState) forceFull(reason string) {
 	d.mu.Lock()
@@ -332,9 +346,14 @@ func (d *agentHelloDeltaState) forceFull(reason string) {
 	}
 }
 
-// reconcileRegisteredServerSessions 用 agent.registered 回包里服务端的当前会话数
-// 做轻对账:服务端归零而基线非零 = 内存态丢失信号,升格下帧 full。数目相近的
-// 偏差是服务端过滤语义(mcp/去重),不触发。
+// reconcileRegisteredServerSessions 用 agent.registered 回包里服务端的当前
+// 会话总量做轻对账:服务端归零而基线非零 = 内存态丢失信号,升格下帧 full。
+// 数目相近的偏差是服务端过滤语义(mcp/去重),不触发。
+// 字段语义(2026-11-28 rank3 修复):对账源=server_session_count(真实总量);
+// 旧字段 vibe_session_count 是「本帧变更条数」而非总量,delta/heartbeat 帧恒
+// 为 0——旧实现拿它当总量,每个 delta/heartbeat 后必误判归零,强制全量与
+// delta 严格 60s 交替(线上 754 帧实测 52% 全量永动,~162MB/天/设备)。
+// 仅在新字段缺席时(老服务端)回落旧字段,行为与旧版一致。
 func (d *agentHelloDeltaState) reconcileRegisteredServerSessions(serverSessions int) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
