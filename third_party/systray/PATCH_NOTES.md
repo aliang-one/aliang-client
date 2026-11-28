@@ -23,7 +23,7 @@ Apache-2.0(LICENSE 原样保留)。本目录的 go.mod 保持上游 module path 
 除本节所列外,其余文件逐字节 = 上游 v1.2.2。所有补丁处均有 `本仓补丁`
 注释锚点(升级时 grep 此词重放补丁)。
 
-### systray.go(1 处,2026-11-26)
+### systray.go(1 处,2026-11-26;2026-11-28 原子化)
 
 1. `panelClickFn` + `SetPanelClickHook(fn func())`:面板模式点击回调。设置后
    后端把托盘图标的左/右键点击交给回调(每次点击起新 goroutine
@@ -32,6 +32,13 @@ Apache-2.0(LICENSE 原样保留)。本目录的 go.mod 保持上游 module path 
    面板胶水小节)。回调契约已写进注释:应快速返回(否则 goroutine 按连点
    次数无上限堆积)、可能并发执行(串行化归接线层)、panic 会终止整个进程
    (无 recover 的 goroutine)。
+   **2026-11-28 原子化**(M2 评审升级必修):`panelClickFn` 从裸 `func()` 改为
+   `atomic.Value` 存 `*panelClickBox`,两平台读点统一经
+   `loadPanelClickHook()`——M2 的兜底/恢复路径(`enterPanelFallback` /
+   `restorePanelMode`)在**运行期**写此变量,而读侧在 Windows 消息循环
+   goroutine / macOS AppKit 主线程,裸 var 是数据竞争(`-race` 真实路径必报,
+   单测用替身绕过才没红)。用 `atomic.Value` 而非泛型 `atomic.Pointer[T]`:
+   本 module 声明 `go 1.13`,不为单处改动抬语言版本。
 
 ### systray_windows.go(12 处;条目 1~3=2026-11-20 GDI 修复,条目 4~8=2026-11-26 面板胶水——下文条目号指本清单编号,「12 处」与「锚点 4~12」指注释锚点计数:GDI 占 3、面板胶水占 9)
 

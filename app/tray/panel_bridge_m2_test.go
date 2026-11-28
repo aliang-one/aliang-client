@@ -105,7 +105,8 @@ func TestPanelM2SpawnOptsAssembly(t *testing.T) {
 		panelAnchorSampler = func() panelAnchorSample {
 			return m2Sample(900, 1400, 22, 22, 2560, 1600, true)
 		}
-		a := &CompanionApp{httpURL: "http://127.0.0.1:56789"}
+		a := &CompanionApp{}
+		a.setHTTPURL("http://127.0.0.1:56789")
 		opts := a.panelSpawnOpts()
 		if opts.URL != "http://127.0.0.1:56789/panel.html" {
 			t.Fatalf("URL = %q, want 运行时真实端口的 /panel.html", opts.URL)
@@ -128,7 +129,8 @@ func TestPanelM2SpawnOptsAssembly(t *testing.T) {
 		panelAnchorSampler = func() panelAnchorSample {
 			return m2Sample(0, -33, 22, 22, 2560, 1600, true) // Task 4 探针实测占位形态
 		}
-		a := &CompanionApp{httpURL: "http://127.0.0.1:56789"}
+		a := &CompanionApp{}
+		a.setHTTPURL("http://127.0.0.1:56789")
 		opts := a.panelSpawnOpts()
 		if opts.AnchorX != 500-11 || opts.AnchorY != 1400-11 || opts.IconW != 22 || opts.IconH != 22 {
 			t.Fatalf("占位矩形未走光标兜底:%+v", opts)
@@ -139,7 +141,8 @@ func TestPanelM2SpawnOptsAssembly(t *testing.T) {
 		s := m2Sample(0, -33, 22, 22, 0, 0, true)
 		s.HasCursor = false // macOS 形态
 		panelAnchorSampler = func() panelAnchorSample { return s }
-		a := &CompanionApp{httpURL: "http://127.0.0.1:56789"}
+		a := &CompanionApp{}
+		a.setHTTPURL("http://127.0.0.1:56789")
 		opts := a.panelSpawnOpts()
 		if opts.AnchorX != 0 || opts.AnchorY != panelMenuBarNeutralY {
 			t.Fatalf("无光标判废未走中性顶部锚:%+v", opts)
@@ -153,7 +156,8 @@ func TestPanelM2SpawnOptsAssembly(t *testing.T) {
 		panelAnchorSampler = func() panelAnchorSample {
 			return m2Sample(0, 0, 0, 0, 2560, 1600, false) // ok=false(托盘未初始化)
 		}
-		a := &CompanionApp{httpURL: "http://127.0.0.1:56789"}
+		a := &CompanionApp{}
+		a.setHTTPURL("http://127.0.0.1:56789")
 		opts := a.panelSpawnOpts()
 		if opts.AnchorX != 500-11 || opts.AnchorY != 1400-11 {
 			t.Fatalf("ok=false 未走光标兜底:%+v", opts)
@@ -230,7 +234,8 @@ func TestPanelM2LauncherWiring(t *testing.T) {
 	modeCalls := make([]bool, 0, 1)
 	panelModeSetter = func(on bool) { modeCalls = append(modeCalls, on) }
 
-	a := &CompanionApp{httpURL: "http://127.0.0.1:56789"}
+	a := &CompanionApp{}
+	a.setHTTPURL("http://127.0.0.1:56789")
 	a.installPanelLauncher()
 
 	if registered == nil {
@@ -286,7 +291,8 @@ func TestPanelM2FallbackToggle(t *testing.T) {
 	visorCalls := make([]bool, 0, 4)
 	panelOpenItemVisor = func(_ *systray.MenuItem, show bool) { visorCalls = append(visorCalls, show) }
 
-	a := &CompanionApp{httpURL: "http://127.0.0.1:56789"}
+	a := &CompanionApp{}
+	a.setHTTPURL("http://127.0.0.1:56789")
 	// mPanelOpen 以零值 MenuItem 代真:显隐走 stub 替身,不触碰 AppKit/wndProc。
 	a.mPanelOpen = &systray.MenuItem{}
 	a.installPanelLauncher()
@@ -356,7 +362,8 @@ func TestPanelM2QuitGateWiring(t *testing.T) {
 	panelClickRegister = func(fn func()) { registered = fn }
 	panelModeSetter = func(bool) {}
 
-	a := &CompanionApp{httpURL: "http://127.0.0.1:56789"}
+	a := &CompanionApp{}
+	a.setHTTPURL("http://127.0.0.1:56789")
 	a.installPanelLauncher()
 	registered() // 开面板
 
@@ -413,7 +420,8 @@ func TestPanelM2ForwardExitChain(t *testing.T) {
 	panelClickRegister = func(fn func()) { registered = fn }
 	panelModeSetter = func(bool) {}
 
-	a := &CompanionApp{httpURL: "http://127.0.0.1:56789"}
+	a := &CompanionApp{}
+	a.setHTTPURL("http://127.0.0.1:56789")
 	a.installPanelLauncher()
 	// 重拉调度截获走通知通道:到达方是转投 goroutine,主 goroutine 不得
 	// 无同步直读计数切片(-race 面),通道通知 + 超时等待替代。

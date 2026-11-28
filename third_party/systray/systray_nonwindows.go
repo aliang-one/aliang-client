@@ -107,7 +107,7 @@ func systray_menu_item_selected(cID C.int) {
 //
 //export systray_tray_clicked
 func systray_tray_clicked() {
-	if panelClickFn != nil {
-		go panelClickFn()
+	if fn := loadPanelClickHook(); fn != nil {
+		go fn()
 	}
 }

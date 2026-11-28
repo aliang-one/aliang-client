@@ -32,7 +32,8 @@ func TestDashboardReviveGate_AllowThenCooldown(t *testing.T) {
 func TestMaybeReviveDashboard_Guards(t *testing.T) {
 	// 守卫路径(http_enabled 缺席/为 true)在触碰 ipcClient 之前返回——
 	// 用零值 ipcClient 断言不 panic、不标记 gate。
-	a := &CompanionApp{httpURL: "http://127.0.0.1:56431"}
+	a := &CompanionApp{}
+	a.setHTTPURL("http://127.0.0.1:56431")
 	now := time.Now()
 
 	a.maybeReviveDashboard(map[string]interface{}{"is_running": true}, now)

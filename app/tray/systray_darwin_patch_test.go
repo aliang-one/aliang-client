@@ -223,15 +223,20 @@ func TestVendoredSystrayDarwinPanelPatch(t *testing.T) {
 		}
 
 		// Go 侧出口与 Windows 侧 wndProc 点击分支对齐:非阻塞丢 goroutine,
-		// 绝不在 AppKit 主线程做耗时工作;hook 为 nil 则忽略。
+		// 绝不在 AppKit 主线程做耗时工作;hook 为 nil 则忽略。2026-11-28
+		// 原子化:读侧须经 loadPanelClickHook(AppKit 主线程 cgo 进来读,
+		// M2 运行期写,裸读是数据竞争)。
 		body := goFuncBody(t, nonwindowsSrc, "systray_tray_clicked")
 		for _, want := range []string{
-			"if panelClickFn != nil {",
-			"go panelClickFn()",
+			"if fn := loadPanelClickHook(); fn != nil {",
+			"go fn()",
 		} {
 			if !strings.Contains(body, want) {
 				t.Errorf("systray_tray_clicked 实现缺少 %q(必须与 Windows 侧同款:非阻塞起 goroutine):\n%s", want, body)
 			}
+		}
+		if strings.Contains(body, "panelClickFn") {
+			t.Errorf("systray_tray_clicked 直接引用 panelClickFn(须经 loadPanelClickHook 读——AppKit 主线程 cgo 进来读,M2 运行期写):\n%s", body)
 		}
 		assertAnchorAbove(t, nonwindowsSrc, "//export systray_tray_clicked", 8)
 	})

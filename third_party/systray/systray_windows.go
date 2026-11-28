@@ -304,8 +304,8 @@ func (t *winTray) wndProc(hWnd windows.Handle, message uint32, wParam, lParam ui
 		case WM_RBUTTONUP, WM_LBUTTONUP:
 			// 本仓补丁:面板模式下左右键点击都交给面板回调(异步),不再弹
 			// 原生菜单;回调未设置(nil)保持上游行为 = 弹原生菜单兜底。
-			if panelClickFn != nil {
-				go panelClickFn()
+			if fn := loadPanelClickHook(); fn != nil {
+				go fn()
 			} else {
 				t.showMenu()
 			}

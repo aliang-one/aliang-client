@@ -46,7 +46,7 @@ func TestPanelBridgeURLAssembly(t *testing.T) {
 		if got := a.panelBaseURL(); !strings.HasPrefix(got, "http://127.0.0.1:") {
 			t.Fatalf("panelBaseURL() 空基址未回退默认管理地址: %q", got)
 		}
-		a.httpURL = "http://127.0.0.1:56789"
+		a.setHTTPURL("http://127.0.0.1:56789")
 		if got := a.panelBaseURL(); got != "http://127.0.0.1:56789" {
 			t.Fatalf("panelBaseURL() = %q, want 运行时真实地址 http://127.0.0.1:56789", got)
 		}
@@ -70,7 +70,8 @@ func TestPanelBridgeClickOpensRuntimePortURL(t *testing.T) {
 	modeCalls := make([]bool, 0, 1)
 	panelModeSetter = func(on bool) { modeCalls = append(modeCalls, on) }
 
-	a := &CompanionApp{httpURL: "http://127.0.0.1:56789"}
+	a := &CompanionApp{}
+	a.setHTTPURL("http://127.0.0.1:56789")
 	a.installPanelBridge()
 
 	if registered == nil {
@@ -121,7 +122,8 @@ func TestPanelBridgeOpenFailureFallsBackToDesktopNotify(t *testing.T) {
 	panelNotifier = func(title, message string) { notified = title + "|" + message }
 	panelModeSetter = func(bool) {}
 
-	a := &CompanionApp{httpURL: "http://127.0.0.1:56789"}
+	a := &CompanionApp{}
+	a.setHTTPURL("http://127.0.0.1:56789")
 	hook := a.panelClickCallback()
 	hook() // 不得 panic
 
@@ -140,7 +142,8 @@ func TestPanelBridgeCallbackRecoversPanic(t *testing.T) {
 	panelNotifier = func(string, string) {}
 	panelModeSetter = func(bool) {}
 
-	a := &CompanionApp{httpURL: "http://127.0.0.1:56789"}
+	a := &CompanionApp{}
+	a.setHTTPURL("http://127.0.0.1:56789")
 	hook := a.panelClickCallback()
 
 	defer func() {

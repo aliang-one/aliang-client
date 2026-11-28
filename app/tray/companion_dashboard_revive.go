@@ -53,5 +53,5 @@ func (a *CompanionApp) maybeReviveDashboard(status map[string]interface{}, now t
 		return
 	}
 	a.applyDashboardStartResponse(resp)
-	logger.Info(fmt.Sprintf("Dashboard revived via start_http at %s", a.httpURL))
+	logger.Info(fmt.Sprintf("Dashboard revived via start_http at %s", a.getHTTPURL()))
 }

@@ -53,11 +53,30 @@ const panelDefaultBaseURL = "http://" + config.DefaultManagementAddr
 // panelBaseURL 返回面板基址:companion 的 httpURL 由 start_http 响应刷新
 // (applyDashboardStartResponse;端口被占时 core 回退随机口),必须用运行时
 // 真实值而非写死默认口。空值仅是防御(两平台 NewCompanionApp 都有初值)。
+//
+// httpURL 并发面(2026-11-28 评审修):写侧 applyDashboardStartResponse 在
+// connectAndStartHTTP/补发 goroutine 运行期写;读侧除本函数(M2 launcher 每
+// 次 spawn 经 panelSpawnOpts 调)、openDashboard(companion.go:512 /
+// companion_windows.go:478)、dashboard_revive 日志外,还有 openDashboard
+// 自身。裸 string 字段是数据竞争——改 atomic.Value 存 string,读写一律经
+// 下面两个 accessor,禁止直接访问字段。
 func (a *CompanionApp) panelBaseURL() string {
-	if a.httpURL != "" {
-		return a.httpURL
+	if u := a.getHTTPURL(); u != "" {
+		return u
 	}
 	return panelDefaultBaseURL
+}
+
+// getHTTPURL 读仪表盘基址(atomic;零值/未设返回空串)。
+func (a *CompanionApp) getHTTPURL() string {
+	u, _ := a.httpURL.Load().(string)
+	return u
+}
+
+// setHTTPURL 写仪表盘基址(atomic;start_http 响应刷新与 NewCompanionApp
+// 初值都走这里)。
+func (a *CompanionApp) setHTTPURL(u string) {
+	a.httpURL.Store(u)
 }
 
 // panelURL 拼接面板页地址(/panel.html 由 core 仪表盘伺服,回环免 cookie)。

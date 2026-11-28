@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -43,7 +44,10 @@ type CompanionApp struct {
 	panelLauncher *PanelLauncher
 
 	ipcClient *ipc.Client
-	httpURL   string
+	// httpURL 仪表盘基址(由 start_http 响应刷新,补发路径运行期写;托盘
+	// 菜单/面板 spawn 等多 goroutine 读)——atomic.Value 存 string,读写一律经
+	// getHTTPURL/setHTTPURL(panel_bridge.go,2026-11-28 评审修)。
+	httpURL   atomic.Value
 	isRunning bool
 	// autostart 标记本次 companion 由登录自启拉起(MSI HKCU Run 键传
 	// --autostart,2026-11-27 P0)。与手动双击的行为差异只有两点:不自动
@@ -64,9 +68,9 @@ type CompanionApp struct {
 func NewCompanionApp() *CompanionApp {
 	a := &CompanionApp{
 		ipcClient: ipc.NewClient(),
-		httpURL:   panelDefaultBaseURL, // 基址字面拷贝三处归一,见 panel_bridge.go
 		done:      make(chan struct{}),
 	}
+	a.setHTTPURL(panelDefaultBaseURL) // 基址字面拷贝三处归一,见 panel_bridge.go
 	// M2 面板 launcher 在这里(而非 onReady)装配:字段写在任何菜单/转投
 	// goroutine 启动之前,handlePanelOpenClick/forwardPanelExit 的读天然
 	// happens-before,无 race 面(见 panel_bridge_m2.go newPanelLauncher)。
@@ -186,9 +190,9 @@ func (a *CompanionApp) connectAndStartHTTP() {
 
 	if data, ok := resp.Data.(map[string]interface{}); ok {
 		if port, ok := data["port"].(string); ok && port != "" {
-			a.httpURL = "http://127.0.0.1:" + port
+			a.setHTTPURL("http://127.0.0.1:" + port)
 		} else if portNum, ok := data["port"].(float64); ok {
-			a.httpURL = fmt.Sprintf("http://127.0.0.1:%d", int(portNum))
+			a.setHTTPURL(fmt.Sprintf("http://127.0.0.1:%d", int(portNum)))
 		}
 	}
 
@@ -475,7 +479,7 @@ func (a *CompanionApp) applyUnavailableState(reason string) {
 }
 
 func (a *CompanionApp) openDashboard() {
-	cmd := newBackgroundCommand("rundll32", "url.dll,FileProtocolHandler", a.httpURL)
+	cmd := newBackgroundCommand("rundll32", "url.dll,FileProtocolHandler", a.getHTTPURL())
 	if err := cmd.Start(); err != nil {
 		logger.Error("Failed to open dashboard from Windows companion", "error", err)
 	}

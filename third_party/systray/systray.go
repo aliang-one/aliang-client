@@ -111,12 +111,39 @@ func Quit() {
 	quitOnce.Do(quit)
 }
 
+// ⚠️ 跨 goroutine 读写(M2 起为必修,2026-11-28 评审升级):写侧是 Go 侧
+// SetPanelClickHook(onReady goroutine 装配,M2 兜底/恢复路径
+// enterPanelFallback/restorePanelMode 在【运行期】再次写);读侧是 Windows
+// wndProc(systray_windows.go 的消息循环 goroutine)与 macOS
+// systray_tray_clicked(AppKit 主线程经 cgo 进来)。裸 var 是数据竞争
+// (-race 在真实路径必报;单测用替身绕过了这条链才没红)。
+//
 // 本仓补丁:面板模式点击回调。设置后,后端把托盘图标的左/右键点击都交给
 // 回调(每次点击起新 goroutine 异步执行),不再弹原生菜单;nil(默认)保持
 // 上游行为 = 点击弹原生菜单(原生菜单兜底模式)。读取此回调的是 Windows 的
 // wndProc 与 macOS 的 systray_tray_clicked(2026-11-26 面板胶水接入 darwin)。
 // 应在 Run/Register 之前设置;运行期切换的时序责任由面板接线层自担。
-var panelClickFn func()
+// 存取一律经 loadPanelClickHook,禁止直接读字段。用 atomic.Value 而非泛型
+// atomic.Pointer[T]:本 module 声明 go 1.13,不为单处改动抬语言版本;
+// atomic.Value 不接受 nil Store,经 panelClickBox 包一层统一类型。
+var panelClickFn atomic.Value // 存 *panelClickBox;零值=未进面板模式
+
+// panelClickHook 具名函数类型(box 字段类型;与裸 func() 等价,具名只为
+// 可读)。
+type panelClickHook func()
+
+// panelClickBox 回调盒:fn 为 nil 表示「摘回调」(SetPanelClickHook(nil)),
+// 与「从未设置」(零值 atomic.Value)在 load 侧同为 nil 语义。
+type panelClickBox struct{ fn panelClickHook }
+
+// loadPanelClickHook 读侧唯一入口(两平台读点都走这里);nil=未进面板模式。
+func loadPanelClickHook() panelClickHook {
+	box, _ := panelClickFn.Load().(*panelClickBox)
+	if box == nil {
+		return nil
+	}
+	return box.fn
+}
 
 // SetPanelClickHook 注册托盘图标点击回调(面板模式)。
 // fn 为 nil 时恢复原生菜单兜底模式。
@@ -125,7 +152,7 @@ var panelClickFn func()
 // 串行化由接线层负责;回调 panic 发生在无 recover 的 goroutine 上,
 // 会终止整个进程。
 func SetPanelClickHook(fn func()) {
-	panelClickFn = fn
+	panelClickFn.Store(&panelClickBox{fn: fn})
 }
 
 // AddMenuItem adds a menu item with the designated title and tooltip.

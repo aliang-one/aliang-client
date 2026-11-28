@@ -34,16 +34,25 @@ func TestSystrayWindowsPanelPatch(t *testing.T) {
 	winSrc := vendoredSystrayWindowsSource(t)
 
 	t.Run("公共层点击回调hook", func(t *testing.T) {
+		// 2026-11-28 原子化:panelClickFn 从裸 func() 改 atomic.Value 存
+		// *panelClickBox(M2 兜底/恢复路径运行期写、wndProc/AppKit 主线程读,
+		// 裸 var 是数据竞争)。锚定新形态 + 反向锚裸 var 不得回归。
 		for _, want := range []string{
-			"var panelClickFn func()",
+			"var panelClickFn atomic.Value",
 			"func SetPanelClickHook(fn func()) {",
-			"panelClickFn = fn",
+			"panelClickFn.Store(&panelClickBox{fn: fn})",
+			"func loadPanelClickHook() panelClickHook {",
 		} {
 			if !strings.Contains(publicSrc, want) {
 				t.Errorf("systray.go 缺少 %q", want)
 			}
 		}
-		assertAnchorAbove(t, publicSrc, "var panelClickFn func()", 6)
+		if strings.Contains(publicSrc, "var panelClickFn func()") {
+			t.Error("systray.go 的 panelClickFn 退回裸 func()(数据竞争回归——M2 运行期写/跨 goroutine 读,必须 atomic)")
+		}
+		// 补丁说明较长(跨 goroutine 读写理由 + atomic.Value 选型),锚点窗
+		// 放宽到 10 行;「本仓补丁」仍在 var 声明的同一注释块内。
+		assertAnchorAbove(t, publicSrc, "var panelClickFn atomic.Value", 10)
 	})
 
 	t.Run("wndProc左右键分支", func(t *testing.T) {
@@ -62,8 +71,8 @@ func TestSystrayWindowsPanelPatch(t *testing.T) {
 
 		for _, want := range []string{
 			"case WM_RBUTTONUP, WM_LBUTTONUP:",
-			"if panelClickFn != nil {",
-			"go panelClickFn()",
+			"if fn := loadPanelClickHook(); fn != nil {",
+			"go fn()",
 			"} else {",
 			"t.showMenu()",
 		} {
@@ -71,12 +80,16 @@ func TestSystrayWindowsPanelPatch(t *testing.T) {
 				t.Errorf("wndProc 的 lParam 分支缺少 %q", want)
 			}
 		}
+		// 反向锚:wndProc 不得直接读 panelClickFn(绕过 atomic 读侧入口)。
+		if strings.Contains(seg, "panelClickFn") {
+			t.Errorf("wndProc 点击分支直接引用 panelClickFn(须经 loadPanelClickHook 读):\n%s", seg)
+		}
 		// 顺序钉住 if/else 语义:hook 已设置走点击回调(不再 showMenu),
 		// 未设置才落回原生菜单兜底。
-		const anchor = "if panelClickFn != nil {"
+		const anchor = "if fn := loadPanelClickHook(); fn != nil {"
 		if start := strings.Index(seg, anchor); start >= 0 {
 			tail := seg[start:]
-			order := []string{anchor, "go panelClickFn()", "} else {", "t.showMenu()"}
+			order := []string{anchor, "go fn()", "} else {", "t.showMenu()"}
 			pos := 0
 			for _, want := range order {
 				at := strings.Index(tail[pos:], want)

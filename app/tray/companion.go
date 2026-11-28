@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"aliang.one/nursorgate/app/agentruntime"
@@ -44,8 +45,13 @@ type CompanionApp struct {
 	// panelLauncher M2 面板 launcher(installPanelLauncher 装配,nil=未装配)。
 	panelLauncher *PanelLauncher
 
-	ipcClient    *ipc.Client
-	httpURL      string
+	ipcClient *ipc.Client
+	// httpURL 仪表盘基址(由 start_http 响应刷新,补发路径运行期写;托盘
+	// 菜单/面板 spawn 等多 goroutine 读)——atomic.Value 存 string,读写一律经
+	// getHTTPURL/setHTTPURL(panel_bridge.go,2026-11-28 评审修:M2 的
+	// panelSpawnOpts 每次 spawn 都读它,与 applyDashboardStartResponse 的运行期
+	// 写构成数据竞争)。
+	httpURL      atomic.Value
 	isRunning    bool
 	coreReady    bool
 	reconnectSeq int
@@ -63,9 +69,9 @@ type CompanionApp struct {
 func NewCompanionApp() *CompanionApp {
 	a := &CompanionApp{
 		ipcClient: ipc.NewClient(),
-		httpURL:   companionHTTPURL,
 		done:      make(chan struct{}),
 	}
+	a.setHTTPURL(companionHTTPURL)
 	// M2 面板 launcher 在这里(而非 onReady)装配:字段写在任何菜单/转投
 	// goroutine 启动之前,handlePanelOpenClick/forwardPanelExit 的读天然
 	// happens-before,无 race 面(见 panel_bridge_m2.go newPanelLauncher)。
@@ -187,7 +193,7 @@ func (a *CompanionApp) connectAndStartHTTP() {
 	a.applyDashboardStartResponse(resp)
 
 	a.coreReady = true
-	logger.Debug(fmt.Sprintf("Core connected, HTTP dashboard available at %s", a.httpURL))
+	logger.Debug(fmt.Sprintf("Core connected, HTTP dashboard available at %s", a.getHTTPURL()))
 
 	if err := agentruntime.EnsureStarted(); err != nil {
 		logger.Warn(fmt.Sprintf("Failed to start user agent runtime from tray companion: %v", err))
@@ -201,9 +207,9 @@ func (a *CompanionApp) connectAndStartHTTP() {
 func (a *CompanionApp) applyDashboardStartResponse(resp *ipc.Response) {
 	if data, ok := resp.Data.(map[string]interface{}); ok {
 		if port, ok := data["port"].(string); ok && port != "" {
-			a.httpURL = "http://127.0.0.1:" + port
+			a.setHTTPURL("http://127.0.0.1:" + port)
 		} else if portNum, ok := data["port"].(float64); ok {
-			a.httpURL = fmt.Sprintf("http://127.0.0.1:%d", int(portNum))
+			a.setHTTPURL(fmt.Sprintf("http://127.0.0.1:%d", int(portNum)))
 		}
 	}
 }
@@ -509,7 +515,7 @@ func (a *CompanionApp) applyUnavailableState(reason string) {
 }
 
 func (a *CompanionApp) openDashboard() {
-	dashboardURL := a.httpURL
+	dashboardURL := a.getHTTPURL()
 	if dashboardURL == "" {
 		dashboardURL = companionHTTPURL
 	}
