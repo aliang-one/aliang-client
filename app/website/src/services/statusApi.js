@@ -1,5 +1,6 @@
 import { syncUnauthenticatedAuthState } from '../stores/auth';
 import { handleAuthenticationFailure } from './authFailure';
+import { assistPrefix } from './assistPrefix';
 
 function extractEnvelope(json) {
   const payload = json && typeof json === 'object' ? json : {};
@@ -11,7 +12,7 @@ function extractEnvelope(json) {
 }
 
 async function request(path, options = {}) {
-  const response = await fetch(path, {
+  const response = await fetch(assistPrefix() + path, {
     credentials: 'same-origin',
     headers: {
       'Content-Type': 'application/json',

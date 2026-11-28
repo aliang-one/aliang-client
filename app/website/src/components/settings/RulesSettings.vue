@@ -674,6 +674,7 @@
 import { useI18n } from '../../i18n';
 import { openTutorialDocs } from '../../composables/useTutorialDocs';
 import { showErrorDialog } from '../../composables/useErrorDialog';
+import { assistPrefix } from '../../services/assistPrefix';
 import { getStatusSummary, testSshConnection } from '../../services/statusApi';
 import SshChainCanvas from './SshChainCanvas.vue';
 
@@ -1717,7 +1718,7 @@ export default {
       this.knownHosts.loading = true;
       this.knownHosts.failed = false;
       try {
-        const res = await fetch('/api/proxy/ssh/known-hosts', { credentials: 'same-origin' });
+        const res = await fetch(assistPrefix() + '/api/proxy/ssh/known-hosts', { credentials: 'same-origin' });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const json = await res.json();
         const items = json?.data?.known_hosts;
@@ -1732,7 +1733,7 @@ export default {
     async removeKnownHost(entry) {
       try {
         const query = `?host=${encodeURIComponent(entry.host)}&port=${encodeURIComponent(entry.port)}`;
-        await fetch(`/api/proxy/ssh/known-hosts${query}`, { method: 'DELETE', credentials: 'same-origin' });
+        await fetch(`${assistPrefix()}/api/proxy/ssh/known-hosts${query}`, { method: 'DELETE', credentials: 'same-origin' });
       } catch {
         // 删除失败同样静默：下方刷新会把最新列表（或失败文案）带回来
       }
@@ -1745,7 +1746,7 @@ export default {
         }
       }
       try {
-        await fetch('/api/proxy/ssh/known-hosts', { method: 'DELETE', credentials: 'same-origin' });
+        await fetch(assistPrefix() + '/api/proxy/ssh/known-hosts', { method: 'DELETE', credentials: 'same-origin' });
       } catch {
         // 同上：刷新兜底
       }

@@ -7,7 +7,10 @@
     只读结构性保证(spec §10):xterm 以 disableStdin 构造,且本页**不订阅
     onData、不持有任何 send 通道**——观看者对目标设备零交互通道。数据仅为
     单向镜像:useAssist 单例的 watch WS 收到 terminal.output/terminal.replay
-    字符串分片,逐帧 write 进 xterm。
+    字符串分片,逐帧 write 进 xterm;P2 Task 4 起同一 WS 还会收到页面镜像
+    帧族 assist.rr.event / assist.rr.snapshot / assist.nav(设备侧纯中继),
+    分流进 rrweb Replayer(live 模式)——Replayer 渲染在自带沙箱 iframe 里,
+    观众端只渲染快照副本、不派发任何事件,XSS/双执行面不存在。
   -->
   <div class="fixed inset-0 z-[900] flex flex-col bg-slate-950 text-slate-100" data-testid="assist-watch-page">
     <!-- 顶栏:返回 + 状态指示 + 计时 + 结束(双段确认) -->
@@ -98,36 +101,73 @@
       {{ t(assistEndReasonKey(endReason)) }}
     </div>
 
-    <!-- 主体:xterm 恒挂载(保尺寸/保末屏),等待/无会话以覆盖层盖在上面 -->
-    <div class="relative flex-1 overflow-hidden bg-black">
-      <div ref="hostEl" class="absolute inset-0" data-testid="assist-watch-term-host"></div>
-
-      <!-- 待审批覆盖层:管理员尚未开始,等待模式下 WS 已连但无数据 -->
-      <div
-        v-if="state === 'requested'"
-        class="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-slate-950/95 px-6 text-center"
-        data-testid="assist-watch-waiting"
-      >
-        <span class="inline-block h-3 w-3 animate-pulse rounded-full bg-primary" />
-        <p class="text-sm text-slate-200">{{ t('assist_watch_waiting') }}</p>
-        <p v-if="message" class="max-w-md text-xs text-slate-400">{{ message }}</p>
-      </div>
-
-      <!-- 无进行中的协助(页面以无会话状态被打开):空白 + 返回 -->
-      <div
-        v-if="state === 'idle'"
-        class="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-slate-950 px-6 text-center"
-        data-testid="assist-watch-none"
-      >
-        <p class="text-sm text-slate-300">{{ t('assist_watch_none') }}</p>
+    <!-- 主体:Tab 双视图(P2 Task 4)——[页面] = rrweb Replayer 镜像,
+         [终端] = P1 xterm 现状。两 pane 恒挂载 v-show 显隐:xterm 不因切 Tab
+         重初始化(保尺寸/保末屏),Replayer iframe 同理不被重建。 -->
+    <div class="flex flex-1 flex-col overflow-hidden">
+      <!-- Tab 条:两粒小按钮,样式与顶栏按钮族一致 -->
+      <div class="flex shrink-0 items-center gap-1 border-b border-slate-800 bg-slate-900 px-2 py-1">
         <button
           type="button"
-          class="rounded bg-primary px-4 py-2 text-sm font-bold text-white hover:bg-primary/90"
-          data-testid="assist-watch-none-back"
-          @click="goBack"
+          :class="tabClass('page')"
+          :aria-pressed="activeTab === 'page'"
+          data-testid="assist-watch-tab-page"
+          @click="activeTab = 'page'"
+        >{{ t('assist_watch_tab_page') }}</button>
+        <button
+          type="button"
+          :class="tabClass('terminal')"
+          :aria-pressed="activeTab === 'terminal'"
+          data-testid="assist-watch-tab-terminal"
+          @click="activeTab = 'terminal'"
+        >{{ t('assist_watch_tab_terminal') }}</button>
+      </div>
+
+      <!-- 终端 pane:xterm 恒挂载(保尺寸/保末屏),等待/无会话以覆盖层盖在上面 -->
+      <div v-show="activeTab === 'terminal'" class="relative flex-1 overflow-hidden bg-black" data-testid="assist-watch-pane-terminal">
+        <div ref="hostEl" class="absolute inset-0" data-testid="assist-watch-term-host"></div>
+
+        <!-- 待审批覆盖层:管理员尚未开始,等待模式下 WS 已连但无数据 -->
+        <div
+          v-if="state === 'requested'"
+          class="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-slate-950/95 px-6 text-center"
+          data-testid="assist-watch-waiting"
         >
-          {{ t('assist_watch_back') }}
-        </button>
+          <span class="inline-block h-3 w-3 animate-pulse rounded-full bg-primary" />
+          <p class="text-sm text-slate-200">{{ t('assist_watch_waiting') }}</p>
+          <p v-if="message" class="max-w-md text-xs text-slate-400">{{ message }}</p>
+        </div>
+
+        <!-- 无进行中的协助(页面以无会话状态被打开):空白 + 返回 -->
+        <div
+          v-if="state === 'idle'"
+          class="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-slate-950 px-6 text-center"
+          data-testid="assist-watch-none"
+        >
+          <p class="text-sm text-slate-300">{{ t('assist_watch_none') }}</p>
+          <button
+            type="button"
+            class="rounded bg-primary px-4 py-2 text-sm font-bold text-white hover:bg-primary/90"
+            data-testid="assist-watch-none-back"
+            @click="goBack"
+          >
+            {{ t('assist_watch_back') }}
+          </button>
+        </div>
+      </div>
+
+      <!-- 页面 pane:rrweb Replayer 容器(live 模式);无底座(未收到快照)
+           时以占位盖住——增量帧没有 FullSnapshot 底座渲染不出任何东西 -->
+      <div v-show="activeTab === 'page'" class="relative flex-1 overflow-hidden bg-black" data-testid="assist-watch-pane-page">
+        <div ref="pageHostEl" class="absolute inset-0 overflow-auto" data-testid="assist-watch-page-host"></div>
+        <div
+          v-if="!pageReady"
+          class="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-slate-950/95 px-6 text-center"
+          data-testid="assist-watch-page-syncing"
+        >
+          <span class="inline-block h-3 w-3 animate-pulse rounded-full bg-primary" />
+          <p class="text-sm text-slate-200">{{ t('assist_watch_page_syncing') }}</p>
+        </div>
       </div>
     </div>
   </div>
@@ -138,6 +178,12 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
+// rrweb Replayer(P2 Task 4):观看页把 admin 采集端中继来的 rrweb 事件流
+// 以 live 模式渲染进沙箱 iframe。v2.2.2 的规范入口就是主包 `rrweb`(其
+// export map "." → dist/rrweb.js 同时导出 record 与 Replayer),Replayer 的
+// 沙箱/鼠标轨迹样式在其 dist/style.css,需一并引入。
+import { Replayer } from 'rrweb';
+import 'rrweb/dist/style.css';
 import { useI18n } from '../../i18n';
 import { useNavigation } from '../../composables/useNavigation';
 import { useEscLayer } from '../../composables/useEscStack';
@@ -161,6 +207,7 @@ const {
 } = useAssist();
 
 const hostEl = ref(null);
+const pageHostEl = ref(null);
 const endConfirming = ref(false);
 const elapsedSec = ref(0);
 // 动作失败(结束/取消)的瞬态提示:composable 的 lastError 只存 i18n KEY,
@@ -168,12 +215,41 @@ const elapsedSec = ref(0);
 const actionError = ref('');
 let actionErrorTimer = null;
 
+// —— 页面镜像 Tab(P2 Task 4)——
+// 默认 [终端]:P1 已验证的主视图;[页面] 是 admin 开始镜像操作后才有的画面,
+// 用户自行点击切换。activeTab 只管显隐(v-show),不影响两 pane 的帧消费。
+const activeTab = ref('terminal');
+// pageReady = Replayer 已有可渲染底座(快照已注入)。false 时页面 pane 显示
+// 「等待画面同步」占位:进入页面/收到 nav 重置/新会话,都回到 false。
+const pageReady = ref(false);
+
 let term = null;
 let fit = null;
 let resizeObserver = null;
 let tickTimer = null;
 let startedAt = 0;
 let disposed = false;
+
+// —— rrweb Replayer 状态 ——
+// replayer 恒以 live 惯例构造:new Replayer([], {liveMode:true}) → startLive()
+// → 事件经 addEvent 注入。底座(Meta + FullSnapshot)由快照引导:
+//   · assist.rr.snapshot → 重建 Replayer,注入快照(数组或单事件都收);
+//   · assist.rr.event 带 FullSnapshot(type 2)→ 同样引导建 Replayer(spec
+//     §帧族表:rr.event 事件增量「含 FullSnapshot 标记」,首连流量走这条);
+//   · 其余 rr.event 增量 → replayer 存在才 addEvent,无底座静默丢弃。
+let replayer = null;
+// 底座前奏缓冲:Meta 事件(type 4)先行到达且尚无 Replayer 时暂存——Replayer
+// 的 iframe 尺寸由 Meta 定(handleResize 才把 iframe 从 display:none 放出来),
+// 缺 Meta 时以合成 Meta 兜底。
+let pendingPageMeta = null;
+// rrweb 事件分型常量(EventType):Meta=4,FullSnapshot=2,增量=3。
+const RR_TYPE_FULL_SNAPSHOT = 2;
+const RR_TYPE_META = 4;
+// 合成 Meta 的兜底视口:admin 采集端的真实视口未知(快照帧只带 FullSnapshot
+// 不带 Meta 时才走到这),取常见桌面尺寸;镜像 DOM 会按此宽度回流,不是像素
+// 拷贝,宽度差异只影响排版不影响内容。若 pane 处于隐藏 Tab(clientWidth=0),
+// 取容器尺寸会得到 0×0 的隐形 iframe,故必须用固定值。
+const SYNTH_VIEWPORT = { width: 1280, height: 800 };
 // 帧游标:上一帧已写对象(对象身份锚)。用「最后一帧身份」当 watch 触发源,
 // 而非靠 length 增量——frames 是上限 2000 的环形数组,封顶后 push+splice 同步
 // 发生,净长度不变,Vue 的 length watcher 会因新旧值相等而不触发,导致丢帧。
@@ -201,6 +277,16 @@ const connHint = computed(() => {
   if (watchStatus.value === 'closed') return t('assist_watch_disconnected');
   return '';
 });
+
+// Tab 按钮样式:选中态实底,未选中淡字(顶栏按钮族同款灰阶)。
+function tabClass(which) {
+  return [
+    'rounded border px-3 py-1 text-xs font-medium transition-colors',
+    activeTab.value === which
+      ? 'border-slate-600 bg-slate-700 text-slate-100'
+      : 'border-transparent text-slate-400 hover:bg-slate-800 hover:text-slate-200',
+  ].join(' ');
+}
 
 function formatElapsed(sec) {
   const total = Math.max(0, Math.floor(sec));
@@ -242,10 +328,146 @@ function initTerminal() {
   }
 }
 
+// —— 页面镜像:rrweb Replayer ——
+// 载荷防御:rrweb 事件以 JSON 字符串坐 data 字段,坏 JSON / 非 object / 缺
+// 数值 type 一律跳过(记一条 warn),绝不向上抛——残帧连片到达时不能把整条
+// 帧流(含终端腿)拖死。
+function parseRrPayload(data) {
+  let ev = data;
+  if (typeof data === 'string') {
+    try {
+      ev = JSON.parse(data);
+    } catch (_) {
+      console.warn('[assist-watch] rrweb 帧载荷非合法 JSON,已跳过');
+      return null;
+    }
+  }
+  if (!ev || typeof ev !== 'object' || typeof ev.type !== 'number') return null;
+  return ev;
+}
+
+function synthMetaEvent() {
+  return {
+    type: RR_TYPE_META,
+    timestamp: Date.now(),
+    data: { href: window.location.href, width: SYNTH_VIEWPORT.width, height: SYNTH_VIEWPORT.height },
+  };
+}
+
+function destroyReplayer() {
+  if (replayer) {
+    try {
+      replayer.destroy();
+    } catch (_) { /* 已残的 Replayer 销毁失败不影响页面 */ }
+    replayer = null;
+  }
+  pageReady.value = false;
+}
+
+// 页面镜像整体重置:销毁 Replayer + 丢掉底座前奏缓冲。assist.nav(整页跳转,
+// admin 侧录制随文档生命周期中断、重建后重发全量快照)与新会话走这里。
+function resetPageMirror() {
+  destroyReplayer();
+  pendingPageMeta = null;
+}
+
+// live 惯例建 Replayer(rrweb 文档口径):空事件数组初始化 → startLive →
+// 之后一律 addEvent 注入。root 指进页面 pane 容器,wrapper/iframe 都长在那。
+function ensureReplayer() {
+  if (replayer || disposed || !pageHostEl.value) return;
+  try {
+    replayer = new Replayer([], { liveMode: true, root: pageHostEl.value });
+    replayer.startLive();
+    pageReady.value = true;
+  } catch (e) {
+    replayer = null;
+    pageReady.value = false;
+    console.warn('[assist-watch] rrweb Replayer 创建失败', e);
+  }
+}
+
+function addRrEvent(ev) {
+  if (!replayer) return false;
+  try {
+    replayer.addEvent(ev);
+    return true;
+  } catch (e) {
+    console.warn('[assist-watch] rrweb 事件注入失败,已跳过', e);
+    return false;
+  }
+}
+
+// 底座引导:按序注入 lead(可为空)+ 底座事件。底座集里缺 Meta 就补(缓冲的
+// 真 Meta 优先,合成兜底)——Meta 决定 iframe 尺寸,缺了画面恒不可见。
+function pageBoot(events) {
+  const list = Array.isArray(events) ? events.filter(Boolean) : [];
+  if (!list.length) return;
+  const hasMeta = list.some((e) => e.type === RR_TYPE_META);
+  const withMeta = hasMeta ? list : [pendingPageMeta || synthMetaEvent(), ...list];
+  if (!withMeta.some((e) => e.type === RR_TYPE_FULL_SNAPSHOT)) return; // 无底座渲染不出
+  resetPageMirror(); // 重建语义:旧 Replayer 销毁,从新底座长出新画面
+  ensureReplayer();
+  if (!replayer) return;
+  for (const ev of withMeta) addRrEvent(ev);
+}
+
+function handleRrEvent(frame) {
+  const ev = parseRrPayload(frame.data);
+  if (!ev) return;
+  if (ev.type === RR_TYPE_META && !replayer) {
+    pendingPageMeta = ev; // 底座前奏,等 FullSnapshot 一同注入
+    return;
+  }
+  if (ev.type === RR_TYPE_FULL_SNAPSHOT) {
+    pageBoot([ev]); // spec 帧族表:FullSnapshot 可经 rr.event 走(首连流量)
+    return;
+  }
+  if (replayer) addRrEvent(ev); // 无底座的增量静默丢弃(等快照重建)
+}
+
+// 快照载荷:单事件对象或事件数组均可,线上形态是 JSON 字符串——先整体
+// 解出再分型(直接把字符串喂 parseRrPayload 会把数组整体当残帧丢掉)。
+function handleRrSnapshot(frame) {
+  let payload = frame.data;
+  if (typeof payload === 'string') {
+    try {
+      payload = JSON.parse(payload);
+    } catch (_) {
+      console.warn('[assist-watch] rrweb 快照载荷非合法 JSON,已跳过');
+      return;
+    }
+  }
+  let list = null;
+  if (Array.isArray(payload)) {
+    list = payload.map((d) => parseRrPayload(d)).filter(Boolean);
+  } else if (payload && typeof payload === 'object') {
+    const single = parseRrPayload(payload);
+    list = single ? [single] : null;
+  }
+  if (list && list.length) pageBoot(list);
+}
+
+// 帧分派:一条 WS 上两族帧(终端 + 页面镜像),按 type 分流。信号族
+// (terminal.exit / assist.request 等)与未知类型页面侧无事可做,直接过。
 function writeFrame(frame) {
   if (!frame || typeof frame.type !== 'string') return;
-  if (frame.type !== 'terminal.output' && frame.type !== 'terminal.replay') return;
-  if (typeof frame.data === 'string' && frame.data.length) term.write(frame.data);
+  switch (frame.type) {
+    case 'terminal.output':
+    case 'terminal.replay':
+      if (typeof frame.data === 'string' && frame.data.length) term.write(frame.data);
+      return;
+    case 'assist.rr.event':
+      handleRrEvent(frame);
+      return;
+    case 'assist.rr.snapshot':
+      handleRrSnapshot(frame);
+      return;
+    case 'assist.nav':
+      resetPageMirror();
+      return;
+    default:
+      return;
+  }
 }
 
 // 帧游标推进:只写自重连/挂载以来的新增帧。锚点法见 lastWrittenFrame 注释。
@@ -322,6 +544,10 @@ watch(state, (next) => {
   if (next === 'requested') {
     startPolling();
     ensureConnected();
+    // 新会话开档:上一会话的页面镜像是死会话的残影(admin 侧录制随旧会话
+    // 已断),重置回占位,等新会话的快照重建。终态(ended)不清——末屏保留
+    // 与终端腿同款口径。
+    resetPageMirror();
   } else {
     stopPolling();
   }
@@ -360,6 +586,7 @@ onUnmounted(() => {
   if (actionErrorTimer) { clearTimeout(actionErrorTimer); actionErrorTimer = null; }
   if (resizeObserver) { resizeObserver.disconnect(); resizeObserver = null; }
   if (term) { term.dispose(); term = null; }
+  destroyReplayer(); // 含沙箱 iframe 的整个 wrapper 随 destroy 移除
   stopPolling();
   // 只断 WS,不 resetTransient:弹窗的瞬态复位是它自己的职责(Task 9 注记)。
   watchWs.disconnect();

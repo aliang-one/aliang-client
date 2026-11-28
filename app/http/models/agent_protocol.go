@@ -189,6 +189,13 @@ const (
 	AgentEventAssistRejected  = "assist.rejected" // 云端→设备:admin 已拒绝
 	AgentEventAssistEnd       = "assist.end"      // 双向:任一侧结束(带 reason,见 assistEndReason)
 	AgentEventAssistState     = "assist.state"    // 云端→设备:房间状态镜像(预留,P1 仅记录日志)
+
+	// rrweb 页面镜像帧族(remote-assist P2):方向恒为 云端→设备→观看端
+	// 纯中继——admin 观看页采集侧注入的 rrweb 事件/全量快照与导航兜底,
+	// 设备不改写载荷、不进状态机、无回帧,原样扇给观看端注册表。
+	AgentEventAssistRrEvent    = "assist.rr.event"    // 云端→设备→观看端:rrweb 事件增量(纯中继)
+	AgentEventAssistRrSnapshot = "assist.rr.snapshot" // 云端→设备→观看端:rrweb 全量快照(纯中继)
+	AgentEventAssistNav        = "assist.nav"         // 云端→设备→观看端:整页跳转兜底 {url}(纯中继)
 )
 
 type AgentProtocolContract struct {

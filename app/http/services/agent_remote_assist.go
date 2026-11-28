@@ -21,6 +21,11 @@ const (
 	assistDurationCap     = 2 * time.Hour
 	assistRequestCooldown = 60 * time.Second
 	assistAdminAbsentCap  = 10 * time.Minute // 判定在云端(admin WS 在云端),设备只收终帧
+	// rrweb 中继丢帧 Warn 的限频步长(计数口径,非每帧):高频臂残帧可到
+	// 50+/s(串会话粘滞/采集侧漏 session_id),每帧一条 Warn 即日志风暴——
+	// 首丢必记,其后每满 N 次才落一条带累计数的摘要。N=500 按 50 ev/s 折
+	// 算≈每 10s 一条,既留观测线又不刷屏。
+	assistRrDropLogEveryN = 500
 )
 
 type assistState string
@@ -75,6 +80,12 @@ type remoteAssistManager struct {
 	endReason     assistEndReason // 终态粘性:槽位释放后保留,Snapshot 据此汇报 ended
 	endedAt       time.Time
 	lastSessionID string
+
+	// rrDropCount rrweb 中继串会话丢帧累计(限频 Warn 的计数器,m.mu 保护):
+	// 第 1 次与之后每满 assistRrDropLogEveryN 次落一条摘要 Warn(步长依据见
+	// 该常量注释)。计数和而非按 sid 分桶——assist sid 是 nanos 唯一键,分桶
+	// 表只会单调增长无人清扫。
+	rrDropCount int
 
 	lastEnded time.Time // 冷却锚点(仅非过期终态落点,见 finishLocked)
 
@@ -614,6 +625,62 @@ func (m *remoteAssistManager) cloudEndOnce(sid string, reason assistEndReason) (
 }
 
 // ---------------------------------------------------------------------------
+// rrweb 页面镜像帧族设备侧中继(P2 Task 1):assist.rr.event / rr.snapshot /
+// assist.nav 的下行腿
+// ---------------------------------------------------------------------------
+
+// RelayRrFrame rrweb 页面镜像帧的设备侧纯中继:帧原样扇给该会话全部在册
+// 观看端(扇出形状与 assistTerminalCompositeWriter 的 terminal.output 扇出
+// 一致,差别只在来源——从 PTY 复制循环换成云端下行分派点)。frameType 由
+// 分派口透传(switch 已算好的 msgType,免逐帧再解析);返回值报告帧是否真
+// 被中继(true=过了守卫,含观看桶为空的 no-op;false=串会话被丢)——高频
+// 臂的活性触达只在 true 时做,被丢帧零成本(见 handleRemoteAgentMessage
+// rr case 的序注释)。
+//
+// 纯中继铁律:不改写载荷(type/session_id/data/url 全量透传)、不进状态机
+// (零迁移零钩子)、无回帧。守卫只有一道——session_id 必须匹配当前会话或
+// 粘性终态会话 id:requested/active/刚终态均放行(观看端在任何这些状态下都
+// 可能仍连着,收尾期的尾巴帧不该被掐)。不匹配(串会话/已翻代)静默丢弃,
+// 不发 error 帧——P1 OnRemoteFrame 的 error 帧语义只属于状态机信令族,纯
+// 中继面对残帧做错误风暴只会打爆云侧读循环,丢帧即可;观看桶为空时
+// fanOutToViews 天然 no-op,陈旧帧无落点。
+//
+// 丢帧 Warn 限频(评审 Fix):残帧可连片到达(快发重申后粘滞的采集侧仍以旧
+// sid 中继、或采集侧漏 session_id,50+/s 量级),每帧一条即日志风暴——首丢
+// 必记,其后每满 assistRrDropLogEveryN 次才落一条带累计数的摘要。计数和而
+// 非按 sid 分桶,理由见 rrDropCount 字段注释。Warn 在锁外落(logger 是 IO,
+// 锁内落日志违本文件锁纪律),丢弃判定与计数在同一临界区固化。
+//
+// 调用面:handleRemoteAgentMessage 的 rr 帧族 case(已过 enabled-device 门
+// remoteAgentMessageRequiresEnabledDevice,本方法不复查 enabled——与 P1
+// assist 信令臂同款分工:门在分派口,manager 管业务)。
+func (m *remoteAssistManager) RelayRrFrame(msg map[string]interface{}, frameType string) bool {
+	sid := remoteString(msg, "session_id")
+	m.mu.Lock()
+	target := m.lastSessionID
+	if m.session != nil {
+		target = m.session.id
+	}
+	dropped := sid == "" || sid != target
+	logDrop, dropCount := false, 0
+	if dropped {
+		m.rrDropCount++
+		dropCount = m.rrDropCount
+		logDrop = dropCount == 1 || dropCount%assistRrDropLogEveryN == 0
+	}
+	m.mu.Unlock()
+	if dropped {
+		if logDrop {
+			logger.Warn(fmt.Sprintf("[ASSIST] rr relay dropped (session mismatch) type=%s got=%q want=%q cumulative=%d",
+				frameType, sid, target, dropCount))
+		}
+		return false
+	}
+	m.fanOutToViews(sid, msg)
+	return true
+}
+
+// ---------------------------------------------------------------------------
 // 协助终端腿(Task 5):approved 激活 PTY、终态回收、观看端扇出注册表。
 //
 // ID 方案(刻意):终端 session_id == 状态机会话 id(两者同为 assist-<nanos>,
@@ -793,6 +860,7 @@ func AssistViewEndFrame(sessionID string, reason string) map[string]interface{} 
 //   - 会话已退(tombstone):按 exited 形态回放;
 //   - 无会话(尚未建终端的 requested 态/未知名):no-op 优雅跳过——
 //     等待模式无 ring 可回,连接静默进入 live 等待。
+//
 // attachToken 恒空串:观看端不是 attach 语义的请求方(无 token 路由),
 // 帧保持 legacy 字节形态。
 func (s *AgentService) AssistTerminalReplayTo(sessionID string, writeJSON agentTerminalWriter) {

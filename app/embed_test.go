@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"io/fs"
+	"path"
 	"regexp"
 	"strings"
 	"testing"
@@ -47,13 +48,17 @@ func TestWebsiteFSContainsAllReferencedAssets(t *testing.T) {
 				continue
 			}
 
-			var path string
+			var p string
 			if strings.HasPrefix(ref, "/") {
-				path = distRoot + ref
+				p = distRoot + ref
 			} else {
-				path = pageDir + ref
+				p = pageDir + ref
 			}
-			if _, err := fs.Stat(WebsiteFS, path); err != nil {
+			// 远程协助 P2(Task 3):构建产物改相对 base 后引用带 ./ 前缀
+			// (./assets/main-*.js)。embed FS 只收 clean 路径,fs.Stat 不做
+			// 目录清理——此处必须显式 Clean,否则相对化改造会被本测试误红。
+			p = path.Clean(p)
+			if _, err := fs.Stat(WebsiteFS, p); err != nil {
 				t.Errorf("%s 引用的资产不在嵌入 FS: %s (%v)", page, ref, err)
 			}
 		}

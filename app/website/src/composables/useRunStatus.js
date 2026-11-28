@@ -1,5 +1,6 @@
 import { ref } from 'vue';
 import { handleAuthenticationFailure } from '../services/authFailure';
+import { assistPrefix } from '../services/assistPrefix';
 import { syncAuthFromStartupStatus, syncUnauthenticatedAuthState } from '../stores/auth';
 
 const runMode = ref('unknown');
@@ -49,7 +50,7 @@ function normalizeMode(mode) {
 
 export async function syncRunStatus() {
   try {
-    const response = await fetch('/api/run/status');
+    const response = await fetch(assistPrefix() + '/api/run/status');
     const payload = await response.json().catch(() => ({}));
     handleAuthenticationFailure(response.status, payload, syncUnauthenticatedAuthState);
     if (!response.ok) {
@@ -89,7 +90,7 @@ export async function syncRunStatus() {
 
 export async function syncStartupStatus() {
   try {
-    const response = await fetch('/api/startup/status');
+    const response = await fetch(assistPrefix() + '/api/startup/status');
     const payload = await response.json().catch(() => ({}));
     handleAuthenticationFailure(response.status, payload, syncUnauthenticatedAuthState);
     if (!response.ok) {

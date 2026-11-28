@@ -343,9 +343,11 @@ import { computed, reactive, ref, onUnmounted, watch } from 'vue';
 import { useCertStatus } from '../composables/useCertStatus';
 import { showErrorDialog } from '../composables/useErrorDialog';
 import { useEscLayer } from '../composables/useEscStack';
+import { assistPrefix } from '../services/assistPrefix';
 import { useI18n } from '../i18n';
 
-const API_BASE = '/api';
+// 远程协助 P2:镜像前缀挂载(/assist/service/)下证书族 API 也要过前缀。
+const API_BASE = assistPrefix() + '/api';
 const CERT_TYPE = 'mitm-ca';
 const AUDIT_KEY = 'cert-operation-audit-v1';
 

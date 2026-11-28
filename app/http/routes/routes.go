@@ -347,6 +347,15 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	// runtime(会话闸/注册/回放/只读循环),core 侧闸门②+同源闸+proxy 透传
 	// (proxyAIStream,与聊天/网页终端同管线)。缺任一侧=404(双注册纪律)。
 	register("/api/agent/assist/stream", h.Agent.HandleAssistStream, http.MethodGet)
+	// 远程协助同构代理路由(P2 Task 2,spec §7.3/§8.3):/assist/service/*
+	// 剥前缀反代本机 dashboard 真身(默认 127.0.0.1:56431 self-call),使
+	// rrweb 快照的根相对/相对资产 URL 两端 origin 均可解析。方法白名单
+	// (GET/HEAD/POST/PUT/PATCH/DELETE)在 handler 内统一裁决——镜像操作面
+	// 须放行写方法(评审修订;方法前缀注册一 pattern 只认一个方法,多方法
+	// 走裸路径+handler 内闸,同 gates 端点形态)。会话闸真值经探针取自
+	// user agent runtime(session 端点)。双注册另一处 agentruntime/server.go
+	// (缺任一侧=404;route_parity_test 正则已扩 assist 前缀兜底)。
+	register("/assist/service/", h.Agent.HandleAssistServiceProxy, http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete)
 	register("/api/agent/operations/events", h.Agent.HandleOperationEvents, http.MethodGet)
 	register("/api/agent/ai/stream", h.Agent.HandleAIStream, http.MethodGet)
 	register("/api/agent/ai/approval-hook", h.Agent.HandleAIApprovalHook, http.MethodPost)

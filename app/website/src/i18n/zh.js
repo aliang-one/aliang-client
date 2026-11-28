@@ -2102,4 +2102,8 @@ export default {
   assist_watch_connecting: '正在连接…',
   assist_watch_disconnected: '连接已断开',
   assist_watch_elapsed: '已协助 {time}',
+  // -- 远程协助 P2 Task 4:观看页 Tab + rrweb 页面镜像 --
+  assist_watch_tab_page: '页面',
+  assist_watch_tab_terminal: '终端',
+  assist_watch_page_syncing: '等待画面同步…',
 };

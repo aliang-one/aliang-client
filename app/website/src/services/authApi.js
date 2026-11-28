@@ -1,3 +1,5 @@
+import { assistPrefix } from './assistPrefix';
+
 function objectValue(value) {
   return value && typeof value === 'object' ? value : {};
 }
@@ -40,7 +42,7 @@ async function request(path, options = {}, timeoutMs) {
   const timer = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
   let response;
   try {
-    response = await fetch(path, {
+    response = await fetch(assistPrefix() + path, {
       credentials: 'same-origin',
       ...options,
       headers: {

@@ -1,5 +1,6 @@
 import { syncUnauthenticatedAuthState } from '../stores/auth';
 import { handleAuthenticationFailure } from './authFailure';
+import { assistPrefix } from './assistPrefix';
 
 function extractEnvelope(json) {
   const payload = json && typeof json === 'object' ? json : {};
@@ -11,7 +12,8 @@ function extractEnvelope(json) {
 }
 
 async function request(path, options = {}) {
-  const response = await fetch(path, {
+  // 远程协助 P2:任意前缀挂载(/assist/service/ 镜像)下 API 调用统一过前缀。
+  const response = await fetch(assistPrefix() + path, {
     credentials: 'same-origin',
     ...options,
     headers: {
@@ -195,7 +197,7 @@ export async function uploadChatAttachment(sessionId, file) {
   const form = new FormData();
   form.append('session_id', sessionId);
   form.append('file', file);
-  const response = await fetch('/api/agent/ai/attachment/upload', {
+  const response = await fetch(assistPrefix() + '/api/agent/ai/attachment/upload', {
     method: 'POST',
     credentials: 'same-origin',
     body: form,
@@ -390,7 +392,7 @@ export async function fsRead(path, token) {
 // 下载:binary 流(ServeContent),不走 request()(它假定 JSON envelope)。
 // 失败体仍是 JSON 信封(403/404/400),读出 msg 让 UI 文案可读。
 export async function fsDownload(path, token) {
-  const response = await fetch(`/api/agent/fs/download?path=${encodeURIComponent(path)}`, {
+  const response = await fetch(`${assistPrefix()}/api/agent/fs/download?path=${encodeURIComponent(path)}`, {
     method: 'GET',
     credentials: 'same-origin',
     headers: { 'X-Web-Terminal-Token': token },
@@ -410,7 +412,7 @@ export async function fsUpload(dir, file, token) {
   const form = new FormData();
   form.append('dir', dir);
   form.append('file', file);
-  const response = await fetch('/api/agent/fs/upload', {
+  const response = await fetch(assistPrefix() + '/api/agent/fs/upload', {
     method: 'POST',
     credentials: 'same-origin',
     headers: { 'X-Web-Terminal-Token': token },
@@ -461,7 +463,7 @@ export async function fsDelete(path, recursive, token) {
 // 文案映射。通用 request() 只抛 Error(msg),这里在抛错前把 code/status 挂到
 // Error 上(仅协助族,不改动既有调用面)。
 async function assistRequest(path, options = {}) {
-  const response = await fetch(path, {
+  const response = await fetch(assistPrefix() + path, {
     credentials: 'same-origin',
     ...options,
     headers: {

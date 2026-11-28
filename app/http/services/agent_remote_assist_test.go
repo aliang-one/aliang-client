@@ -2,6 +2,7 @@ package services
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
+	"aliang.one/nursorgate/app/tunnel"
+	"aliang.one/nursorgate/common/cache"
 )
 
 // newTestAssistManager 可变时钟桩:闭包捕获 tick,经 manager.clockAdvance
@@ -477,15 +480,164 @@ func TestAssistRollbackGuardKeepsApprovedSession(t *testing.T) {
 
 func TestAssistRemoteFramesRequireEnabledDevice(t *testing.T) {
 	// enabled 门:禁用设备不接受协助信令(与 terminal/AI 控制面同族)。
+	// P2 Task 1 起含 rrweb 页面镜像帧族(rr.event/rr.snapshot/nav)——镜像
+	// 下行同为控制面能力,禁用设备不接受。
 	for _, typ := range []string{
 		models.AgentEventAssistApproved,
 		models.AgentEventAssistRejected,
 		models.AgentEventAssistEnd,
 		models.AgentEventAssistState,
+		models.AgentEventAssistRrEvent,
+		models.AgentEventAssistRrSnapshot,
+		models.AgentEventAssistNav,
 	} {
 		if !remoteAgentMessageRequiresEnabledDevice(typ) {
 			t.Fatalf("assist frame %s must be behind the enabled-device gate", typ)
 		}
+	}
+}
+
+// ——— 远程协助 P2 Task 1:rrweb 页面镜像帧族下行纯中继 ———
+
+// assistRrEnvHygiene 驱动 handleRemoteAgentMessage 的密闭纪律(照
+// agent_legacy_arm_guard_test.go):分派臂 setRemoteConnectionState →
+// saveStateLocked 落 agent 状态文件(路径经 cache 目录/HOME 解析),HOME/
+// ALIANG_DATA_DIR 指临时目录 + 重算 cache 单例(Cleanup LIFO 先于 t.Setenv
+// 还原,防单例指着已删 temp 目录泄漏给同包后续测试)。
+func assistRrEnvHygiene(t *testing.T) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
+	cache.ResetCacheDirForTest()
+	t.Cleanup(cache.ResetCacheDirForTest)
+}
+
+func TestAssistRrFrameRelayToViews(t *testing.T) {
+	assistRrEnvHygiene(t)
+	h := newTestAssistManagerWithFakeTerminal(t)
+	s := h.svc
+	sid, err := s.assist.RequestAndSignal("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.assist.OnRemoteFrame(map[string]interface{}{
+		"type": models.AgentEventAssistApproved, "session_id": sid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	probe := &assistViewProbe{}
+	s.AssistRegisterViewSink(sid, "view-probe", probe.fan)
+	t.Cleanup(func() { s.AssistUnregisterViewSink(sid, "view-probe") })
+
+	// ① assist.rr.event:approved 后经 handleRemoteAgentMessage 注入,探针
+	// 收到原样帧(session_id/data 全量透传),零回帧(纯中继)。
+	coll, write := newPayloadCollector()
+	s.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
+		"type":       models.AgentEventAssistRrEvent,
+		"session_id": sid,
+		"data":       `{"type":3,"data":{"source":2,"texts":["echo routed"]}}`,
+	}, write)
+	var gotRr map[string]interface{}
+	if !assistWaitUntil(2*time.Second, func() bool {
+		f, ok := probe.frameOfType(models.AgentEventAssistRrEvent)
+		gotRr = f
+		return ok && strings.Contains(fmt.Sprint(f["data"]), `"texts"`)
+	}) {
+		t.Fatal("view probe must receive the relayed assist.rr.event verbatim")
+	}
+	if gotRr["session_id"] != sid {
+		t.Fatalf("relayed rr frame must preserve session_id, got %v want %v", gotRr["session_id"], sid)
+	}
+	if errs := coll.ofTypes(models.AgentEventError); len(errs) != 0 {
+		t.Fatalf("rr relay must not emit any error frame, got %v", errs)
+	}
+
+	// ② assist.rr.snapshot 同族中继(FullSnapshot 大帧同走纯中继,语义一致)。
+	collSnap, writeSnap := newPayloadCollector()
+	s.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
+		"type":       models.AgentEventAssistRrSnapshot,
+		"session_id": sid,
+		"data":       `{"type":2,"data":{"node":"<html/>"}}`,
+	}, writeSnap)
+	if !assistWaitUntil(2*time.Second, func() bool { return probe.Got(`"node":"<html/>"`) }) {
+		t.Fatal("view probe must receive the relayed assist.rr.snapshot verbatim")
+	}
+	if errs := collSnap.ofTypes(models.AgentEventError); len(errs) != 0 {
+		t.Fatalf("snapshot relay must not emit any error frame, got %v", errs)
+	}
+
+	// ③ assist.nav 同族(url 载荷全量透传)。
+	collNav, writeNav := newPayloadCollector()
+	s.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
+		"type":       models.AgentEventAssistNav,
+		"session_id": sid,
+		"url":        "https://assist.example/page-2",
+	}, writeNav)
+	if !assistWaitUntil(2*time.Second, func() bool {
+		_, ok := probe.frameOfType(models.AgentEventAssistNav)
+		return ok
+	}) {
+		t.Fatal("view probe must receive the relayed assist.nav frame")
+	}
+	nav, _ := probe.frameOfType(models.AgentEventAssistNav)
+	if nav["url"] != "https://assist.example/page-2" || nav["session_id"] != sid {
+		t.Fatalf("assist.nav must be relayed verbatim (url/session_id preserved), got %v", nav)
+	}
+	if errs := collNav.ofTypes(models.AgentEventError); len(errs) != 0 {
+		t.Fatalf("nav relay must not emit any error frame, got %v", errs)
+	}
+
+	// ④ 串会话/陈旧 sid:静默丢弃——零 error 帧、探针零新帧(纯中继面对
+	// 残帧不做错误风暴;P1 OnRemoteFrame 的 error 帧语义只属于状态机信令族)。
+	before := probe.count()
+	collMis, writeMis := newPayloadCollector()
+	s.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
+		"type":       models.AgentEventAssistRrEvent,
+		"session_id": "assist-stale-ghost",
+		"data":       `{"type":3}`,
+	}, writeMis)
+	if errs := collMis.ofTypes(models.AgentEventError); len(errs) != 0 {
+		t.Fatalf("mismatched sid must be dropped silently without an error frame, got %v", errs)
+	}
+	if n := probe.count(); n != before {
+		t.Fatalf("mismatched sid must not reach view sinks, probe frames %d -> %d", before, n)
+	}
+}
+
+func TestAssistRrRelayRejectedOnDisabledDevice(t *testing.T) {
+	assistRrEnvHygiene(t)
+	// enabled-device 门全路径(gate 成员测试的互补面):禁用设备收 rr 帧族
+	// 得标准 error 帧、探针零帧。forceDisconnectRemote 会触达 ai/tunnel/
+	// terminal/assist 四管理器,本夹具给齐全四件(空管理器惰性零副作用)
+	// ——assistHarness 的裸 svc 无 ai/tunnel,走禁用路径必 nil 指针,不可复用。
+	svc := &AgentService{
+		terminal: newAgentTerminalManager(),
+		assist:   newRemoteAssistManager(nil),
+		ai:       newAgentAIManager(),
+		tunnel:   tunnel.NewManager(nil),
+	}
+	svc.mu.Lock()
+	svc.state.RemoteAssistEnabled = true // 总闸开着:拒绝必须来自 enabled-device 门而非总闸
+	svc.state.Enabled = false            // 设备禁用 → remoteControlAllowed=false
+	svc.mu.Unlock()
+
+	probe := &assistViewProbe{}
+	svc.AssistRegisterViewSink("assist-ghost", "view-probe", probe.fan)
+	t.Cleanup(func() { svc.AssistUnregisterViewSink("assist-ghost", "view-probe") })
+
+	coll, write := newPayloadCollector()
+	svc.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
+		"type":       models.AgentEventAssistRrEvent,
+		"session_id": "assist-ghost",
+		"data":       `{"type":2}`,
+	}, write)
+	errs := coll.ofTypes(models.AgentEventError)
+	if len(errs) != 1 || !strings.Contains(fmt.Sprint(errs[0]["error"]), "disabled") {
+		t.Fatalf("disabled device must reject rr frames with the standard error frame, got %v", errs)
+	}
+	if n := probe.count(); n != 0 {
+		t.Fatalf("disabled device must not relay, probe got %d frames", n)
 	}
 }
 
@@ -755,6 +907,25 @@ func (p *assistViewProbe) Got(substr string) bool {
 		}
 	}
 	return false
+}
+
+// count 探针已收帧总数(rr 中继「静默丢弃」断言用:前后计数不变)。
+func (p *assistViewProbe) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.frames)
+}
+
+// frameOfType 返回探针收到的首个指定帧型帧(原样引用,中继透传断言用)。
+func (p *assistViewProbe) frameOfType(typ string) (map[string]interface{}, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, f := range p.frames {
+		if t, _ := f["type"].(string); t == typ {
+			return f, true
+		}
+	}
+	return nil, false
 }
 
 func (p *assistViewProbe) endFrame() (map[string]interface{}, bool) {

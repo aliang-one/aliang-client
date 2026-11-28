@@ -2106,4 +2106,8 @@ export default {
   assist_watch_connecting: 'Connecting…',
   assist_watch_disconnected: 'Disconnected',
   assist_watch_elapsed: 'Assisting {time}',
+  // -- Remote assist P2 Task 4: watch page tabs + rrweb page mirror --
+  assist_watch_tab_page: 'Page',
+  assist_watch_tab_terminal: 'Terminal',
+  assist_watch_page_syncing: 'Waiting for screen sync…',
 };

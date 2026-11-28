@@ -39,14 +39,15 @@ func TestAgentRouteParityBetweenCoreAndUserAgent(t *testing.T) {
 	}
 
 	core := extractAgentRoutePaths(t, string(coreSrc),
-		regexp.MustCompile(`register\("(?:[A-Za-z]+ )?(/(?:api/agent|api/proxy|api/mesh|mcp/aliang)[^"]*)"`))
+		regexp.MustCompile(`register\("(?:[A-Za-z]+ )?(/(?:api/agent|api/proxy|api/mesh|mcp/aliang|assist)[^"]*)"`))
 	// agent 侧同样剥掉可选方法前缀（mcp 注册表 {name} 路径 PUT/DELETE 分流到
 	// 不同 handler，须方法前缀注册；比对口径与 core 侧对称，路径集合才是真值）。
 	// 2026-11-22 死锁善后:status/sync/disable 三端点改 mux.Handle(路径,
 	// wrapAgentBusyRoute(handler)) 套服务端收割,正则放宽认识 Handle 写法——
-	// 两者都是真注册,审计口径(防漏注册)不变。
+	// 两者都是真注册,审计口径(防漏注册)不变。2026-11-28 P2 Task 2 起纳
+	// /assist 前缀(同构代理路由双注册,缺任一侧=404)。
 	agent := extractAgentRoutePaths(t, string(agentSrc),
-		regexp.MustCompile(`mux\.Handle(?:Func)?\("(?:[A-Za-z]+ )?(/(?:api/agent|api/proxy|api/mesh|mcp/aliang)[^"]*)"`))
+		regexp.MustCompile(`mux\.Handle(?:Func)?\("(?:[A-Za-z]+ )?(/(?:api/agent|api/proxy|api/mesh|mcp/aliang|assist)[^"]*)"`))
 
 	var drifted []string
 	for path := range core {

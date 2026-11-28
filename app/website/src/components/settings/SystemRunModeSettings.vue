@@ -208,6 +208,7 @@ import { nextTick } from 'vue';
 import { useNavigation } from '../../composables/useNavigation';
 import { useRunStatus } from '../../composables/useRunStatus';
 import { showErrorDialog } from '../../composables/useErrorDialog';
+import { assistPrefix } from '../../services/assistPrefix';
 import { useI18n } from '../../i18n';
 
 export default {
@@ -526,7 +527,7 @@ export default {
       await this.switchMode();
     },
     async requestJSON(url, options = {}) {
-      const res = await fetch(url, options);
+      const res = await fetch(assistPrefix() + url, options);
       const payload = await res.json().catch(() => ({}));
       if (!res.ok || payload?.code !== 0) {
         const msg = payload?.msg || payload?.message || `Request failed (${res.status})`;
