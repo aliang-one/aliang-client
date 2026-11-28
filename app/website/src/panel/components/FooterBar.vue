@@ -61,6 +61,11 @@ export default {
     // openExternal(kind) — 仪表盘/设备互访两键共用:宿主在 → 投 open 消息,
     // 投递返回值即送达语义,返回 false(宿主对象被改坏等通道异常)→ 同窗
     // 导航兜底,动作不断链;无宿主 → 不碰宿主通道,直接同窗导航。
+    // 宿主侧 open 分派成功即 exit(0) 正常关闭面板(2026-11-28 用户走查
+    // 「点仪表盘开了浏览器,面板不消失」:此前壳 open 后驻留,指望浏览器
+    // 抢焦点走失焦链,macOS Accessory 进程的 NonactivatingPanel 永不 resignKey,
+    // Windows 冷启动前台切换延迟期间面板悬在前面)——页面无需也不能自己
+    // 关自己,关闭归壳。
     function openExternal(kind) {
       if (hosted) {
         if (postMessageHost({ type: 'open', kind })) return;

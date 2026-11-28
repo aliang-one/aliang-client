@@ -87,17 +87,23 @@ func TestPanelwinDarwinShellStructure(t *testing.T) {
 			}
 		}
 
-		// 点面板外即收:全局鼠标监听三件套(鼠标事件无需 TCC;菜单栏带
-		// y<40 排除——托盘图标自身的点击是 companion 的手势,不能被本监听
-		// 抢先关闭),且监听体内 exit(0) 正常关闭。
+		// 点面板外即收:全局鼠标监听三件套(鼠标事件无需 TCC;菜单栏带排除
+		// ——托盘图标自身的点击是 companion 的手势,不能被本监听抢先关闭),
+		// 且监听体内 exit(0) 正常关闭。
+		// ⚠️ 菜单栏带方向(2026-11-28 评审修):macOS 全局坐标左下原点,菜单栏
+		// 在顶部,判据必须是 loc.y > 主屏高-40;此前锚的 `loc.y < 40` 排除的
+		// 是屏幕底部(方向反了),反向锚不得回归。
 		for _, want := range []string{
 			"addGlobalMonitorForEventsMatchingMask",
 			"NSEventMaskLeftMouseDown",
-			"loc.y < 40",
+			"loc.y > primaryH - 40",
 		} {
 			if !strings.Contains(src, want) {
 				t.Errorf("panelwin_darwin.m 缺少 %q(点外部关闭链不完整)", want)
 			}
+		}
+		if strings.Contains(stripObjcComments(src), "loc.y < 40") {
+			t.Error("panelwin_darwin.m 菜单栏带判据退回 `loc.y < 40`(macOS 全局坐标左下原点,这排除的是屏幕底部,方向反了)")
 		}
 		monIdx := strings.Index(src, "addGlobalMonitorForEventsMatchingMask")
 		if monIdx < 0 {
@@ -169,7 +175,7 @@ func TestPanelwinDarwinShellStructure(t *testing.T) {
 		if !strings.Contains(src, `addScriptMessageHandler`) || !strings.Contains(src, `name:@"panel"`) {
 			t.Errorf("panelwin_darwin.m 缺少 addScriptMessageHandler name:@\"panel\"(与前端 messageHandlers.panel 对齐)")
 		}
-		// open 分派:kind → 对应 URL,经 NSWorkspace 开默认浏览器后驻留。
+		// open 分派:kind → 对应 URL,经 NSWorkspace 开默认浏览器。
 		for _, want := range []string{
 			`@"dashboard"`, // kind=dashboard → 仪表盘 URL
 			`@"peer"`,      // kind=peer → 设备互访 URL
@@ -178,6 +184,40 @@ func TestPanelwinDarwinShellStructure(t *testing.T) {
 			if !strings.Contains(src, want) {
 				t.Errorf("panelwin_darwin.m 缺少 %q(open 分派不完整)", want)
 			}
+		}
+		// open 后即退(2026-11-28 用户走查「点仪表盘开了浏览器,面板不消失」):
+		// 此前刻意驻留,指望浏览器激活→面板 resignKey 走失焦即退链——但
+		// Accessory 进程 + NonactivatingPanel 点击内部不成为 active app,
+		// openURL 拉浏览器到前台时面板不是 key,resignKey 永不发,面板悬着。
+		// 外部动作已完成,openURL 之后必须 exit(0)(正常关闭,launcher 零惩罚);
+		// 「open 后驻留」不得回归。openURL 与 exit(0) 必须同在 open 分支内
+		// (exit 不得提到 openURL 之前——那会在浏览器还没拉起时就把面板关掉,
+		// 虽然对用户感知无差,但 openURL 从已 exit 的进程发出去属竞态)。
+		openBody := objcMethodBody(src, "didReceiveScriptMessage:")
+		openIdx := strings.Index(openBody, `isEqualToString:@"open"`)
+		if openIdx < 0 {
+			t.Fatalf("panelwin_darwin.m 缺 open 分支")
+		}
+		openBranch := openBody[openIdx:]
+		if next := strings.Index(openBranch, `isEqualToString:@"resize"`); next >= 0 {
+			openBranch = openBranch[:next]
+		}
+		urlIdx := strings.Index(openBranch, "openURL")
+		exitIdx := strings.Index(openBranch, "exit(0)")
+		if urlIdx < 0 {
+			t.Fatalf("panelwin_darwin.m open 分支缺 openURL(分派链断裂):\n%s", openBranch)
+		}
+		if exitIdx < 0 {
+			t.Fatalf("panelwin_darwin.m open 分支缺 exit(0)(open 后驻留回归——面板不会消失):\n%s", openBranch)
+		}
+		if exitIdx < urlIdx {
+			t.Fatalf("panelwin_darwin.m open 分支 exit(0) 在 openURL 之前(浏览器还没拉起就关面板):\n%s", openBranch)
+		}
+		// 失败路径(目标 URL 解析为 nil / 未知 kind)必须【不】exit:没有
+		// 外部动作发生,面板驻留让用户换键重试。锚定:openURL 调用包在
+		// if (url) 闸内,exit(0) 也在同一闸内(if (target) 块)。
+		if !strings.Contains(openBranch, "if (url)") {
+			t.Errorf("panelwin_darwin.m open 分支缺 if (url) 闸(解析失败不应 openURL/exit):\n%s", openBranch)
 		}
 		// 未知类型默认忽略:类型白名单(quit/open/resize,新增需双侧同批),
 		// handler 必须有显式忽略分支(注释锚点),不得崩。

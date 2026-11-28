@@ -10,7 +10,10 @@
 // 点面板外(global mouseDown)/失焦(resignKey)→ exit(0) 正常关闭;托盘
 // 图标的 close 请求(SIGUSR1,handler 在 panelwin_darwin.go)→ exit(0);
 // 页面 quit 消息 → exit(60);open 消息 → NSWorkspace openURL 开默认浏览器
-// 后驻留;resize 消息 → 跟随改窗高(高度自适应),且【首次】resize 到位
+// 后 exit(0)(2026-11-28:此前驻留,指望浏览器抢焦点走 resignKey 链,但
+// Accessory 进程的 NonactivatingPanel 点击内部不成为 active app,resignKey
+// 永不发,面板悬着不消失——用户走查坐实);resize 消息 → 跟随改窗高
+// (高度自适应),且【首次】resize 到位
 // 才真正上屏(首帧尺寸修正,见 applicationDidFinishLaunching/showIfAwaitingFirstResize)。
 // 进程退出即窗口消失,
 // 不存在任何驻留形态的残留窗口。
@@ -204,9 +207,21 @@ extern void panelwinGoHeightChanged(double height);
       NSURL* url = [NSURL URLWithString:target];
       if (url) {
         [[NSWorkspace sharedWorkspace] openURL:url];
+        // open 后即退(exit 0 正常关闭,2026-11-28 用户反馈「点仪表盘开了
+        // 浏览器,面板不消失」):此前刻意驻留,指望浏览器激活→面板
+        // resignKey 走失焦即退链——但本进程是 Accessory 策略、面板又
+        // 是 NonactivatingPanel,点击面板内部【不会】让本进程成为
+        // active app,openURL 把浏览器拉到前台时面板根本不是 key,
+        // resignKey 永远不发,面板就悬在那里。外部动作已完成、面板
+        // 没有继续存在的理由,确定性退出;与 Windows 侧 WM_ACTIVATE
+        // 失活链(浏览器抢前台即退)在用户感知上对齐。退出码 0 走
+        // launcher 正常关闭路径,零惩罚零重拉。
+        NSLog(@"panelwin: open 已分派(%@),面板正常关闭(exit 0)", kind);
+        exit(0);
       }
     }
-    // open 后驻留(面板不退出);未知 kind 落到这里同样静默驻留。
+    // URL 解析失败/未知 kind:没有外部动作发生,面板驻留(用户还可能
+    // 换一个键再点),静默不动。
     return;
   }
   if ([type isEqualToString:@"resize"]) {
@@ -358,14 +373,25 @@ extern void panelwinGoHeightChanged(double height);
   panel.contentView.layer.masksToBounds = YES;
 
   // 点面板外即收:global mouseDown(本窗口内的点击走本地路径不进此监听,
-  // 故凡到达此处的点击必然在面板外)=正常关闭 exit(0);菜单栏带(y<40)
-  // 排除——托盘图标自身的点击是 companion 的手势(close 请求由它发),
-  // 不能被本监听抢先关闭(否则形成「点一次没反应」竞态)。handler 在注册
-  // 线程(主线程)回调,仍走 dispatch_async 保险。
+  // 故凡到达此处的点击必然在面板外)=正常关闭 exit(0);菜单栏带排除——
+  // 托盘图标自身的点击是 companion 的手势(close 请求由它发),不能被本
+  // 监听抢先关闭(否则形成「点一次没反应」竞态)。
+  // ⚠️ 坐标系(2026-11-28 评审修):global monitor 的 event.locationInWindow
+  // 是全局坐标且 macOS 全局坐标系是【左下原点】(与 panelwin_run 换算
+  // bottomLeftY 同系)——此前写 `loc.y < 40` 排除的是屏幕【底部】40pt,
+  // 方向反了:菜单栏在顶部,应是 loc.y > 屏高-40;而屏幕底部的点击反而
+  // 被误排除(多显示器副屏时面板关不掉)。屏高取主屏 frame 高(带菜单栏那
+  // 块,全局坐标零点在其左下角);取不到屏高(screens 为空)时不排除——
+  // 宁可让托盘点击也走本监听(结果同样是 exit 0,与 close 请求殊途同归),
+  // 不让面板失去关闭路径。40 是菜单栏高度量级(Laptop 24~37pt、带刘海
+  // 37~38pt、外接 25pt),不是精确值;托盘图标自身高度 ~22~30pt,40 的
+  // 带宽容得下。handler 在注册线程(主线程)回调,仍走 dispatch_async 保险。
   [NSEvent addGlobalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown
                                          handler:^(NSEvent *event) {
-    NSPoint loc = event.locationInWindow; // global monitor:屏幕全局坐标(左上原点)
-    if (loc.y < 40) {
+    NSPoint loc = event.locationInWindow; // global monitor:全局坐标,左下原点(window==nil)
+    NSScreen *primary = [[NSScreen screens] firstObject];
+    CGFloat primaryH = primary ? primary.frame.size.height : 0;
+    if (primaryH > 0 && loc.y > primaryH - 40) {
       return;
     }
     dispatch_async(dispatch_get_main_queue(), ^{
