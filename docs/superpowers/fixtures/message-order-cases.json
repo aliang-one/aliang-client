@@ -1,0 +1,59 @@
+{
+  "_meta": {
+    "purpose": "DEBT-05 共享回归夹具:同一批乱序/重复/旧快照样例,手机与网页必须收敛到相同顺序。权威源在 alianggate 本文件;RN 仓 src/utils/__fixtures__/message-order-cases.json 是逐字节副本,改这里后要同步过去。",
+    "contract": "占位部分排序:只重排带 seq 的元素,且只占用它们自己原来的下标位;无 seq 的条目原地不动。seq 相等时按原下标稳定排序。",
+    "shape": "input 为消息数组,每项 {id, seq?};expected 为排序后的 id 序列。"
+  },
+  "cases": [
+    {
+      "name": "全是新记录时得到真正的 seq 序",
+      "input": [{"id":"c","seq":3},{"id":"a","seq":1},{"id":"b","seq":2}],
+      "expected": ["a","b","c"]
+    },
+    {
+      "name": "无 seq 的本地气泡原地不动,前后记录序不变",
+      "input": [{"id":"local-draft"},{"id":"c","seq":3},{"id":"a","seq":1},{"id":"b","seq":2},{"id":"failed-send"}],
+      "expected": ["local-draft","a","b","c","failed-send"]
+    },
+    {
+      "name": "新旧混合:新记录只在它们占据的位置内互相排好",
+      "input": [{"id":"old-1"},{"id":"c","seq":30},{"id":"old-2"},{"id":"a","seq":10},{"id":"old-3"}],
+      "expected": ["old-1","a","old-2","c","old-3"]
+    },
+    {
+      "name": "seq 倒挂(云端 position 对实录反序事故)",
+      "input": [{"id":"later","seq":47095},{"id":"earlier","seq":12},{"id":"middle","seq":300}],
+      "expected": ["earlier","middle","later"]
+    },
+    {
+      "name": "重复投递:同一条消息出现两次,排序后仍相邻且顺序稳定",
+      "input": [{"id":"dup","seq":5},{"id":"x","seq":9},{"id":"dup","seq":5}],
+      "expected": ["dup","dup","x"]
+    },
+    {
+      "name": "seq 相等时按原下标稳定排序",
+      "input": [{"id":"p","seq":7},{"id":"q","seq":7},{"id":"r","seq":7}],
+      "expected": ["p","q","r"]
+    },
+    {
+      "name": "seq 为 0 视为不可排序(旧 agent 的行)",
+      "input": [{"id":"zero","seq":0},{"id":"b","seq":2},{"id":"a","seq":1}],
+      "expected": ["zero","a","b"]
+    },
+    {
+      "name": "只有一条带 seq:原样返回,不改引用",
+      "input": [{"id":"solo","seq":1},{"id":"plain"}],
+      "expected": ["solo","plain"]
+    },
+    {
+      "name": "快照截尾后首条不再是第 0 条(seq 仍能还原真实先后)",
+      "input": [{"id":"tail","seq":100},{"id":"mid","seq":60},{"id":"head","seq":50}],
+      "expected": ["head","mid","tail"]
+    },
+    {
+      "name": "空列表",
+      "input": [],
+      "expected": []
+    }
+  ]
+}
