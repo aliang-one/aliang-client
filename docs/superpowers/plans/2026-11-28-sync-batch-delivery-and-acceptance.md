@@ -488,3 +488,62 @@ NET-01 的验收有 5 条。逐条核对代码后的现状：
 
 ②⑤ 的两个新端点沿用了 `IsLoopbackRequest` 这个既有信任边界——与同类管理面
 写操作一致，没有引入新的暴露面，但也没有改善它。
+
+### 8.4 ④：按调用方授权（D4 定为只读）
+
+此前只有目标设备的总开关 `peerExecEnabled`，对所有调用方一视同仁。改为
+`peer_grants` 表：主键 `(target_device_id, caller_device_id)`，`scopes` 以逗号
+分隔存 TEXT，`revoked_at` 软删除保留审计痕迹。
+
+独立表而非 Device 字段——hello 全量 upsert 是整对象覆盖，设备字段会被 agent
+每次重发抹掉，而授权是属主在本机设的。
+
+**兼容语义（关键）**：授权表为空 = 沿用总开关，存量行为不变；表一旦有记录就
+按表判定。这样不会因为上线这个功能让所有现存设备突然不能互访。总开关仍是
+总闸：关掉时即使授权表放行也拒。
+
+三个端点：`GET/PUT /api/devices/:id/peer-grants`、
+`DELETE .../:callerDeviceId`。授予时校验 caller 与目标同账号——不能跨账号
+授权，否则等于把别人的设备当跳板。设备被删时授权一并清理。
+
+未覆盖：`fetch` 的按调用方授权。服务端只存储透传 `peerFetchEnabled`，实际
+校验在 agent 侧执行，需要 agent 配合才能做完整闭环。`scopes` 里的 `'fetch'`
+已预留。
+
+### 8.5 环回访问安全：方案与边界
+
+NET-01 把「本机任意进程可经回环无凭证调管理接口」列为待堵的洞。
+`IsLoopbackRequest` 被十几处 handler 用作信任边界，假设是「本机回环 = 本机
+属主」——这个假设在本机有恶意进程时不成立。
+
+**方案：每请求签名，不做 challenge-response。**
+
+```
+core 启动
+  ├─ 生成 32 字节随机 token（crypto/rand）
+  ├─ 存内存 + 写入 children 的 env（ALIANG_LOCAL_AUTH）
+  └─ 管理面中间件：回环请求必须带 X-Aliang-Local-Auth: <token>
+
+agent/tray 启动
+  └─ 从 env 读 token，调本机管理接口时带上
+```
+
+为什么够用：本机恶意进程拿不到 token——它读不到另一个进程的环境变量
+（Linux/macOS 下 `/proc/<pid>/environ` 需要同 uid 或 root）。不需要改 IPC
+协议、不需要 challenge-response、不需要新端口。改动面是一个中间件 + 一个
+env 常量 + 子进程 spawn 处传 env。
+
+**它挡不住什么**（边界说清楚）：
+
+- 同 uid 的恶意进程可以通过 `/proc/<pid>/environ` 读到（Linux）。要挡这个
+  得上 socket 权限（`SO_PEERCRED`），但那要求本机调用方走 Unix socket 而
+  不是 HTTP——改动面大一个量级。
+- root 用户。
+
+**结论**：这个方案把攻击面从「本机任意进程」缩到「同 uid 进程」，投入产出
+比最高。要再往上就是另一个量级的工作，现阶段不值得。
+
+**迁移**：回环请求没带 token 时先放行 + 记 warn，跑一个版本确认没有遗漏的
+调用方，再改成拒绝。这样不会因为漏改某个调用方导致功能静默失效。
+
+此方案尚未实施，等确认后开工。
