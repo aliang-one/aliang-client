@@ -288,6 +288,7 @@ export default {
   chat_attachUnsupported: '仅支持 JPEG / PNG / GIF / WebP 图片。',
   chat_attachSteerBlocked: '回合进行中暂不能发图片，请等当前回合结束后再发。',
   chat_statusRunning: '对话中',
+  chat_statusBackground: '后台中',
   chat_statusDone: '已完成',
   chat_aiThinking: '正在思考…',
   chat_thinkingRunning: '思考中…',

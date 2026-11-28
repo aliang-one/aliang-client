@@ -93,6 +93,9 @@ export function useDeviceSessions() {
     shell.messages = [];
     shell.approvals = [];
     shell.running = entry.status === 'running'; // 侧栏状态点；快照帧原位更新
+    // background(2026-11-28「后台中」批):主回合收口但 subagent lane 仍在
+    // 干活——侧栏独立琥珀点,与 running 绿点区分,随清单刷新原位更新。
+    shell.background = entry.status === 'background';
     shell.deviceLoadedAt = 0; // 详情装载时刻（openDeviceSession 5 分钟 TTL）
     // 与本地会话的 epoch ms 同一口径，侧栏 today/yesterday/older 分组直接排序
     shell.updatedAt = Date.parse(entry.updated_at || '') || 0;
@@ -125,6 +128,7 @@ export function useDeviceSessions() {
     cached.projectPath = entry.project_path || '';
     cached.deviceSession = entry;
     cached.running = entry.status === 'running';
+    cached.background = entry.status === 'background';
     cached.updatedAt = Date.parse(entry.updated_at || '') || cached.updatedAt || 0;
     // approval_mode 回填（2026-11-09 修复）：清单是服务端权威，漏回填会让已
     // 打开的壳保留建壳时刻的旧挡位，下一条消息重发 create 显式下发旧值，把

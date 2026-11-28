@@ -215,4 +215,29 @@ describe('useDeviceSessions', () => {
   it('详情 TTL 常量为 5 分钟', () => {
     expect(DEVICE_SESSION_DETAIL_TTL_MS).toBe(5 * 60 * 1000);
   });
+
+  // background(2026-11-28「后台中」批):status=background 映射为壳的
+  // background 字段(侧栏琥珀点),不得混入 running;清单刷新原位翻转。
+  it('background 状态映射:壳带 background 字段,running/background 互斥且原位刷新', async () => {
+    const entry = { ...AGENTCORE_ENTRY, status: 'background' };
+    getAgentSessions.mockResolvedValue({ sessions: [entry] });
+    const ds = useDeviceSessions();
+    await ds.loadDeviceSessions();
+
+    const shell = ds.shellForEntry(entry);
+    expect(shell.background).toBe(true);
+    expect(shell.running).toBe(false);
+
+    // 原位刷新:后台 lane 收口 → idle,banner 字段随清单翻转。
+    entry.status = 'idle';
+    const refreshed = ds.shellForEntry(entry);
+    expect(refreshed).toBe(shell); // 稳定对象:原位更新不换壳
+    expect(refreshed.background).toBe(false);
+    expect(refreshed.running).toBe(false);
+
+    // 再翻回 running:互斥成立。
+    entry.status = 'running';
+    expect(ds.shellForEntry(entry).running).toBe(true);
+    expect(ds.shellForEntry(entry).background).toBe(false);
+  });
 });

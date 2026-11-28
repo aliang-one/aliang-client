@@ -288,6 +288,7 @@ export default {
   chat_attachUnsupported: 'Only JPEG / PNG / GIF / WebP images are supported.',
   chat_attachSteerBlocked: "Images can't be sent while a turn is running — wait for it to finish.",
   chat_statusRunning: 'In conversation',
+  chat_statusBackground: 'Working in background',
   chat_statusDone: 'Done',
   chat_aiThinking: 'Thinking…',
   chat_thinkingRunning: 'Thinking…',
