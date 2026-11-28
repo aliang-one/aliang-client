@@ -30,8 +30,8 @@
 
 | 仓库 | 分支 | 提交 | 远端 |
 |---|---|---|---|
-| alianggate（Go agent + 网页） | master | `47d0fd1a` | 已推送；`v1.1.133` 构建发布成功，新门禁首次全程通过 |
-| AliangPhoneServer | main | `9d51dc3` | 已推送；线上跑 `sync-all-r2`（不含重启裁决，见 §5.5） |
+| alianggate（Go agent + 网页） | master | `47f2c8d8` | 已推送；`v1.1.134` 含 RUN-03 进程退出收口 |
+| AliangPhoneServer | main | `b5b5999` | 已推送；线上跑 `batch-b-r1`（重启裁决 + SUB-06/16 已启用） |
 | AliangVibeCodingPhone（RN） | main | `1b139df` | 已推送，iOS 1.0.10 (42) 已装到 iPhone 16 Pro |
 
 PhoneServer 的 k8s 部署已完成（见 §5.1）。真实服务名是
@@ -176,7 +176,34 @@ started, not when the remote WS session connected」），只是没被用上。
 秒内重启也能区分）。补 `TestAgentHelloStartedAtIsProcessStable` 锁死语义，
 该测试在还原到 `time.Now()` 时准确失败。随 `v1.1.131` 发布。
 
-**重启裁决的 PhoneServer 代码已在 main（`1e2bfbf`），但线上未启用。** 重新
-启用前必须确认全部在线 agent 已升级到 `v1.1.131` 及以上——旧 agent 上报的
-`started_at` 仍会每次变化，裁决会误杀。可用日志 `[agent-restart] detected`
-的频率判断：健康状态下它只在 agent 真正重启时出现。
+重启裁决已于 `batch-b-r1` 上线（2026-11-28）。上线时的验证结果：已升级到
+1.1.133 的 `liang-dev` 重连**不再**触发 `detected`；本机 agent 真实重启时正确
+触发并结算 1 个在途回合；仍跑旧版的 Windows 设备被版本门禁跳过。健康状态下
+`[agent-restart] detected` 只在 agent 真正重启时出现。
+
+### 5.6 B 批收尾（SUB-06 / SUB-16 / RUN-03）
+
+**SUB-06 服务端结算收口子 agent。** `finalizeTurnActivity` 会把 started/progress
+的子 agent 与 started 的 command 翻成 interrupted，但它只在 agent 自己发终态帧
+时被调。服务端主动结算（`releaseDeviceRunningSessions`，即重启/离线/凭据失效）
+漏掉了它——回合状态收敛了，结构化事件里的子 agent 永远停在 started/progress，
+手机上就是转圈永不结束。在结算点补调，推送链复用同一条。
+
+**SUB-16 终态带原因（可落地部分）。** 翻 interrupted 时把原因写进
+`summary.status_detail`——它是 wire 白名单里既有的「状态说明」字段，RN 直接显示
+在 detail 行，手机侧零改动。agent 自己写了更具体的说明时保留。「停止中」状态
+与单停入口依赖 SUB-03，属 E 批。
+
+**RUN-03 进程退出收口。** `StopLocalServer` 只做 HTTP shutdown + 停
+usage/keepalive，从不调 `closeAll`——run 的 ctx 不被 cancel，进程组组杀就不会
+触发，claude/codex 子进程成为孤儿继续写工作区。新增 `AgentService.Shutdown`，
+在 HTTP shutdown 之前调。测试起一个带生产同款 Setpgid+组杀的真实子进程，断言
+Shutdown 后 5s 内死亡；去掉 closeAll 后该测试准确失败。
+
+**设备升级。** `liang-dev`（222.1）升到 v1.1.133。升级后新版 core 自己托管
+agent，与 `aliang-agent.service` 抢 `~/.aliang/agent/agent.pid` 锁导致无限重启，
+已禁用该 unit。`0.196` 不在 aliangboard 台账，本机与 222.1 均无到它的密钥，
+未升级。本机按用户要求暂不动（其他会话在测试）。
+
+**未做。** DEBT-09 口令轮换需安排发布窗口。RUN-01 的手动续跑入口、RUN-04
+连续中断熔断未开始。
