@@ -439,3 +439,52 @@ goroutine 的失败路径里，测试主 goroutine 抢先扫目录读到残留�
 - **`runTerminatedBy` 只对新产生的中断生效**：13 个存量 cancelled 会话仍显示
   完成。要修可以写一次性回填脚本，按 events 里的 `Run cancelled ... (agent_*)`
   文案回溯，但那是字符串耦合，收益不高。
+
+## 8. D 批 NET-01 进展（2026-11-28）
+
+NET-01 的验收有 5 条。逐条核对代码后的现状：
+
+| 条目 | 要求 | 状态 |
+|---|---|---|
+| ① | 另一台局域网主机经代理面/管理面/agent 的访问被拒 | 已修（`295c0031`，`proxy_face_guard` 等测试通过） |
+| ② | 非本机属主的账号在仪表盘登录后不能换绑设备 | 本批修复 |
+| ③ | 任何两台设备建立数据面连接都要经同账号身份核验 | 已实现（`startPeerExec` 显式校验 `target.userId === callerDevice.userId`，不符 404 掩蔽） |
+| ④ | 可以按调用方给「只读 / 可执行」，可以撤销 | **未做**，依赖 D4 |
+| ⑤ | 换账号登录时有明确提示 | 本批修复 |
+
+### 8.1 ②：换绑须属主确认
+
+`ReRegisterIfUserIdentityChanged` 检测到登录身份与本机已绑定账号不一致时，此前
+无条件清空注册状态并用新身份重新注册——任何能在这台仪表盘登录自己账号的人，
+都能把这台设备绑走。
+
+改为搁置等确认：mismatch 时只记 `PendingRebindUser`、置 `Enabled=false`、断开
+远端，不动 `RegisteredUser`/`Device`。新增 `ConfirmRebind`/`RejectRebind` 与两个
+受守卫的端点（`IsLoopbackRequest || RequireDashboardSession`，与其它管理面写
+操作同口径）。core 与 user-agent 两侧都注册，route parity 测试守着。
+
+刻意保留的：`Registered` 保持 true——它反映「服务端仍把这台设备注册在原账号
+下」，清掉会让状态失真，换绑被拒后也无法据此恢复。同一账号内的身份修正
+（fallback 身份 → 真 JWT）仍即时生效。
+
+### 8.2 ⑤：明确提示
+
+`AgentSettings.vue` 加换绑确认区：`sync_status === 'rebind_pending'` 时显示
+「本机当前绑定 X，仪表盘刚登录的是 Y」与确认/拒绝两个按钮。前端此前只把
+`sync_message` 当兜底文案，用户只会看到 agent 莫名其妙下线。
+
+### 8.3 两个需要你决策的
+
+**④ 按调用方的只读/可执行授权。** 需求清单标注它「需要 D4（远程仪表盘只读
+还是可改）」。D4 没定，④ 就没法设计——只读和可改对应两套完全不同的授权模型。
+
+**本机任意进程可经回环无凭证调管理接口。** NET-01 把它列为「分支没关的三件
+事」之一。`IsLoopbackRequest` 被十几处 handler 用作信任边界，它的假设是
+「本机回环 = 本机属主」。这个假设在「本机有恶意进程」时不成立。
+
+堵这个洞需要本机 IPC 鉴权（NET-01 说的第三件「IPC 套接字无鉴权」），是独立的
+安全工程：所有 handler 的鉴权链要改，IPC 协议要加 challenge-response。改动面
+大，我没有擅自开工。
+
+②⑤ 的两个新端点沿用了 `IsLoopbackRequest` 这个既有信任边界——与同类管理面
+写操作一致，没有引入新的暴露面，但也没有改善它。
