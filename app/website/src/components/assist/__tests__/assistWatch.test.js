@@ -9,12 +9,17 @@
 // 覆盖:waiting / active 渲染、只读 disableStdin、output/replay 逐帧 write、
 // 重连清屏续屏(term.clear + 只写新回放)、assist.end 停 WS + 终态横幅 + 原因
 // 文案 + 末屏保留、Esc 返回、结束协助双段确认。
+// P2 Task 4 扩展:Tab 切换(v-show 双保活)、rrweb Replayer 假体(mock rrweb
+// 模块)——rr.snapshot / rr.event(FullSnapshot)引导建 Replayer + startLive、
+// rr.event 增量 addEvent、Meta 缺失时合成、assist.nav 重置回占位、坏 JSON
+// 跳过不破流、终端流与页面流互不干扰、帧游标跨混合帧族推进不重放。
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createApp, h, nextTick } from 'vue';
 
 const mocks = vi.hoisted(() => ({
   termInstances: [],
   ro: { instances: [] },
+  replayers: [],
 }));
 
 // xterm 假体:记录 opts/open/write/clear/dispose;read-only 断言取 opts.disableStdin。
@@ -42,6 +47,25 @@ vi.mock('@xterm/addon-fit', () => ({
   FitAddon: class {
     constructor() { this.fitCalls = 0; }
     fit() { this.fitCalls += 1; }
+  },
+}));
+
+// rrweb 假体:记录构造参数(initialEvents/liveMode/root)、startLive/addEvent/
+// destroy 调用;liveMode 断言取 config.liveMode。真实 Replayer 在 jsdom 下要
+// 建 sandboxed iframe + polyfill,组件测试用记录型假体足矣(与 xterm 同手法)。
+vi.mock('rrweb', () => ({
+  Replayer: class {
+    constructor(initialEvents, config) {
+      this.initialEvents = initialEvents;
+      this.config = config;
+      this.added = [];
+      this.liveStarted = false;
+      this.destroyed = false;
+      mocks.replayers.push(this);
+    }
+    startLive() { this.liveStarted = true; }
+    addEvent(ev) { this.added.push(ev); }
+    destroy() { this.destroyed = true; }
   },
 }));
 
@@ -115,6 +139,7 @@ beforeEach(() => {
   globalThis.WebSocket = FakeWebSocket;
   mocks.termInstances.length = 0;
   mocks.ro.instances.length = 0;
+  mocks.replayers.length = 0;
   currentPage.value = 'dashboard';
   global.ResizeObserver = class {
     constructor(cb) { this.cb = cb; mocks.ro.instances.push(this); }
@@ -329,5 +354,203 @@ describe('AssistWatchPage Esc 返回', () => {
     window.dispatchEvent(ev);
     await nextTick();
     expect(currentPage.value).toBe('dashboard');
+  });
+});
+
+// —— P2 Task 4:观看页 Tab + rrweb Replayer ——
+// rrweb 事件假体:只带 Replayer 分型所需的最小字段。
+let rrTs = 1700000000000;
+function rrMeta() {
+  rrTs += 1;
+  return { type: 4, timestamp: rrTs, data: { href: 'https://x.test/', width: 1000, height: 700 } };
+}
+function rrFullSnap() {
+  rrTs += 1;
+  return { type: 2, timestamp: rrTs, data: { node: { type: 0, childNodes: [] }, initialOffset: { top: 0, left: 0 } } };
+}
+function rrIncremental(source = 0) {
+  rrTs += 1;
+  return { type: 3, timestamp: rrTs, data: { source, texts: [] } };
+}
+
+async function mountActive() {
+  const a = useAssist();
+  a.state.value = 'active';
+  a.sessionId.value = 's1';
+  const m = await mountPage();
+  const sock = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+  openSock(sock);
+  return { a, m, sock };
+}
+
+describe('AssistWatchPage P2 Tab 切换', () => {
+  it('默认终端 Tab;切换 [页面] 双 pane v-show 保活(节点恒在,仅显隐)', async () => {
+    const { m } = await mountActive();
+    const termPane = m.el.querySelector('[data-testid="assist-watch-pane-terminal"]');
+    const pagePane = m.el.querySelector('[data-testid="assist-watch-pane-page"]');
+    expect(termPane).toBeTruthy();
+    expect(pagePane).toBeTruthy();
+    // 默认终端可见、页面隐藏(v-show)
+    expect(termPane.style.display).not.toBe('none');
+    expect(pagePane.style.display).toBe('none');
+    // 页面 Tab 无快照 → 「等待画面同步」占位(隐藏 pane 里也应有,切过去即见)
+    expect(pagePane.querySelector('[data-testid="assist-watch-page-syncing"]').textContent).toContain(t('assist_watch_page_syncing'));
+
+    m.el.querySelector('[data-testid="assist-watch-tab-page"]').click();
+    await nextTick();
+    expect(pagePane.style.display).not.toBe('none');
+    expect(termPane.style.display).toBe('none');
+    // 占位可见
+    expect(pagePane.querySelector('[data-testid="assist-watch-page-syncing"]').style.display).not.toBe('none');
+
+    m.el.querySelector('[data-testid="assist-watch-tab-terminal"]').click();
+    await nextTick();
+    expect(termPane.style.display).not.toBe('none');
+    expect(pagePane.style.display).toBe('none');
+    // xterm host 恒在(保活,不重初始化)
+    expect(m.el.querySelector('[data-testid="assist-watch-term-host"]')).toBeTruthy();
+    expect(FakeWebSocket.instances.length).toBe(1); // 切 Tab 不动 WS
+  });
+});
+
+describe('AssistWatchPage P2 rrweb Replayer 接帧', () => {
+  it('assist.rr.snapshot → 新建 Replayer([]) liveMode + startLive;快照缺 Meta 时合成注入;占位消失', async () => {
+    const { m, sock } = await mountActive();
+    const full = rrFullSnap();
+    send(sock, { type: 'assist.rr.snapshot', session_id: 's1', data: JSON.stringify(full) });
+    await nextTick();
+    expect(mocks.replayers.length).toBe(1);
+    const rp = mocks.replayers[0];
+    expect(rp.config.liveMode).toBe(true);
+    expect(rp.initialEvents).toEqual([]); // live 惯例:空初始化,startLive 后 addEvent
+    expect(rp.liveStarted).toBe(true);
+    // 注入顺序 = [合成 Meta, 快照](Meta 决定 iframe 尺寸,缺了恒 display:none)
+    expect(rp.added.length).toBe(2);
+    expect(rp.added[0].type).toBe(4);
+    expect(rp.added[0].data.width).toBeGreaterThan(0);
+    expect(rp.added[1]).toEqual(full);
+    // 占位收敛
+    expect(m.el.querySelector('[data-testid="assist-watch-page-syncing"]')).toBeNull();
+  });
+
+  it('assist.rr.event:Meta 先缓冲,FullSnapshot 经 rr.event 也能引导建 Replayer(用真 Meta,不合成)', async () => {
+    const { sock } = await mountActive();
+    const meta = rrMeta();
+    const full = rrFullSnap();
+    send(sock, { type: 'assist.rr.event', session_id: 's1', data: JSON.stringify(meta) });
+    await nextTick();
+    expect(mocks.replayers.length).toBe(0); // Meta 单独到不建(等底座)
+    send(sock, { type: 'assist.rr.event', session_id: 's1', data: JSON.stringify(full) });
+    await nextTick();
+    expect(mocks.replayers.length).toBe(1);
+    expect(mocks.replayers[0].added).toEqual([meta, full]);
+  });
+
+  it('rr.event 增量 → addEvent 依序追加;无 Replayer 时的增量丢弃不建', async () => {
+    const { sock } = await mountActive();
+    // 无底座:增量直接丢,不建 Replayer
+    send(sock, { type: 'assist.rr.event', session_id: 's1', data: JSON.stringify(rrIncremental()) });
+    await nextTick();
+    expect(mocks.replayers.length).toBe(0);
+    // 建底座后:增量依序 addEvent
+    send(sock, { type: 'assist.rr.snapshot', session_id: 's1', data: JSON.stringify(rrFullSnap()) });
+    send(sock, { type: 'assist.rr.event', session_id: 's1', data: JSON.stringify(rrIncremental()) });
+    send(sock, { type: 'assist.rr.event', session_id: 's1', data: JSON.stringify(rrIncremental(2)) });
+    await nextTick();
+    expect(mocks.replayers.length).toBe(1);
+    const rp = mocks.replayers[0];
+    expect(rp.added.length).toBe(4); // 合成 Meta + 快照 + 2 增量
+    expect(rp.added[2].type).toBe(3);
+    expect(rp.added[3].data.source).toBe(2);
+  });
+
+  it('assist.nav → destroy + 占位回归;其后增量帧静默丢弃;新快照重建新实例', async () => {
+    const { m, sock } = await mountActive();
+    send(sock, { type: 'assist.rr.snapshot', session_id: 's1', data: JSON.stringify(rrFullSnap()) });
+    await nextTick();
+    const rp1 = mocks.replayers[0];
+    expect(rp1.destroyed).toBe(false);
+
+    send(sock, { type: 'assist.nav', session_id: 's1', url: 'https://x.test/next' });
+    await nextTick();
+    expect(rp1.destroyed).toBe(true);
+    expect(m.el.querySelector('[data-testid="assist-watch-page-syncing"]')).not.toBeNull();
+
+    // 导航后 admin 侧重建录制,增量在新快照前到达 = 无底座,丢弃且不建
+    send(sock, { type: 'assist.rr.event', session_id: 's1', data: JSON.stringify(rrIncremental()) });
+    await nextTick();
+    expect(mocks.replayers.length).toBe(1);
+
+    // 新快照 → 新 Replayer 实例(旧实例不复活)
+    send(sock, { type: 'assist.rr.snapshot', session_id: 's1', data: JSON.stringify(rrFullSnap()) });
+    await nextTick();
+    expect(mocks.replayers.length).toBe(2);
+    expect(mocks.replayers[1].destroyed).toBe(false);
+    expect(m.el.querySelector('[data-testid="assist-watch-page-syncing"]')).toBeNull();
+  });
+
+  it('坏 JSON / 无 type 载荷跳过(不抛、不破流),终端流不受 rr 帧影响', async () => {
+    const { m, sock } = await mountActive();
+    send(sock, { type: 'assist.rr.event', session_id: 's1', data: 'not-json{' });
+    send(sock, { type: 'assist.rr.event', session_id: 's1', data: JSON.stringify({ foo: 1 }) });
+    send(sock, { type: 'assist.rr.event', session_id: 's1', data: 42 });
+    send(sock, { type: 'assist.rr.snapshot', session_id: 's1', data: '[[broken' });
+    send(sock, { type: 'terminal.output', data: 'alive\r\n' });
+    await nextTick();
+    expect(mocks.replayers.length).toBe(0); // 残帧不建
+    expect(m.term.written).toBe('alive\r\n'); // 终端流照常
+    // 走数组形态的快照里混坏元素:有效元素仍被注入
+    const good = rrFullSnap();
+    send(sock, { type: 'assist.rr.snapshot', session_id: 's1', data: JSON.stringify([good]) });
+    await nextTick();
+    expect(mocks.replayers.length).toBe(1);
+    expect(mocks.replayers[0].added[mocks.replayers[0].added.length - 1]).toEqual(good);
+    expect(m.el.querySelector('[data-testid="assist-watch-page-syncing"]')).toBeNull();
+  });
+
+  it('帧游标跨混合帧族推进:终端/页面各写各的,互不重放', async () => {
+    const { m, sock } = await mountActive();
+    send(sock, { type: 'assist.rr.snapshot', session_id: 's1', data: JSON.stringify(rrFullSnap()) });
+    send(sock, { type: 'terminal.output', data: 'A\r\n' });
+    send(sock, { type: 'assist.rr.event', session_id: 's1', data: JSON.stringify(rrIncremental()) });
+    send(sock, { type: 'terminal.output', data: 'B\r\n' });
+    send(sock, { type: 'assist.nav', session_id: 's1', url: 'u' });
+    send(sock, { type: 'terminal.output', data: 'C\r\n' });
+    await nextTick();
+    const rp = mocks.replayers[0];
+    // 终端只收 terminal.*(3 帧各一次)
+    expect(m.term.written).toBe('A\r\nB\r\nC\r\n');
+    // 页面只收 rr.*:合成 Meta + 快照 + 1 增量(nav 已 destroy,不追加)
+    expect(rp.added.length).toBe(3);
+    expect(rp.added.filter((e) => e.type === 3).length).toBe(1);
+    expect(rp.destroyed).toBe(true);
+  });
+
+  it('快照后仍可重入:新快照(数组形态含 Meta)重建,旧实例销毁', async () => {
+    const { sock } = await mountActive();
+    send(sock, { type: 'assist.rr.snapshot', session_id: 's1', data: JSON.stringify(rrFullSnap()) });
+    await nextTick();
+    expect(mocks.replayers.length).toBe(1);
+    const meta = rrMeta();
+    const full2 = rrFullSnap();
+    // 数组形态 + 自带 Meta:不合成、不外插
+    send(sock, { type: 'assist.rr.snapshot', session_id: 's1', data: JSON.stringify([meta, full2]) });
+    await nextTick();
+    expect(mocks.replayers.length).toBe(2);
+    expect(mocks.replayers[0].destroyed).toBe(true);
+    const rp2 = mocks.replayers[1];
+    expect(rp2.added).toEqual([meta, full2]);
+  });
+
+  it('新会话(requested)→ 页面镜像重置回占位,不等 nav', async () => {
+    const { a, m, sock } = await mountActive();
+    send(sock, { type: 'assist.rr.snapshot', session_id: 's1', data: JSON.stringify(rrFullSnap()) });
+    await nextTick();
+    expect(mocks.replayers[0].destroyed).toBe(false);
+
+    a.state.value = 'requested';
+    await nextTick();
+    expect(mocks.replayers[0].destroyed).toBe(true);
+    expect(m.el.querySelector('[data-testid="assist-watch-page-syncing"]')).not.toBeNull();
   });
 });
