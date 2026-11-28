@@ -15,6 +15,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -498,16 +499,36 @@ func TestAgentPeerLanPushListen_SlotCancelKillsConn(t *testing.T) {
 	if werr == nil && rerr == nil {
 		t.Fatal("conn must be torn down after slot cancel")
 	}
-	// partial 不得残留
+	// partial 不得残留。清理发生在 serve goroutine 的失败路径里(io.CopyN 报
+	// ErrUnexpectedEOF → os.Remove),与这里的主 goroutine 是并发的:立刻扫目录
+	// 会在清理跑完前读到残留(Linux CI 实锤,macOS 上调度快所以没暴露)。
+	// 有界轮询等待,超时才判失败。
 	inbox, err := agentTransferInboxDir()
 	if err != nil {
 		t.Fatal(err)
 	}
-	entries, _ := os.ReadDir(inbox)
-	for _, e := range entries {
-		if strings.Contains(e.Name(), "slotkill.bin") {
-			t.Fatalf("cancelled transfer must not leave partial: %s", e.Name())
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		entries, _ := os.ReadDir(inbox)
+		left := ""
+		for _, e := range entries {
+			if strings.Contains(e.Name(), "slotkill.bin") {
+				left = e.Name()
+				break
+			}
 		}
+		if left == "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			names := make([]string, 0, len(entries))
+			for _, e := range entries {
+				info, _ := e.Info()
+				names = append(names, e.Name()+"("+fmt.Sprint(info.Size())+"b)")
+			}
+			t.Fatalf("cancelled transfer must not leave partial: %s; inbox=%s all=%v", left, inbox, names)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
