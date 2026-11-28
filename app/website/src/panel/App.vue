@@ -11,7 +11,7 @@
      不随 zone 走,随区显隐是实现层决定;⑥的 mockup border-top 因同因不抄,
      见 FooterBar 文件头)。 -->
 <script setup>
-import { computed, nextTick, provide, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, provide, ref, watch } from 'vue';
 import { postMessageHost } from './api';
 import { useSummary } from './summary';
 import { derivePanelState } from './state';
@@ -76,22 +76,24 @@ function scheduleReportHeight() {
 // 回调量到的是中间态、终态漏报;ResizeObserver 对尺寸变化逐帧天然覆盖动画
 // 全程,变化停止后最后一次回调量到终态。RO 只当触发器,量法仍是
 // reportHeight 的 scrollHeight(≤1px 抖动门共用)。
-// ⚠️ 延到首个非空 summary 才建(Minor-6):RO 在 observe() 时会带一次当前
-// 尺寸的初始回调,挂在 onMounted 会量到骨架高度、上报一帧错误尺寸;首帧
-// 形态交壳默认高,数据到位再跟随。
+// 任何状态都跟随(2026-11-28 实机反馈:降级/错误态不收缩=默认高下留大片
+// 空窗,比「骨架高度闪一帧」严重得多,撤销 Minor-6 延后口径):onMounted
+// 建 RO(observe() 自带当前尺寸初始回调)+ 立即首量;summary 快照预热
+// (localStorage)让首帧即真实内容高。数据驱动的显隐/行数变化经 nextTick
+// 等 DOM 刷完再量;文字增删若不改高度,RO 不触发也无需上报。
 let heightObserver = null;
 function ensureHeightObserver() {
   if (heightObserver || !panelEl.value) return;
   heightObserver = new ResizeObserver(scheduleReportHeight);
   heightObserver.observe(panelEl.value);
 }
-// 数据驱动:首个非空 summary 落地后建 RO + 首量(RO 初始回调与 nextTick
-// 首量同帧合并,≤1px 门去重);summary 为 null(连接失败降级态)不量,
-// 高度交壳默认高兜底。区块显隐/行数变化等数据驱动高度经 nextTick 等 DOM
-// 刷完再量;文字增删若不改高度,RO 不触发也无需上报。
-watch(summary, (val) => {
-  if (!val) return;
-  ensureHeightObserver();
+onMounted(() => {
+  nextTick(() => {
+    ensureHeightObserver();
+    scheduleReportHeight();
+  });
+});
+watch(summary, () => {
   nextTick(scheduleReportHeight);
 });
 </script>

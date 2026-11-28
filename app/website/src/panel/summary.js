@@ -74,8 +74,33 @@ export function parseSummary(raw) {
 // 调用纪律(M-4):仅 App.vue 根壳调用一次(全局唯一数据源);Task 8-11
 // 的区块组件一律经 inject('panelData') 取同一份数据,严禁各自再开轮询
 // ——2s×N 份轮询会把服务端 agents 快照/磁盘扫放大 N 倍。
+// 快照预热(2026-11-28 冷启动体验,用户反馈「列表过一会才出现」):壳每次
+// 点击都是全新进程、全新 JS 上下文,首拉(~百 ms)落地前页面是骨架——把上
+// 一轮成功 summary 存 localStorage,启动时先渲染快照再被首拉覆盖,列表
+// 即刻出现。读写全 try/catch(localStorage 不可用环境静默跳过)。
+export const SUMMARY_SNAPSHOT_KEY = 'panel:lastSummary';
+
+export function loadSummarySnapshot() {
+  try {
+    const raw = localStorage.getItem(SUMMARY_SNAPSHOT_KEY);
+    if (raw === null) return null;
+    return parseSummary(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+function saveSummarySnapshot(parsed) {
+  try {
+    localStorage.setItem(SUMMARY_SNAPSHOT_KEY, JSON.stringify(parsed));
+  } catch {
+    // 配额满/隐私模式:预热失效但轮询数据链不受影响。
+  }
+}
+
 export function useSummary({ pollMs = SUMMARY_POLL_MS } = {}) {
-  const summary = ref(null);
+  // 启动即用快照预热(可能陈旧,≤2s 内被首拉覆盖;parseSummary 再归一一遍)。
+  const summary = ref(loadSummarySnapshot());
   const connLost = ref(false);
 
   let failCount = 0;
@@ -87,6 +112,7 @@ export function useSummary({ pollMs = SUMMARY_POLL_MS } = {}) {
     try {
       const raw = await getSummary();
       summary.value = parseSummary(raw);
+      if (summary.value !== null) saveSummarySnapshot(summary.value);
       failCount = 0; // 成功即恢复清零
       connLost.value = false;
     } catch {

@@ -1,7 +1,7 @@
 // summary.test.js — parseSummary 容错解析 + useSummary 轮询(失败计数/恢复/卸载停轮询)。
 // 用 fake timers + mock global fetch,不打真实网络。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { parseSummary, useSummary } from './summary';
+import { loadSummarySnapshot, parseSummary, SUMMARY_SNAPSHOT_KEY, useSummary } from './summary';
 
 // ---- parseSummary ---------------------------------------------------------
 
@@ -191,5 +191,52 @@ describe('useSummary 轮询', () => {
     stop();
     await vi.advanceTimersByTimeAsync(6000);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('summary 快照预热(localStorage)', () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it('空缓存 → loadSummarySnapshot 返回 null', () => {
+    expect(loadSummarySnapshot()).toBe(null);
+  });
+
+  it('写入快照键 → 往返解析出归一 summary(run 子源归一形态保持)', () => {
+    const snapshot = { version: '1.1.139-local', run: { is_running: true, mode: 'http', status_desc: 'x', listen_addr: '127.0.0.1:56432' }, ai: { enabled: true }, agents: null, endpoints: null };
+    localStorage.setItem(SUMMARY_SNAPSHOT_KEY, JSON.stringify(snapshot));
+    const parsed = loadSummarySnapshot();
+    expect(parsed).not.toBe(null);
+    expect(parsed.version).toBe('1.1.139-local');
+    expect(parsed.run).toEqual({ is_running: true, mode: 'http', status_desc: 'x', listen_addr: '127.0.0.1:56432', blocked: { code: '', msg: '' } });
+    expect(parsed.ai).toEqual({ enabled: true });
+    expect(parsed.agents).toBe(null);
+  });
+
+  it('缓存垃圾(JSON 解析炸)→ null 不炸', () => {
+    localStorage.setItem(SUMMARY_SNAPSHOT_KEY, '{not-json');
+    expect(loadSummarySnapshot()).toBe(null);
+  });
+
+  it('缓存非对象(数组/字符串)→ null 不炸', () => {
+    localStorage.setItem(SUMMARY_SNAPSHOT_KEY, '[1,2]');
+    localStorage.setItem(SUMMARY_SNAPSHOT_KEY + 'b', '"str"');
+    expect(loadSummarySnapshot()).toBe(null);
+    localStorage.setItem(SUMMARY_SNAPSHOT_KEY, '"str"');
+    expect(loadSummarySnapshot()).toBe(null);
+  });
+
+  it('useSummary 轮询成功 → 快照键被写入(下次 spawn 预热)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: 0, data: { version: 'v' } }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { stop } = useSummary();
+    await vi.waitFor(() => {
+      expect(localStorage.getItem(SUMMARY_SNAPSHOT_KEY)).not.toBe(null);
+    });
+    const cached = JSON.parse(localStorage.getItem(SUMMARY_SNAPSHOT_KEY));
+    expect(cached.version).toBe('v');
+    stop();
+    vi.unstubAllGlobals();
   });
 });
