@@ -346,6 +346,42 @@ func TestPolicyCacheAbsentReturnsFalse(t *testing.T) {
 	}
 }
 
+func TestPolicyCacheSkipsBadEntryKeepsGoodEntries(t *testing.T) {
+	// 单条坏正则只剔除该条目，不再整份作废——整份拒绝会把所有健康项目的
+	// 策略一起打回内置默认（2026-11-28 三审 F8：坏正则全局降级修复）。
+	setupAgentPolicyTestEnv(t)
+	raw := `{"by_path":{` +
+		`"/proj/good":{"scheme":"custom","default_decision":"require_approval","rules":[{"id":"ok","match":{"tool":["Bash"],"command_regex":"^ls"},"decision":"auto_approve"}]},` +
+		`"/proj/bad":{"scheme":"custom","default_decision":"require_approval","rules":[{"id":"bad","match":{"tool":["Bash"],"command_regex":"(unclosed"},"decision":"auto_approve"}]}}}`
+	path, err := approvalPolicyCachePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := loadPolicyCache()
+	if !ok {
+		t.Fatal("cache with one bad entry must still load good entries")
+	}
+	if _, exists := got["/proj/bad"]; exists {
+		t.Fatal("bad-regex entry must be skipped")
+	}
+	p, exists := got["/proj/good"]
+	if !exists {
+		t.Fatal("good entry must survive a sibling bad entry")
+	}
+	if p.Scheme != "custom" || p.DefaultDecision != decisionRequireApproval {
+		t.Fatalf("good entry shape broken: scheme=%s default=%s", p.Scheme, p.DefaultDecision)
+	}
+	if d, _ := evaluateApprovalPolicy(p, "Bash", json.RawMessage(`{"command":"ls -la"}`)); d != decisionAutoApprove {
+		t.Fatalf("good entry engine broken: ls -la -> %s", d)
+	}
+}
+
 func TestPolicyCacheRejectsInvalidRegex(t *testing.T) {
 	// A cached per-path policy with an invalid regex must not be loaded (would
 	// risk mis-evaluation); the caller falls back to the built-in instead.
@@ -362,8 +398,14 @@ func TestPolicyCacheRejectsInvalidRegex(t *testing.T) {
 	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := loadPolicyCache(); ok {
-		t.Fatal("policy with invalid regex must yield ok=false")
+	// 2026-11-28 起坏条目按条剔除（不再整份 ok=false）：不变量是「坏正则
+	// 策略永不加载」——该路径必须落空、回落内置默认，而非加载半编译策略。
+	got, ok := loadPolicyCache()
+	if !ok {
+		t.Fatal("bad-only cache loads as empty map (per-entry skip)")
+	}
+	if _, exists := got["/proj/bad"]; exists {
+		t.Fatal("policy with invalid regex must never be loaded")
 	}
 }
 

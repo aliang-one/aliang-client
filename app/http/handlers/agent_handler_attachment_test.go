@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"aliang.one/nursorgate/app/http/middleware"
+	"aliang.one/nursorgate/app/http/services"
 )
 
 func attachmentTestEnv(t *testing.T) string {
@@ -140,8 +141,9 @@ func TestHandleAttachmentUploadGuards(t *testing.T) {
 		t.Fatalf("missing session_id = %d", rr.Code)
 	}
 
-	// 超过 10MiB
-	req = attachmentUploadRequest(t, "s", "big.png", make([]byte, 10<<20+1))
+	// 超过上传帽（引用导出常量：帽位随下载腿对齐调整时本测试自动跟随，
+	// 2026-11-28 起 = 20MiB，前端 UI 预检仍 10MiB）
+	req = attachmentUploadRequest(t, "s", "big.png", make([]byte, services.AgentAttachmentUploadMaxBytes+1))
 	req.RemoteAddr = "127.0.0.1:55555"
 	rr = httptest.NewRecorder()
 	h.HandleAttachmentUpload(rr, req)

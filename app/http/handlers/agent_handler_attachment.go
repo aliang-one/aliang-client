@@ -6,6 +6,7 @@ package handlers
 // 判定，服务层 agentAttachmentResolve 再守一遍）。PhoneServer 零改动。
 
 import (
+	"fmt"
 	"io"
 	"mime"
 	"net/http"
@@ -78,7 +79,7 @@ func (h *AgentHandler) HandleAttachmentUpload(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if len(src) > services.AgentAttachmentUploadMaxBytes {
-		common.ErrorBadRequest(w, "Attachment exceeds 10 MiB", nil)
+		common.ErrorBadRequest(w, fmt.Sprintf("Attachment exceeds %d MiB", services.AgentAttachmentUploadMaxBytes/(1<<20)), nil)
 		return
 	}
 	ref, err := services.AgentAttachmentUploadFromBytes(sessionID, header.Filename, src)

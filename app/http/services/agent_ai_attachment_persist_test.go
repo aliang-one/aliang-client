@@ -74,6 +74,20 @@ func TestAgentAttachmentPersistRejectsBadInput(t *testing.T) {
 	}
 }
 
+func TestAgentAttachmentPersistAcceptsDownloadBandImages(t *testing.T) {
+	// 10-20MiB 带内的图（下载腿帽 20MiB 内）必须可持久化：旧 10MiB 帽会把
+	// 内核已下载的带内图静默跳过（journal 无引用=网页/手机永不显示，
+	// 2026-11-28 三审 F9：与下载帽对齐，消灭带内降级）。
+	agentAttachmentPersistTestEnv(t)
+	ref, err := agentAttachmentPersist("sess", "band", ".png", make([]byte, 15<<20))
+	if err != nil {
+		t.Fatalf("15MiB in-download-band image must persist: %v", err)
+	}
+	if ref == "" {
+		t.Fatal("persisted ref must be non-empty")
+	}
+}
+
 func TestAgentAttachmentResolveRejectsEscape(t *testing.T) {
 	agentAttachmentPersistTestEnv(t)
 	for _, bad := range []string{

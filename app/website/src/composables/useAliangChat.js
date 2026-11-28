@@ -1439,6 +1439,15 @@ export function useAliangChat() {
   // 后终态帧落在后台会话时照样复位。三处置位点（sendMessage/sendRecall/
   // steer 降级改发）同步落值。
   let sendingConvId = null;
+  // 在途发送归属判定（2026-11-28 三审 F3 谓词统一 + 评审 R2 收纯归属形态）：
+  // B4 之后本端发送的归属权威是 sendingConvId（发起会话）——sending 的每个
+  // 写点（sendMessage/sendRecall/steer 降级改发）都同步落 sendingConvId，
+  // 页面级 activeId 析取词只贡献反向漂移（后台在途发送被误归属到当前正看的
+  // 会话：终态腿假解锁/ownPending 误真/steer 降级误放行）。终态账务门控、
+  // run.started ownPending、快照 inFlight、steer 降级四站点统一走此助手。
+  function isOwnSendInFlight(conv) {
+    return sending.value && !!conv && sendingConvId === conv.id;
+  }
   // 图片附件（spec 2026-11-05-chat-image-pipeline §3.6）：pending=已上传待随
   // ai.message 发出的引用（{ref,path,name,mime,bytes}）；uploading 期间禁发
   // （防载荷半截）。瞬态：不进 conversationForStorage。
@@ -1489,7 +1498,11 @@ export function useAliangChat() {
       // 连续 IDLE_PROBE_LIMIT 个窗口连快照都没有（socket 半死黑洞）才落
       // 原判兜底，并补收窗修 flag 僵尸。
       const probes = idleWatchdogProbes.get(conv.id) || 0;
-      if (!conv.deviceSession
+      // 探测宽限豁免收窄（2026-11-28 三审 F2）：旧口径一刀切豁免设备壳，
+      // 壳上长静默（慢工具/手机端审批等待）被直接盲杀。可订阅壳（agentcore
+      // 裸 id）与本地会话同样有权威快照通道，同享探测优先；不可订阅壳
+      // （claude_/codex_ 前缀）维持直落原判。
+      if ((!conv.deviceSession || deviceSessionSubscribable(conv))
         && probes < IDLE_PROBE_LIMIT
         && sendAI({ type: 'ai.session.subscribe', session_id: conv.aiSessionId })) {
         idleWatchdogProbes.set(conv.id, probes + 1);
@@ -1566,6 +1579,9 @@ export function useAliangChat() {
   // tool_ask 提问卡键位（2026-11-08 dashboard 渲染接入）：`session:interaction`
   // 封死已答/已作废卡，镜像 handledOptionIds（迟到重投不复活、作答不重复）。
   const handledToolAskIds = new Set();
+  // resolved 留痕条去重键（二轮评审 R4'）：独立于 handled*Ids——后者是 upsert
+  // 复活闸（封了会拦同 slug 后续合法卡），本集合只拦留痕条重复推。
+  const resolvedNoteKeys = new Set();
 
   const activeConversation = computed(() =>
     conversations.value.find(c => c.id === activeId.value) || null
@@ -2489,7 +2505,25 @@ export function useAliangChat() {
     // journal 切片天然缺在途回合内容，无占位则替换后的 delta 被 done 屏障
     // 静默吞掉；占位由随后到达的 delta 续流、ai.done 收口。
     const rows = Array.isArray(e.transcript) ? e.transcript : [];
-    if (rows.length) {
+    // 快照降级守卫（2026-11-28 三审 F1 + 二轮评审换 seq 判据）：握手快照
+    // （≤200 行切片）在详情分页拉全（≤500 行）之后必到——idle 且已装详情的
+    // 壳被更小的快照整体替换=静默降级。判据=快照末行 seq vs 本地展示流最大
+    // journal seq（seq 由 2026-11-10 身份化发给全部 journal 行，含 end/error
+    // 系统折行——id 判据对「失败收尾会话」失守：系统行不带 message_id）：
+    //   末行 seq === 本地最大 = 快照尾部与本地同尾（纯降级）→ 跳过；
+    //   末行 seq >   本地最大 = 本地缺新尾巴（断线追赶）→ 放行；
+    //   末行 seq <   本地最大 = journal 收缩（撤回截断，快照更短且更旧）→ 放行。
+    // 无 seq（旧 agent 行）→ 放行 = 旧行为。跑动中的壳与未装详情的壳不变。
+    const lastSnapSeq = Number(rows[rows.length - 1]?.seq);
+    let localMaxSeq = 0;
+    for (const m of shell.messages) {
+      const sq = chatMessageSeq(m);
+      if (sq > localMaxSeq) localMaxSeq = sq;
+    }
+    const snapshotDowngrade = shell.deviceLoadedAt && !isConversationRunning(shell)
+      && rows.length > 0 && lastSnapSeq > 0 && localMaxSeq > 0
+      && lastSnapSeq === localMaxSeq;
+    if (rows.length && !snapshotDowngrade) {
       applyDeviceSnapshotTranscript(shell, rows, e.status === 'running');
       if (activeId.value === shell.id) scrollToBottom();
     }
@@ -2507,6 +2541,14 @@ export function useAliangChat() {
 
     // status → 壳 running 标记（侧栏状态点消费）
     shell.running = e.status === 'running';
+    // 壳喂狗点（2026-11-28 三审 F2）：running 快照回包=会话活性权威证据——
+    // 清探测计数并再武装（reconcileLocalSnapshot 的喂狗只服务本地会话，壳
+    // 分支此前无喂狗点，探测宽限期内回包到不了狗就到期）。仅已武装的壳
+    // （本端续聊 sendMessage 链 armIdleWatchdog）补喂，不给围观壳凭空造狗。
+    if (e.status === 'running' && idleWatchdogTimers.has(shell.id)) {
+      idleWatchdogProbes.delete(shell.id);
+      armIdleWatchdog(shell);
+    }
   }
 
   // 本地会话快照对账（薄壳）。核心语义已上提纯函数 reconcileLocalSnapshot-
@@ -2521,7 +2563,7 @@ export function useAliangChat() {
     const snapshotRunning = e.status === 'running';
     // 本端发送在途（create/ai.message 未落定）：run 可能刚要起跑，此刻的
     // idle 快照不是终态证据，绝不动消息列表（误收敛=假 done+delta 全丢）。
-    let inFlight = local.id === activeId.value && sending.value;
+    let inFlight = isOwnSendInFlight(local);
     if (inFlight && !snapshotRunning) {
       const latestUser = local.messages.findLast(m => m?.role === 'user');
       const lastUserRow = rows.findLastIndex(row => row?.role === 'user');
@@ -3362,12 +3404,14 @@ export function useAliangChat() {
 
   function finishRun(conv) {
     conv.updatedAt = now();
-    // B4（2026-11-20 审计二批）：sending 跟随「发起发送的会话」而非当前活跃
-    // 会话——发消息后切走会话，run 终态到达后台会话时 sending 也必须复位，
-    // 否则全 app 输入框锁死到刷新。
-    if (activeId.value === conv.id || sendingConvId === conv.id) {
+    // B4（2026-11-20 审计二批）+ 二轮评审 major：纯归属口径——旧 activeId
+    // 析取词会让「用户正看着的会话」的 matched 他会话终态把本端在途发送
+    // 提前复位（idle 快照的在途守卫随即失效→误收敛在跑回合）。sending 的
+    // 三个写点（sendMessage/sendRecall/steer 降级改发）恒同步落 sendingConvId，
+    // 删除会话路径成对清理，纯归属即完备。
+    if (sendingConvId === conv.id) {
       sending.value = false;
-      if (sendingConvId === conv.id) sendingConvId = null;
+      sendingConvId = null;
     }
     saveToStorage();
   }
@@ -3388,7 +3432,9 @@ export function useAliangChat() {
 
   // --- 图片附件（spec 2026-11-05-chat-image-pipeline §3.6） ---
 
-  // 客户端预检与 agent 侧对齐：≤8 张/消息、单张 ≤10MiB、仅 jpeg/png/gif/webp。
+  // 客户端预检（UI 口径）：≤8 张/消息、单张 ≤10MiB、仅 jpeg/png/gif/webp。
+  // 注意：agent 侧上传/持久帽已放宽到 20MiB（2026-11-28 对齐下载腿），UI 预检
+  // 10MiB 是刻意保留的产品口径（分叉仅影响 API 直传），勿改注释为「对齐」。
   // 错误走 createError 面板（下次成功发送清除）；上传串行进行防乱序。
   const ATTACH_IMAGE_EXT = /\.(jpe?g|png|gif|webp)$/i;
   // 附件 chips 本地唯一 id（2026-11-20 审计⑥）：上传信封的 ref 对同名文件
@@ -3600,7 +3646,7 @@ export function useAliangChat() {
   async function downgradeSteerAfterAck(conv, item) {
     if (!conv || conv.deviceSession || item.downgraded) return;
     item.downgraded = true; // 单向锁：此后任何路径都只尝试这一次
-    if (conv.id === activeId.value && sending.value) return;
+    if (isOwnSendInFlight(conv)) return;
     const text = String(item.content || '').trim();
     if (!text) return;
     endRunWindow(conv);
@@ -4090,7 +4136,7 @@ export function useAliangChat() {
     // 断线自愈路径的再武装口：onclose 曾无条件 disarm（计时器为 null，旧门
     // `if (idleWatchdogTimer && ...)` 从此永远假——重连治愈的 run 僵死即永
     // running），活跃会话发送在途时允许从零重新武装。
-    if ((idleWatchdogTimers.has(conv.id) || (conv.id === activeId.value && sending.value)) && !routedToShell) {
+    if ((idleWatchdogTimers.has(conv.id) || isOwnSendInFlight(conv)) && !routedToShell) {
       // 真帧喂狗（症状1修复联动）：任何到达帧都是活性证据，探测计数归零——
       // 真在跑的会话不会累积到探测上限，兜底染红只打完全无响应的会话。
       idleWatchdogProbes.delete(conv.id);
@@ -4138,7 +4184,7 @@ export function useAliangChat() {
         // matchedById 门控：未命中帧（fallback 兜底挂活跃会话）绝不凭空造泡
         // /置 runActive——他会话的 run 不得污染活跃会话（旧实现只抬不造）。
         if (matchedById) {
-          beginRunWindow(conv, now(), { ownPending: conv.id === activeId.value && sending.value, turnMessageId: e.message_id || '' });
+          beginRunWindow(conv, now(), { ownPending: isOwnSendInFlight(conv), turnMessageId: e.message_id || '' });
           // 外来回合快照拉取：run.started 不携带提问行，订阅握手回包（快照）
           // 是网页拿到外来 user 行的唯一载体——本端命中即补订阅（inFlight 守卫
           // 下对本端在途流无副作用）。旧泡关账随 persist 落盘。
@@ -4225,14 +4271,24 @@ export function useAliangChat() {
           let hadRunning = false;
           if (matchedById) {
             hadRunning = endRunWindow(conv);
-          } else if (asst) {
+          } else if (asst && !isOwnSendInFlight(conv)) {
+            // 渲染腿同样让位于自有在途发送（评审 R-major）：外来终态不得关掉
+            // 本端在途占位泡（关掉即裂泡前奏，真 delta 到达另产新泡）。
             asst.status = 'done';
           }
           // 终态文案：优先后端人话原因（e.error），否则本地化文案——绝不把
           // 英文状态词原样写进答案气泡（旧实现空气泡时写 "stopped" 字面量）。
-          if (asst && !asst.content) asst.content = e.error || t('chat_runStopped');
+          // 文案行与渲染腿同门（二轮评审 major 探针实证）：own-send 期外来
+          // 终态不得把停止文案写进本端在途占位泡（真 delta 会续写在污染文本
+          // 之后并随 persist 落盘）。
+          if (asst && !asst.content && (matchedById || !isOwnSendInFlight(conv))) {
+            asst.content = e.error || t('chat_runStopped');
+          }
+          // 账务腿归属门控（评审 R-major：第三条终态腿——手动停止/看门狗击杀/
+          // 限流类终止只发终态 ai.status 不发 ai.done/error，恰是迟到终态最常见
+          // 形态，此前整腿未门）。清卡精确清外来卡；关账仅归属成立时执行。
           clearApprovalsForSession(conv, e.session_id);
-          finishRun(conv);
+          if (matchedById) finishRun(conv);
           if (matchedById && runDoneNeedsSnapshot(conv, hadRunning)) {
             sendAI({ type: 'ai.session.subscribe', session_id: conv.aiSessionId });
           }
@@ -4290,6 +4346,48 @@ export function useAliangChat() {
         // （B2）：归属漂移时卡可能落在别的会话对象上。
         if (e && e.status === 'resolved') {
           sweepResolveOption(conversations.value, e, handledOptionIds, now());
+          // 已答回执留痕（2026-11-28 三审 F7 + 二轮评审重定口径）：卡面是
+          // 瞬态（不落盘，刷新即失），系统条是唯一跨刷新真值——因此无论
+          // 卡是否在场（别端翻卡/自答回投/无卡漏帧）都推「已选择」留痕条；
+          // 瞬态期卡面+条并存是有意代价。去重用独立 resolvedNoteKeys（键级，
+          // 二轮评审：内容去重会把「不同提问同选型」的第二条真留痕吞掉；
+          // 不用 handledOptionIds 封键——option_id 是模型自写 slug 会跨回合
+          // 重用，封键会把后续同 slug 合法卡拦死在 upsert 门）。壳路由帧
+          // 额外写本地孪生会话（saveToStorage 过滤 deviceSession，壳上条
+          // 不持久）。
+          const optId = String(e?.option_id || '').trim();
+          const optKey = `${String(e.session_id || '')}:${optId}`;
+          if (conv && optId && !resolvedNoteKeys.has(optKey)) {
+            const picked = Array.isArray(e.selected) ? e.selected.map(v => String(v)) : [];
+            const custom = typeof e.custom_text === 'string' ? e.custom_text.trim() : '';
+            const parts = [...picked, custom].filter(Boolean);
+            if (parts.length) {
+              resolvedNoteKeys.add(optKey);
+              const noteContent = systemNoteContent(e.sourceId, `${t('chat_optionSelected')}: ${parts.join(' / ')}`);
+              const targets = [conv];
+              if (conv.deviceSession) {
+                const twin = conversations.value.find(c => !c.deviceSession
+                  && c.aiSessionId === e.session_id && c !== conv);
+                if (twin) targets.push(twin);
+              }
+              let pushedNote = false;
+              for (const target of targets) {
+                target.messages.push({
+                  role: 'assistant',
+                  kind: 'system',
+                  note: 'option_resolved',
+                  content: noteContent,
+                  status: 'done',
+                  ts: now(),
+                });
+                pushedNote = true;
+              }
+              if (pushedNote) {
+                scrollToBottom();
+                persist = true;
+              }
+            }
+          }
           break;
         }
         upsertOptionCard(conv, e);
@@ -4301,6 +4399,46 @@ export function useAliangChat() {
         // agent 兼容（request 帧本无 status 字段）。翻卡走全局扫卡（B2）。
         if (e && e.status === 'resolved') {
           sweepResolveToolAsk(conversations.value, e, handledToolAskIds, now());
+          // 已答回执留痕（2026-11-28 三审 F7 + 二轮评审重定口径）：同 ai.option
+          // resolved——always-push + resolvedNoteKeys 键级去重 + 壳孪生持久。
+          const askId = String(e?.interaction_id || '').trim();
+          const askKey = `${String(e.session_id || '')}:${askId}`;
+          if (conv && askId && !resolvedNoteKeys.has(askKey)) {
+            const answer = e.answer && typeof e.answer === 'object' ? e.answer : {};
+            const picked = Array.isArray(answer.selected_option_ids)
+              ? answer.selected_option_ids.map(v => String(v))
+              : answer.selected_option_id
+                ? [String(answer.selected_option_id)]
+                : [];
+            const custom = typeof answer.message === 'string' ? answer.message.trim() : '';
+            const parts = [...picked, custom].filter(Boolean);
+            if (parts.length) {
+              resolvedNoteKeys.add(askKey);
+              const noteContent = systemNoteContent(e.sourceId, `${t('chat_optionSelected')}: ${parts.join(' / ')}`);
+              const targets = [conv];
+              if (conv.deviceSession) {
+                const twin = conversations.value.find(c => !c.deviceSession
+                  && c.aiSessionId === e.session_id && c !== conv);
+                if (twin) targets.push(twin);
+              }
+              let pushedNote = false;
+              for (const target of targets) {
+                target.messages.push({
+                  role: 'assistant',
+                  kind: 'system',
+                  note: 'tool_ask_resolved',
+                  content: noteContent,
+                  status: 'done',
+                  ts: now(),
+                });
+                pushedNote = true;
+              }
+              if (pushedNote) {
+                scrollToBottom();
+                persist = true;
+              }
+            }
+          }
           break;
         }
         upsertToolAskCard(conv, e);
@@ -4411,12 +4549,28 @@ export function useAliangChat() {
         let hadRunning = false;
         if (matchedById) {
           hadRunning = endRunWindow(conv);
-        } else {
+        } else if (!isOwnSendInFlight(conv)) {
+          // 渲染腿同样让位于自有在途发送（评审 R-major）：外来终态不得关掉
+          // 本端在途占位泡。已知窄面挂账（二轮评审 minor，沿袭非本批引入）：
+          // ①门=会话粒度——同会话上一回合迟到 matched 终态仍可关当前窗
+          // （ai.error 腿有 runningTurnMessageId 回合守卫，done/status 腿
+          // 未对齐）；②让位只覆盖 sendMessage 系在途，option 续跑/steer
+          // 回合的活泡不在保护域（其帧同会话恒命中，暴露面极窄）。
           const fallbackAsst = findRunningAssistant(conv);
           if (fallbackAsst) fallbackAsst.status = 'done';
         }
+        // 账务腿归属门控（2026-11-28 三审 F4 + 评审 R1 精化）：清卡按
+        // e.session_id 精确清——未命中帧也只清它自己的外来卡（③兜底挂靠的
+        // 卡随其 run 终结正常退场），不碰活跃会话自己的卡；关账（finishRun）
+        // 仅在「命中本会话」或「本端在途发送归属此会话」时执行——未命中的
+        // 外来终态（删除在跑会话后 origin 直投的迟到帧）只关渲染泡，不提前
+        // 解锁输入（解锁会让快照对账的在途守卫失效，下一枚 idle 快照误收敛
+        // 在跑回合）。口径同 ai.session.closed 的 matchedById 先例。
         clearApprovalsForSession(conv, e.session_id);
-        finishRun(conv);
+        // 门=matchedById 单条件（评审 R 精化）：自端终态帧恒带 conv.aiSessionId
+        // （created ack 在 ai.message 前落 id）必命中；未命中帧必为外来，
+        // 「自有在途」豁免反而给外来终态开门（own-send 期 B5 白名单恒放行）。
+        if (matchedById) finishRun(conv);
         // 终态定谳复订阅（2026-11-05「只看到 59 60」形态 + vm22 外来回合）：
         // journal turn 行在回合结束才落盘——恢复会话/活体补建会话收到的
         // delta 只覆盖片段，全文此刻才第一次可得。再取一次快照，
@@ -4459,6 +4613,14 @@ export function useAliangChat() {
           && chatTurnBareId(conv.runningTurnMessageId) !== chatTurnBareId(e.message_id)) {
           console.debug('[aliang-chat] drop misattributed ai.error', e.message_id,
             'current=', conv.runningTurnMessageId);
+          return;
+        }
+        // 渲染腿让位（二轮评审 major 同族第三腿）：run 未起（runningTurnMessageId
+        // 空，上方归属守卫放行）时，外来 error 不得拆本端在途占位泡、不得种
+        // 外来失败条（deviceSystemNoteBubble 无来源标，用户会读成自己的发送
+        // 失败并随 persist 永久留痕）。
+        if (!matchedById && isOwnSendInFlight(conv)) {
+          console.debug('[aliang-chat] drop foreign ai.error onto own in-flight send', e.message_id);
           return;
         }
         const alreadyShown = messages.some(m => m?.note === 'turn_failed' && m.failedMessageId === e.message_id);
@@ -4506,8 +4668,10 @@ export function useAliangChat() {
           disarmIdleWatchdog(conv);
           endRunWindow(conv);
         }
+        // 账务腿归属门控：口径同 ai.done——清卡精确清外来卡；关账门=matchedById
+        // （未命中必为外来，自端终态帧恒带 conv.aiSessionId 必命中）。
         clearApprovalsForSession(conv, e.session_id);
-        finishRun(conv);
+        if (matchedById) finishRun(conv);
         return;
       }
       case 'ai.session.closed': {
