@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -586,6 +587,208 @@ func TestEmitTerminalBoundedPassesThroughSuccess(t *testing.T) {
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Fatalf("emit 调用次数 = %d, want 1", got)
 	}
+}
+
+// TestStopRoutesThroughGuardKill 锁死 ai.stop 的 guard 路由：手机主动停止
+// 命中已挂 guard 的回合时必须走 guard.kill——补上判死轨迹与宽限强拆兜底，
+// 而不是旧版的裸 cancel（卡死回合停不掉也无轨迹）。断言三段：killReason
+// 同步落账、guard 的 cancel 恰好触发一次、宽限后经 emit 收到恰好一个
+// turn_stalled 终态（证明强拆计时器真的臂起了）；回复帧照旧是 stopping。
+func TestStopRoutesThroughGuardKill(t *testing.T) {
+	oldGrace := agentAIKillGrace
+	agentAIKillGrace = 40 * time.Millisecond
+	t.Cleanup(func() { agentAIKillGrace = oldGrace })
+
+	m, session, guard, rec := newGuardTestManager(t)
+	oldCancel := guard.cancel
+	cancels := int32(0)
+	guard.cancel = func() { atomic.AddInt32(&cancels, 1); oldCancel() }
+	mu, events, writeJSON := captureAIWriter(t)
+
+	m.stop(map[string]interface{}{"session_id": session.id}, writeJSON)
+
+	if reason := guard.activity.killReasonOr(""); reason != "user_stop" {
+		t.Fatalf("killReason = %q, want user_stop", reason)
+	}
+	if got := atomic.LoadInt32(&cancels); got != 1 {
+		t.Fatalf("guard cancel called %d times, want 1", got)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	stoppingSeen := false
+	stalledCount := 0
+	for time.Now().Before(deadline) {
+		if !stoppingSeen {
+			for _, payload := range findAIEvents(mu, events, models.AgentEventAIStatus) {
+				if payload["status"] == "stopping" {
+					stoppingSeen = true
+				}
+			}
+		}
+		stalledCount = 0
+		for _, payload := range rec.snapshot() {
+			if payload["error_code"] == "turn_stalled" {
+				stalledCount++
+			}
+		}
+		if stoppingSeen && stalledCount > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !stoppingSeen {
+		t.Fatal("stopping status frame missing")
+	}
+	if stalledCount == 0 {
+		t.Fatalf("turn_stalled terminal never arrived after grace (payloads=%d)", len(rec.snapshot()))
+	}
+	// 强拆链完成：finalizeStalledGuard→clearRunning 会 markDone 并摘 guard。
+	select {
+	case <-guard.done:
+	default:
+		t.Fatal("guard.done not closed: force finalize did not run")
+	}
+	m.mu.Lock()
+	afterGuard := session.guard
+	m.mu.Unlock()
+	if afterGuard != nil {
+		t.Fatal("guard still attached after force finalize cleared the session")
+	}
+}
+
+// TestStopWithoutGuardFallsBackToCancel：guard 未挂载（TUI 回合/挂载竞态）时，
+// stop 回退裸 cancel，行为与旧版完全一致——killReason 不得被染上，回复帧不变。
+func TestStopWithoutGuardFallsBackToCancel(t *testing.T) {
+	m := newAgentAIManager()
+	activity := newAgentAIActivity()
+	_, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	cancels := int32(0)
+	session := &agentAISession{
+		id:       "sess-noguard",
+		runSeq:   1,
+		cancel:   func() { atomic.AddInt32(&cancels, 1); cancel() },
+		activity: activity,
+	}
+	m.sessions[session.id] = session
+	mu, events, writeJSON := captureAIWriter(t)
+
+	m.stop(map[string]interface{}{"session_id": session.id}, writeJSON)
+
+	if got := atomic.LoadInt32(&cancels); got != 1 {
+		t.Fatalf("cancel called %d times, want 1", got)
+	}
+	if reason := activity.killReasonOr(""); reason != "" {
+		t.Fatalf("killReason = %q, want empty（无 guard 必须走旧版裸 cancel 路径）", reason)
+	}
+	statuses := findAIEvents(mu, events, models.AgentEventAIStatus)
+	if len(statuses) != 1 || statuses[0]["status"] != "stopping" {
+		t.Fatalf("status replies = %v, want exactly one stopping", statuses)
+	}
+}
+
+// TestStopIdleSessionExternalInterruptBranch：guard 与 cancel 双空、带
+// source_session_id 的注册空闲会话，stop 仍走外部 TUI 中断分支（fallback 链
+// 的最后一环，旧版分支保留）；回复照旧是 stopping（外部中断成败不改回复）。
+func TestStopIdleSessionExternalInterruptBranch(t *testing.T) {
+	const sid = "stop-guard-idle-ext"
+	_ = externalInterruptFixture(t, sid, livePidRecord(t, sid, `"status":"busy","entrypoint":"cli"`))
+	lastPid := stubExternalInterrupt(t, nil)
+
+	m := newAgentAIManager()
+	m.mu.Lock()
+	m.sessions["reg-idle"] = &agentAISession{id: "reg-idle", resumeSessionID: sid}
+	m.mu.Unlock()
+	mu, events, writeJSON := captureAIWriter(t)
+
+	m.stop(map[string]interface{}{
+		"session_id":        "reg-idle",
+		"source_session_id": sid,
+	}, writeJSON)
+
+	if got := lastStubbedPid(lastPid); got != os.Getpid() {
+		t.Fatalf("interrupt pid = %d, want %d（外部中断分支未走到）", got, os.Getpid())
+	}
+	statuses := findAIEvents(mu, events, models.AgentEventAIStatus)
+	if len(statuses) != 1 || statuses[0]["status"] != "stopping" {
+		t.Fatalf("status replies = %v, want exactly one stopping", statuses)
+	}
+}
+
+// TestStopDoesNotOverwriteWatchdogReason 锁死判死归因的因果语义：watchdog
+// 已落账 idle_timeout 后，收尾窗内用户按停止走 guard.kill("user_stop")——
+// killOnce 新鲜，取消与强拆臂起照常发生（判死兜底不因归因保序而失效），但
+// 先因优先的 setKillReason 必须拒绝把真实死因洗成 user_stop；宽限期内正常
+// 收敛（markDone）后强拆哑火，死因原样保留。
+func TestStopDoesNotOverwriteWatchdogReason(t *testing.T) {
+	oldGrace := agentAIKillGrace
+	agentAIKillGrace = 40 * time.Millisecond
+	t.Cleanup(func() { agentAIKillGrace = oldGrace })
+
+	m, session, guard, rec := newGuardTestManager(t)
+	// 模拟 watchdog 已判死（五条判死路径的第一步都是 setKillReason）。
+	guard.activity.setKillReason("idle_timeout")
+	oldCancel := guard.cancel
+	cancels := int32(0)
+	guard.cancel = func() { atomic.AddInt32(&cancels, 1); oldCancel() }
+	mu, events, writeJSON := captureAIWriter(t)
+
+	m.stop(map[string]interface{}{"session_id": session.id}, writeJSON)
+
+	if reason := guard.activity.killReasonOr(""); reason != "idle_timeout" {
+		t.Fatalf("killReason = %q, want idle_timeout（user_stop 不得覆盖先因）", reason)
+	}
+	if got := atomic.LoadInt32(&cancels); got != 1 {
+		t.Fatalf("guard cancel called %d times, want 1（[ai.run.kill] 路径仍须激活）", got)
+	}
+	statuses := findAIEvents(mu, events, models.AgentEventAIStatus)
+	if len(statuses) != 1 || statuses[0]["status"] != "stopping" {
+		t.Fatalf("status replies = %v, want exactly one stopping", statuses)
+	}
+	// run 在宽限期内正常返回：markDone 关掉 done，强拆计时器哑火。
+	m.markRunGuardDone(session.id, guard.runSeq, guard)
+	select {
+	case <-guard.done:
+	default:
+		t.Fatal("guard.done not closed after markRunGuardDone")
+	}
+	time.Sleep(80 * time.Millisecond)
+	if got := len(rec.snapshot()); got != 0 {
+		t.Fatalf("terminal emitted %d times despite normal convergence, want 0", got)
+	}
+	if reason := guard.activity.killReasonOr(""); reason != "idle_timeout" {
+		t.Fatalf("killReason = %q after grace, want idle_timeout（强拆未跑，死因原样保留）", reason)
+	}
+}
+
+// TestKillReasonFirstWriteWinsAndForceOverwrites 单测 setKillReason 的因果
+// 语义本体：多路判死竞速（watchdog 五条 / 用户停止 / 内核停滞回调）下先到者
+// 留账、后到者不覆盖（双向都不覆盖）；forceFinalize 的兜底诊断走 force 变体，
+// 保留覆盖权；nil receiver 与 setKillReason 同口径安全。
+func TestKillReasonFirstWriteWinsAndForceOverwrites(t *testing.T) {
+	// watchdog 先判死，用户停止后到：死因仍是 watchdog 的。
+	watchdogFirst := newAgentAIActivity()
+	watchdogFirst.setKillReason("idle_timeout")
+	watchdogFirst.setKillReason("user_stop")
+	if got := watchdogFirst.killReasonOr(""); got != "idle_timeout" {
+		t.Fatalf("killReason = %q, want idle_timeout（先因优先，后发 user_stop 不得覆盖）", got)
+	}
+	// 用户先停止，watchdog 后发：死因仍是 user_stop。
+	userFirst := newAgentAIActivity()
+	userFirst.setKillReason("user_stop")
+	userFirst.setKillReason("idle_timeout")
+	if got := userFirst.killReasonOr(""); got != "user_stop" {
+		t.Fatalf("killReason = %q, want user_stop（先因优先，后发 idle_timeout 不得覆盖）", got)
+	}
+	// forceFinalize 的兜底诊断保留覆盖权。
+	userFirst.forceSetKillReason("idle_timeout")
+	if got := userFirst.killReasonOr(""); got != "idle_timeout" {
+		t.Fatalf("killReason = %q, want idle_timeout（force 变体必须可覆盖）", got)
+	}
+	// nil receiver 双路安全（与 setKillReason 既有口径一致）。
+	var n *agentAIActivity
+	n.setKillReason("x")
+	n.forceSetKillReason("x")
 }
 
 // forceFinalize 自己绝不能被卡死的写侧拖住：会话复位（手机回到 idle）是

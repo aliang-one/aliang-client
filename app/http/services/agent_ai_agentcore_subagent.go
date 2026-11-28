@@ -206,6 +206,12 @@ type agentCoreSubagentBridge struct {
 	// 内置+MCP,主 agent 把跨设备任务 delegate 给子 agent 时子 agent 无从
 	// 执行）。桥自带 journal 闭包(绑主 run session),复用实例零额外建连。
 	peerTools func() []agentcore.Tool
+	// bgTools：后台 shell 查询/终止工具工厂（BashOutput/KillShell 桥）。
+	// nil=不注入。与 peerTools 同款继承语义+同款缺口修补口径——子 agent 经
+	// 共享 ToolEnv 能用 Bash 的 run_in_background 起后台任务，内核成功文案
+	// 指回 BashOutput/KillShell 消费；不注入则子 agent 每次后台启动都撞
+	// 死胡同工具调用（2026-11-28 后台 shell 批评审 Important 1）。
+	bgTools func() []agentcore.Tool
 	// onToolCall：journal 回调——Task 调用本身与（经装饰器的）子 run 内置工具
 	// 调用都会触发；nil=不记。
 	onToolCall func(tool, summary string, isErr bool, result string)
@@ -547,6 +553,11 @@ func (b *agentCoreSubagentBridge) subRegistry(mcpTools []agentcore.Tool, toolHoo
 	}
 	if b.peerTools != nil {
 		for _, tool := range b.peerTools() {
+			registry.Register(tool)
+		}
+	}
+	if b.bgTools != nil {
+		for _, tool := range b.bgTools() {
 			registry.Register(tool)
 		}
 	}
@@ -972,6 +983,12 @@ func (m *agentAIManager) agentCoreSubagentTaskTool(run agentAIRun,
 	if peerTools := m.agentCorePeerTools(run); len(peerTools) > 0 {
 		peerFactory = func() []agentcore.Tool { return peerTools }
 	}
+	// 后台 shell 查询/终止桥:与 peer 桥同款工厂继承+同款 readOnly 口径
+	// (判定由调用方注入闸保证,子 agent 桥只在 !run.readOnly 时注入)。
+	var bgFactory func() []agentcore.Tool
+	if bgTools := m.agentCoreBackgroundTools(run); len(bgTools) > 0 {
+		bgFactory = func() []agentcore.Tool { return bgTools }
+	}
 	mainModel := agentCoreModel(run)
 	seen := map[string]bool{}
 	bridges := make(map[string]*agentCoreSubagentBridge, len(defs))
@@ -1009,6 +1026,7 @@ func (m *agentAIManager) agentCoreSubagentTaskTool(run agentAIRun,
 			logf:           logf,
 			mcpTools:       mcpFactory,
 			peerTools:      peerFactory,
+			bgTools:        bgFactory,
 			onToolCall:     onToolCall,
 			contextWindow:  run.contextWindow,
 			toolCeiling:    agentCoreSubagentToolCeiling(),

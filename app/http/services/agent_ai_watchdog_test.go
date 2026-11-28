@@ -185,9 +185,11 @@ func TestAgentAIRunStoppedStatus(t *testing.T) {
 		t.Fatalf("idle = (%q,%q), want (idle_timeout, non-empty)", status, msg)
 	}
 
-	// Hard ceiling kill reason.
-	a.setKillReason("hard_ceiling")
-	if status, msg := agentAIRunStoppedStatus(a, nil); status != "hard_timeout" || msg == "" {
+	// Hard ceiling kill reason.（setKillReason 已改先因优先：同 activity 上
+	// 不能再覆写，改用全新实例，本用例只验状态映射不验覆写。）
+	hard := newAgentAIActivity()
+	hard.setKillReason("hard_ceiling")
+	if status, msg := agentAIRunStoppedStatus(hard, nil); status != "hard_timeout" || msg == "" {
 		t.Fatalf("hard = (%q,%q), want (hard_timeout, non-empty)", status, msg)
 	}
 
