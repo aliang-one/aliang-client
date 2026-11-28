@@ -321,3 +321,62 @@ vs 进程启动时刻」为界，而不是以「设备」为界。
 - **被中断的回合文案**：裁决结算写出的是「Run cancelled」，语义上应是
   「已中断」——cancelled 暗示用户主动停止。RUN-01 验收要求「显示中断及原因」，
   这个文案需要改。
+
+## 7. 三个线上事故（2026-11-28）
+
+### 7.1 重启裁决误杀新回合
+
+已在 §6.5 记录，此处只记结论：裁决改为只结算 `runStartedAt` 早于新进程
+`started_at` 的会话。
+
+### 7.2 连接池被 flush 打满（P0，影响所有用户）
+
+**现象**：每次 pod 滚动更新，启动加载 1453 会话后集中 flush，
+`[flush] dt=30763ms`，`pool(wait/idle/total) before=191/0/10`，Postgres 连接
+超时，**所有写入失败约 40 秒**。两次滚动更新均复现。
+
+**根因**：`runFlushStateSaveOnce` 逐条 `await upsertAiSession`，而每条自己
+`pool.connect() → BEGIN → advisory lock → 8 次往返 → COMMIT → release`。
+1453 条 ≈ 1.2 万次往返挤在 `max=10` 的池子上。代码注释写着「Await them one
+at a time so a full snapshot cannot fan out hundreds of pool queries」，但
+串行 await 并不减少连接借还次数，HTTP 读请求在两次借还之间根本抢不到连接。
+
+**修法**：`PostgresDatabase.flushSnapshot` 拿 1 个连接、开 1 个事务，整个快照
+的写入都在里面跑。把 `persistAiSessionTransaction` 的事务体抽成
+`persistAiSessionOnClient` 供两条路径共用；`rollbackOnAbort` 区分单条路径
+（保留 ROLLBACK）与批量路径（只跳过该条，不毁掉整个事务）。
+
+**验证**（真实 PG 16 容器 + 线上）：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| 启动 flush 期间 pool wait | 191 | **0** |
+| 连接占用 | O(n)，n=会话数 | 1 |
+| 写入失败窗口 | 约 40 秒 | 无 |
+
+flush 本身仍需约 20 秒（1453 会话的量摆在那），但不再阻塞读。
+
+**遗留**：启动时仍有两条 `lock timeout`——agent hello 风暴与 flush 抢同一行
+的咨询锁，5 秒超时后放弃本次写（可丢写，下轮重试）。属既有设计，不丢数据。
+
+### 7.3 aliang-options 审批卡被代码块吞掉
+
+**现象**：手机上看到「SHOW Long text · 3 lines」折叠块，里面躺着
+`<approval-request><card-json>{...}` 和结尾的 `</approval-request>`，审批卡
+消失。
+
+**根因**：模型把围栏写成 **4 个反引号**（```` ```` ````），而 RN 与服务端的
+围栏正则只认 3 个。正则匹配到前 3 个后把 JSON 转成 `<approval-request>`
+标签，第 4 个反引号留在原处——`collectMarkdownCodeRanges` 把整段（含刚生成
+的审批标签）划进代码区，tokenizer 跳过它。
+
+服务端还有第二层失效：`fenceTolerantOptionBlocks` 的兜底扫描里，4 反引号
+围栏的 language 被解析成 `` `aliang-options ``（带前导反引号），不在白名单，
+被当成代码示例跳过——所以服务端也没能把它识别成派生审批卡。
+
+**修法**：三端围栏正则改为 `/(`{3,})aliang-options\s*([\s\S]*?)\1/g`
+（反向引用保证开闭数量一致）。网页端是按行扫描，行为不同：`indexOf` 从第 2
+个反引号起匹配、开栏判定碰巧成立，但 `start` 指向第 2 个反引号，第 1 个被
+留在正文里——卡前挂着孤立的反引号，已一并修掉。
+
+**回归护栏**：带其它语言标签的围栏里的 JSON 仍不得变成审批卡。
