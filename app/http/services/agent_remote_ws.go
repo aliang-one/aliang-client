@@ -815,12 +815,13 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 		s.applyCloudOperation(account, msg)
 	case models.AgentEventRegistered:
 		logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection registered_ack server_device_id=%s", strings.TrimSpace(fmt.Sprint(msg["device_id"]))))
-		// 增量协议轻对账(零新协议):agent.registered 每帧必回且携带服务端当前
-		// vibe 会话数。服务端归零而基线非零 = 内存态丢失信号(PG flush 回滚类
-		// 残余窗口),升格下帧 full;重启类丢失由拓扑兜底(重启必杀 socket→
-		// connect 全量),这里只封尾部窗口。
-		if serverSessions, ok := msg["vibe_session_count"].(float64); ok {
-			s.helloDelta.reconcileRegisteredServerSessions(int(serverSessions))
+		// 增量协议轻对账(零新协议):agent.registered 每帧必回。对账源=
+		// server_session_count(服务端真实总量,2026-11-28 rank3);老服务端
+		// 回落 vibe_session_count(行为与旧版一致)。服务端归零而基线非零 =
+		// 内存态丢失信号(PG flush 回滚类残余窗口),升格下帧 full;重启类
+		// 丢失由拓扑兜底(重启必杀 socket→connect 全量),这里只封尾部窗口。
+		if serverSessions, ok := registeredServerSessionCount(msg); ok {
+			s.helloDelta.reconcileRegisteredServerSessions(serverSessions)
 		}
 		s.mu.Lock()
 		// device_id is permanent and client-owned: ignore the id the server

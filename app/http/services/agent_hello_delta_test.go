@@ -211,6 +211,26 @@ func TestHelloRegisteredAckMismatchForcesFull(t *testing.T) {
 	assert.NotEqual(t, "full", plan2.mode, "正常数目的偏差(过滤语义)不得触发 full")
 }
 
+// rank3(2026-11-28)字段钉死:对账源优先 server_session_count(真实总量);
+// 老服务端缺新字段回落 vibe_session_count(兼容,行为同旧版);两键都缺不算数。
+// 这是对抗检查定谳的「双向耦合地雷」半边——单独修计数语义而不先接线
+// session_changes(rank2,PhoneServer 侧)会打开翻转硬丢失窗口。
+func TestRegisteredServerSessionCountFieldPreference(t *testing.T) {
+	n, ok := registeredServerSessionCount(map[string]interface{}{
+		"server_session_count": float64(5),
+		"vibe_session_count":   float64(0),
+	})
+	assert.True(t, ok)
+	assert.Equal(t, 5, n, "新字段在场上必须优先——旧字段是本帧变更数不是总量")
+
+	n2, ok2 := registeredServerSessionCount(map[string]interface{}{"vibe_session_count": float64(3)})
+	assert.True(t, ok2)
+	assert.Equal(t, 3, n2, "老服务端缺新字段回落旧字段")
+
+	_, ok3 := registeredServerSessionCount(map[string]interface{}{})
+	assert.False(t, ok3, "两键都缺不参与对账")
+}
+
 // 端到端:三次 sendAgentHello 走线 full → heartbeat → delta(经 hermetic home)。
 func TestSendAgentHelloWireModes(t *testing.T) {
 	home := t.TempDir()
