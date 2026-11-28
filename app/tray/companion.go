@@ -7,6 +7,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"aliang.one/nursorgate/app/agentruntime"
@@ -37,6 +38,12 @@ type CompanionApp struct {
 	mAIHeader    *systray.MenuItem
 	mAIProviders []*systray.MenuItem
 
+	// mPanelOpen「打开面板」恢复项(M2,见 panel_bridge_m2.go):面板模式
+	// 隐藏,兜底态(连崩 3 次)Show,点击 → RetryFromFallback。
+	mPanelOpen *systray.MenuItem
+	// panelLauncher M2 面板 launcher(installPanelLauncher 装配,nil=未装配)。
+	panelLauncher *PanelLauncher
+
 	ipcClient    *ipc.Client
 	httpURL      string
 	isRunning    bool
@@ -46,15 +53,24 @@ type CompanionApp struct {
 	// companion_dashboard_revive.go)。
 	dashReviveGate dashboardReviveGate
 	done           chan struct{}
+	// quitOnce 退出承诺点护栏(M2 评审 M-2):panelQuitInvoker 引入首个
+	// 并发触发点(forwardPanelExit goroutine 的 code=60 转投可与托盘菜单
+	// quit 并发),护 close(done) 恰一次,防两次退出交叠 double close panic。
+	quitOnce sync.Once
 }
 
 // NewCompanionApp creates a new CompanionApp with IPC client.
 func NewCompanionApp() *CompanionApp {
-	return &CompanionApp{
+	a := &CompanionApp{
 		ipcClient: ipc.NewClient(),
 		httpURL:   companionHTTPURL,
 		done:      make(chan struct{}),
 	}
+	// M2 面板 launcher 在这里(而非 onReady)装配:字段写在任何菜单/转投
+	// goroutine 启动之前,handlePanelOpenClick/forwardPanelExit 的读天然
+	// happens-before,无 race 面(见 panel_bridge_m2.go newPanelLauncher)。
+	a.newPanelLauncher()
+	return a
 }
 
 func (a *CompanionApp) onReady() {
@@ -87,6 +103,13 @@ func (a *CompanionApp) onReady() {
 
 	systray.AddSeparator()
 
+	// M2 托盘面板:「打开面板」恢复项——库只有 append 语义,必须排在 AI
+	// header 之前创建;面板模式隐藏,兜底态(连崩 3 次)Show,点击走
+	// handlePanelOpenClick(见 panel_bridge_m2.go)。
+	a.mPanelOpen = systray.AddMenuItem("Open Panel", "Reopen the tray panel after repeated crashes")
+	panelOpenItemVisor(a.mPanelOpen, false)
+	systray.AddSeparator()
+
 	// AI Acceleration status section (hidden by default)
 	a.mAIHeader = systray.AddMenuItem("AI Acceleration", "AI acceleration status")
 	a.mAIHeader.Disable()
@@ -109,9 +132,11 @@ func (a *CompanionApp) onReady() {
 		go a.agentWatchdogLoop()
 	}()
 
-	// M1 托盘面板接线(收尾动作):左右键点击 → panel.html。必须位于菜单
-	// 构建完成之后——面板模式会摘掉原生菜单,提前摘会把空菜单钉上状态项。
-	a.installPanelBridge()
+	// M2 托盘面板接线(收尾动作):左右键点击 → launcher.Click(面板进程
+	// 开合/崩溃兜底,见 panel_bridge_m2.go),取代 M1 的浏览器形态。必须
+	// 位于菜单构建完成之后——面板模式会摘掉原生菜单,提前摘会把空菜单钉上
+	// 状态项(M1 时序契约延续)。
+	a.installPanelLauncher()
 }
 
 func (a *CompanionApp) onExit() {
@@ -210,6 +235,8 @@ func (a *CompanionApp) handleMenuEvents() {
 			a.restartProxy()
 		case <-a.mOpenDashboard.ClickedCh:
 			a.openDashboard()
+		case <-a.mPanelOpen.ClickedCh:
+			a.handlePanelOpenClick()
 		case <-a.mQuit.ClickedCh:
 			a.quit()
 			return
@@ -511,10 +538,19 @@ func (a *CompanionApp) openDashboard() {
 }
 
 func (a *CompanionApp) quit() {
-	select {
-	case <-a.done:
-	default:
+	// 双触发护栏(M2 评审 M-2):panelQuitInvoker(M2)引入首个并发触发点
+	// ——forwardPanelExit goroutine 的 code=60 转投可与托盘菜单 quit 并发,
+	// 旧 select 判废形态下两次触发可同时走到 default 分支 → double
+	// close(done) panic。Once 护承诺点:仅首次触发 close done 并走完整
+	// 退出序列,并发迟到者直接返回(macOS 退出序列无取消路径,Once 消费
+	// 即必然退出);首次触发语义不变。
+	committed := false
+	a.quitOnce.Do(func() {
+		committed = true
 		close(a.done)
+	})
+	if !committed {
+		return
 	}
 
 	// 1. Stop proxy if running

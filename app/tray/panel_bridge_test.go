@@ -152,10 +152,12 @@ func TestPanelBridgeCallbackRecoversPanic(t *testing.T) {
 }
 
 // TestPanelBridgeOnReadyWiringBothPlatforms 钉接线时序与平台分工:两平台
-// onReady 末尾(菜单构建完成、既有 goroutine 启动之后)都挂
-// installPanelBridge;bridge 内部先注册回调再开面板模式;macOS 面板模式
-// =摘菜单挂回调(SetPanelMode(true)),时序靠「位于菜单构建之后」保证,
-// 提前摘菜单会把空菜单钉上状态项。
+// onReady 末尾(菜单构建完成、既有 goroutine 启动之后)都挂面板接线。M2
+// 起 onReady 挂 installPanelLauncher(launcher.Click 取代 M1 的浏览器回调,
+// 见 panel_bridge_m2_test.go);M1 的 installPanelBridge 函数与其测试保留
+// (M1 行为不变,浏览器打开能力仍可被其它路径复用)。bridge 内部先注册回调
+// 再开面板模式;macOS 面板模式=摘菜单挂回调(SetPanelMode(true)),时序靠
+// 「位于菜单构建之后」保证,提前摘菜单会把空菜单钉上状态项。
 func TestPanelBridgeOnReadyWiringBothPlatforms(t *testing.T) {
 	bridgeSrc := trayFileSource(t, "panel_bridge.go")
 	darwinShimSrc := trayFileSource(t, "panel_mode_darwin.go")
@@ -173,9 +175,9 @@ func TestPanelBridgeOnReadyWiringBothPlatforms(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				body := goFuncBody(t, trayFileSource(t, tc.file), "onReady")
 
-				idx := strings.Index(body, "a.installPanelBridge()")
+				idx := strings.Index(body, "a.installPanelLauncher()")
 				if idx < 0 {
-					t.Fatalf("onReady 缺少 a.installPanelBridge() 挂接:\n%s", body)
+					t.Fatalf("onReady 缺少 a.installPanelLauncher() 挂接(M2 接线取代 M1):\n%s", body)
 				}
 				// 时序一:菜单构建完成之后(否则 macOS 摘菜单接回的是空菜单)。
 				quitIdx := strings.Index(body, "a.mQuit = systray.AddMenuItem")
@@ -188,16 +190,16 @@ func TestPanelBridgeOnReadyWiringBothPlatforms(t *testing.T) {
 					t.Fatalf("onReady 找不到 goroutine 启动锚点 %q:\n%s", tc.goroutineA, body)
 				}
 				if idx < quitIdx || idx < goIdx {
-					t.Fatalf("installPanelBridge 必须在菜单构建(%d)与 goroutine 启动(%d)之后,实际 %d", quitIdx, goIdx, idx)
+					t.Fatalf("installPanelLauncher 必须在菜单构建(%d)与 goroutine 启动(%d)之后,实际 %d", quitIdx, goIdx, idx)
 				}
 				// 挂接是 onReady 最后一句:其后仅允许空白与整行 // 注释
 				// (按行剥离尾注释,宽容未来在挂接后补的说明性注释)。
-				for _, line := range strings.Split(body[idx+len("a.installPanelBridge()"):], "\n") {
+				for _, line := range strings.Split(body[idx+len("a.installPanelLauncher()"):], "\n") {
 					line = strings.TrimSpace(line)
 					if line == "" || strings.HasPrefix(line, "//") {
 						continue
 					}
-					t.Fatalf("installPanelBridge 之后 onReady 还有代码(挂接必须收尾): %q", line)
+					t.Fatalf("installPanelLauncher 之后 onReady 还有代码(挂接必须收尾): %q", line)
 				}
 			})
 		}

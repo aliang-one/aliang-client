@@ -8,6 +8,10 @@
 
 **Architecture:** 托盘层保留内嵌 getlantern/systray v1.2.2 + 本仓补丁（点击回调 + 图标矩形）。面板页由 core 回环仪表盘伺服 `/panel.html`，数据走同源 `/api`。里程碑 1 的宿主动作 = 开浏览器（复用既有 openDashboard 模式）；里程碑 2 换成 `internal/panelwin` 独立辅助进程（同一 aliang 二进制的 `panel` 子命令，点击才拉起、失焦即退、崩溃自动重拉、连续失败接回原生菜单），宿主通信仅两个自定义 WebMessage（`quit` → exit 60 / `open` → 浏览器）。模式切换运行中禁用（不复刻 SwitchMode 停而不起）。
 
+> **架构修订（2026-11-28 用户拍板方案 B「首次后常驻」）——⚠️ 已撤销（2026-11-28 实机三连败，见提交信息）**：方案 B 的常驻形态实测不可靠，同根=常驻的隐藏 WKWebView/WebView2 窗口在该 macOS 上不工作——①orderOut 后 makeKeyAndOrderFront/orderFrontRegardless 均被防抢焦点策略静默忽略（再也打不开）；②重显后 WebKit 内容不回复绘制（空白框）；③显示路径 makeKey 抢用户焦点→被夺回→0.12s 内 resignKey 自动再隐藏。**回归口径「点击才拉起+关闭即退」**：无子 → spawn（快照预热让打开瞬间即有上轮内容）；有子 → 发 **close 请求**（darwin=SIGUSR1 / windows=`WM_APP+1`，子进程 exit(0) 正常关闭，窗口随进程退出消失——双击保护语义变为「有子在册=点图标即请求关闭」）；点面板外（全局鼠标监听，菜单栏带 y<40 排除）/失焦（resignKey+everKeyed 守卫 / WM_ACTIVATE 失活）→ 子进程 exit(0)；孤儿防护保留（macOS ppid 看门狗 / Windows Job 收割）；**macOS 首次上屏延迟 150ms → 600ms**（避开托盘点击 key/space 震荡期的「悬挂窗口」态，见决策 6）。quit（exit 60）/崩溃分类/兜底语义全部不变；高度自适应（resize/RO 量高）与快照预热零触碰。~~原方案 B 口径：toggle 信号可见⇄隐藏 + 失焦=隐藏 + 隐藏 10 分钟空闲回收~~（全部随撤销批删除）。
+
+> **架构评审挂账（2026-11-28，Approved 随批）**：①launcher「Click 探测-代行收尸」路径与并发 Click 的基线同型亚微秒交叠（可清新子→双面板，实际不可观测；修法=代行收尸改 childExitedIfCurrent，需权衡漏计面）；②SIGUSR1 µs 级合并丢失面（点一次没反应，再点自愈，零状态损坏）已声明于 panel_spawn_darwin.go；③windows FindWindowW 类名全局定位双实例投错面已备忘于 panel_spawn_windows.go；④panelIdle timer fire 后未置 nil（生产不可达）。
+
 **Tech Stack:** Go 1.26 + 内嵌 systray（保留）；M2 增：macOS cgo ObjC（NSPanel + WKWebView，沿用 autoreleasepool 纪律）、Windows jchv/go-webview2 的 **pkg/edge.Chromium**（底层组件，见 Task 13 注意）+ x/sys/windows；Vue 3 + Vite 多页入口（panel.html，纯 .js 测试）；vitest。
 
 **规格来源：** `docs/superpowers/specs/2026-11-26-tray-panel-style-design.md`（§3/§4/§5/§6/§9）、`tray-menu-style-mockups.html`（数值与 SVG）、`2026-11-26-tray-replacement-research.md`（§4.2/§4.3/§6.5/§6.7——**该文档仅在主检出目录，Task 0 先复制进 worktree**）。
@@ -17,6 +21,8 @@
 2. 模式切换 = 运行中禁用；停止态切换只影响下次启动。
 3. Linux 不做、库不换；窗口壳纯原生不引 Wails。
 4. 交付节奏 = 两步走：先浏览器版（M1），后加壳（M2）；前端两阶段完全复用。
+5. ~~**方案 B「首次后常驻」（用户 2026-11-28）**：toggle 信号化 + 失焦=隐藏 + 隐藏 10 分钟空闲回收~~ **已撤销（2026-11-28 实机三连败，见决策 6 与顶部架构修订块）**，回归「点击才拉起+关闭即退」+ close 请求语义。
+6. **撤销方案 B 的定谳依据 + 悬挂窗口机制（2026-11-28 实机走查+CGWindowList 取证）**：常驻的隐藏 WKWebView 窗口在该 macOS 上三种失败模式——①orderOut 后 makeKeyAndOrderFront/orderFrontRegardless 均被防抢焦点策略静默忽略（再也打不开）；②重显后 WebKit 内容不回复绘制（空白框）；③显示路径 makeKey 抢用户焦点→被夺回→0.12s 内 resignKey 自动再隐藏。另坐实**「悬挂窗口」机制**：companion 在托盘点击处理中途 spawn 子进程，子进程的首次 orderFront 撞进系统 key/space 切换未稳定期（托盘点击震荡约 1s 内），窗口进入「已注册但永不合成」态——CGWindowList onscreen 永远查无此窗，后续信号也无法让它上屏（实测 7 分钟后的信号无效）；系统平静期同代码每次正常上屏。对策：初始上屏延迟 150ms → **600ms**（避开震荡期；页面加载在等待期照常进行，上屏时内容已就绪），初始上屏**不 makeKey**（避开失败模式③），resignKey 保留 everKeyed 守卫。
 
 **工作分支：** `fix/systray-darwin-autorelease-leak`（基点 e3b0dceb）。worktree：`/Users/mac/MyProgram/GoProgram/nursor/alianggate/.claude/worktrees/fix-systray-darwin-autorelease-leak`。
 
@@ -51,7 +57,7 @@ app/website/
 .github/workflows/tag-build-release.yml  改：matrix job 按 goos 插 go test 闸
 ```
 
-职责边界：companion（点击→M1 开浏览器 / M2 拉起面板进程；失败计数；兜底；退出码 60→既有 quit 闸）｜panel 进程【M2】（窗口、锚定、失焦退、消息→退出码/开浏览器）｜面板页（渲染 + /api）｜core（两个新端点）。
+职责边界：companion（点击→M1 开浏览器 / M2 拉起面板进程 + close 请求投递；失败计数；兜底；退出码 60→既有 quit 闸）｜panel 进程【M2】（窗口、锚定、点外/失焦/close 请求即退（撤销方案 B 后口径）、孤儿自检、消息→退出码/开浏览器）｜面板页（渲染 + /api）｜core（两个新端点）。
 
 **通信协议（面板页 → 宿主）**：页面 `postMessageHost` 发 JSON `{"type":"quit"}` / `{"type":"open","kind":"dashboard"}`。M1 浏览器无宿主 → `postMessageHost` 返回 false，页面按「无宿主模式」降级（退出键隐藏，见 Task 11）。M2 宿主处理：quit → exit 60；open → 按 kind 取对应 URL 开默认浏览器（v1 两 kind 均传仪表盘根 URL，评审次#8）。**零桥接框架、零自动注入运行时；消息 handler 名固定 `"panel"`（Task 13 结构测试断言）。**
 
@@ -318,13 +324,13 @@ Agent 区（§4.5）：标题「AI AGENT · 24H」；每内核一卡（🤖+名+
 
 行为（`aliang panel --url URL --ax X --ay Y --w 340 --h 560 --side top|bottom --open-dashboard URL --open-peer URL`）：
 - 锚定纯函数 `anchorToWindowPos(ax,ay,w,h,side,panelW,panelH)`：side=bottom → `y=ay-panelH-8`；side=top → `y=ay+h+4`；x 居中并钳边距 8。表驱动测试。
-- **Windows（panelwin_windows.go）**：①**自含 DPI 声明**（PerMonitorV2 `SetProcessDpiAwarenessContext` 十几行直接写在包内——`app/tray` 的同名函数未导出且 internal 不得反向依赖 app 包，二审阻塞 2）；②自建 `WS_POPUP` + `WS_EX_TOOLWINDOW|WS_EX_TOPMOST`；③`DWMWA_WINDOW_CORNER_PREFERENCE=ROUND` + `DWMSBT_TRANSIENTWINDOW`（22621+，低版本静默降级）；④WebView2 **必须用 `github.com/jchv/go-webview2/pkg/edge` 的 `Chromium`**：`Embed(自建HWND)` + `MessageCallback` 收 `{"type":...}` + 自建消息循环——**顶层 `WebView` 包装不可用**（其 Bind/JSON-RPC 会拦截 postMessage、无 WebMessageReceived 钩子，quit/open 链会静默断裂，二审重要 4）；⑤**显示前 `SetForegroundWindow(hwnd)`**（`AllowSetForegroundWindow` 只授予资格，不调则 `WM_ACTIVATE` 失活永不触发、失焦即退整条失效——二审阻塞 3）；⑥**尺寸 DPI 缩放**：创建后 `GetDpiForWindow` 取 scale，`SetWindowPos` 按 `W*scale/H*scale` 物理尺寸设置，CSS 视口维持 340 逻辑宽（二审重要 6：锚定坐标物理直通、尺寸逻辑×scale）；⑦`WM_ACTIVATE` 失活 → exit 0；⑧导航白名单：`NavigationStarting` 仅放行 `--url` 的回环 origin（调研 §6.3 不变量）；⑨消息 handler：quit → exit 60；open → 按 kind 取 `--open-dashboard/--open-peer` URL 开默认浏览器（ShellExecute）后驻留。
-- **macOS（panelwin_darwin.m）**：NSPanel（borderless + `NSWindowStyleMaskNonactivatingPanel`，`canBecomeKey=YES`）+ **`NSVisualEffectView`（behindWindow）材质铺底 + WKWebView `drawsBackground=false` + NSPanel `opaque=false`**（spec §1/§7：毛玻璃归系统材质层，前端只画半透明底；`drawsBackground` 为私有 KVC 面——公证探针随 Task 16 亚克力探针同批，调研 §6.5）+ `windowDidResignKey` → exit 0 + `WKUserContentController addScriptMessageHandler name:@"panel"`（**handler 名必须为 "panel"**，与前端 `messageHandlers.panel` 对齐，结构测试断言）+ `makeKeyAndOrderFront` + `NSApp activate`（不取焦点则失焦即退永不触发）+ open → `NSWorkspace openURL`。导航白名单：`decidePolicyFor` 仅放行回环 origin。
+- **Windows（panelwin_windows.go）**：①**自含 DPI 声明**（PerMonitorV2 `SetProcessDpiAwarenessContext` 十几行直接写在包内——`app/tray` 的同名函数未导出且 internal 不得反向依赖 app 包，二审阻塞 2）；②自建 `WS_POPUP` + `WS_EX_TOOLWINDOW|WS_EX_TOPMOST`；③`DWMWA_WINDOW_CORNER_PREFERENCE=ROUND` + `DWMSBT_TRANSIENTWINDOW`（22621+，低版本静默降级）；④WebView2 **必须用 `github.com/jchv/go-webview2/pkg/edge` 的 `Chromium`**：`Embed(自建HWND)` + `MessageCallback` 收 `{"type":...}` + 自建消息循环——**顶层 `WebView` 包装不可用**（其 Bind/JSON-RPC 会拦截 postMessage、无 WebMessageReceived 钩子，quit/open 链会静默断裂，二审重要 4）；⑤**显示前 `SetForegroundWindow(hwnd)`**（`AllowSetForegroundWindow` 只授予资格，不调则 `WM_ACTIVATE` 失活永不触发、失焦即退整条失效——二审阻塞 3）；⑥**尺寸 DPI 缩放**：创建后 `GetDpiForWindow` 取 scale，`SetWindowPos` 按 `W*scale/H*scale` 物理尺寸设置，CSS 视口维持 340 逻辑宽（二审重要 6：锚定坐标物理直通、尺寸逻辑×scale）；⑦`WM_ACTIVATE` 失活 → exit 0（~~方案 B 2026-11-28 曾划改为 `ShowWindow(SW_HIDE)` 隐藏~~ **2026-11-28 撤销方案 B 后恢复 exit 0 失焦即退**）；⑧导航白名单：`NavigationStarting` 仅放行 `--url` 的回环 origin（调研 §6.3 不变量）；⑨消息 handler：quit → exit 60；open → 按 kind 取 `--open-dashboard/--open-peer` URL 开默认浏览器（ShellExecute）后驻留。
+- **macOS（panelwin_darwin.m）**：NSPanel（borderless + `NSWindowStyleMaskNonactivatingPanel`，`canBecomeKey=YES`）+ **`NSVisualEffectView`（behindWindow）材质铺底 + WKWebView `drawsBackground=false` + NSPanel `opaque=false`**（spec §1/§7：毛玻璃归系统材质层，前端只画半透明底；`drawsBackground` 为私有 KVC 面——公证探针随 Task 16 亚克力探针同批，调研 §6.5）+ `windowDidResignKey` → exit 0（~~方案 B 2026-11-28 曾划改为 resignKey → orderOut 隐藏~~ **2026-11-28 撤销方案 B 后恢复 exit 0 失焦即退，带 everKeyed 守卫；孤儿自检 exit 0 仍在 Go 侧**） + `WKUserContentController addScriptMessageHandler name:@"panel"`（**handler 名必须为 "panel"**，与前端 `messageHandlers.panel` 对齐，结构测试断言）+ 初始上屏 `orderFrontRegardless`（600ms 延迟，**不 makeKey**——失败模式③与悬挂窗口机制见决策 6）+ open → `NSWorkspace openURL`。导航白名单：`decidePolicyFor` 仅放行回环 origin。
 - 结构测试（.m）：含 resignKey、`NSVisualEffectView`、`addScriptMessageHandler name:@"panel"`、全部 autoreleasepool、无裸 autorelease 创建点。
 
-- [ ] 锚定测试红→绿；结构测试红→实现→绿；`go build ./cmd/...` + `GOOS=windows go build ./cmd/...` + `GOOS=linux go list -deps ./cmd/aliang | grep -cE "webview2|panelwin|wails"`（期望 0）
-- [ ] **手工冒烟（本机 macOS）**：面板出现在图标下方、无 Dock 图标、毛玻璃材质可见、点击内部获焦、点外部退出、quit 消息退出码 60、open 开浏览器后驻留
-- [ ] Commit（`新增:internal/panelwin——纯原生窗口壳(NSPanel+WKWebView / WS_POPUP+WebView2)`）
+- [x] 锚定测试红→绿；结构测试红→实现→绿；`go build ./cmd/...` + `GOOS=windows go build ./cmd/...` + `GOOS=linux go list -deps ./cmd/aliang | grep -cE "webview2|panelwin|wails"`（期望 0）。**实作备注（终审回填）**：实现=33209324 + 评审增益=5728a7f1（darwin 主线程钉定 + ObjC 畸形 payload 守卫 + fail-closed 退出路径）。
+- [ ] **手工冒烟（本机 macOS）**：面板出现在图标下方、无 Dock 图标、毛玻璃材质可见、点击内部获焦、点外部退出、quit 消息退出码 60、open 开浏览器后驻留（**待装包走查**——归 Task 16 出包节）。
+- [x] Commit（`新增:internal/panelwin——纯原生窗口壳(NSPanel+WKWebView / WS_POPUP+WebView2)`）
 
 ---
 
@@ -346,9 +352,9 @@ func (l *PanelLauncher) RetryFromFallback()
 
 失败判定（拍板 1「只兜崩溃」）：崩溃 = `code != 0 && code != 60` 且非主动 Kill（`kill -9` 的信号死亡 exit −1 亦落入）→ 记失败 + 1s 后重拉；`code == 0`（失焦自退）与 `killedByUs`（点图标收起）= 正常关闭，零惩罚零重拉；10 分钟滑窗 3 次崩溃 → `onFallback()` + 停拉；存活 >60s 清零；`code == 60` → OnQuitRequested；fallback 态 Click 无效，仅 RetryFromFallback 可退出。
 
-表驱动必测：正常开合；快速双击 toggle 不计数；失焦自退（code=0, alive<2s）不计数；连崩 3 次→fallback；fallback 后 Click 无效、Retry 恢复；60 分派；>60s 清零。
+表驱动必测：正常开合；快速双击 close 请求不计数（请求期间幂等）；close 请求 exit(0) 零惩罚；点外/失焦即退（code=0）不计数；连崩 3 次→fallback；fallback 后 Click 无效、Retry 恢复；60 分派；>60s 清零。
 
-- [ ] 红→实现→绿→Commit（`新增:面板 launcher 状态机——崩溃兜底/正常关闭零惩罚`）
+- [x] 红→实现→绿→Commit（`新增:面板 launcher 状态机——崩溃兜底/正常关闭零惩罚`）。**实作备注（终审回填）**：实现=8e709082 + 评审增益=89d2a198（pendingRetry 真登记闭合幽灵重拉 + spawn panic 兜底转崩溃 + 注释契约修正）。
 
 ---
 
@@ -357,6 +363,10 @@ func (l *PanelLauncher) RetryFromFallback()
 **⚠️ Task 4 探针实测给本任务的两条硬要求：**
 1. **状态项窗口有约 800ms 的占位期**：创建后立即取 `TrayRect` 会拿到占位矩形（实测形态 (0,-33)）且 `ok=true`——接线层必须**现取现用**（点击时取，那时必然已摆放），禁止启动早期缓存矩形；或对「y≥屏高 或 x=0 且 y<0」形态判废（与 Windows S_FALSE 判废同型）。
 2. **`button.menu` 不可作接回判据**：AppKit 不把 `statusItem.menu` 传播到按钮视图的 menu（两态均空）——判接回状态用 `statusItem.menu` 本身 + action/target 是否摘除。
+
+**⚠️ panelwin 壳质量评审（M2 Task 13）追加的两条硬验收项：**
+3. **DPI>100% 锚定收口（150% 实机必现破损）**：锚定现用逻辑面板宽高对物理图标坐标，150% 下面板底边越过图标顶约 280px——接线设计必须收口（launcher 侧按 scale 换算面板尺寸传物理值，或壳内拿到 DPI 后对 Y 重锚），Windows 150% 实机走查为硬验收。
+4. **Windows 键盘首帧焦点（SetForegroundWindow 时序/chromium.Focus）与 403 fail-closed 退出路径列入 Task 16 实机探针。**
 
 **Files:**
 - Create: `app/tray/panel_bridge_m2.go` 接线扩展 + 测试追加
@@ -368,25 +378,31 @@ func (l *PanelLauncher) RetryFromFallback()
 - 锚定判废（在接线层）：Windows `TrayRect()` 失败/超 1.5 倍主屏 → GetCursorPos 兜底；macOS 直传。
 - bridge 测试：接线、fallback 切换、菜单项显隐翻转。
 - **手工验收（本机 macOS）**：弹面板→再点收起（零惩罚）；`kill -9` 面板→自动重拉；连杀 3 次→菜单接回+「打开面板」→点击走通；面板内退出→确认→既有退出闸照旧。
-- [ ] 红→实现→绿→验收记录→Commit（`新增:companion M2 接线——spawn/兜底切回/恢复项`）
+- [x] 红→实现→绿→验收记录→Commit（`新增:companion M2 接线——spawn/兜底切回/恢复项`）。**实作备注（Task 15 批次）**：①落地文件=panel_bridge_m2.go（判废/方位/参数组装/兜底切换/退出对接，纯 Go 双平台）+panel_spawn_darwin.go/panel_spawn_windows.go（spawn 与锚定采样 shim）+panelwin_reanchor.go（DPI 物理重锚纯函数）；②DPI 收口按裁定落在壳内（GetDpiForWindow scale 后重锚），side 经「bottom 假设恒等还原图标顶边→是否落在任务栏条带（SM_CYFULLSCREEN−60px）」判别，scale=1 恒等（100% 机器零变化）；③spawn 组装=同二进制 `panel` 子命令（os.Executable），参数与 cmd/panel.go flags 一一对应（结构测试钉死）；④Windows spawn 顺序=CREATE_SUSPENDED→AllowSetForegroundWindow→Job 入树→Resume（Job 句柄刻意不 Close：KILL_ON_JOB_CLOSE 靠「句柄活到进程死」构成收割语义）；⑤launcher 装配挪到 NewCompanionApp（字段写在菜单/转投 goroutine 启动前，闭合读写 race 面）；⑥门禁全绿（-race 双包/gofmt/Linux 闭包 0/GOOS=windows：panelwin build+vet 干净，app/tray 被 app/http→storage 的 cgo 跨编译墙挡住=基线同源，已用去 storage 脚手架模块完成真类型检查）。**手工验收待装包后走查（本批不执行,见 Task 16 出包节）**。
 
 ---
 
 ### Task 16: 打包、文档与验收收口
 
-- [ ] **Linux 排除门终验**：`GOOS=linux CGO_ENABLED=1 go list -deps ./cmd/aliang | grep -cE "webview2|panelwin|wails"`（期望 0）；`GOOS=linux CGO_ENABLED=0 go build ./cmd/...`
-- [ ] 全量测试：`go test ./app/tray/ ./internal/ipc/ ./internal/singleinstance/ ./cmd/ ./internal/panelwin/ ./app/http/services/ -count=1` + `cd app/website && npm run test -- src/panel`
-- [ ] PATCH_NOTES 登记 Task 3/4 补丁（重放锚点清单）；调研文档随本批提交入库
-- [ ] 出包：macOS `VERSION=v1.1.129-local bash scripts/build-pkg.sh` 装机；Windows 走 MSI 链
-- [ ] **验收走查（spec §9 + 调研 §7 探针）**：macOS 26/27 各一台七态逐项 + 深浅色 + 失焦 + 锚定 + 崩溃演练 + `footprint` 对照 + **毛玻璃材质可见**；Windows 11 真机（4070）：同清单 + GDI 平坦（GetGuiResources）+ 溢出区锚定回退 + DPI 125%/150%（CSS 视口宽必须恒 340）+ **亚克力/圆角实机探针**（不生效→回退纯半透明并回写 spec §7）+ **WKWebView 透明底公证探针**
-- [ ] spec 回写备注（豁免项：错误行跳日志、设备互访 v1=仪表盘根页、§7 材质探针结论）
-- [ ] Commit（`新增:托盘面板 M2 收口——壳验收与文档`）
+- [x] **Linux 排除门终验**：`GOOS=linux CGO_ENABLED=1 go list -deps ./cmd/aliang | grep -cE "webview2|panelwin|wails"`（期望 0）；`GOOS=linux CGO_ENABLED=0 go build ./cmd/...`。**实作备注（Task 16 收口批,2026-11-28）**：依赖闭包命中 = 0 ✓;`CGO_ENABLED=0` build 败于 `app/http/storage/quick_setup_combo_store.go:29 undefined: sqlite3.ErrConstraint`——**预存非本批引入**（与分支基点 7345756b 的同文件逐字节一致,mattn/go-sqlite3 纯 cgo 在 CGO_ENABLED=0 下无符号可用,`cmd/`→storage 依赖在基点已存在）,按门禁字面如实记录不强行修;真 Linux 构建走 CGO_ENABLED=1 通道。
+- [x] 全量测试：`go test ./app/tray/ ./internal/ipc/ ./internal/singleinstance/ ./cmd/ ./internal/panelwin/ ./app/http/services/ -count=1` + `cd app/website && npx vitest run src/panel`。**实作备注（Task 16 收口批,2026-11-28）**：Go 六包全绿（tray 1.118s / ipc 2.877s / singleinstance 2.290s / cmd 47.721s / panelwin 4.165s+编辑后复跑 0.878s / services 255.824s,EXIT=0,两已知预存 flake 未触发）;vitest 10 文件 193/193 全绿（基线 193 一致）。
+- [x] PATCH_NOTES 登记 Task 3/4 补丁（重放锚点清单）；调研文档随本批提交入库。**实作备注（Task 16 收口批）**：登记已随 M1/M2 前序批次完成（systray.go 1 锚 / systray_windows.go 12 锚 / darwin.m 18 锚 / darwin.go 2 / nonwindows.go 1 / systray.h 2,与文件实测逐一对上）;本批复核发现 windows 节编号引用漂移（「钉住 4~11」为增锚前旧值）已修正并消歧条目号/锚点号;调研文档两份已随 11f6768e / c53cefb9 入库,与主仓原件逐字节一致。
+- [ ] 出包：macOS `VERSION=v1.1.129-local bash scripts/build-pkg.sh` 装机；Windows 走 MSI 链。**（待主控收口批后执行,本批红线不出包）**
+- [ ] **验收走查（spec §9 + 调研 §6.9 探针）**：macOS 26/27 各一台七态逐项 + 深浅色 + 失焦 + 锚定 + 崩溃演练 + `footprint` 对照 + **毛玻璃材质可见**；Windows 11 真机（4070）：同清单 + GDI 平坦（GetGuiResources）+ 溢出区锚定回退 + DPI 125%/150%（CSS 视口宽必须恒 340）+ **亚克力/圆角实机探针**（不生效→回退纯半透明并回写 spec §7）+ **WKWebView 透明底公证探针**。**（待装机走查;材质探针结论已在 spec §10 先行占位;⚠️ 4070 走查前须先撤 IFEO/WER 取证三件套,或 Windows 腿改用另一台 Win11 真机——调研 §6.9:「4070 处于 WER 取证态且 companion / agent 是红线,需另选机器」）**
+- [ ] **M2 接线评审挂账（2026-11-27 评审判定 Needs fixes→本批收口余项，随本任务出包走查定夺）**：
+  - **M-5**：M1 形态 `panel_bridge.go` 的 `installPanelBridge`/`uninstallPanelBridge`/`panelClickCallback` 失去生产调用方（仅测试引用）——出包走查时拍板去留（删码须同步裁撤对应测试）。
+  - **M-6**：reanchor side 判别两边界：①Win10 垂直任务栏误判（视觉错位级）；②`SM_CYFULLSCREEN` 主屏归属对副屏锚定坐标可能反向误判——根治=壳内 `MonitorFromPoint`+`GetMonitorInfo` 取真实工作区，随实机走查定夺。
+  - **M-7（终审回填,预存,Task 13 评审范围）**：负坐标副屏钳边（panelwin.go `AnchorToWindowPos` 对 x 无条件钳 >=8——主屏左侧副屏的托盘图标会把面板弹到主屏；macOS 可达,Windows 主屏恒原点不可达）——根治=按 ax 所在屏矩形钳制,挂后续批。
+- [x] spec 回写备注（豁免项：错误行跳日志、设备互访 v1=仪表盘根页、§7 材质探针结论）。**实作备注（Task 16 收口批）**：已落 spec 文档尾新增「§10 M2 实现备注（2026-11-28）」——①豁免项定案（两处 v1 均开仪表盘根页）;②材质探针结论占位待装机回填 §7;③组头 g-current 瞬切已实现、淡入留样式打磨。
+- [x] Commit（`文档:M2 收口——全量门禁绿+PATCH_NOTES 补登+调研报告入库+panelwin nit 清理`）
 
 ---
 
 ## 明确不做
 
-Linux 任何托盘能力；fyne-io/Wails 托盘与窗口栈；v4 协议/GUID；变更门控三端统一；endpoint/会话管理界面；provider 详情 popover（v1 toast）；面板高度自适应（固定 560）；日志页深链（开仪表盘根页）。
+Linux 任何托盘能力；fyne-io/Wails 托盘与窗口栈；v4 协议/GUID；变更门控三端统一；endpoint/会话管理界面；provider 详情 popover（v1 toast）；日志页深链（开仪表盘根页）。
+
+> 撤销项：~~面板高度自适应（固定 560）~~——2026-11-28 用户拍板拉入范围，resize 协议扩展已实现（25864d03 + 评审增益批：applyHeight 几何抽纯函数表驱动、WebView2 Resize 跟随、前端 RO 量高）。
 
 ## 风险与执行注意
 

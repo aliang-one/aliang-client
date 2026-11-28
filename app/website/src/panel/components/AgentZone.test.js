@@ -273,6 +273,26 @@ describe('AgentZone 挂载 DOM 契约', () => {
     expect(chips1.some((c) => c.className.includes('live'))).toBe(false);
   });
 
+  it('单行紧凑化(2026-11-28 用户反馈):芯片行在 .top 卡头行内(紧跟内核名、右箭头之前),不留独立第二行', () => {
+    const { el } = mountZone({ agents: makeAgents(demoKernels()) });
+    for (const card of qa(el, '.agent-card')) {
+      const top = q(card, '.top');
+      const stats = q(card, '.stats');
+      // 芯片容器是 .top 的直接子元素(单行),不是卡片的独立第二行
+      expect(stats).not.toBeNull();
+      expect(stats.parentElement).toBe(top);
+      // 行序:图标 → 内核名 → 芯片 → 右箭头(箭头恒行尾;SVG 的 className
+      // 是 SVGAnimatedString,按仓内惯例用 getAttribute('class') 断言)
+      const kids = Array.from(top.children);
+      expect(kids[0].className).toContain('a-ico');
+      expect(kids[1].className).toContain('name');
+      expect(kids[kids.length - 1].getAttribute('class')).toContain('chev');
+      expect(kids.indexOf(stats)).toBeGreaterThan(kids.indexOf(kids[1]));
+      // 收起态也应是单行:卡片下除 .top/.sess-list 外无其他行容器
+      expect(Array.from(card.children).map((c) => c.className)).toEqual(['top', 'sess-list']);
+    }
+  });
+
   it('卡片点击展开/收起明细:open 类切换;明细条渲染(状态点 run/idle/标题/meta)', async () => {
     const { el } = mountZone({ agents: makeAgents(demoKernels()) });
     const card0 = qa(el, '.agent-card')[0];

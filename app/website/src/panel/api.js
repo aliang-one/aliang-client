@@ -200,6 +200,9 @@ export function isHosted() {
 // postMessageHost(msg) — 把消息投给原生宿主:
 //   Windows WebView2: window.chrome.webview.postMessage
 //   macOS WKWebView:  window.webkit.messageHandlers.panel.postMessage
+// 宿主消息协议(类型白名单):quit / open / resize;resize=高度自适应
+// (2026-11-28 用户拍板:页面量内容高上报,壳 clamp 后跟随改窗口高度);
+// 新增类型需双侧同批(前端+双平台壳),未知类型壳侧忽略不崩。
 // 两个后端皆缺(如 M1 浏览器直开 panel.html 的无宿主模式)→ 返回 false,
 // 不抛错——调用方以返回值判定「无宿主模式」。
 export function postMessageHost(msg) {

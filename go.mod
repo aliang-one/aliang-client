@@ -27,6 +27,13 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/schema v1.4.1
 	github.com/gorilla/websocket v1.5.3
+	// 托盘面板原生壳(Windows 侧,internal/panelwin)专用:只用其 pkg/edge 的
+	// 底层 Chromium 组件(Embed 自建 HWND + MessageCallback),顶层 WebView
+	// 包装不可用(Bind/JSON-RPC 拦截 postMessage、无 WebMessageReceived 钩子,
+	// quit/open 消息链静默断裂)。钉死 pseudo-version 不跟 latest:edge 的
+	// 私有 vtbl/回调面随上游变动,升级须过 Windows 实机回归(实现计划 M2
+	// Task 13 与调研 §6.3;Task 16 验收含实机探针)。
+	github.com/jchv/go-webview2 v0.0.0-20260205173254-56598839c808
 	github.com/mattn/go-sqlite3 v1.14.22
 	github.com/miekg/dns v1.1.68
 	github.com/modelcontextprotocol/go-sdk v1.8.0
@@ -101,6 +108,7 @@ require (
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/hashicorp/go-sockaddr v1.0.7 // indirect
 	github.com/jackmordaunt/icns/v3 v3.0.1 // indirect
+	github.com/jchv/go-winloader v0.0.0-20250406163304-c1995be93bd1 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect

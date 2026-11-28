@@ -1,6 +1,7 @@
 <!-- App.vue — 托盘面板根壳:
      theme + 340px 容器 + Toast 挂载 + 数据层接线(useSummary 轮询 +
-     derivePanelState 七态派生,provide 给区块组件)。
+     derivePanelState 七态派生,provide 给区块组件)+ 高度自适应
+     (量内容高经 resize 消息上报宿主,壳跟随改窗高;2026-11-28 用户拍板)。
      区块组件:①状态头/②传输行(Task 8)/③AI 加速(Task 9)/④ENDPOINT
      (Task 10)/⑤AI AGENT + ⑥底部动作行(Task 11)全部落地,无占位。
      ④⑤的分隔线放区尾并随整区显隐:整区不渲染(数据缺失硬性降级)时
@@ -10,7 +11,9 @@
      不随 zone 走,随区显隐是实现层决定;⑥的 mockup border-top 因同因不抄,
      见 FooterBar 文件头)。 -->
 <script setup>
-import { computed, provide, ref } from 'vue';
+import { computed, nextTick, onMounted, provide, ref, watch } from 'vue';
+import { postMessageHost } from './api';
+import { createHeightReporter } from './heightReport';
 import { useSummary } from './summary';
 import { derivePanelState } from './state';
 import Toast, { useToast } from './components/Toast.vue';
@@ -43,10 +46,56 @@ provide('panelData', { summary, connLost, panelState, localTransition, refresh }
 // toast 队列单例(接口 toast.show(msg, kind))也一并注入。
 const toast = useToast();
 provide('panelToast', toast);
+
+// —— 高度自适应(2026-11-28 用户拍板,M2 follow-up)——
+// 页面量内容高(scrollHeight 取整)经宿主通道发 resize 消息,壳 clamp 后
+// 跟随改窗口高度;超过屏幕可用高才页内滚动(此前固定 560 内容要滚「有点
+// 不合适」,且 AI AGENT 区展开高度可变)。浏览器无宿主时 postMessageHost
+// 返回 false,静默跳过(无宿主模式高度即视口,不上报)。
+const panelEl = ref(null);
+// 高度上报器(量高/合帧/≤1px 抖动门抽到 heightReport.js 可测单元):
+// 合帧【不用 rAF】——面板壳「先隐藏、首次 resize 到位才上屏」,未上屏窗口
+// 里 WebKit/Chromium 挂起 scripted animations,rAF 回调永不执行,首个
+// resize 会永远发不出、面板盲等 1.2s 兜底;定谳与取舍见 heightReport.js
+// 文件头(P1-1)。lastSent/pending 状态都在 reporter 内部,本组件零持有。
+const { report: reportHeight, schedule: scheduleReportHeight } = createHeightReporter({
+  measure: () => (panelEl.value ? panelEl.value.scrollHeight : null),
+  send: postMessageHost,
+});
+// 尺寸观察器(评审增益批,替换 MutationObserver 方案):AGENT 明细/ENDPOINT
+// 组的展开动画(max-height 0.25s)逐帧改中间高度——MutationObserver 单次
+// 回调量到的是中间态、终态漏报;ResizeObserver 对尺寸变化逐帧天然覆盖动画
+// 全程,变化停止后最后一次回调量到终态。RO 只当触发器,量法仍是
+// reportHeight 的 scrollHeight(≤1px 抖动门共用)。
+// 任何状态都跟随(2026-11-28 实机反馈:降级/错误态不收缩=默认高下留大片
+// 空窗,比「骨架高度闪一帧」严重得多,撤销 Minor-6 延后口径):onMounted
+// 建 RO(observe() 自带当前尺寸初始回调)+ 立即首量;summary 快照预热
+// (localStorage)让首帧即真实内容高。数据驱动的显隐/行数变化经 nextTick
+// 等 DOM 刷完再量;文字增删若不改高度,RO 不触发也无需上报。
+let heightObserver = null;
+function ensureHeightObserver() {
+  if (heightObserver || !panelEl.value) return;
+  heightObserver = new ResizeObserver(scheduleReportHeight);
+  heightObserver.observe(panelEl.value);
+}
+onMounted(() => {
+  nextTick(() => {
+    ensureHeightObserver();
+    // 首报直调 reportHeight(不经 schedule,同步强布局读取):RO 在未上屏
+    // 窗口对尺寸变化的回调行为存疑(可能同样受可见性影响),首报不能押在
+    // 它身上——直调保证至少一条链路必然发出 resize;schedule/RO 作后续
+    // 增量跟随的通道。外层 nextTick 等 DOM 刷完(onMounted 时根已挂载,
+    // nextTick 在隐藏窗照常执行)。
+    reportHeight();
+  });
+});
+watch(summary, () => {
+  nextTick(scheduleReportHeight);
+});
 </script>
 
 <template>
-  <div class="panel">
+  <div class="panel" ref="panelEl">
     <!-- ① 状态头部:logo + 状态 + 副标题 + 状态点(Task 8) -->
     <StatusHeader />
     <div class="sep"></div>
