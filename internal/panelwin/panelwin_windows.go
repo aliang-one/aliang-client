@@ -342,6 +342,11 @@ func runPanelWindow(opts Options) error {
 		shown = true
 		procSetForegroundWindow.Call(hwnd)
 		procShowWindow.Call(hwnd, uintptr(swShow))
+		// ⚠️ SW_SHOW 后必须重推 bounds:Embed/resize 期 PutBounds 发生在
+		// 窗口隐藏态,部分系统形态下未被 WebView2 接受——显示瞬间的视口
+		// 仍是旧尺寸,内容错位+双滚动条(2026-11-28 0.196 实机走查坐实)。
+		// 可见状态下 PutBounds 必然生效,此处重推一次。
+		chromium.Resize()
 		chromium.Focus()
 		logger.Info("panelwin: 面板上屏(" + reason + ")")
 	}
