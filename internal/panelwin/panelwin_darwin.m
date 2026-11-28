@@ -14,10 +14,10 @@
 // 页面 quit 消息 → exit(60);open 消息 → NSWorkspace openURL 开默认浏览器后
 // 驻留;resize 消息 → 跟随改窗高(高度自适应)。
 //
-// ⚠️ 已知限制(方案 B 拍板明示):面板从未成为 key 之前,失焦事件不存在
-// ——首开未点面板内部时,点外部不隐藏,收起手势=托盘点击(toggle 恒可用);
-// 用户点击面板内部一次后,次级失焦链即活。退出码契约:0=正常关闭(现由
-// 空闲回收与孤儿自检产生,失焦不再产生退出)、60=quit、其余=崩溃。
+// 点面板外即收(2026-11-28 用户反馈,全局鼠标监听实现):global monitor 对
+// 鼠标事件【无需】TCC 授权(仅键盘事件需要 Input Monitoring)——面板未成为
+// key 也能收到「面板外」的点击。退出码契约:0=正常关闭(现由空闲回收与
+// 孤儿自检产生,失焦不再产生退出)、60=quit、其余=崩溃。
 //
 // 进程是叶子进程,窗口/对象生命周期=进程存活,不做显式释放。
 //
@@ -325,6 +325,22 @@ static PanelAppDelegate* panelDelegate = nil;
   panel.contentView.wantsLayer = YES;
   panel.contentView.layer.cornerRadius = 16;
   panel.contentView.layer.masksToBounds = YES;
+
+  // 点面板外即收:global mouseDown(本窗口内的点击走本地路径不进此监听,
+  // 故凡到达此处的点击必然在面板外)=隐藏;菜单栏带(y<40)排除——托盘图标
+  // 自身的点击是 companion 的 toggle 手势,若被本监听抢先隐藏,随后的
+  // toggle 显示会形成「点一次没反应」竞态。handler 在注册线程(主线程)
+  // 回调,仍走 dispatch_async 保险;幂等由 panelSetHidden 闸承担。
+  [NSEvent addGlobalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown
+                                         handler:^(NSEvent *event) {
+    NSPoint loc = event.locationInWindow; // global monitor:屏幕全局坐标(左上原点)
+    if (loc.y < 40) {
+      return;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [self panelSetHidden:YES];
+    });
+  }];
 
   // 上屏取证(Task 16 探针):0.5s 后回报 occlusion/key 状态——Space 事故
   // (窗口在册但不在屏)在这里一行日志就能归因。

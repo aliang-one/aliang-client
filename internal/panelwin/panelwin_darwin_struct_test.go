@@ -115,6 +115,16 @@ func TestPanelwinDarwinShellStructure(t *testing.T) {
 		if !strings.Contains(src, `forKey:@"drawsBackground"`) {
 			t.Errorf("panelwin_darwin.m 的 drawsBackground 必须经 setValue:forKey:@NO 的 KVC 形态(私有 API 口径)")
 		}
+		// 点面板外即收:全局鼠标监听三件套(鼠标事件无需 TCC;菜单栏带排除)
+		for _, want := range []string{
+			"addGlobalMonitorForEventsMatchingMask",
+			"NSEventMaskLeftMouseDown",
+			"loc.y < 40",
+		} {
+			if !strings.Contains(src, want) {
+				t.Errorf("panelwin_darwin.m 缺少 %q(点外部收起链不完整)", want)
+			}
+		}
 		// 材质层 frame 必须是 contentView 本地坐标(2026-11-28 实机走查坐实:
 		// 用 contentRectForFrameRect:panel.frame 的屏幕全局坐标 addSubview,
 		// 材质层落到可视区外=全透明空壳窗口)。锚死本地坐标形态,拦回退;

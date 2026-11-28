@@ -45,6 +45,9 @@ func spawnPanelProcess(opts SpawnOpts) (ChildProcess, error) {
 //
 // ⚠️ SIGUSR1 专用于面板 toggle,其他组件不得占用(壳内 signal.Notify 接管
 // 后默认终止行为被替换;companion 自身进程不注册本信号,不影响托盘侧)。
+// 已知边界:标准信号不排队,µs 级合并窗口内连续两次点击可能丢一次 toggle
+// (用户感知=点一次没反应,再点即恢复;launcher 不跟踪可见性,零状态损坏,
+// 架构上刻意容忍,2026-11-28 架构评审定谳)。
 var panelToggleSender = func(pid int) error {
 	return syscall.Kill(pid, syscall.SIGUSR1)
 }

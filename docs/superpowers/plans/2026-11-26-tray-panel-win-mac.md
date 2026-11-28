@@ -8,7 +8,9 @@
 
 **Architecture:** 托盘层保留内嵌 getlantern/systray v1.2.2 + 本仓补丁（点击回调 + 图标矩形）。面板页由 core 回环仪表盘伺服 `/panel.html`，数据走同源 `/api`。里程碑 1 的宿主动作 = 开浏览器（复用既有 openDashboard 模式）；里程碑 2 换成 `internal/panelwin` 独立辅助进程（同一 aliang 二进制的 `panel` 子命令，点击才拉起、失焦即退、崩溃自动重拉、连续失败接回原生菜单），宿主通信仅两个自定义 WebMessage（`quit` → exit 60 / `open` → 浏览器）。模式切换运行中禁用（不复刻 SwitchMode 停而不起）。
 
-> **架构修订（2026-11-28 用户拍板方案 B「首次后常驻」）**：原「点击才拉起、失焦即退」口径划改——首次点击 spawn 面板（一次加载感，不可避免），之后每次点击发 **toggle 信号**（darwin=SIGUSR1 / windows=`WM_APP+1`）做可见⇄隐藏瞬时开合，进程不退；**失焦=隐藏**（resignKey / WM_ACTIVATE 失活 → orderOut/SW_HIDE，不再 exit）；**空闲回收**：隐藏持续 10 分钟 → 子进程 exit(0)（launcher 记正常关闭零惩罚）；孤儿防护：macOS 壳内每 5s 查 `ppid==1` 自检退出，Windows 依赖既有 Job 收割。quit（exit 60）/崩溃分类/兜底语义全部不变。**已知限制：面板从未成为 key 之前，失焦事件不存在——首开未点面板内部时点外部不隐藏，收起手势=托盘点击（toggle 恒可用）；用户点击面板内部一次后次级失焦链即活。**
+> **架构修订（2026-11-28 用户拍板方案 B「首次后常驻」）**：原「点击才拉起、失焦即退」口径划改——首次点击 spawn 面板（一次加载感，不可避免），之后每次点击发 **toggle 信号**（darwin=SIGUSR1 / windows=`WM_APP+1`）做可见⇄隐藏瞬时开合，进程不退；**失焦=隐藏**（resignKey / WM_ACTIVATE 失活 → orderOut/SW_HIDE，不再 exit）；**空闲回收**：隐藏持续 10 分钟 → 子进程 exit(0)（launcher 记正常关闭零惩罚）；孤儿防护：macOS 壳内每 5s 查 `ppid==1` 自检退出，Windows 依赖既有 Job 收割。quit（exit 60）/崩溃分类/兜底语义全部不变。**已知限制（2026-11-28 深夜更新）：~~首开未点面板内部时点外部不隐藏~~ 已由「点面板外即收」全局鼠标监听补齐（global mouseDown 对鼠标事件无需 TCC；菜单栏带 y<40 排除防托盘 toggle 竞态；面板未成为 key 也能收到面板外点击）。**
+
+> **架构评审挂账（2026-11-28，Approved 随批）**：①launcher「Click 探测-代行收尸」路径与并发 Click 的基线同型亚微秒交叠（可清新子→双面板，实际不可观测；修法=代行收尸改 childExitedIfCurrent，需权衡漏计面）；②SIGUSR1 µs 级合并丢失面（点一次没反应，再点自愈，零状态损坏）已声明于 panel_spawn_darwin.go；③windows FindWindowW 类名全局定位双实例投错面已备忘于 panel_spawn_windows.go；④panelIdle timer fire 后未置 nil（生产不可达）。
 
 **Tech Stack:** Go 1.26 + 内嵌 systray（保留）；M2 增：macOS cgo ObjC（NSPanel + WKWebView，沿用 autoreleasepool 纪律）、Windows jchv/go-webview2 的 **pkg/edge.Chromium**（底层组件，见 Task 13 注意）+ x/sys/windows；Vue 3 + Vite 多页入口（panel.html，纯 .js 测试）；vitest。
 

@@ -60,6 +60,8 @@ func spawnPanelProcess(opts SpawnOpts) (ChildProcess, error) {
 // 完成可见⇄隐藏(ShowWindow/SetForegroundWindow/chromium.Focus)。找不到
 // 窗口(面板已死/尚未建窗)或投递失败 → 返回错误,launcher 按无子处理
 // 回退 spawn。pid 形参忽略:窗口类名是定位纽带,签名与 darwin 统一。
+// 已知边界:FindWindowW 按类名【全局】定位——双 companion 并存(单实例守卫
+// 正常时不可达)会投递到错误面板实例,备忘(2026-11-28 架构评审)。
 var panelToggleSender = func(pid int) error {
 	if panelProcFindWindowW.Find() != nil || panelProcPostMessageW.Find() != nil {
 		return fmt.Errorf("toggle 投递 API 不可用")
