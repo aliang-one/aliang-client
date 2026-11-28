@@ -72,6 +72,7 @@ extern void panelwinGoVisibilityChanged(int hidden);
 // (Go goroutine 直调的 C 入口)经它把 toggle 派发到主线程。进程是单窗
 // 叶子进程,无生命周期管理。
 static PanelAppDelegate* panelDelegate = nil;
+static volatile int panelPendingToggle = 0; // toggle 待执行标志(timer 泵读,见 didFinishLaunching)
 
 @implementation PanelAppDelegate
 
@@ -92,11 +93,21 @@ static PanelAppDelegate* panelDelegate = nil;
     [self.panel orderOut:nil];
     NSLog(@"panelwin: orderOut 隐藏(驻留不退出;失焦=隐藏,方案 B)");
   } else {
-    // 复活双保险:不取焦点则次级失焦链(resignKey)永不触发。
+    // 复活三保险(2026-11-28 实机走查坐实:orderOut 后的 makeKeyAndOrderFront
+    // 对未激活的后台 accessory 应用会被 macOS 静默忽略——首开能显示是因为
+    // 新窗口首次 orderFront 不受此限,orderOut 后重显被「防抢焦点」策略拦下,
+    // 用户视角「再也打不开」):
+    //   ① orderFrontRegardless——无视激活状态强制上屏(orderOut 复显的关键);
+    //   ② makeKeyAndOrderFront——恢复 key,武装次级失焦链;
+    //   ③ activateIgnoringOtherApps——尽力激活。
     self.lastMakeKeyAt = CFAbsoluteTimeGetCurrent();
+    [self.panel orderFrontRegardless];
     [self.panel makeKeyAndOrderFront:nil];
+    if (!self.panel.isVisible) {
+      NSLog(@"panelwin: 显示后仍不可见(orderFront 被系统拒绝),留 Task 16 探针");
+    }
     [NSApp activateIgnoringOtherApps:YES];
-    NSLog(@"panelwin: toggle 显示");
+    NSLog(@"panelwin: toggle 显示 visible=%d", self.panel.isVisible ? 1 : 0);
   }
   // 回传 Go(导出回调):Go 侧据新可见性启动/重置/停止空闲回收计时
   // (panelwin_darwin.go panelwinGoVisibilityChanged → panelIdle)。
@@ -367,6 +378,44 @@ static PanelAppDelegate* panelDelegate = nil;
     });
   }];
 
+  // TEMP-DOM(调试,提交前移除):每次 toggle 后读挂载实况
+  __block WKWebView *dbgWeb = nil;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                 dispatch_get_main_queue(), ^{
+    for (NSView *v in panel.contentView.subviews) {
+      for (NSView *sv in v.subviews) {
+        if ([sv isKindOfClass:[WKWebView class]]) { dbgWeb = (WKWebView *)sv; }
+      }
+    }
+    if (!dbgWeb) { NSLog(@"panelwin: TEMP no webview"); return; }
+    [dbgWeb evaluateJavaScript:@"fetch('/assets/_plugin-vue_export-helper-Ds4qx6Dg.js').then(r=>{window.__h='helper:'+r.status;return r.text()}).then(t=>{window.__h+=' len:'+t.length}).catch(e=>{window.__h='ERR:'+String(e)});JSON.stringify({app:document.getElementById('app')?document.getElementById('app').childElementCount:-1,text:(document.body.innerText||'').slice(0,40),ready:document.readyState,perr:(window.__perr||[]).slice(0,3)})"
+         completionHandler:^(id r, NSError *e) {
+      NSLog(@"panelwin: TEMP-DOM err=%@ result=%@", e.localizedDescription ?: @"-", r ?: @"(nil)");
+      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                     dispatch_get_main_queue(), ^{
+        [dbgWeb evaluateJavaScript:@"window.__h||'(unset)'" completionHandler:^(id r2, NSError *e2) {
+          NSLog(@"panelwin: TEMP-HELPER err=%@ result=%@", e2.localizedDescription ?: @"-", r2 ?: @"(nil)");
+        }];
+      });
+    }];
+  });
+
+  // toggle 执行泵:主 run loop NSTimer 轮询 pending 标志(绕开 GCD 主队列
+  // 拖延;0.25s 间隔=可感知上限,实测本进程 timer 是否准时将入走查记录)。
+  [NSTimer scheduledTimerWithTimeInterval:0.25
+                                   repeats:YES
+                                     block:^(NSTimer *t) {
+    NSInteger fired = 0;
+    if (panelPendingToggle) {
+      panelPendingToggle = 0;
+      fired = 1;
+    }
+    if (fired && panelDelegate) {
+      NSLog(@"panelwin: timer 执行 toggle @ %@", [NSDate date]);
+      [panelDelegate panelSetHidden:!panelDelegate.panel.isVisible];
+    }
+  }];
+
   // 上屏取证(Task 16 探针):0.5s 后回报 occlusion/key 状态——Space 事故
   // (窗口在册但不在屏)在这里一行日志就能归因。
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
@@ -447,11 +496,9 @@ void panelwin_run(const char* url, int x, int yTop, int w, int h,
 // 不经返回值)。函数体整体包 @autoreleasepool(Go goroutine 线程无 pool,
 // 纪律见文件头)。
 void panelwin_toggle(void) {
-  @autoreleasepool {
-    dispatch_async(dispatch_get_main_queue(), ^{
-      if (panelDelegate) {
-        [panelDelegate panelSetHidden:!panelDelegate.panel.isVisible];
-      }
-    });
-  }
+  // 方案 B 实测定谳(2026-11-28):GCD 主队列块在本进程(未激活 accessory,
+  // 主 goroutine LockOSThread 停在 cgo)会被运行循环拖延数秒——toggle 改
+  // pending 标志 + 主 run loop NSTimer 轮询执行(见 didFinishLaunching)。
+  panelPendingToggle = 1;
+  NSLog(@"panelwin: toggle 收到(cgo 入口,置 pending)");
 }
