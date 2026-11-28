@@ -380,3 +380,62 @@ flush 本身仍需约 20 秒（1453 会话的量摆在那），但不再阻塞�
 留在正文里——卡前挂着孤立的反引号，已一并修掉。
 
 **回归护栏**：带其它语言标签的围栏里的 JSON 仍不得变成审批卡。
+
+### 7.4 中断的回合显示 Completed（已修）
+
+**现象**：用户发消息时 agent 恰好下线，服务端创建了 run 但起不来，随后被
+`agent_restarted` 结算。手机显示 Completed，用户以为跑完了。
+
+**根因**：`runState` 的 `cancelled` 同时承载「用户主动停止」与「执行者丢失」
+两种语义，而 `derivePhase` 把它一律映射成 `completed`。手机端 `session.phase`
+优先级最高，所以本地推导也被带偏；`failedTurnMessageId` 只认
+`phase === 'failed'`，「未收到回复 · 重试」的入口因此不触发。
+
+**修法**：`AiSession` 加 `runTerminatedBy`（`user` | `executor_lost` | `server`）。
+
+- `releaseDeviceRunningSessions`（所有执行者丢失的汇聚点）打 `executor_lost`
+- `mobile/handler` 的 `ai.stop` 打 `user`
+- `beginAiRun` 清标记，新一轮不被旧标记污染
+- `derivePhase`：`cancelled` + 非用户终结 → `failed`
+- 持久化：`ai_sessions` 加 `run_terminated_by` 列，SQLite `ensureColumn` 与
+  PG `ALTER TABLE IF NOT EXISTS` 均幂等
+
+存量记录的 `run_terminated_by` 为 null，保持旧语义显示完成——13 个存量
+cancelled 会话不受影响。
+
+### 7.5 选项卡能看不能点（已修）
+
+**现象**：消息里的选项卡正常显示，但点击无反应。
+
+**根因**：派生审批只在流式 delta 到达时跑一次。那条消息的围栏是 4 反引号，
+当时解析失败，审批从未创建；消息落库后再无触发点。手机端仍把 JSON 渲染成卡
+（纯客户端解析），但服务端没有对应 approval 记录，点击时 `approval_id` 对不上。
+
+气泡里的这张卡按设计是「静态降级展示」——`suppressedApprovalPlanKeys` 对账
+隐藏的就是它，本身不承担交互。真正的答题入口是服务端派生的审批卡。
+
+**修法**：`GET /api/ai/sessions/:id` 加 `backfillDerivedAssistantApprovals`。
+只看最后一条 assistant 消息（选项围栏按协议在回合末尾；扫整个 transcript 会
+把早已处理过的历史方案翻出来），幂等（派生 ID 按 plan key 稳定）。
+
+打开那个会话就会补建，之后卡可以正常点。
+
+### 7.6 发布门禁又抓到一个
+
+v1.1.136 的 `AI critical regression` 在 `app/mesh` 包里抓到
+`TestAgentPeerLanPushListen_SlotCancelKillsConn`：partial 清理发生在 serve
+goroutine 的失败路径里，测试主 goroutine 抢先扫目录读到残留。macOS 调度快
+所以从不复现。改为有界轮询（3 秒），Linux 容器 `-count=3` 通过。
+
+这是门禁第一次跑 mesh 包，暴露的是既有问题。
+
+### 7.7 两个未修的
+
+- **发送失败不标红**：agent 下线时发消息，HTTP 是成功的（服务端创建了消息
+  和 run），所以 `message.failed` 不置位——失败的是 run，不是 send。7.4 修
+  之后这类回合会显示失败并给重试入口，视觉上已经能看出问题。要不要额外把
+  用户气泡也标红，取决于产品判断：那会把「发送成功但没跑成」和「发送失败」
+  混为一谈。
+- **`runTerminatedBy` 只对新产生的中断生效**：13 个存量 cancelled 会话仍显示
+  完成。要修可以写一次性回填脚本，按 events 里的 `Run cancelled ... (agent_*)`
+  文案回溯，但那是字符串耦合，收益不高。
