@@ -282,3 +282,42 @@ RN `localService` 的 `discoverReachableBaseUrl prob` 约每 2 次全量出现 1
 - DEBT-05 第二步「共享纯状态转换」：夹具已就绪，但 RN 的 `mergeAgentMessages`
   按WeakMap 缓存与浅比较深度定制，网页端是另一种思路，直接抽共享函数风险大。
   建议等夹具跑稳一段时间再评估。
+
+### 6.5 事故：重启裁决误杀新回合（已修）
+
+**现象**（2026-11-28 02:49～02:51）：用户在手机上发起回合，首段文字刚上屏
+2 秒就被标成「Run cancelled (agent_restarted)」。同一会话连续两次回合都被杀。
+
+**根因**：`settleRunsForAgentRestart` 结算的是「该设备当前所有 running
+会话」，无法区分「旧进程遗留」和「新进程刚起」。本机 agent 因其他会话测试
+在 2 分钟内反复重启，每次重连都触发一次裁决，把新进程起的回合一并结算。
+
+时间线（来自 `ai_Dhi5gO93hYOg` 的 events）：
+
+```
+02:49:33  Run started
+02:49:53  Run cancelled  (agent_restarted)   ← 第一回合
+02:51:34  Run started
+02:51:51  首段文字上屏
+02:51:53  Run cancelled  (agent_restarted)   ← 第二回合，首段文字后 2 秒
+```
+
+**修法**：裁决只结算 `runStartedAt` 早于新进程 `started_at` 的会话。
+新进程启动后才起的回合不属于遗留，必须继续跑。没有 `runStartedAt` 的旧
+服务端记录无法判断，保守按遗留处理；没传 `agentStartedAt` 时退回原语义。
+
+**验证**：修复部署后本机 agent 又重启一次，日志只有 `detected` 没有
+`settled`——当前在跑的回合是重启后才起的，不再被误杀。
+
+**设计上的教训**：RUN-01/02 的裁决把「agent 重启」当成「设备上所有在途回合
+都失效」，但重启后的新进程会立刻开始接新回合。裁决必须以「回合启动时刻
+vs 进程启动时刻」为界，而不是以「设备」为界。
+
+### 6.6 观察到但未处理
+
+- **启动时 Postgres 连接池打满**：pod 启动加载 1453 会话后集中 flush，
+  `pool wait` 峰值 191（`max_connections=200`），约 40 秒写入不可用后自愈。
+  每次滚动更新都会重现。不是数据错误，但会让启动窗口内的写入失败。
+- **被中断的回合文案**：裁决结算写出的是「Run cancelled」，语义上应是
+  「已中断」——cancelled 暗示用户主动停止。RUN-01 验收要求「显示中断及原因」，
+  这个文案需要改。
