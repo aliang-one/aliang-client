@@ -1,8 +1,9 @@
 <!-- AgentZone.vue — 面板⑤AI AGENT · 24H 区(spec §4.5 + §6-7)。
      分区标题「AI AGENT · 24H」(mockup .sec-head 原值);每个探测到的 AI 内核
-     一张卡片(圆角 12px,内边距 9×11):🤖 图标 + 内核名 + 右箭头(展开时
-     rotate 90°,mockup chevRight 原值);点卡片展开/收起 24h 会话明细。
-     卡内统计芯片(10.5px/600):「活跃 N」绿底 brand-dim ·「空闲 N」·
+     一张卡片(圆角 12px;2026-11-28 用户反馈单行紧凑化:内边距收 7×10,
+     卡头一行放下 🤖 图标 + 内核名 + 统计芯片 + 右箭头,原独立芯片第二行
+     取消);点卡片展开/收起 24h 会话明细(展开态卡头仍是同一行)。
+     统计芯片(10.5px/600):「活跃 N」绿底 brand-dim ·「空闲 N」·
      「24h 共 N」;活跃为 0 不显活跃芯片——空闲为 0 同款隐藏(mockup
      runN/idleN 双判空口径,24h 芯片恒显)。展开明细每条 = 状态点(活跃绿
      带光晕 / 空闲灰)+ 会话标题(11px/600 截断)+ 「来源 · 相对时间」。
@@ -141,6 +142,13 @@ export default {
           <!-- eslint-disable-next-line vue/no-v-html —— 内容是本文件字面常量 -->
           <span class="a-ico" aria-hidden="true" v-html="BOT_SVG"></span>
           <span class="name">{{ k.name }}</span>
+          <!-- 统计芯片(2026-11-28 用户反馈单行紧凑化:原独立第二行并进
+               头部行,紧跟内核名、右箭头之前;判空隐藏由 model 承载) -->
+          <div class="stats">
+            <span v-for="(c, i) in k.chips" :key="i" class="stat-chip" :class="c.cls">
+              <span v-if="c.dot" class="cdot" :style="c.dimDot ? { opacity: 0.4 } : null"></span>{{ c.text }}
+            </span>
+          </div>
           <!-- 右箭头(mockup chevRight 原值):展开 rotate 90° -->
           <svg
             class="chev"
@@ -157,12 +165,6 @@ export default {
           >
             <path d="M9 18l6-6-6-6" />
           </svg>
-        </div>
-        <!-- 统计芯片:活跃(绿底 live)/空闲/24h 共;判空隐藏由 model 承载 -->
-        <div class="stats">
-          <span v-for="(c, i) in k.chips" :key="i" class="stat-chip" :class="c.cls">
-            <span v-if="c.dot" class="cdot" :style="c.dimDot ? { opacity: 0.4 } : null"></span>{{ c.text }}
-          </span>
         </div>
         <!-- 24h 会话明细:展开 max-height 0→260px 过渡 0.25s(mockup 原值) -->
         <div class="sess-list">
@@ -214,10 +216,12 @@ export default {
   }
 }
 
-/* 内核卡片(mockup .agent-card 原值):圆角 12px,内边距 9×11 */
+/* 内核卡片(mockup .agent-card 原值,2026-11-28 单行紧凑化收窄):
+   圆角 12px 不动;内边距 9×11 → 7×10;上下外边距 3 → 2(卡片之间的
+   间距 6 → 4 微收,幅度克制) */
 .agent-card {
-  margin: 3px 12px;
-  padding: 9px 11px;
+  margin: 2px 12px;
+  padding: 7px 10px;
   border-radius: 12px;
   background: rgba(0, 0, 0, 0.03);
   border: 1px solid rgba(0, 0, 0, 0.04);
@@ -263,18 +267,21 @@ export default {
   transform: rotate(90deg);
 }
 
-/* 统计芯片行(mockup .stats 原值) */
+/* 统计芯片(mockup .stats 原值;2026-11-28 单行紧凑化:原独立第二行
+   margin-top 7px 并进 .top 头部行——紧跟内核名、右箭头之前,一行放下。
+   flex-shrink 0 保芯片不被长内核名压扁,挤压由 .name 截断承担) */
 .agent-card .stats {
   display: flex;
-  gap: 5px;
-  margin-top: 7px;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
 }
 .stat-chip {
   display: flex;
   align-items: center;
-  gap: 5px;
-  padding: 3px 8px;
-  border-radius: 7px;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 6px;
   font-size: 10.5px;
   font-weight: 600;
   background: rgba(0, 0, 0, 0.05);

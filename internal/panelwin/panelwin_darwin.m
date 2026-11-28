@@ -266,6 +266,16 @@
   [panel makeKeyAndOrderFront:nil];
   [NSApp activateIgnoringOtherApps:YES];
 
+  // 原生圆角(2026-11-28 用户反馈:CSS 的 --panel-radius 只作用内层 .panel
+  // div,它贴满窗口后被窗口边界裁成方角——「外边框始终方方正正」的真相)。
+  // contentView 打 layer 圆角+裁边,裁的是【整个窗口】的四个角;圆角外
+  // 露出的是透明区(opaque=NO+clearColor 不变),悬浮在内容上方无违和。
+  // 半径 16 与前端 --panel-radius 同步(app/website/src/panel/theme.css
+  // :root 几何常量),改动需两处同批。
+  panel.contentView.wantsLayer = YES;
+  panel.contentView.layer.cornerRadius = 16;
+  panel.contentView.layer.masksToBounds = YES;
+
   // 上屏取证(Task 16 探针):0.5s 后回报 occlusion/key 状态——Space 事故
   // (窗口在册但不在屏)在这里一行日志就能归因。
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),

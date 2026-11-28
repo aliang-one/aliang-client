@@ -34,7 +34,11 @@ import (
 //  5. 主线程钉定:panelwin_darwin.go 必须 runtime.LockOSThread——AppKit
 //     UI 事件循环必须在主线程,不钉则 NSApp run 失效、失焦即退链死成僵尸;
 //  6. 畸形 payload 守卫:type/kind 提取先过 isKindOfClass:[NSString class]
-//     闸({"type":123} 这类形态走「未知忽略」,不得 unrecognized selector 崩)。
+//     闸({"type":123} 这类形态走「未知忽略」,不得 unrecognized selector 崩);
+//  7. 原生圆角(2026-11-28 用户反馈):contentView layer wantsLayer/
+//     cornerRadius/masksToBounds 三件套——CSS 圆角只作用内层 .panel div,
+//     被窗口边界裁成方角;半径 16 与前端 --panel-radius 同步
+//     (app/website/src/panel/theme.css),两处改动需同批。
 
 func TestPanelwinDarwinShellStructure(t *testing.T) {
 	src := panelwinDarwinSource(t)
@@ -88,6 +92,25 @@ func TestPanelwinDarwinShellStructure(t *testing.T) {
 		}
 		if !strings.Contains(src, "NSMakeRect(0, 0, w, h)") {
 			t.Errorf("panelwin_darwin.m 材质层 frame 缺少 contentView 本地坐标形态 NSMakeRect(0, 0, w, h)")
+		}
+	})
+
+	t.Run("原生圆角(窗口级)", func(t *testing.T) {
+		// 2026-11-28 用户反馈「外边框始终方方正正」:圆角必须在壳层生效——
+		// contentView 打 layer 圆角+裁边,而不是只靠前端 .panel 的 CSS
+		// border-radius(它贴满窗口后被窗口边界裁成方角)。三件套缺一即回退:
+		// 缺 wantsLayer → layer 不落地;缺 cornerRadius → 无圆角;
+		// 缺 masksToBounds → 子视图(材质层/WebView)溢出方角。
+		for _, want := range []string{
+			"panel.contentView.wantsLayer = YES",
+			// 半径 16 与前端 theme.css --panel-radius 同步(app/website/src/
+			// panel/theme.css),改动需两处同批——锚字面量拦单侧漂移。
+			"panel.contentView.layer.cornerRadius = 16",
+			"panel.contentView.layer.masksToBounds = YES",
+		} {
+			if !strings.Contains(src, want) {
+				t.Errorf("panelwin_darwin.m 缺少 %q(原生圆角三件套不完整,窗口外边框回退方角)", want)
+			}
 		}
 	})
 
