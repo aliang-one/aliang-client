@@ -2541,6 +2541,10 @@ export function useAliangChat() {
 
     // status → 壳 running 标记（侧栏状态点消费）
     shell.running = e.status === 'running';
+    // background 同步回写（2026-11-28 评审 F2）：快照是打开壳最高频的状态
+    // 入口，漏回写会让琥珀点在看片场景缺失（idle→background）或残留
+    // （background→idle 衰减），要等下一次节流清单刷新才自愈。
+    shell.background = e.status === 'background';
     // 壳喂狗点（2026-11-28 三审 F2）：running 快照回包=会话活性权威证据——
     // 清探测计数并再武装（reconcileLocalSnapshot 的喂狗只服务本地会话，壳
     // 分支此前无喂狗点，探测宽限期内回包到不了狗就到期）。仅已武装的壳

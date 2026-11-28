@@ -1606,6 +1606,7 @@ export default {
   agent_activity_filterAll: 'All',
   agent_activity_desc: 'Recent Agent sessions and prompts (prompts in full, replies summarized)',
   agent_activity_running: 'Running',
+  agent_activity_background: 'Working in background',
   agent_activity_loading: 'Loading…',
   agent_activity_loadFailed: 'Failed to load',
   agent_activity_noSessions: 'No agent sessions yet',

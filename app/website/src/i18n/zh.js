@@ -1606,6 +1606,7 @@ export default {
   agent_activity_filterLabel: 'Agent 类型',
   agent_activity_filterAll: '全部',
   agent_activity_running: '进行中',
+  agent_activity_background: '后台中',
   agent_activity_loading: '加载中…',
   agent_activity_loadFailed: '加载失败',
   agent_activity_noSessions: '暂无 Agent 会话记录',
