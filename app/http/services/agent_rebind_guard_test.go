@@ -62,6 +62,19 @@ func TestRebind_DifferentAccountPendsInsteadOfSwitching(t *testing.T) {
 	if enabled {
 		t.Fatal("agent must not stay enabled while a rebind is pending")
 	}
+
+	// 前端靠 Status() 带出的两个字段显示「本机绑定 X,刚登录的是 Y」。
+	// 此前这两个字段只在 agentState 上,没进响应——前端拿不到,提示区显示空值。
+	resp := s.Status()
+	if resp.PendingRebindUser != "id:2" {
+		t.Fatalf("Status().PendingRebindUser = %q, want id:2", resp.PendingRebindUser)
+	}
+	if resp.RegisteredUser != "id:1" {
+		t.Fatalf("Status().RegisteredUser = %q, want id:1", resp.RegisteredUser)
+	}
+	if resp.SyncStatus != "rebind_pending" {
+		t.Fatalf("Status().SyncStatus = %q, want rebind_pending", resp.SyncStatus)
+	}
 }
 
 func TestRebind_SameAccountStillCorrectsImmediately(t *testing.T) {

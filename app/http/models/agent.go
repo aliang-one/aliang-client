@@ -23,7 +23,12 @@ type AgentStatusResponse struct {
 	LastSyncAt      string             `json:"last_sync_at,omitempty"`
 	SyncStatus      string             `json:"sync_status,omitempty"`
 	SyncMessage     string             `json:"sync_message,omitempty"`
-	Message         string             `json:"message,omitempty"`
+	// RegisteredUser 是本机已绑定的账号 key(NET-01 ⑤:换账号登录时前端要显示
+	// 「本机绑定 X,刚登录的是 Y」,两者都要能从状态里读到)。
+	RegisteredUser string `json:"registered_user,omitempty"`
+	// PendingRebindUser 非空表示换绑待属主确认——前端据此显示确认/拒绝入口。
+	PendingRebindUser string `json:"pending_rebind_user,omitempty"`
+	Message           string `json:"message,omitempty"`
 	// Degraded 标记本次响应来自「锁忙降级」路径(2026-11-22 死锁善后):内部
 	// sync/register 长持锁期间以最近一次已知快照返回,非实时采集。正常路径
 	// 恒为 false(zero,JSON omitempty 不落字段)。
