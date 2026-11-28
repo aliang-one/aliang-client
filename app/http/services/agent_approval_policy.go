@@ -1321,6 +1321,9 @@ func builtinBalancedPolicy() ApprovalPolicy {
 				Match: approvalRuleMatch{Tool: []string{
 					"Read", "Grep", "Glob", "LS",
 					"TodoWrite", "TaskUpdate", "TaskCreate", "WebSearch",
+					// KillShell 只及于登记处名下进程（后台 shell 批 2026-11-28），
+					// 风险面=任务自身启动物；BashOutput 纯读。
+					"BashOutput", "KillShell",
 				}},
 			},
 			{

@@ -334,7 +334,29 @@ func (a *agentAIActivity) idleFor() time.Duration {
 	return time.Since(time.Unix(0, last))
 }
 
+// setKillReason 采用先因优先（first-write-wins）：判死原因只在为空时落账。
+//
+// 为什么：判死入口有多条互相竞速的路径——watchdog 五条天花板、用户主动停止
+// （stop→guard.kill）、内核停滞回调（coreSteer.onStalled 的 no_guard 分支）——
+// 先触发 cancel 的那条才是真实死因。旧的「后来者覆盖」语义会让收尾窗内的
+// user_stop 把 watchdog 已落账的 idle_timeout 洗成 user_stop（或反向），终态
+// 归因与 [ai.run.kill] 日志随之失真。需要覆盖权的唯一调用方是 forceFinalize
+// （判死兜底诊断），它显式走 forceSetKillReason。
 func (a *agentAIActivity) setKillReason(reason string) {
+	if a == nil {
+		return
+	}
+	a.killReasonMu.Lock()
+	if a.killReason == "" { // 先因优先：多路判死竞速，首个死因留账
+		a.killReason = reason
+	}
+	a.killReasonMu.Unlock()
+}
+
+// forceSetKillReason 仅 forceFinalize（判死兜底诊断）使用：宽限期满仍未收敛
+// 时，兜底判定原因覆盖先因——此刻唯一可信的结论是「按 reason 判死且 run 没
+// 能在宽限内自然返回」，终态归因必须跟着它走。
+func (a *agentAIActivity) forceSetKillReason(reason string) {
 	if a == nil {
 		return
 	}

@@ -303,6 +303,12 @@ func (s *AgentService) Shutdown() {
 	if s.ai != nil {
 		s.ai.closeAllWithReason("agent_shutdown")
 	}
+	// 后台 shell 登记处收口（2026-11-28 后台 shell 批）：跨 run 存活的进程
+	// 在进程退出时真关停（RUN-03 同语义：agent 退出不留仍在改工作区的进程；
+	// run 的 closeAll 刻意不杀它们，见 agentcore/tools.go BackgroundShells 注释）。
+	if s.ai != nil {
+		s.ai.backgroundShellsCloseAll("agent_shutdown")
+	}
 	if s.terminal != nil {
 		s.terminal.closeAll()
 	}

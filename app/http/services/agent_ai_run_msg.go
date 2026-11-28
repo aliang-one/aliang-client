@@ -540,6 +540,7 @@ func (m *agentAIManager) stop(msg map[string]interface{}, writeJSON agentTermina
 		return
 	}
 	cancel := session.cancel
+	guard := session.guard // attachRunGuard 同锁写入；nil=TUI 回合等未挂场景
 	runWrite := session.activeWriter
 	cancelledApprovals := m.clearPendingApprovalsLocked(
 		sessionID,
@@ -550,10 +551,14 @@ func (m *agentAIManager) stop(msg map[string]interface{}, writeJSON agentTermina
 	if runWrite == nil {
 		runWrite = writeJSON
 	}
-	// TODO(ai-run-resilience): 此处的 cancel 不经过 agentAIRunGuard——卡死回合
-	// 上用户主动停止时没有 [ai.run.kill] 轨迹、也没有 30s 强拆兜底。见
-	// docs/superpowers/plans/2026-10-27-ai-run-resilience.md（计划未覆盖）。
-	if cancel != nil {
+	// 2026-11-28（后台 shell 批刀3）：用户主动停止改走 guard.kill——补上
+	// [ai.run.kill] 判死轨迹与 30s 强拆兜底（此前裸 cancel，卡死回合停不掉
+	// 也无轨迹，挂账 TODO(ai-run-resilience) 就业）。guard 未挂载（TUI 回合
+	// /竞态）回退裸 cancel，行为与旧版一致。后台 shell 不受影响：进程归属
+	// 登记处，不随 run ctx 终止。
+	if guard != nil {
+		guard.kill("user_stop")
+	} else if cancel != nil {
 		cancel()
 	} else if sourceSessionID != "" {
 		// Registered but idle: the previous agent-spawned turn already
