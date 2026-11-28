@@ -662,6 +662,10 @@ jobs:
     name: Publish release assets
     needs: build
     runs-on: ubuntu-latest
+    # -local 后缀 tag=本地测试构建:只出 artifact 不发 GitHub release
+    # (2026-11-28:local 测试包污染 Latest 有「幽灵 release 抢下载中心」
+    # 事故前科;MSI 从 artifact 下载装测试机)。
+    if: ${{ !contains(github.ref_name, '-local') }}
     steps:
       - name: Download packaged artifacts
         uses: actions/download-artifact@v4
