@@ -192,8 +192,6 @@ func registerStaticFiles() {
 
 	// 注册 assets 路径处理器
 	mux.HandleFunc("/assets/", func(w http.ResponseWriter, r *http.Request) {
-		setAssetsCacheHeaders(w)
-
 		// 移除前导 /assets/
 		filePath := strings.TrimPrefix(r.URL.Path, "/assets/")
 
@@ -206,6 +204,12 @@ func registerStaticFiles() {
 		// 尝试打开文件
 		file, err := websiteRoot.Open("assets/" + filePath)
 		if err != nil {
+			// ⚠️ 404 路径【不得】携带 immutable 缓存头——2026-11-28 面板白屏
+			// 帮凶:setAssetsCacheHeaders 原先在此处之前无条件执行,404 响应
+			// 也带 public/31536000/immutable,客户端(WebKit URLCache)把构建
+			// 期缺失资产的 404 负缓存一年,服务端修复后客户端仍永久命中缓存的
+			// 404。缓存头只在命中成功后设置;404 显式 no-store。
+			w.Header().Set("Cache-Control", "no-store")
 			http.NotFound(w, r)
 			return
 		}
@@ -218,7 +222,8 @@ func registerStaticFiles() {
 			return
 		}
 
-		// 设置 Content-Type
+		// 设置 Content-Type 与长缓存（仅命中成功的资产;404 已在上方 no-store）
+		setAssetsCacheHeaders(w)
 		setContentType(w, filePath)
 
 		// 使用 ServeContent（支持 Range 请求和缓存）
