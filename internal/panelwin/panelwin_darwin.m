@@ -64,6 +64,8 @@ extern void panelwinGoVisibilityChanged(int hidden);
 @property (copy) NSString* peerURL;        // open kind=peer → 此 URL
 @property (copy) NSString* launchURL;      // --url,panel.html 完整地址
 @property (assign) NSRect contentRect;     // AppKit 全局左下原点的窗口 frame
+@property (assign) BOOL everKeyed;         // 曾成为 key(见 resignKey 守卫)
+@property (assign) CFAbsoluteTime lastMakeKeyAt; // 最近一次 makeKey 时刻(resignKey 抖动窗守卫)
 @end
 
 // 面板 delegate 的进程级引用(panelwin_run 建立后恒非 nil):panelwin_toggle
@@ -91,6 +93,7 @@ static PanelAppDelegate* panelDelegate = nil;
     NSLog(@"panelwin: orderOut 隐藏(驻留不退出;失焦=隐藏,方案 B)");
   } else {
     // 复活双保险:不取焦点则次级失焦链(resignKey)永不触发。
+    self.lastMakeKeyAt = CFAbsoluteTimeGetCurrent();
     [self.panel makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
     NSLog(@"panelwin: toggle 显示");
@@ -105,12 +108,26 @@ static PanelAppDelegate* panelDelegate = nil;
 // companion toggle 复活。隐藏后窗口无 key,resignKey 不再触发。
 // ⚠️ 面板从未成为 key 之前本回调不存在(见文件头已知限制)。
 - (void)windowDidResignKey:(NSNotification *)notification {
+  // ⚠️ everKeyed 守卫(2026-11-28 实机走查坐实):spawn 发生在托盘点击的
+  // key 处理中途,makeKey 抢到的 key 会被该点击的收尾瞬间夺走→resignKey
+  // 立即触发→面板一出生就 orderOut,用户视角「点击没反应」而子进程按
+  // 方案 B 常驻。从未成为过 key 的面板不响应失焦隐藏;首次真实点击面板
+  // (becomeKey)后,本守卫放行,次级失焦链即活。
+  // makeKey 后 300ms 内的 resignKey 一律视为托盘点击的 key 抖动(toggle
+  // 显示路径同样发生在点击处理中途),忽略;真失焦发生在用户切走时,距
+  // makeKey 必然 >300ms。everKeyed=从未成为 key 的兜底。
+  if (!self.everKeyed ||
+      CFAbsoluteTimeGetCurrent() - self.lastMakeKeyAt < 0.3) {
+    NSLog(@"panelwin: resignKey 忽略(从未成为 key,或 makeKey 后 300ms 抖动窗内)");
+    return;
+  }
   NSLog(@"panelwin: resignKey → orderOut 隐藏(失焦=隐藏,方案 B)");
   [self panelSetHidden:YES];
 }
 
 - (void)windowDidBecomeKey:(NSNotification *)notification {
-  NSLog(@"panelwin: becomeKey");
+  self.everKeyed = YES;
+  NSLog(@"panelwin: becomeKey(失焦链武装)");
 }
 
 // 导航取证(Task 16 探针):页面加载成败一行日志,白名单误拦/网络失败不再哑。
@@ -313,8 +330,16 @@ static PanelAppDelegate* panelDelegate = nil;
   }
 
   // 激活双保险:不取焦点则失焦即退永不触发。
-  [panel makeKeyAndOrderFront:nil];
-  [NSApp activateIgnoringOtherApps:YES];
+  // ⚠️ 首次上屏延迟 150ms(2026-11-28 实机走查坐实):spawn 在托盘点击的
+  // key 处理中途,立即 makeKey 会与该点击的 key 收尾相撞(见 resignKey
+  // 守卫)——让抖动先结束再上屏抢 key。toggle 复活路径(panelSetHidden:NO)
+  // 不经过此处,无延迟。
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                 dispatch_get_main_queue(), ^{
+    self.lastMakeKeyAt = CFAbsoluteTimeGetCurrent();
+    [panel makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+  });
 
   // 原生圆角(2026-11-28 用户反馈:CSS 的 --panel-radius 只作用内层 .panel
   // div,它贴满窗口后被窗口边界裁成方角——「外边框始终方方正正」的真相)。

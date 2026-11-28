@@ -115,6 +115,16 @@ func TestPanelwinDarwinShellStructure(t *testing.T) {
 		if !strings.Contains(src, `forKey:@"drawsBackground"`) {
 			t.Errorf("panelwin_darwin.m 的 drawsBackground 必须经 setValue:forKey:@NO 的 KVC 形态(私有 API 口径)")
 		}
+		// resignKey 抖动窗守卫:everKeyed 打标+300ms 窗+两处 makeKey 时间戳
+		for _, want := range []string{
+			"everKeyed",
+			"lastMakeKeyAt",
+			"CFAbsoluteTimeGetCurrent() - self.lastMakeKeyAt < 0.3",
+		} {
+			if !strings.Contains(src, want) {
+				t.Errorf("panelwin_darwin.m 缺少 %q(resignKey 抖动窗守卫不完整,spawn 期 key 抖动会一出生就隐藏)", want)
+			}
+		}
 		// 点面板外即收:全局鼠标监听三件套(鼠标事件无需 TCC;菜单栏带排除)
 		for _, want := range []string{
 			"addGlobalMonitorForEventsMatchingMask",
