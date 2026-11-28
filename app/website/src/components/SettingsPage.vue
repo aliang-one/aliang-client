@@ -268,6 +268,7 @@
             :saving="isSavingCustomerConfig"
             :error="customerConfigError"
             :success-message="customerConfigSuccess"
+            :legacy-agentcore-llm="agentCoreLegacyLLM"
             @save="saveCustomerConfig"
           />
         </section>
@@ -346,7 +347,7 @@ import SystemRunModeSettings from './settings/SystemRunModeSettings.vue';
 import AppearanceSettings from './settings/AppearanceSettings.vue';
 import AgentPage from './settings/agent/AgentPage.vue';
 import SectionHeader from './settings/SectionHeader.vue';
-import { normalizeAgentCoreLLMConfig, applyAgentCoreLLMClearing, normalizeAgentCoreTuning, normalizePeerMCPConfig, normalizeOpenVikingConfig } from '../utils/agentCoreSettings';
+import { normalizeAgentCoreTuning, normalizePeerMCPConfig, normalizeOpenVikingConfig } from '../utils/agentCoreSettings';
 import { useNavigation } from '../composables/useNavigation';
 import { useEscLayer } from '../composables/useEscStack';
 import { openTutorialDocs } from '../composables/useTutorialDocs';
@@ -377,13 +378,9 @@ function createDefaultCustomerConfig() {
       enable: false,
       vars: {}
     },
-    // 线格式键 enabled(Go tag),与 normalizeAgentCoreLLMConfig 输出一致——
-    // 不要写 enable,否则 patch 里的布尔会被后端 encoding/json 静默丢弃
-    agentcore_llm: {
-      enabled: false,
-      base_url: '',
-      api_key: ''
-    },
+    // ⚠️ agentcore_llm 已退役(endpoint 二期 Task 8,spec §7.3/§9):归一链
+    // 不再产出该键;Go POST 白名单保留接受(值被忽略),旧配置提示经
+    // agentCoreLegacyLLM 只读检测位传卡片。
     // SSH 入口服务面(customer.ssh_ingress;三态指针 nil=false,前端恒产出显式
     // 布尔——nil 与 false 行为等价;port 0=后端归一默认 56442)
     ssh_ingress: normalizeSSHIngressConfig(),
@@ -495,7 +492,8 @@ function normalizeCustomerConfig(payload = {}) {
     proxy_rules: normalizeProxyRules(payload?.proxy_rules),
     model_mapping: normalizeModelMappingConfig(payload?.model_mapping),
     custom_env_vars: normalizeCustomEnvVarsConfig(payload?.custom_env_vars),
-    agentcore_llm: normalizeAgentCoreLLMConfig(payload?.agentcore_llm),
+    // agentcore_llm 摘键:endpoint 二期 Task 8——GET 回显的旧键被归一链丢弃,
+    // 保存路径(patch)永不读写该键(Go 白名单仍接受,值被忽略,spec §9)。
     // memory_enabled(记忆总开关)/ai_mcp(agent-as-MCP 工具面总开关)与
     // mcp_enabled/skills_enabled 同挂 normalizeAgentCoreTuning 的透传
     // allowlist——改布尔键清单只动 agentCoreSettings.js,此处共用同一出口,
@@ -588,7 +586,8 @@ function buildCustomerConfigPatch(nextConfig, currentConfig) {
     patch.mesh.fallback.host_key = '';
   }
 
-  applyAgentCoreLLMClearing(patch, normalizedNext.agentcore_llm, normalizedCurrent.agentcore_llm);
+  // agentcore_llm 显式清空链已退役(endpoint 二期 Task 8):归一链摘键后
+  // 两侧永远无该键,buildConfigPatch 自然不产出 patch.agentcore_llm。
 
   return Object.keys(patch).length ? patch : undefined;
 }
@@ -703,7 +702,11 @@ export default {
       customerConfigSuccess: '',
       isLoadingCustomerConfig: false,
       isSavingCustomerConfig: false,
-      hasLoadedCustomerConfig: false
+      hasLoadedCustomerConfig: false,
+      // 旧版内核端点配置检测位(endpoint 二期 Task 8):GET /api/config/customer
+      // 现有读取链的原始响应仍回显 customer.agentcore_llm(归一链已摘键,
+      // 这里在归一前从原始体取值),传「内核调优」卡作灰字提示。只读,不写。
+      agentCoreLegacyLLM: false
     };
   },
   computed: {
@@ -808,12 +811,15 @@ export default {
         const json = await res.json();
         const data = json?.data || json;
         this.customerConfig = normalizeCustomerConfig(data?.customer);
+        // 旧版端点配置检测:必须在归一前从原始响应取(归一链已摘 agentcore_llm 键)。
+        this.agentCoreLegacyLLM = data?.customer?.agentcore_llm?.enabled === true;
         this.customerConfigVersion = typeof data?.version === 'string' ? data.version : '';
         this.hasLoadedCustomerConfig = true;
         this.customerConfigError = '';
       } catch (error) {
         this.customerConfig = createDefaultCustomerConfig();
         this.customerConfigVersion = '';
+        this.agentCoreLegacyLLM = false;
         this.customerConfigError = error instanceof Error ? error.message : this.t('settings_configLoadFailed');
       } finally {
         this.isLoadingCustomerConfig = false;
@@ -847,6 +853,11 @@ export default {
         const json = await res.json();
         const data = json?.data || json;
         this.customerConfig = normalizeCustomerConfig(data?.customer || mergedConfig);
+        // POST 响应仍回显 customer 时刷新旧端点配置检测位(响应缺 customer
+        // 则维持现值,避免把已检出的旧配置误熄)。
+        if (data?.customer) {
+          this.agentCoreLegacyLLM = data.customer.agentcore_llm?.enabled === true;
+        }
         this.customerConfigVersion = typeof data?.version === 'string' ? data.version : this.customerConfigVersion;
         this.customerConfigError = '';
         this.customerConfigSuccess = this.t('settings_configSaved');

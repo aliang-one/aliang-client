@@ -19,7 +19,6 @@ import (
 	"aliang.one/nursorgate/app/agentcore"
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/cache"
-	"aliang.one/nursorgate/processor/config"
 )
 
 // 这一组测试锁死**宿主侧**的内置内核接线，与 app/agentcore 的内核测试互补：
@@ -923,13 +922,14 @@ func TestRunAgentCoreEmptyModelLeavesNoJournalFile(t *testing.T) {
 }
 
 // TestRunAgentCoreUpstreamDownLeavesNoJournalFile 同上，落点换成「上游未起」
-// 这道门。用显式自定义端点（EffectiveAgentCoreLLM 指向必然连不上的回环端口）
-// 触发——该分支只拨测不自愈，绝不 POST 本机管理面。
+// 这道门。用 registry BYO 行指向必然连不上的回环端口触发——该分支只拨测
+// 不自愈，绝不 POST 本机管理面。（旧字段 customer.agentcore_llm 已退役，
+// spec 二期 §9：即便配置了也不再驱动出网，不再是合法的触发手段。）
 func TestRunAgentCoreUpstreamDownLeavesNoJournalFile(t *testing.T) {
+	isolateAgentCoreRegistryEnv(t)
 	setTestAgentHome(t)
-	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
-		Enabled: true, BaseURL: "http://127.0.0.1:1",
-	})
+	store := newAgentCoreEndpointRegistryStore(t)
+	createEndpoint(t, store, byoEndpoint("ep-dead-run", "http://127.0.0.1:1", "sk-x"))
 
 	m := newAgentAIManager()
 	const sessionID = "conv-journal-updown"

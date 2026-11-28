@@ -230,7 +230,7 @@ func (s *EndpointService) selectAuto(protocol, model string, excludeIDs []string
 		if e.RateLimitedUntil > now {
 			continue
 		}
-		if e.HealthStatus != "ok" && e.CooldownUntil > now {
+		if !endpointHealthUsable(e, now) {
 			continue
 		}
 		s.recoverIfNeeded(e, now)
@@ -263,7 +263,7 @@ func (s *EndpointService) fallbackBuiltin(protocol string) (*config.LLMEndpoint,
 	}
 	now := time.Now().Unix()
 	if !b.Enabled || !endpointProtocolMatch(b, protocol) ||
-		b.RateLimitedUntil > now || (b.HealthStatus != "ok" && b.CooldownUntil > now) {
+		b.RateLimitedUntil > now || !endpointHealthUsable(b, now) {
 		logger.Warn(fmt.Sprintf("endpoint: 无候选且内置行不可用(protocol=%s enabled=%v health=%s cooldown_until=%d rate_limited_until=%d),返回 no_endpoint_available",
 			protocol, b.Enabled, b.HealthStatus, b.CooldownUntil, b.RateLimitedUntil))
 		return nil, ErrNoEndpoint
@@ -298,6 +298,11 @@ func (s *EndpointService) recoverIfNeeded(e *config.LLMEndpoint, now int64) {
 	if e.CooldownUntil > now {
 		return // 未到期,不该被恢复(调用点已过滤,双保险)
 	}
+	if e.CooldownUntil <= 0 {
+		// 锁存态(401/402:disabled + 无冷却):永不自愈,只能「重置健康」或
+		// 一次真实成功清回 ok。
+		return
+	}
 	if !s.currentPolicy().FailureDisable {
 		// 池模式不写库(不变量 6):行在过滤语义上已可用,陈旧健康态原样保留。
 		logger.Info(fmt.Sprintf("endpoint: %s 冷却已到期(池模式,健康态不落库,陈旧态保留)", e.ID))
@@ -326,6 +331,23 @@ func (s *EndpointService) recoverIfNeeded(e *config.LLMEndpoint, now int64) {
 	e.HealthStatus = "ok"
 	e.ConsecutiveFailures = 0
 	logger.Info(fmt.Sprintf("endpoint: %s 冷却到期懒恢复(ok,计数清零)", e.ID))
+}
+
+// endpointHealthUsable 判断一行的健康态在 now 时刻是否可用于路由(spec 二期
+// §5.3 锁存语义):
+//   - ok → 可用;
+//   - 非 ok 且 cooldown_until 在未来 → 冷却中,不可用;
+//   - 非 ok 且 cooldown_until 已过期(>0) → 冷却到期,可用(由调用点懒恢复);
+//   - 非 ok 且 cooldown_until == 0 → 锁存态(401/402 认证/欠费,无冷却),永不
+//     自愈,不可用——只能 ResetHealth 或真实成功(ReportSuccess)清回 ok。
+func endpointHealthUsable(e *config.LLMEndpoint, now int64) bool {
+	if e.HealthStatus == "ok" {
+		return true
+	}
+	if e.CooldownUntil > now {
+		return false
+	}
+	return e.CooldownUntil > 0
 }
 
 // endpointProtocolMatch 按 protocol 字符串查对应 toggle;未知协议不匹配任何行
@@ -366,18 +388,35 @@ func endpointModelAllowed(modelsJSON, requestedModel string) bool {
 	return false
 }
 
-// ---- 失败状态机(spec §6.2)--------------------------------------------------
+// ---- 失败状态机(spec §6.2 + 二期修订 §5.3/§5.5/§9.1)------------------------
 
-// ReportFailure 按 §6.2 表格落状态:
+// ReportFailure 按状态落健康态与计数(一期 §6.2 表格 + 二期修订):
 //
-//	429            → 不计数,rate_limited_until = now + 组策略 429 冷却(不摘除)
+//	401/402        → 首次即锁存:health_status=disabled、cooldown_until=0(无冷却、
+//	                 不自愈),last_error 记「认证失败/欠费」;计数 +1/+1。
+//	                 **绕过池模式门控**(spec §5.3/§9.1 显式豁免:确定性凭据错误
+//	                 与「暂时性失败要不要自动摘」正交——死 key 留在池里只吃
+//	                 failover 税)。
+//	429            → rate_limited_until = until(>0 用调用方解析出的截止,覆盖组
+//	                 策略);until<=0 回落 now+组策略 RateLimitCooldownSec;不改
+//	                 连续失败/不摘除;计数 +1/+1。
+//	403            → 归计数路径(语义歧义按普通失败计):consecutive_failures+1,
+//	                 达阈值且 failure_disable=1 → disabled+冷却;计数 +1/+1。
 //	5xx / 连接失败 → consecutive_failures+1;达 threshold(且 failure_disable=1)
-//	                 → disabled + cooldown_until = now + 组策略冷却
-//	其它 4xx       → 完全忽略(不计数不落状态)
+//	                 → disabled + cooldown_until = now + 组策略冷却;计数 +1/+1。
+//	其它 4xx       → 完全忽略(不计数不落状态,不变量 5)。
 //
-// 池模式(组策略 failure_disable=0,不变量 6):失败只打日志,不写任何健康列。
+// 池模式(组策略 failure_disable=0,二期 §9.1 修订不变量 6):**只门控动作**
+// (disabled 迁移与冷却写库),计数列(total/failed)与 last_error 照记(行业
+// 共识「指标永远记,只门控动作」——new-api auto_ban=0 只跳过 DisableChannel,
+// 照采指标)。
+//
+// until 是路由层/内核缝(能拿到响应头处)预解析的 429 冷却截止(unix 秒):
+// 0/负 = 未解析或无头,按组策略推导(负值按 0 处理,非法头防护)。clamp
+// 60..21600 在 ratelimitwin 解析器里做,本方法只消费结果。
+//
 // 健康态读改写持 mu 串行,防并发失败互相覆盖计数。
-func (s *EndpointService) ReportFailure(id string, status int, errMsg string) {
+func (s *EndpointService) ReportFailure(id string, status int, errMsg string, until int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -390,31 +429,65 @@ func (s *EndpointService) ReportFailure(id string, status int, errMsg string) {
 	}
 	now := time.Now().Unix()
 
+	// 401/402 锁存:确定性凭据错误,绕过池模式门控(spec §5.3/§9.1 显式豁免)。
+	if status == http.StatusUnauthorized || status == http.StatusPaymentRequired {
+		label := "认证失败(401)"
+		if status == http.StatusPaymentRequired {
+			label = "欠费(402)"
+		}
+		if msg := strings.TrimSpace(errMsg); msg != "" {
+			label += ": " + msg
+		}
+		// 强制清 cooldown(无冷却 = 不自愈),保留 consecutive_failures 与
+		// rate_limited_until;唯一恢复路径是「重置健康」或一次真实成功。
+		if err := s.store.UpdateHealth(id, storage.HealthUpdate{
+			Status:           "disabled",
+			Failures:         e.ConsecutiveFailures,
+			CooldownUntil:    0,
+			RateLimitedUntil: e.RateLimitedUntil,
+			LastErr:          label,
+		}); err != nil {
+			logger.Warn(fmt.Sprintf("endpoint: %s 401/402 锁存写库失败: %v", id, err))
+		}
+		s.bumpCounters(id, 1, 1, label)
+		logger.Warn(fmt.Sprintf("endpoint: %s status=%d 锁存(disabled,无冷却不自愈) err=%q", id, status, errMsg))
+		return
+	}
+
+	// 池模式:计数与 last_error 照记,健康四列不写(不变量 6 修订)。
+	if !policy.FailureDisable {
+		if recordedFailureStatus(status) {
+			s.bumpCounters(id, 1, 1, errMsg)
+			logger.Warn(fmt.Sprintf("endpoint: %s status=%d 池模式只记计数(健康列不写) err=%q", id, status, errMsg))
+		} else {
+			logger.Info(fmt.Sprintf("endpoint: %s 客户端错误 status=%d 不计数(池模式) err=%q", id, status, errMsg))
+		}
+		return
+	}
+
 	switch {
 	case status == http.StatusTooManyRequests: // 429
-		if !policy.FailureDisable {
-			logger.Warn(fmt.Sprintf("endpoint: %s 429(池模式不落状态) err=%q", id, errMsg))
-			return
+		eff := until
+		if eff < 0 { // 非法头防护:负值按 0,回落组策略
+			eff = 0
 		}
-		until := now + int64(policy.RateLimitCooldownSec)
+		if eff == 0 { // 无预解析:回落组策略默认
+			eff = now + int64(policy.RateLimitCooldownSec)
+		}
 		if err := s.store.UpdateHealth(id, storage.HealthUpdate{
 			Status:           e.HealthStatus, // 429 不改健康状态
 			Failures:         e.ConsecutiveFailures,
 			CooldownUntil:    e.CooldownUntil,
-			RateLimitedUntil: until,
+			RateLimitedUntil: eff,
 			LastErr:          errMsg,
 		}); err != nil {
 			logger.Warn(fmt.Sprintf("endpoint: %s 429 冷却写库失败: %v", id, err))
-			return
 		}
-		logger.Warn(fmt.Sprintf("endpoint: %s 429 限流,冷却至 %d(%ds,不计数不摘除) err=%q",
-			id, until, policy.RateLimitCooldownSec, errMsg))
+		s.bumpCounters(id, 1, 1, errMsg)
+		logger.Warn(fmt.Sprintf("endpoint: %s 429 限流,冷却至 %d(不摘除) err=%q", id, eff, errMsg))
 
-	case status >= 500 || status <= 0: // 5xx / 连接失败 / 超时(status<=0 = 无 HTTP 状态)
-		if !policy.FailureDisable {
-			logger.Warn(fmt.Sprintf("endpoint: %s 上游失败 status=%d(池模式不落状态) err=%q", id, status, errMsg))
-			return
-		}
+	case status == http.StatusForbidden || status >= 500 || status <= 0:
+		// 5xx/连接失败/超时与 403(语义歧义按普通失败计)共用计数路径。
 		failures := e.ConsecutiveFailures + 1
 		u := storage.HealthUpdate{
 			Status:           e.HealthStatus,
@@ -423,9 +496,18 @@ func (s *EndpointService) ReportFailure(id string, status int, errMsg string) {
 			RateLimitedUntil: e.RateLimitedUntil,
 			LastErr:          errMsg,
 		}
-		// threshold<=0 不摘除:0 的「连续失败 0 次就摘」是退化语义,会形成
-		// 失败→摘除→秒恢复的循环;用户要立即摘除应设 threshold=1。
-		if policy.FailureThreshold > 0 && failures >= policy.FailureThreshold {
+		// 已锁存行(disabled + cooldown=0,401/402 终态)必须保持锁存:计数路径
+		// 若给它赋冷却,cooldown>0 就不再满足「锁存」特征,到期会被 recoverIfNeeded
+		// 自愈回 ok,违反「永不自愈」。可达场景=锁存落地时已在途的请求、出口/显式
+		// 行(selectExplicit 不受健康态拦)。仍照常 bump 计数、更新 last_error。
+		if e.HealthStatus != "ok" && e.CooldownUntil <= 0 {
+			u.Status = "disabled"
+			u.CooldownUntil = 0
+			logger.Warn(fmt.Sprintf("endpoint: %s 已锁存(status=%s)收到失败 status=%d,保持锁存(不赋冷却) err=%q",
+				id, e.HealthStatus, status, errMsg))
+		} else if policy.FailureThreshold > 0 && failures >= policy.FailureThreshold {
+			// threshold<=0 不摘除:0 的「连续失败 0 次就摘」是退化语义,会形成
+			// 失败→摘除→秒恢复的循环;用户要立即摘除应设 threshold=1。
 			u.Status = "disabled"
 			u.CooldownUntil = now + int64(policy.CooldownSec)
 			logger.Warn(fmt.Sprintf("endpoint: %s 连续失败 %d 次(阈值 %d)摘除,冷却至 %d status=%d err=%q",
@@ -437,35 +519,71 @@ func (s *EndpointService) ReportFailure(id string, status int, errMsg string) {
 		if err := s.store.UpdateHealth(id, u); err != nil {
 			logger.Warn(fmt.Sprintf("endpoint: %s 失败计数写库失败: %v", id, err))
 		}
+		s.bumpCounters(id, 1, 1, errMsg)
 
 	default:
-		// 其它 4xx:透传错误但不计数(spec §6.2 不变量 5)。
+		// 其它 4xx(400/413/422 等):透传错误但不计数(spec 不变量 5)。
 		logger.Info(fmt.Sprintf("endpoint: %s 客户端错误 status=%d 不计数 err=%q", id, status, errMsg))
 	}
 }
 
-// ReportSuccess 成功清零(spec §6.2 最后一行)。全清(状态/计数/两路冷却/摘要):
-// 请求真实走通是它可用的最强证据;池模式不写(不变量 6,池模式下本就没有
-// 需要清的计数)。
+// recordedFailureStatus 判断状态是否属于「要记账的失败」(二期 §9.1:池模式下
+// 也照记)。不含 401/402(锁存在池模式门控之前单独处理)与其它被忽略的 4xx。
+func recordedFailureStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusForbidden ||
+		status >= 500 || status <= 0
+}
+
+// bumpCounters 是计数列 + last_error 的窄写(二期 §9.1:指标永远记)。调用方
+// 持 mu;失败只记日志,不影响健康写。
+func (s *EndpointService) bumpCounters(id string, totalDelta, failedDelta int64, lastErr string) {
+	if err := s.store.BumpCounters(id, totalDelta, failedDelta, lastErr); err != nil {
+		logger.Warn(fmt.Sprintf("endpoint: %s 计数写库失败: %v", id, err))
+	}
+}
+
+// MarkUsed 是 last_used_at 的专用窄写(spec 二期 §5.7):内核出口解析命中即
+// 打点,只动打点列,不碰健康/计数/冷却。刻意不开在 Select 里——Select 与
+// 56432 路由层共享,路由层没有粘性/run 语义,内核打点只发生在 resolver 命中
+// (宿主 agentCoreRunEgress,含 builtin 兜底行)。失败只记日志,不影响路由。
+func (s *EndpointService) MarkUsed(id string) {
+	if err := s.store.MarkUsed(id); err != nil {
+		logger.Warn(fmt.Sprintf("endpoint: %s 打点(last_used_at)失败: %v", id, err))
+	}
+}
+
+// ReportSuccess 成功全清(spec §6.2 最后一行)+ 计数 +1(total+1, failed+0)。
+// 请求真实走通是它可用的最强证据,也是 401/402 锁存的恢复路径之一(另一条是
+// 手动「重置健康」)。池模式下只记计数并清 last_error,不碰 health_status 等
+// 健康列(不变量 6)——因此池模式下锁存的唯一恢复路径是 ResetHealth。
 func (s *EndpointService) ReportSuccess(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if !s.currentPolicy().FailureDisable {
-		logger.Info(fmt.Sprintf("endpoint: %s 成功(池模式,健康态不落库)", id))
+		s.bumpCounters(id, 1, 0, "")
+		logger.Info(fmt.Sprintf("endpoint: %s 成功(池模式只记计数,健康列不写)", id))
 		return
 	}
-	if err := s.store.UpdateHealth(id, storage.HealthUpdate{
-		Status: "ok", Failures: 0, CooldownUntil: 0, RateLimitedUntil: 0, LastErr: "",
-	}); err != nil {
+	if err := s.clearHealth(id); err != nil {
 		logger.Warn(fmt.Sprintf("endpoint: %s 成功清零写库失败: %v", id, err))
 		return
 	}
+	s.bumpCounters(id, 1, 0, "")
 	logger.Info(fmt.Sprintf("endpoint: %s 成功,健康态清零", id))
 }
 
+// clearHealth 把健康四列清回可用态(状态 ok、连续失败 0、两路冷却 0、摘要清)。
+// 生命周期计数列(total/failed)刻意不动——它们是「只累计不清零」的观测指标。
+// 调用方持 mu(或处于无并发的管理面路径)。
+func (s *EndpointService) clearHealth(id string) error {
+	return s.store.UpdateHealth(id, storage.HealthUpdate{
+		Status: "ok", Failures: 0, CooldownUntil: 0, RateLimitedUntil: 0, LastErr: "",
+	})
+}
+
 // ResetHealth 手动重置健康(管理面「重置健康」按钮,spec §6.4):立即清零全部
-// 健康列并立即可选,不等冷却到期。
+// 健康列并立即可选,不等冷却到期。也是 401/402 锁存的恢复路径之一。
 //
 // 缺失 id 契约:store 的 UpdateHealth 是 UPDATE ... WHERE id=?,0 行受影响也
 // 返回 nil,本方法保持返回 nil——调用方(handler)如需区分「重置成功」与
@@ -474,10 +592,7 @@ func (s *EndpointService) ResetHealth(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	err := s.store.UpdateHealth(id, storage.HealthUpdate{
-		Status: "ok", Failures: 0, CooldownUntil: 0, RateLimitedUntil: 0, LastErr: "",
-	})
-	if err != nil {
+	if err := s.clearHealth(id); err != nil {
 		return fmt.Errorf("endpoint: 重置健康失败: %w", err)
 	}
 	logger.Info(fmt.Sprintf("endpoint: %s 手动重置健康(ok,计数/冷却清零)", id))
@@ -865,7 +980,41 @@ func (s *EndpointService) CreateEndpoint(e *config.LLMEndpoint) error { return s
 
 // UpdateEndpoint 配置列白名单更新;健康列 clobber 由 store 白名单挡住。
 // 管理面专用,数据面勿用。
-func (s *EndpointService) UpdateEndpoint(e *config.LLMEndpoint) error { return s.store.Update(e) }
+// 激活迁移清零(spec 二期 §5.6):对比 DB 当前行 enabled,false→true 时执行
+// ResetHealth 同款清零——消灭「打开了还是不用」(陈旧 disabled/冷却态挡住新
+// 激活的行)。生命周期计数列不清(只累计不清零)。
+func (s *EndpointService) UpdateEndpoint(e *config.LLMEndpoint) error {
+	if e == nil {
+		return s.store.Update(e)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cur, err := s.store.Get(e.ID)
+	if err != nil {
+		// 读不到当前行:交给 Update 报「不存在」;不触发迁移清零(拿不准原态
+		// 就不写健康列,避免把并发路径刚写的失败态误清)。
+		return s.store.Update(e)
+	}
+	if err := s.store.Update(e); err != nil {
+		return err
+	}
+	if !cur.Enabled && e.Enabled {
+		if err := s.clearHealth(e.ID); err != nil {
+			logger.Warn(fmt.Sprintf("endpoint: %s 激活(0→1)清零健康失败(可用重置健康补救): %v", e.ID, err))
+		} else {
+			// 同步回写入参行:handler 用同一指针构造 PUT 响应视图,不清这里会
+			// 让响应短暂展示清前的陈旧健康态(下次 GET 才正确)。
+			e.HealthStatus = "ok"
+			e.ConsecutiveFailures = 0
+			e.CooldownUntil = 0
+			e.RateLimitedUntil = 0
+			e.LastError = ""
+			logger.Info(fmt.Sprintf("endpoint: %s 激活(enabled 0→1),健康态清零", e.ID))
+		}
+	}
+	return nil
+}
 
 // DeleteEndpoint 删除;builtin → storage.ErrBuiltinImmutable(handler 映射 409)。
 // 管理面专用,数据面勿用。
@@ -980,4 +1129,12 @@ func (s *EndpointService) ActivateInGroup(protocol, targetID string) error {
 	}
 	logger.Info(fmt.Sprintf("endpoint: 托盘激活 id=%s protocol=%s(组内互斥,其余同组 auto 行已停用)", target.ID, protocol))
 	return nil
+}
+
+// SetEgressKernel 出口指定换绑直通(store 事务方法,「全表至多一行=1」的唯一
+// 写入口;非 anthropic 拒、builtin 允许、不存在 404 的哨兵语义都在 store 层,
+// handler 原样映射)。管理面专用,数据面勿用——数据面出口是只读消费
+// (kernelEndpointResolver 读 egress_kernel=1 的行),永远不经本方法。
+func (s *EndpointService) SetEgressKernel(id string, set bool) error {
+	return s.store.SetEgressKernel(id, set)
 }

@@ -90,9 +90,12 @@ export function validateEndpointConfig({
 }
 
 // 服务端列表项(GET /api/endpoints,LLMEndpoint JSON 视图 + 掩码 api_key +
-// inflight)→ 组件展示/表单形态。⚠️ api_key 永不回显完整值:完整值只存在于
-// apiKeyMasked(掩码串)供展示,表单输入 apiKey 恒空——编辑时留空 = 不改
-// (§17 不变量 7)。缺键安全回落,builtin/enabled 缺省与 POST 契约对齐。
+// inflight + 二期运行态六字段)→ 组件展示/表单形态。⚠️ api_key 永不回显完整
+// 值:完整值只存在于 apiKeyMasked(掩码串)供展示,表单输入 apiKey 恒空——
+// 编辑时留空 = 不改(§17 不变量 7)。缺键安全回落,builtin/enabled 缺省与 POST
+// 契约对齐。二期(spec 2026-11-27 §8)直透字段:egress_kernel(出口指示/徽标)、
+// last_used_at + total_requests + failed_requests(行尾计数)、cooldown_until +
+// rate_limited_until(三词徽标的「恢复于/限流至 HH:MM」tooltip)。
 export function normalizeEndpointView(source) {
   if (!source || typeof source !== 'object' || Array.isArray(source)) return null;
   const num = (v, fallback = 0) =>
@@ -114,6 +117,12 @@ export function normalizeEndpointView(source) {
     healthStatus: typeof source.health_status === 'string' ? source.health_status : 'ok',
     lastError: typeof source.last_error === 'string' ? source.last_error : '',
     inflight: num(source.inflight),
+    egressKernel: source.egress_kernel === true,
+    lastUsedAt: num(source.last_used_at),
+    totalRequests: num(source.total_requests),
+    failedRequests: num(source.failed_requests),
+    cooldownUntil: num(source.cooldown_until),
+    rateLimitedUntil: num(source.rate_limited_until),
   };
 }
 
@@ -122,7 +131,8 @@ export function normalizeEndpointView(source) {
 // store 层对 builtin 行 priority≠0 直接拒写,兜底防的是残留值静默 400)。
 // api_key 空值不进载荷——PUT 语义「空 = 不改」要求键缺省而非空串;POST 侧缺
 // 键 = 服务端空值,与「新端点无凭据」合法形态一致(非回环缺 key 已被
-// validate 挡住)。
+// validate 挡住)。二期:enabled 不再进载荷——表单勾选已移除(行上开关取代),
+// 激活迁移走行开关的独立快速路径 PUT {enabled};POST 缺键服务端默认 true。
 export function endpointToPayload(form, isBuiltin = false) {
   const f = form || {};
   const apiKey = String(f.apiKey || '').trim();
@@ -141,10 +151,59 @@ export function endpointToPayload(form, isBuiltin = false) {
     priority: isBuiltin ? 0 : (Number(String(f.priority ?? '0').trim()) || 0),
     max_concurrency: Number(String(f.maxConcurrency ?? '0').trim()) || 0,
     models,
-    enabled: f.enabled !== false,
   };
   if (apiKey) payload.api_key = apiKey;
   return payload;
+}
+
+// ---- 二期行上徽标/出口指示纯函数(spec 2026-11-27 §7.1/§7.2)----------------
+
+// unix 秒 → 本地 HH:MM(补零)。0/负/非数回落空串(调用方以空串判「无 tooltip」)。
+export function formatClockTime(unixSec) {
+  const sec = Number(unixSec);
+  if (!Number.isFinite(sec) || sec <= 0) return '';
+  const d = new Date(sec * 1000);
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${hh}:${mm}`;
+}
+
+// last_used_at(unix 秒)→ i18n 相对时间档位。0/缺键 = 从未调用;未来时间戳
+// (时钟偏差)按「刚刚」兜底,不画负数。返回 {key, params} 由调用方 t() 渲染,
+// 与组件解耦便于纯测。
+export function formatLastUsedAt(unixSec, now = Date.now()) {
+  const nowMs = Number(now);
+  const nowSafe = Number.isFinite(nowMs) && nowMs > 0 ? nowMs : Date.now();
+  const sec = Number(unixSec);
+  if (!Number.isFinite(sec) || sec <= 0) {
+    return { key: 'endpointManager_lastUsedNever', params: {} };
+  }
+  const diffMs = nowSafe - sec * 1000;
+  if (diffMs < 60000) return { key: 'endpointManager_lastUsedJustNow', params: {} };
+  const minutes = Math.floor(diffMs / 60000);
+  if (minutes < 60) return { key: 'endpointManager_lastUsedMinAgo', params: { n: minutes } };
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return { key: 'endpointManager_lastUsedHourAgo', params: { n: hours } };
+  return { key: 'endpointManager_lastUsedDayAgo', params: { n: Math.floor(hours / 24) } };
+}
+
+// 出口指示三态(spec 二期 §7.2,聊天页抽屉吃它):输入 GET /api/endpoints
+// 原始行数组(线格式,内部归一),输出 {mode, name}:
+//   active —— egress_kernel=1 且 enabled:出口生效;
+//   paused —— egress_kernel=1 但 enabled=0:出口暂停保留,auto 调度中
+//             (spec §4:enabled=0 与 egress_kernel=1 可共存,解绑不发生);
+//   auto   —— 无 egress 行:未指定,auto 调度。
+// 服务端事务保证全表至多一行 egress_kernel=1;多行(异常形态)取第一行兜底。
+export function egressIndicator(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  const egress = list
+    .map((r) => (r && typeof r === 'object' && !Array.isArray(r) ? normalizeEndpointView(r) : null))
+    .filter(Boolean)
+    .find((v) => v.egressKernel === true);
+  if (!egress) return { mode: 'auto', name: '' };
+  return egress.enabled === false
+    ? { mode: 'paused', name: egress.name }
+    : { mode: 'active', name: egress.name };
 }
 
 // models 文本域(换行/逗号分隔,可混用)→ JSON 数组字符串。空段过滤;

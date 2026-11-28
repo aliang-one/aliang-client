@@ -183,7 +183,8 @@ type RetryNotice struct {
 
 // streamOptions 收拢 Stream 的可选参数。零值即默认行为。
 type streamOptions struct {
-	onRetry func(RetryNotice)
+	onRetry        func(RetryNotice)
+	onRequestError func(status int, headers http.Header)
 }
 
 // StreamOption 是 Stream 的可选参数。变参是为了既有调用点（含全部单测的
@@ -194,6 +195,24 @@ type StreamOption func(*streamOptions)
 // 等待前）回调一次；没有可重试的失败（如 400 非降档）不会回调。
 func WithRetryNotice(fn func(RetryNotice)) StreamOption {
 	return func(o *streamOptions) { o.onRetry = fn }
+}
+
+// WithRequestError 注册**最终失败**观察者。与 WithRetryNotice 的分工：
+//   - RetryNotice 只在「确定还要再试」时发（含降档、可重试状态的重试）；
+//   - WithRequestError 只在不再重试的那一刻发一次——不可重试错误（400/401/
+//     402/403 等）与重试耗尽都走这里，携带上游状态码与响应头。
+//
+// 这是宿主的失败上报缝：一期 ReportFailure 只被 56432 路由层调用，内核 BYO
+// 直连绕过路由层，401/402 又不可重试（旧 OnRetry 从不触发），于是内核流量的
+// 锁存/限流/计数永远不落地。回调的 headers 可能是 nil（连接层失败、2xx 体内
+// 错误信封），status 为 0 表示没有可观测的 HTTP 状态。
+//
+// 调用方主动终止（ctx 取消/事件中止）不回调——用户取消不算 endpoint 失败，
+// 不应进 ReportFailure 计数。细节：已下发过事件后的 ctx 取消仍会让 Stream
+// 返回错误（ctx.Err() 语义），但**不**触发本回调——那条路径的错误没有上游
+// 状态可携带（(0, nil)），通知宿主只会把用户取消记成上游失败。
+func WithRequestError(fn func(status int, headers http.Header)) StreamOption {
+	return func(o *streamOptions) { o.onRequestError = fn }
 }
 
 // Stream 发起一次流式调用，把事件逐个回调给 onEvent。
@@ -234,6 +253,16 @@ func (c *Client) Stream(ctx context.Context, req *MessagesRequest, onEvent func(
 			ErrorStatus: status,
 			ErrorKind:   kind,
 		})
+	}
+	// notifyRequestError 在「确定不再重试」的每个返回点各发一次。错误值经
+	// errors.As 取出 httpStatusError 的状态与响应头；其它错误（连接层、2xx
+	// 体内信封）给 (0, nil)，宿主据此按普通失败计数。
+	notifyRequestError := func(err error) {
+		if so.onRequestError == nil {
+			return
+		}
+		status, headers := requestErrorFields(err)
+		so.onRequestError(status, headers)
 	}
 
 	// delivered 记录本调用是否已向调用方下发过任何事件。它是**跨尝试**的，
@@ -283,6 +312,18 @@ func (c *Client) Stream(ctx context.Context, req *MessagesRequest, onEvent func(
 		// （upstreamError）可能出现在事件中途——那种情况下重试同样会缝内容，
 		// delivered 判定先拦住是对的。
 		if delivered {
+			// 已下发事件后的 ctx 取消（用户停止 / watchdog 超时）不是上游失败：
+			// 这里的错误多半是 io 管道/读流被取消撕裂，requestErrorFields 会给
+			// (0, nil)，宿主闭包会把一次用户取消当成 endpoint 失败记账（4a 评审
+			// Finding 1）。ctx 已取消时不通知、错误原样返回——返回值语义不变
+			// （调用方仍按 ctx 取消归类），只是失败上报缝不再触发。代价是「真实
+			// 上游失败与取消同时发生」这一竞态窗口少记一次失败：宁可少记，不把
+			// 用户取消记成上游劣化。
+			if ctx.Err() != nil {
+				return err
+			}
+			// 已下发过事件后不再重试：这是本次调用的最终失败，通知宿主。
+			notifyRequestError(err)
 			return err
 		}
 		// 各模型的输出上限不同：defaultMaxTokens（32000）遇到只支持 8k/16k
@@ -295,12 +336,27 @@ func (c *Client) Stream(ctx context.Context, req *MessagesRequest, onEvent func(
 			continue
 		}
 		if !isRetryable(err) {
+			// 400/401/402/403 等确定性错误一次即终态：OnRetry 不会触发，
+			// 失败上报只能靠这条缝（401/402 锁存的前提）。
+			notifyRequestError(err)
 			return err
 		}
 		notifyRetry(attempt+1, err)
 		lastErr = err
 	}
+	// 重试耗尽：lastErr 是最后一次上游失败（通常带状态码/响应头）。
+	notifyRequestError(lastErr)
 	return fmt.Errorf("agentcore: 重试 %d 次后仍失败: %w", maxRetries, lastErr)
+}
+
+// requestErrorFields 从终端错误里取出上游状态码与响应头。非 httpStatusError
+// （连接层失败、2xx 体内错误信封、流中断）返回 (0, nil)。
+func requestErrorFields(err error) (int, http.Header) {
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.status, statusErr.headers
+	}
+	return 0, nil
 }
 
 // retryNoticeFields 把一次失败归类成 api_retry 帧里的 error_status / error
@@ -337,6 +393,11 @@ type httpStatusError struct {
 	status     int
 	body       string
 	retryAfter time.Duration
+	// headers 是上游响应头的快照。OnRequestError 缝要在**最终失败**时把
+	// 429/401/402 的响应头（Retry-After / anthropic-ratelimit-unified-reset）
+	// 交给宿主算限流窗口与锁存，而错误值本身是跨重试循环往外传的唯一载体，
+	// 所以随错误带上（body 关闭后 resp.Header 仍有效，Clone 防止下游改动）。
+	headers http.Header
 }
 
 func (e *httpStatusError) Error() string {
@@ -561,6 +622,7 @@ func (c *Client) streamOnce(ctx context.Context, req *MessagesRequest, onEvent f
 			status:     resp.StatusCode,
 			body:       string(raw),
 			retryAfter: parseRetryAfter(resp.Header.Get("retry-after")),
+			headers:    resp.Header.Clone(),
 		}
 	}
 

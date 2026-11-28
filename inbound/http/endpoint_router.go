@@ -32,6 +32,7 @@ import (
 
 	"aliang.one/nursorgate/common/logger"
 	M "aliang.one/nursorgate/inbound/tun/metadata"
+	"aliang.one/nursorgate/processor/ratelimitwin"
 	"aliang.one/nursorgate/processor/tcp"
 )
 
@@ -48,10 +49,15 @@ type AIEndpointSelector interface {
 	// 其它 wrapped raw error 由路由层映射 500(registry 读挂是服务端故障)。
 	Select(protocol, model, explicitID, excludeID string) (id string, baseURL string, apiKey string, builtin bool, err error)
 	// Acquire 拿并发令牌;maxConcurrency 传 0 = 以 endpoint 行内配置为准。
-	// 返回的 release 必须恰好调用一次。
+	// 返回的 release 必须恰好调用一次;返回 err(队满/排队超时)时无槽位,
+	// 无 release 可调。ErrAIQueueTimeout 的路由语义(二期 spec §6):自动路径
+	// =排除忙行切下一候选(不计失败不动健康列),显式点名路径=立即 503。
 	Acquire(id string, maxConcurrency int) (release func(), err error)
 	ReportSuccess(id string)
-	ReportFailure(id string, status int, errMsg string)
+	// ReportFailure 上报一次失败。until 是调用方在能拿到响应头处（BYO 完整响应
+	// 头/内核 OnRequestError 缝）用 ratelimitwin.Parse 预解析的 429 冷却截止
+	// unix 秒；0/负 = 无预解析，由 service 按组策略推导（只有 429 消费它）。
+	ReportFailure(id string, status int, errMsg string, until int64)
 	// ModelsUnion 返回 /v1/models 聚合数据:{id, owner} 列表(已去重)。
 	ModelsUnion() []map[string]any
 }
@@ -169,6 +175,31 @@ func handleAIRequest(conn net.Conn, reader *bufio.Reader, req *http.Request, met
 
 		release, err := aiSelector.Acquire(id, 0)
 		if err != nil {
+			if errors.Is(err, ErrAIQueueTimeout) {
+				// 队满≠病,是忙(二期 spec §6):不计失败、不动健康列。service 的
+				// Acquire 队满/超时返回 (nil, ErrQueueTimeout) 无槽位,release
+				// 语义天然满足——没有任何可释放的东西,绝不能在此调 release。
+				if explicitID != "" {
+					// 显式点名 + 该行忙 → 立即 503:点名不重选(重选违背点名
+					// 语义,且会再烧一个 30s 排队等待)。
+					logger.Warn(fmt.Sprintf("ai route: 显式点名 endpoint 忙,立即 503 endpoint=%s explicit=%s attempt=%d", id, explicitID, attempt))
+					writeAIErrorBody(conn, http.StatusServiceUnavailable, "endpoint_queue_timeout",
+						fmt.Sprintf("explicit endpoint %s is busy", id))
+					return
+				}
+				if attempt < aiMaxAttempts {
+					// 自动路径:排除忙行切下一候选重试(attempt 上限仍 2,不为
+					// 队满扩——≥3 行且前两行全忙时第三行本轮不试,下一请求
+					// 自然轮到)。
+					logger.Info(fmt.Sprintf("ai route: endpoint 队满,排除后切下一候选 endpoint=%s attempt=%d", id, attempt))
+					excludeID = id
+					continue
+				}
+				logger.Warn(fmt.Sprintf("ai route: 全部候选队满,503 endpoint=%s attempt=%d", id, attempt))
+				writeAIErrorBody(conn, http.StatusServiceUnavailable, "endpoint_queue_timeout",
+					"all endpoint candidates are busy")
+				return
+			}
 			status, code := mapAISelectorError(err)
 			logger.Warn(fmt.Sprintf("ai route: acquire 失败 endpoint=%s attempt=%d status=%d code=%s err=%v", id, attempt, status, code, err))
 			writeAIErrorBody(conn, status, code, "endpoint acquire failed")
@@ -185,7 +216,15 @@ func handleAIRequest(conn net.Conn, reader *bufio.Reader, req *http.Request, met
 			writeAIErrorBody(conn, http.StatusInternalServerError, "endpoint_config_invalid", "endpoint base_url is invalid")
 			return
 		case res.completed && res.status >= 400 && res.status != http.StatusTooManyRequests:
-			// 其它 4xx:已透传,不重试不计数(spec §6.2 不变量 5)。
+			// 其它 4xx(400/404/413/422 等,不含已走 held 通道的 401/402/429):
+			// 已透传,不重试(spec §6.2 不变量 5)。403 例外(二期 §9.1 不变量 5
+			// 修订):归计数路径——语义歧义(可能是凭据/权限问题)按普通失败
+			// 记 total/failed 与 last_error,与内核链对齐;但不切候选(已透传的
+			// 确定性客户端错误,切换=重打同族两枪)、不消费冷却(until=0)。
+			if res.status == http.StatusForbidden {
+				aiSelector.ReportFailure(id, res.status,
+					fmt.Sprintf("%d %s", res.status, http.StatusText(res.status)), 0)
+			}
 			logger.Info(fmt.Sprintf("ai route: 客户端错误透传 endpoint=%s status=%d protocol=%s", id, res.status, protocol))
 			return
 		case res.completed:
@@ -194,13 +233,22 @@ func handleAIRequest(conn net.Conn, reader *bufio.Reader, req *http.Request, met
 			return
 		case res.started:
 			// 不变量 4:流已开始但中断——绝不切换 endpoint,断开收场。
-			aiSelector.ReportFailure(id, 0, res.errMsg())
+			aiSelector.ReportFailure(id, 0, res.errMsg(), 0)
 			logger.Warn(fmt.Sprintf("ai route: 流式响应中断,不重试 endpoint=%s status=%d err=%v", id, res.status, res.err))
 			return
 		}
 
 		if res.held != nil {
-			aiSelector.ReportFailure(id, res.status, res.held.Status)
+			// held 通道(429/5xx/401/402):429 的冷却截止在能拿到响应头处预解析
+			// （spec §5.5）：Retry-After（秒/HTTP-date）与
+			// anthropic-ratelimit-unified-reset 取更远者，clamp 60..21600。
+			// 401/402 走同一条 ReportFailure 缝,until 传 0——service 按 status
+			// 进锁存分支(spec §5.3),不消费冷却。
+			var until int64
+			if res.status == http.StatusTooManyRequests {
+				until = ratelimitwin.Parse(res.status, res.held.Header)
+			}
+			aiSelector.ReportFailure(id, res.status, res.held.Status, until)
 			if attempt < aiMaxAttempts {
 				drainAndCloseAIResponse(res.held)
 				// 重试切下一候选:把本失败 endpoint 记为 exclude,下次 Select
@@ -217,7 +265,7 @@ func handleAIRequest(conn net.Conn, reader *bufio.Reader, req *http.Request, met
 		}
 
 		// 传输失败(无 HTTP 响应)。
-		aiSelector.ReportFailure(id, 0, res.errMsg())
+		aiSelector.ReportFailure(id, 0, res.errMsg(), 0)
 		if attempt < aiMaxAttempts {
 			// 传输失败同样切下一候选(重试不是同 endpoint 重打)。
 			excludeID = id
@@ -249,6 +297,12 @@ func forwardAIAttempt(conn net.Conn, reader *bufio.Reader, req *http.Request, me
 //
 // tcp handler 全程自管流式中继,路由层无法探知响应头是否已写出——因此内置
 // 链一律单次尝试,失败只 ReportFailure + 断开(不变量 4 的保守实现)。
+//
+// 状态可见性(spec 二期 §5.3a):builtin 的上游 HTTP 状态被 tcp handler 吞掉,
+// 本层**尽力而为**——成功返回 completed=true/status=0;handleErr 返回
+// status=0 的失败(由 handleAIRequest 的 res.started 分支 ReportFailure 0)。
+// 上游 4xx/5xx(尤其 429 窗口)在 builtin 路径不可观测,不承诺精确锁存/限流,
+// 这是 spec 明示的尽力语义;需要精确窗口时只能走 BYO(完整响应头)。
 //
 // 已知风险(quality-fix 评审 Important 2,文档化不改行为):本委托用
 // context.Background() 无 deadline——accept 循环的读期限已在 handleRawConnection
@@ -299,7 +353,12 @@ func forwardAIByoAttempt(conn net.Conn, req *http.Request, body []byte, baseURL,
 	}
 
 	status := resp.StatusCode
-	if status == http.StatusTooManyRequests || status >= 500 {
+	// 401/402 与 429/5xx 同走 held 通道(二期 spec §5.3+§6):确定性凭据错误
+	// 既要经 ReportFailure(status 原样透传)进 service 锁存,又值得切下一候选
+	// 重试——held 意味着响应头未写客户端,切换不违反不变量 4;重试耗尽时
+	// 透传最后一次上游错误响应。其余 4xx 仍照旧直通(不重试不计数)。
+	if status == http.StatusTooManyRequests || status >= 500 ||
+		status == http.StatusUnauthorized || status == http.StatusPaymentRequired {
 		// 不透传(留着重试/收尾),body 保持打开交还调用方处置。
 		return aiForwardResult{status: status, held: resp}
 	}

@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -365,8 +366,8 @@ func TestEndpointService_ReportFailureThresholdDisables(t *testing.T) {
 	createEndpoint(t, store, anthropicEP("ep-f", 10))
 
 	// 默认策略 threshold=3:前两次只计数,第三次摘除。
-	svc.ReportFailure("ep-f", 502, "bad gateway")
-	svc.ReportFailure("ep-f", 503, "service unavailable")
+	svc.ReportFailure("ep-f", 502, "bad gateway", 0)
+	svc.ReportFailure("ep-f", 503, "service unavailable", 0)
 	got := mustGet(t, store, "ep-f")
 	if got.ConsecutiveFailures != 2 || got.HealthStatus != "ok" {
 		t.Fatalf("未达阈值只应计数: failures=%d status=%s", got.ConsecutiveFailures, got.HealthStatus)
@@ -374,9 +375,13 @@ func TestEndpointService_ReportFailureThresholdDisables(t *testing.T) {
 	if got.LastError == "" {
 		t.Fatalf("失败应记录 last_error 供面板展示")
 	}
+	// 计数列:每次失败 total+1 failed+1。
+	if got.TotalRequests != 2 || got.FailedRequests != 2 {
+		t.Fatalf("两次失败后计数应为 total=2 failed=2, got total=%d failed=%d", got.TotalRequests, got.FailedRequests)
+	}
 
 	before := time.Now().Unix()
-	svc.ReportFailure("ep-f", 500, "internal error")
+	svc.ReportFailure("ep-f", 500, "internal error", 0)
 	got = mustGet(t, store, "ep-f")
 	if got.HealthStatus != "disabled" || got.ConsecutiveFailures != 3 {
 		t.Fatalf("达阈值应摘除: status=%s failures=%d", got.HealthStatus, got.ConsecutiveFailures)
@@ -400,14 +405,17 @@ func TestEndpointService_ReportFailure429Cooldowns(t *testing.T) {
 	createEndpoint(t, store, anthropicEP("ep-r", 10))
 
 	before := time.Now().Unix()
-	svc.ReportFailure("ep-r", 429, "rate limited")
+	svc.ReportFailure("ep-r", 429, "rate limited", 0)
 	got := mustGet(t, store, "ep-r")
-	// 429 不计数、不摘除,只写 rate_limited_until。
+	// 429 不计连续失败、不摘除,只写 rate_limited_until;请求计数照记(total/failed 各 +1)。
 	if got.RateLimitedUntil <= before || got.RateLimitedUntil > before+61 {
 		t.Fatalf("rate_limited_until 应为 now+60s 附近, got %d", got.RateLimitedUntil)
 	}
 	if got.ConsecutiveFailures != 0 || got.HealthStatus != "ok" || got.CooldownUntil != 0 {
-		t.Fatalf("429 不得计数/摘除: %+v", got)
+		t.Fatalf("429 不计连续失败/不摘除: %+v", got)
+	}
+	if got.TotalRequests != 1 || got.FailedRequests != 1 {
+		t.Fatalf("429 应记 total=1 failed=1, got total=%d failed=%d", got.TotalRequests, got.FailedRequests)
 	}
 
 	// 429 冷却中 Select 跳过 → 回落 builtin。
@@ -434,21 +442,212 @@ func TestEndpointService_ReportFailure4xxIgnored(t *testing.T) {
 	svc, store := newEndpointTestHarness(t)
 	createEndpoint(t, store, anthropicEP("ep-x", 10))
 
-	// 其它 4xx 不计数不落状态(401/403/404 反复打也不摘)。
-	for i := 0; i < 5; i++ {
-		svc.ReportFailure("ep-x", 401, "unauthorized")
+	// 其它 4xx(400/413/422/404 等)不计数不落状态(不变量 5)。
+	for _, status := range []int{400, 413, 422, 404} {
+		svc.ReportFailure("ep-x", status, "client error", 0)
 	}
 	got := mustGet(t, store, "ep-x")
 	if got.ConsecutiveFailures != 0 || got.HealthStatus != "ok" ||
 		got.CooldownUntil != 0 || got.RateLimitedUntil != 0 {
-		t.Fatalf("4xx 必须完全忽略: %+v", got)
+		t.Fatalf("其它 4xx 必须完全忽略: %+v", got)
+	}
+	if got.TotalRequests != 0 || got.FailedRequests != 0 {
+		t.Fatalf("被忽略的 4xx 不得计数: total=%d failed=%d", got.TotalRequests, got.FailedRequests)
 	}
 
 	// status=0(连接失败/超时)按 5xx 同口径计数。
-	svc.ReportFailure("ep-x", 0, "dial tcp: connection refused")
+	svc.ReportFailure("ep-x", 0, "dial tcp: connection refused", 0)
 	got = mustGet(t, store, "ep-x")
 	if got.ConsecutiveFailures != 1 || got.LastError == "" {
 		t.Fatalf("连接失败应计数: %+v", got)
+	}
+	if got.TotalRequests != 1 || got.FailedRequests != 1 {
+		t.Fatalf("连接失败应记 total=1 failed=1, got total=%d failed=%d", got.TotalRequests, got.FailedRequests)
+	}
+}
+
+// 401/402 锁存(spec §5.3):首次即 disabled + cooldown_until=0(无冷却不自愈),
+// last_error 记认证失败/欠费;计数照记。
+func TestEndpointService_ReportFailure401Latch(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+	createEndpoint(t, store, anthropicEP("ep-401", 10))
+
+	svc.ReportFailure("ep-401", 401, "invalid api key", 0)
+	got := mustGet(t, store, "ep-401")
+	if got.HealthStatus != "disabled" {
+		t.Fatalf("401 应锁存为 disabled, got %s", got.HealthStatus)
+	}
+	if got.CooldownUntil != 0 {
+		t.Fatalf("锁存必须无冷却(cooldown_until=0,不自愈), got %d", got.CooldownUntil)
+	}
+	if !strings.Contains(got.LastError, "认证失败") {
+		t.Fatalf("last_error 应记认证失败, got %q", got.LastError)
+	}
+	if got.TotalRequests != 1 || got.FailedRequests != 1 {
+		t.Fatalf("锁存应记 total=1 failed=1, got total=%d failed=%d", got.TotalRequests, got.FailedRequests)
+	}
+
+	// 无冷却不自愈:Select 不得返回锁存行(回落 builtin),且不得清状态。
+	sel, err := svc.Select("anthropic", "", "")
+	if err != nil {
+		t.Fatalf("锁存后应回落 builtin: %v", err)
+	}
+	if sel.ID != storage.BuiltinEndpointID {
+		t.Fatalf("锁存行不应被选中, got %s", sel.ID)
+	}
+	got = mustGet(t, store, "ep-401")
+	if got.HealthStatus != "disabled" || got.CooldownUntil != 0 {
+		t.Fatalf("Select 不得自愈锁存态: %+v", got)
+	}
+}
+
+func TestEndpointService_ReportFailure402Latch(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+	createEndpoint(t, store, anthropicEP("ep-402", 10))
+
+	svc.ReportFailure("ep-402", 402, "insufficient balance", 0)
+	got := mustGet(t, store, "ep-402")
+	if got.HealthStatus != "disabled" || got.CooldownUntil != 0 {
+		t.Fatalf("402 应锁存 disabled+cooldown=0: %+v", got)
+	}
+	if !strings.Contains(got.LastError, "欠费") {
+		t.Fatalf("last_error 应记欠费, got %q", got.LastError)
+	}
+	if got.TotalRequests != 1 || got.FailedRequests != 1 {
+		t.Fatalf("锁存应记 total=1 failed=1, got total=%d failed=%d", got.TotalRequests, got.FailedRequests)
+	}
+}
+
+// 池模式下 401/402 也锁存(锁存绕过池模式门控,spec §5.3/§9.1 显式豁免)。
+func TestEndpointService_ReportFailureLatchBypassesPoolMode(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+	createEndpoint(t, store, anthropicEP("ep-latch-pool", 10))
+	if err := store.SetPolicy(&config.EndpointGroupPolicy{
+		FailureDisable: false, FailureThreshold: 3, CooldownSec: 300, RateLimitCooldownSec: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	svc.ReportFailure("ep-latch-pool", 401, "bad key", 0)
+	got := mustGet(t, store, "ep-latch-pool")
+	if got.HealthStatus != "disabled" || got.CooldownUntil != 0 {
+		t.Fatalf("池模式下 401 仍须锁存 disabled+cooldown=0: %+v", got)
+	}
+	if !strings.Contains(got.LastError, "认证失败") {
+		t.Fatalf("池模式锁存也应记认证失败, got %q", got.LastError)
+	}
+}
+
+// 回归(quality-fix Important 1):锁存落地后,计数路径(5xx/连接失败/403)不得给
+// 锁存行赋冷却——否则 cooldown>0 就不再满足「锁存」特征,冷却到期会被
+// recoverIfNeeded 自愈回 ok,违反不变量「永不自愈」。可达场景=锁存落地时已在途
+// 的请求、出口/显式行(selectExplicit 不受健康态拦)。
+func TestEndpointService_LatchedRowSurvivesFailureCountPath(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+	createEndpoint(t, store, anthropicEP("ep-latch-5xx", 10))
+
+	// 401 锁存。
+	svc.ReportFailure("ep-latch-5xx", 401, "bad key", 0)
+	// 锁存后连续 3 次 5xx(达默认阈值 3):必须仍保持 disabled+cooldown=0。
+	for i := 0; i < 3; i++ {
+		svc.ReportFailure("ep-latch-5xx", 500, "late in-flight", 0)
+	}
+
+	got := mustGet(t, store, "ep-latch-5xx")
+	if got.HealthStatus != "disabled" || got.CooldownUntil != 0 {
+		t.Fatalf("锁存行经计数路径后应仍保持 disabled+cooldown=0: %+v", got)
+	}
+	// 仍不自愈:Select 不返回它(回落 builtin),且 Select 不得改状态。
+	sel, err := svc.Select("anthropic", "", "")
+	if err != nil {
+		t.Fatalf("锁存行不应可被选中(应回落 builtin): %v", err)
+	}
+	if sel.ID != storage.BuiltinEndpointID {
+		t.Fatalf("锁存行经计数路径后不得被选中, got %s", sel.ID)
+	}
+	got = mustGet(t, store, "ep-latch-5xx")
+	if got.HealthStatus != "disabled" || got.CooldownUntil != 0 {
+		t.Fatalf("Select 后锁存态不得自愈: %+v", got)
+	}
+	// 计数照记:1 次 401 + 3 次 500 = total 4 / failed 4。
+	if got.TotalRequests != 4 || got.FailedRequests != 4 {
+		t.Fatalf("计数应照记 total=4 failed=4, got total=%d failed=%d", got.TotalRequests, got.FailedRequests)
+	}
+}
+
+// 401 锁存后的 ResetHealth 清零断言(Minor 4):与 500 熔断的 ResetHealth 测试区分,
+// 确认锁存终态同样可经手动重置恢复。
+func TestEndpointService_ResetHealthClearsLatch(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+	createEndpoint(t, store, anthropicEP("ep-reset-latch", 10))
+
+	svc.ReportFailure("ep-reset-latch", 401, "bad key", 0)
+	if got := mustGet(t, store, "ep-reset-latch"); got.HealthStatus != "disabled" {
+		t.Fatalf("前置:401 应已锁存, got %s", got.HealthStatus)
+	}
+
+	if err := svc.ResetHealth("ep-reset-latch"); err != nil {
+		t.Fatalf("reset health: %v", err)
+	}
+	got := mustGet(t, store, "ep-reset-latch")
+	if got.HealthStatus != "ok" || got.CooldownUntil != 0 ||
+		got.RateLimitedUntil != 0 || got.LastError != "" {
+		t.Fatalf("ResetHealth 应清回锁存态: %+v", got)
+	}
+	sel, err := svc.Select("anthropic", "", "")
+	if err != nil {
+		t.Fatalf("重置后应可选: %v", err)
+	}
+	if sel.ID != "ep-reset-latch" {
+		t.Fatalf("重置后应选中 ep-reset-latch, got %s", sel.ID)
+	}
+}
+
+// 403 归计数路径(语义歧义按普通失败计):连续失败累加,达阈值摘除。
+func TestEndpointService_ReportFailure403CountPath(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+	createEndpoint(t, store, anthropicEP("ep-403", 10))
+
+	svc.ReportFailure("ep-403", 403, "forbidden", 0)
+	got := mustGet(t, store, "ep-403")
+	if got.ConsecutiveFailures != 1 || got.HealthStatus != "ok" {
+		t.Fatalf("403 应计入连续失败: %+v", got)
+	}
+	if got.TotalRequests != 1 || got.FailedRequests != 1 {
+		t.Fatalf("403 应记 total=1 failed=1, got total=%d failed=%d", got.TotalRequests, got.FailedRequests)
+	}
+
+	// 达默认阈值 3 → 摘除。
+	svc.ReportFailure("ep-403", 403, "forbidden", 0)
+	svc.ReportFailure("ep-403", 403, "forbidden", 0)
+	got = mustGet(t, store, "ep-403")
+	if got.HealthStatus != "disabled" || got.CooldownUntil == 0 {
+		t.Fatalf("403 连续失败达阈值应摘除(带冷却): %+v", got)
+	}
+}
+
+// 池模式下 403:计数列与 last_error 照记,健康四列不动(不变量 6 修订)。
+func TestEndpointService_ReportFailure403PoolModeRecordsOnly(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+	createEndpoint(t, store, anthropicEP("ep-403-pool", 10))
+	if err := store.SetPolicy(&config.EndpointGroupPolicy{
+		FailureDisable: false, FailureThreshold: 1, CooldownSec: 300, RateLimitCooldownSec: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	svc.ReportFailure("ep-403-pool", 403, "forbidden", 0)
+	got := mustGet(t, store, "ep-403-pool")
+	// 只门控动作:即便 threshold=1 也不得摘除/写冷却。
+	if got.HealthStatus != "ok" || got.ConsecutiveFailures != 0 ||
+		got.CooldownUntil != 0 || got.RateLimitedUntil != 0 {
+		t.Fatalf("池模式 403 不得写健康四列: %+v", got)
+	}
+	if got.LastError != "forbidden" {
+		t.Fatalf("池模式 403 必须照记 last_error, got %q", got.LastError)
+	}
+	if got.TotalRequests != 1 || got.FailedRequests != 1 {
+		t.Fatalf("池模式 403 应记 total=1 failed=1, got total=%d failed=%d", got.TotalRequests, got.FailedRequests)
 	}
 }
 
@@ -456,8 +655,8 @@ func TestEndpointService_ReportSuccessClears(t *testing.T) {
 	svc, store := newEndpointTestHarness(t)
 	createEndpoint(t, store, anthropicEP("ep-s", 10))
 
-	svc.ReportFailure("ep-s", 500, "boom")
-	svc.ReportFailure("ep-s", 429, "rate")
+	svc.ReportFailure("ep-s", 500, "boom", 0)
+	svc.ReportFailure("ep-s", 429, "rate", 0)
 	svc.ReportSuccess("ep-s")
 
 	got := mustGet(t, store, "ep-s")
@@ -465,27 +664,176 @@ func TestEndpointService_ReportSuccessClears(t *testing.T) {
 		got.CooldownUntil != 0 || got.RateLimitedUntil != 0 || got.LastError != "" {
 		t.Fatalf("成功应清零全部健康态: %+v", got)
 	}
+	// 计数:两次失败(total+2/failed+2)+ 一次成功(total+1/failed+0)。
+	if got.TotalRequests != 3 || got.FailedRequests != 2 {
+		t.Fatalf("成功路径计数应为 total=3 failed=2, got total=%d failed=%d", got.TotalRequests, got.FailedRequests)
+	}
 }
 
-func TestEndpointService_PoolModeWritesNothing(t *testing.T) {
+// ReportSuccess 是 401/402 锁存的恢复路径之一(另一条是 ResetHealth)。
+func TestEndpointService_ReportSuccessClearsLatch(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+	createEndpoint(t, store, anthropicEP("ep-latch-ok", 10))
+
+	svc.ReportFailure("ep-latch-ok", 401, "bad key", 0)
+	if got := mustGet(t, store, "ep-latch-ok"); got.HealthStatus != "disabled" {
+		t.Fatalf("前置:401 应已锁存, got %s", got.HealthStatus)
+	}
+
+	svc.ReportSuccess("ep-latch-ok")
+	got := mustGet(t, store, "ep-latch-ok")
+	if got.HealthStatus != "ok" || got.CooldownUntil != 0 || got.LastError != "" {
+		t.Fatalf("ReportSuccess 应清回锁存态: %+v", got)
+	}
+	// 恢复后应可被 Select 选中。
+	sel, err := svc.Select("anthropic", "", "")
+	if err != nil {
+		t.Fatalf("解除锁存后应可选: %v", err)
+	}
+	if sel.ID != "ep-latch-ok" {
+		t.Fatalf("解除锁存后应选中 ep-latch-ok, got %s", sel.ID)
+	}
+}
+
+// 429 服务面行为(spec §5.5):until>0 覆盖组策略;until=0/负回落组策略。
+func TestEndpointService_ReportFailure429Until(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+	createEndpoint(t, store, anthropicEP("ep-until", 10))
+
+	// until>0:直接采用调用方解析出的截止(覆盖组策略默认 60s)。
+	want := time.Now().Unix() + 999
+	svc.ReportFailure("ep-until", 429, "rate", want)
+	if got := mustGet(t, store, "ep-until"); got.RateLimitedUntil != want {
+		t.Fatalf("until>0 应采用调用方值 %d, got %d", want, got.RateLimitedUntil)
+	}
+
+	// until=0:回落组策略 RateLimitCooldownSec(默认 60s)。
+	before := time.Now().Unix()
+	svc.ReportFailure("ep-until", 429, "rate", 0)
+	got := mustGet(t, store, "ep-until")
+	if got.RateLimitedUntil <= before || got.RateLimitedUntil > before+61 {
+		t.Fatalf("until=0 应回落 now+60s, got %d (before %d)", got.RateLimitedUntil, before)
+	}
+
+	// until<0(非法头):不炸,按 0 处理 → 回落组策略。
+	before = time.Now().Unix()
+	svc.ReportFailure("ep-until", 429, "rate", -123)
+	got = mustGet(t, store, "ep-until")
+	if got.RateLimitedUntil <= before || got.RateLimitedUntil > before+61 {
+		t.Fatalf("until<0 应按 0 回落 now+60s, got %d (before %d)", got.RateLimitedUntil, before)
+	}
+
+	// 自定义组策略 429 冷却时长:until=0 时回落该值。
+	if err := store.SetPolicy(&config.EndpointGroupPolicy{
+		FailureDisable: true, FailureThreshold: 3, CooldownSec: 300, RateLimitCooldownSec: 120,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before = time.Now().Unix()
+	svc.ReportFailure("ep-until", 429, "rate", 0)
+	got = mustGet(t, store, "ep-until")
+	if got.RateLimitedUntil < before+119 || got.RateLimitedUntil > before+122 {
+		t.Fatalf("until=0 应回落组策略 120s, got %d (before %d)", got.RateLimitedUntil, before)
+	}
+}
+
+// 池模式(failure_disable=0)二期语义(spec §9.1 修订不变量 6):只门控动作
+// (disabled 迁移/冷却写库),计数列与 last_error 照记——「指标永远记,只门控动作」。
+func TestEndpointService_PoolModeRecordsCountersOnly(t *testing.T) {
 	svc, store := newEndpointTestHarness(t)
 	createEndpoint(t, store, anthropicEP("ep-p", 10))
 
-	// 池模式(failure_disable=0):失败不落任何状态(含 429)。
 	if err := store.SetPolicy(&config.EndpointGroupPolicy{
 		FailureDisable: false, FailureThreshold: 1, CooldownSec: 60, RateLimitCooldownSec: 60,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	svc.ReportFailure("ep-p", 500, "boom")
-	svc.ReportFailure("ep-p", 500, "boom")
-	svc.ReportFailure("ep-p", 429, "rate limited")
-	svc.ReportSuccess("ep-p") // 也不得写
+	svc.ReportFailure("ep-p", 500, "boom", 0)
+	svc.ReportFailure("ep-p", 500, "boom", 0)
+	svc.ReportFailure("ep-p", 429, "rate limited", 0)
 
+	// 健康四列不动(即便 threshold=1 也不摘除/不写冷却),但计数与摘要照记。
 	got := mustGet(t, store, "ep-p")
 	if got.ConsecutiveFailures != 0 || got.HealthStatus != "ok" ||
+		got.CooldownUntil != 0 || got.RateLimitedUntil != 0 {
+		t.Fatalf("池模式不得写健康四列: %+v", got)
+	}
+	if got.LastError != "rate limited" {
+		t.Fatalf("池模式必须照记 last_error, got %q", got.LastError)
+	}
+	if got.TotalRequests != 3 || got.FailedRequests != 3 {
+		t.Fatalf("池模式失败应记 total=3 failed=3, got total=%d failed=%d", got.TotalRequests, got.FailedRequests)
+	}
+
+	// 池模式成功:只记计数(total+1)+清 last_error,不动健康列。
+	svc.ReportSuccess("ep-p")
+	got = mustGet(t, store, "ep-p")
+	if got.HealthStatus != "ok" || got.ConsecutiveFailures != 0 ||
 		got.CooldownUntil != 0 || got.RateLimitedUntil != 0 || got.LastError != "" {
-		t.Fatalf("池模式不得写任何健康状态: %+v", got)
+		t.Fatalf("池模式成功不得写健康列: %+v", got)
+	}
+	if got.TotalRequests != 4 || got.FailedRequests != 3 {
+		t.Fatalf("池模式成功应记 total=4 failed=3, got total=%d failed=%d", got.TotalRequests, got.FailedRequests)
+	}
+}
+
+// 激活迁移清零(spec §5.6):PUT 路径 enabled 0→1 执行 ResetHealth 同款清零。
+func TestEndpointService_UpdateEnabledActivationClearsHealth(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+
+	ep := anthropicEP("ep-activate", 10)
+	ep.Enabled = false
+	createEndpoint(t, store, ep)
+	// 摆一份陈旧健康态 + 生命周期计数。
+	markHealth(t, store, "ep-activate", storage.HealthUpdate{
+		Status: "disabled", Failures: 3, CooldownUntil: time.Now().Unix() + 300,
+		RateLimitedUntil: time.Now().Unix() + 60, LastErr: "old boom",
+	})
+	if err := store.BumpCounters("ep-activate", 7, 4, "old boom"); err != nil {
+		t.Fatal(err)
+	}
+
+	// enabled 0→1:配置更新 + 健康清零。
+	upd := *ep
+	upd.Enabled = true
+	if err := svc.UpdateEndpoint(&upd); err != nil {
+		t.Fatalf("update endpoint: %v", err)
+	}
+	got := mustGet(t, store, "ep-activate")
+	if !got.Enabled {
+		t.Fatalf("enabled 应落库为 true")
+	}
+	if got.HealthStatus != "ok" || got.ConsecutiveFailures != 0 ||
+		got.CooldownUntil != 0 || got.RateLimitedUntil != 0 || got.LastError != "" {
+		t.Fatalf("激活 0→1 应清零健康态: %+v", got)
+	}
+	// 生命周期计数只累计不清零。
+	if got.TotalRequests != 7 || got.FailedRequests != 4 {
+		t.Fatalf("激活清零不得动生命周期计数, got total=%d failed=%d", got.TotalRequests, got.FailedRequests)
+	}
+	// 入参行同步刷新:handler 用同一指针构造 PUT 响应视图。
+	if upd.HealthStatus != "ok" || upd.CooldownUntil != 0 || upd.LastError != "" {
+		t.Fatalf("激活清零应同步回写入参行(供 PUT 响应): %+v", upd)
+	}
+}
+
+// 非激活(1→1 或 1→0)更新不得清健康——清零只由真正的 0→1 迁移触发。
+func TestEndpointService_UpdateEnabledNoResetWithoutActivation(t *testing.T) {
+	svc, store := newEndpointTestHarness(t)
+	createEndpoint(t, store, anthropicEP("ep-noact", 10))
+	markHealth(t, store, "ep-noact", storage.HealthUpdate{
+		Status: "disabled", Failures: 2, CooldownUntil: time.Now().Unix() + 300, LastErr: "keep me",
+	})
+
+	// 1→1(仍启用)更新:健康态原样保留。
+	ep := anthropicEP("ep-noact", 10)
+	ep.Name = "renamed"
+	if err := svc.UpdateEndpoint(ep); err != nil {
+		t.Fatalf("update endpoint: %v", err)
+	}
+	got := mustGet(t, store, "ep-noact")
+	if got.HealthStatus != "disabled" || got.ConsecutiveFailures != 2 || got.LastError != "keep me" {
+		t.Fatalf("非激活更新不得清健康态: %+v", got)
 	}
 }
 
@@ -699,7 +1047,7 @@ func TestEndpointService_ResetHealth(t *testing.T) {
 
 	// 打满阈值摘除。
 	for i := 0; i < 3; i++ {
-		svc.ReportFailure("ep-h", 500, "boom")
+		svc.ReportFailure("ep-h", 500, "boom", 0)
 	}
 	if got := mustGet(t, store, "ep-h"); got.HealthStatus != "disabled" {
 		t.Fatalf("前置:应已摘除, got %s", got.HealthStatus)
@@ -958,7 +1306,7 @@ func TestEndpointService_SelectDoesNotReviveConcurrentDisable(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			// 阈值 3、当前计数 3:再失败一次即再次摘除。
-			svc.ReportFailure("ep-race", 500, "boom again")
+			svc.ReportFailure("ep-race", 500, "boom again", 0)
 		}()
 		wg.Wait()
 
@@ -1050,7 +1398,7 @@ func TestEndpointService_ReportFailureDeletedID(t *testing.T) {
 	if err := store.Delete("ep-del"); err != nil {
 		t.Fatal(err)
 	}
-	svc.ReportFailure("ep-del", 500, "boom")
+	svc.ReportFailure("ep-del", 500, "boom", 0)
 	svc.ReportSuccess("ep-del")
 
 	if _, err := store.Get("ep-del"); err == nil {

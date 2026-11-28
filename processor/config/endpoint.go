@@ -45,6 +45,22 @@ type LLMEndpoint struct {
 	// LastError 是最近一次失败摘要,展示用,不承载错误链。
 	LastError string `gorm:"type:text" json:"last_error"`
 
+	// ---- 二期增量(spec 2026-11-27 §4)--------------------------------------
+	// EgressKernel 是「AliangCode 出口指定」标记:全表至多一行=1,唯一写入口是
+	// store.SetEgressKernel 事务换绑(REST 请求体没有这个字段,PUT 列白名单也
+	// 不收它)。列名显式钉住:ProtocolOpenAI 一期曾被 gorm 蛇形成
+	// protocol_open_ai,不赌 NamingStrategy 对缩写边界的行为。
+	EgressKernel bool `gorm:"column:egress_kernel;not null;default:0" json:"egress_kernel"`
+	// LastUsedAt 是最近一次被内核选中的时刻(unix 秒,纯观测,不参与调度)。
+	// 写缝两条:MarkUsed 窄写打点 / UpdateHealth 显式值;列值 0 = 从未使用。
+	// 不进 endpointConfigColumns 白名单(spec §5.7:防 GET-merge-PUT 陈旧快照
+	// 回写盖掉打点)。
+	LastUsedAt int64 `gorm:"not null;default:0" json:"last_used_at"`
+	// TotalRequests/FailedRequests 是生命周期请求计数器:ReportSuccess/
+	// ReportFailure 增量 +1(SQL 侧原子累加),只累计不清零。
+	TotalRequests  int64 `gorm:"not null;default:0" json:"total_requests"`
+	FailedRequests int64 `gorm:"not null;default:0" json:"failed_requests"`
+
 	CreatedAt int64 `gorm:"not null" json:"created_at"`
 	UpdatedAt int64 `gorm:"not null" json:"updated_at"`
 }
@@ -60,6 +76,14 @@ func (e *LLMEndpoint) Validate() error {
 	}
 	if !e.ProtocolAnthropic && !e.ProtocolOpenAI {
 		return fmt.Errorf("llm_endpoint.protocol 至少勾选 anthropic/openai 之一")
+	}
+	// 出口规则(spec 二期 §4: Validate+store 双层):egress_kernel=1 只可能落在
+	// anthropic 行上——AliangCode 出口是内核定向出口,内核只说 anthropic 协议。
+	// 本层与 store.SetEgressKernel 双层设防:store 堵「把非 anthropic 行设成出口」
+	// 的正面写缝,这里堵「翻协议留标记」的旁路——PUT 翻转 protocol_anthropic 时
+	// 请求体没有 egress 字段,merge 后的行带着 egress=1 进 Update,被本条拦成 400。
+	if e.EgressKernel && !e.ProtocolAnthropic {
+		return fmt.Errorf("llm_endpoint.egress_kernel 出口指定只接受 anthropic 协议(先取消出口再改协议)")
 	}
 	if strings.TrimSpace(e.BaseURL) != "" {
 		u, err := url.Parse(strings.TrimSpace(e.BaseURL))

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/agentcore"
+	"aliang.one/nursorgate/processor/config"
 )
 
 func writeSubagentDef(t *testing.T, home, filename, body string) {
@@ -258,6 +259,45 @@ func TestAgentCoreSubagentToolsAssembly(t *testing.T) {
 		nil, nil, nil, nil, nil, nil, nil)
 	if router2 == nil || len(router2.types) == 0 {
 		t.Fatalf("空定义集应回落内置默认: %+v", router2)
+	}
+}
+
+// OnRequestError 缝接（spec 二期 §5.3a，4b 评审遗留 4c 补线）：父 run 解析行
+// 传进桥——子 run 与主 run 同一 client 凭据出网，最终失败按同一行上报。
+// 缺省（不传行）桥行保持 nil → reporter nil：子 run 继承链/builtin 流量由
+// 路由层观测，宿主不接缝（与主 run 同判据）。
+func TestAgentCoreSubagentBridgeCarriesParentEgressRow(t *testing.T) {
+	setTestAgentHome(t)
+	m := newAgentAIManager()
+	parentRow := &config.LLMEndpoint{ID: "ep-parent", BaseURL: "http://127.0.0.1:9101", APIKey: "sk-p"}
+
+	router := m.agentCoreSubagentTaskTool(agentAIRun{sessionID: "s-row", projectPath: "/tmp/p"},
+		nil, nil, nil, nil, nil, nil, nil, parentRow)
+	if router == nil {
+		t.Fatal("router 不应为 nil")
+	}
+	if len(router.bridges) == 0 {
+		t.Fatal("至少应有一个内置桥")
+	}
+	for name, b := range router.bridges {
+		if b.egressRow != parentRow {
+			t.Fatalf("桥 %s 应携带父 run 解析行, got %+v", name, b.egressRow)
+		}
+		if agentCoreRequestErrorReporter(b.egressRow) == nil {
+			t.Fatalf("BYO 父行下桥 %s 的失败上报缝应接上", name)
+		}
+	}
+
+	// 缺省形态：不传行 → 桥行 nil → 缝不接（现状：子 run 失败不上报）。
+	router2 := m.agentCoreSubagentTaskTool(agentAIRun{sessionID: "s-row-2", projectPath: "/tmp/p"},
+		nil, nil, nil, nil, nil, nil, nil)
+	for name, b := range router2.bridges {
+		if b.egressRow != nil {
+			t.Fatalf("缺省形态桥 %s 不应带行, got %+v", name, b.egressRow)
+		}
+		if agentCoreRequestErrorReporter(b.egressRow) != nil {
+			t.Fatalf("nil 行下桥 %s 的失败上报缝不应接(路由层已观测,宿主双计数)", name)
+		}
 	}
 }
 

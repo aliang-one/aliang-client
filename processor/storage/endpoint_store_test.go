@@ -4,6 +4,9 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
+
+	"gorm.io/gorm"
 
 	"aliang.one/nursorgate/processor/config"
 )
@@ -255,5 +258,390 @@ func TestEndpointStore_DuplicateIDRejected(t *testing.T) {
 	// 「可映射」= 我们自己的文案(上层可据此回 409),不是透传 sqlite 约束错。
 	if !strings.Contains(err.Error(), "已存在") {
 		t.Fatalf("duplicate id must map to a friendly error, got %q", err)
+	}
+}
+
+// ---- 二期增量(spec 2026-11-27 §4/§5.7):egress_kernel 出口指定 + 计数列 ----
+
+// egressCount 数当前 egress_kernel=1 的行数——「全表至多一行=1」不变量的直接
+// 证据:换绑/取消只要漏改任何一行,行数断言就会现形,比逐行比对更硬。
+func egressCount(t *testing.T, s *EndpointStore) int64 {
+	t.Helper()
+	var n int64
+	if err := s.db.Model(&config.LLMEndpoint{}).Where("egress_kernel = ?", true).Count(&n).Error; err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func newAnthropicEndpoint(t *testing.T, s *EndpointStore, id string) {
+	t.Helper()
+	if err := s.Create(&config.LLMEndpoint{ID: id, Name: id, BaseURL: "https://" + id + ".example.com",
+		APIKey: "sk-" + id, ProtocolAnthropic: true, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// 换绑唯一性(spec §4):设 A→设 B,旧出口行必须熄灭,全表恒至多一行=1;
+// 取消后全表归零。
+func TestEndpointStore_SetEgressKernelRebindUniqueness(t *testing.T) {
+	s := newTestStore(t)
+	newAnthropicEndpoint(t, s, "eg-a")
+	newAnthropicEndpoint(t, s, "eg-b")
+
+	if err := s.SetEgressKernel("eg-a", true); err != nil {
+		t.Fatal(err)
+	}
+	if n := egressCount(t, s); n != 1 {
+		t.Fatalf("after set A want exactly 1 egress row, got %d", n)
+	}
+	// 换绑 B:A 必须被同一事务清掉。
+	if err := s.SetEgressKernel("eg-b", true); err != nil {
+		t.Fatal(err)
+	}
+	ga, err := s.Get("eg-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gb, err := s.Get("eg-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ga.EgressKernel || !gb.EgressKernel {
+		t.Fatalf("rebind must move the flag A=0 B=1, got A=%v B=%v", ga.EgressKernel, gb.EgressKernel)
+	}
+	if n := egressCount(t, s); n != 1 {
+		t.Fatalf("at most one egress row after rebind, got %d", n)
+	}
+	// 取消:全表 0。
+	if err := s.SetEgressKernel("eg-b", false); err != nil {
+		t.Fatal(err)
+	}
+	if n := egressCount(t, s); n != 0 {
+		t.Fatalf("cancel must clear the flag, got %d rows still set", n)
+	}
+}
+
+// 非 anthropic 行拒设(spec §4):错误必须哨兵化(ErrNotAnthropic,handler 据此
+// 映射 400),且拒设不得留下半态;取消路径不需要 anthropic 前提——协议被翻转
+// 的旧行也要有逃生通道。
+func TestEndpointStore_SetEgressKernelNonAnthropicRejected(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.Create(&config.LLMEndpoint{ID: "eg-o", Name: "openai-only",
+		BaseURL: "https://o.example.com", APIKey: "sk-o", ProtocolOpenAI: true, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	err := s.SetEgressKernel("eg-o", true)
+	if !errors.Is(err, ErrNotAnthropic) {
+		t.Fatalf("want ErrNotAnthropic, got %v", err)
+	}
+	got, err := s.Get("eg-o")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.EgressKernel {
+		t.Fatal("rejected set must leave the row untouched")
+	}
+	if err := s.SetEgressKernel("eg-o", false); err != nil {
+		t.Fatalf("cancel must not require anthropic protocol, got %v", err)
+	}
+}
+
+// builtin 行可设(spec §4/§8:内置链路本身就是 anthropic),且可取消回落。
+func TestEndpointStore_SetEgressKernelBuiltinAllowed(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.SetEgressKernel(BuiltinEndpointID, true); err != nil {
+		t.Fatalf("builtin row must be settable as egress, got %v", err)
+	}
+	got, err := s.Get(BuiltinEndpointID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.EgressKernel {
+		t.Fatal("builtin egress flag must persist")
+	}
+	if n := egressCount(t, s); n != 1 {
+		t.Fatalf("want exactly 1 egress row, got %d", n)
+	}
+	if err := s.SetEgressKernel(BuiltinEndpointID, false); err != nil {
+		t.Fatal(err)
+	}
+	if n := egressCount(t, s); n != 0 {
+		t.Fatalf("builtin cancel must clear the flag, got %d", n)
+	}
+}
+
+// 不存在的行:set=true/false 都报「不存在」(gorm.ErrRecordNotFound 包裹),
+// handler(Task 6)据此统一映射 404——取消一个拼错的 id 不该被静默吞掉。
+func TestEndpointStore_SetEgressKernelMissingRow(t *testing.T) {
+	s := newTestStore(t)
+	for _, set := range []bool{true, false} {
+		err := s.SetEgressKernel("no-such-row", set)
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("set=%v: want ErrRecordNotFound, got %v", set, err)
+		}
+	}
+}
+
+// 停用行与出口标记共存(spec §4 用户拍板:出口「暂停保留」——enabled=0 时
+// 内核跳过该行回 auto 调度,重新激活后出口恢复,不撤标记)。
+func TestEndpointStore_SetEgressKernelCoexistsWithDisabled(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.Create(&config.LLMEndpoint{ID: "eg-d", Name: "paused",
+		BaseURL: "https://d.example.com", APIKey: "sk-d", ProtocolAnthropic: true, Enabled: false}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetEgressKernel("eg-d", true); err != nil {
+		t.Fatalf("disabled row must keep the egress flag (pause-not-revoke), got %v", err)
+	}
+	got, err := s.Get("eg-d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.EgressKernel || got.Enabled {
+		t.Fatalf("egress=1 must coexist with enabled=0, got egress=%v enabled=%v",
+			got.EgressKernel, got.Enabled)
+	}
+}
+
+// MarkUsed 窄写(spec §5.7):打点只动 last_used_at,config 列与健康列原值
+// 一概不动——用整行逐字段相等证明,任何漏守的列都会现形。
+func TestEndpointStore_MarkUsedNarrowWrite(t *testing.T) {
+	s := newTestStore(t)
+	e := &config.LLMEndpoint{ID: "mu1", Name: "used", BaseURL: "https://mu.example.com", APIKey: "sk-mu",
+		ProtocolAnthropic: true, Enabled: true, Priority: 42}
+	if err := s.Create(e); err != nil {
+		t.Fatal(err)
+	}
+	// 先把健康态写成非默认值,证明打点不碰健康列。
+	if err := s.UpdateHealth("mu1", HealthUpdate{Status: "cooldown", Failures: 2,
+		CooldownUntil: 999, LastErr: "boom"}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.Get("mu1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkUsed("mu1"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.Get("mu1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 打点目标:last_used_at 落在当下(unix 秒粒度,放宽 1s 防秒界毛刺)。
+	now := time.Now().Unix()
+	if after.LastUsedAt < now-1 || after.LastUsedAt > now+1 {
+		t.Fatalf("last_used_at must be ~now, got %d (now %d)", after.LastUsedAt, now)
+	}
+	// 窄写契约:除 last_used_at 外整行相等。gorm 会顺带刷 updated_at(记账列,
+	// 与 UpdateHealth 同款行为),一并排除。
+	b2 := *before
+	b2.LastUsedAt, b2.UpdatedAt = 0, 0
+	a2 := *after
+	a2.LastUsedAt, a2.UpdatedAt = 0, 0
+	if b2 != a2 {
+		t.Fatalf("MarkUsed must only write last_used_at, row changed: %+v -> %+v", b2, a2)
+	}
+}
+
+// HealthUpdate 计数列扩展(spec §5.7):增量落列且在原值上累加(ReportSuccess/
+// ReportFailure 是事件不是快照);last_used_at 显式值落列,0 是「不动」哨兵
+// (unix 秒恒 >0,不可能是合法打点值——不加守卫会把 MarkUsed 刚写的时刻冲回 0)。
+func TestEndpointStore_UpdateHealthCounterColumns(t *testing.T) {
+	s := newTestStore(t)
+	e := &config.LLMEndpoint{ID: "uc1", Name: "counters", BaseURL: "https://uc.example.com", APIKey: "sk-uc",
+		ProtocolAnthropic: true, Enabled: true}
+	if err := s.Create(e); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateHealth("uc1", HealthUpdate{Status: "ok",
+		TotalDelta: 5, FailedDelta: 2, LastUsedAt: 1700000000}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get("uc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TotalRequests != 5 || got.FailedRequests != 2 {
+		t.Fatalf("counter deltas must land: total=%d failed=%d", got.TotalRequests, got.FailedRequests)
+	}
+	if got.LastUsedAt != 1700000000 {
+		t.Fatalf("last_used_at must land when given, got %d", got.LastUsedAt)
+	}
+	// 二写:增量累加;LastUsedAt=0 不冲旧值;健康列照旧窄写。
+	if err := s.UpdateHealth("uc1", HealthUpdate{Status: "cooldown", Failures: 1,
+		CooldownUntil: 555, TotalDelta: 1}); err != nil {
+		t.Fatal(err)
+	}
+	got2, err := s.Get("uc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got2.TotalRequests != 6 || got2.FailedRequests != 2 {
+		t.Fatalf("deltas must accumulate: total=%d failed=%d", got2.TotalRequests, got2.FailedRequests)
+	}
+	if got2.LastUsedAt != 1700000000 {
+		t.Fatalf("last_used_at=0 must be a no-op sentinel, got %d", got2.LastUsedAt)
+	}
+	if got2.HealthStatus != "cooldown" || got2.ConsecutiveFailures != 1 || got2.CooldownUntil != 555 {
+		t.Fatalf("existing health columns must keep working: %+v", got2)
+	}
+}
+
+// egress_kernel/last_used_at 不进 endpointConfigColumns(spec §4 评审修正③):
+// 全行 PUT 带陈旧快照(egress_kernel=false)不得把出口标记载掉——白名单是
+// 硬防线,注释说了不算,列名审计 + 功能双证。
+func TestEndpointStore_EgressColumnsOutsideConfigWhitelist(t *testing.T) {
+	s := newTestStore(t)
+	newAnthropicEndpoint(t, s, "wl1")
+	if err := s.SetEgressKernel("wl1", true); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟 GET-merge-PUT:调用方手里的快照没有出口字段,PUT 回去整行落库。
+	stale := &config.LLMEndpoint{ID: "wl1", Name: "wl1", BaseURL: "https://wl1.example.com",
+		APIKey: "sk-wl1", ProtocolAnthropic: true, Enabled: true, Priority: 50}
+	if err := s.Update(stale); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.Get("wl1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.EgressKernel {
+		t.Fatal("full-row PUT with stale snapshot must not clear egress_kernel")
+	}
+	// 列名审计:防将来有人「顺手」把这两列加进白名单。
+	for _, c := range endpointConfigColumns {
+		if c == "egress_kernel" || c == "last_used_at" {
+			t.Fatalf("column %q must stay out of endpointConfigColumns (spec §4)", c)
+		}
+	}
+}
+
+// PUT 翻协议旁路被 Validate 拦(spec 二期 §4 Validate+store 双层):请求体没有
+// egress 字段,GET-merge-PUT 翻 protocol_anthropic 时行上残留 egress=1——
+// 这里在 store.Update 的真实调用链上断言:它先跑 Validate,把「翻协议留标记」
+// 的合并行拒掉(handler 路径 UpdateEndpoint→Update 同缝,非单独造的第二条链)。
+// 行上的 egress=1 用裸 SQL 预置(模拟 SetEgressKernel 之外的旁路/历史残留)。
+func TestEndpointStore_UpdateProtocolFlipOnEgressRowRejected(t *testing.T) {
+	s := newTestStore(t)
+	newAnthropicEndpoint(t, s, "flip1")
+	if err := s.db.Exec("UPDATE llm_endpoints SET egress_kernel = 1 WHERE id = ?", "flip1").Error; err != nil {
+		t.Fatal(err)
+	}
+	// GET-merge-PUT 形状:读回整行(带 egress=1)→ 翻 anthropic 关、开 openai
+	// (双协议变 openai-only,自身合法)→ Update 必须被 Validate 拒。
+	row, err := s.Get("flip1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	row.ProtocolAnthropic = false
+	row.ProtocolOpenAI = true
+	err = s.Update(row)
+	if err == nil {
+		t.Fatal("protocol flip on an egress row must be rejected by Validate (spec §4 second layer)")
+	}
+	if !strings.Contains(err.Error(), "egress_kernel") {
+		t.Fatalf("rejection must be the egress rule (handler maps 400), got %q", err)
+	}
+	// 反向正常路径:先取消出口,再 GET-merge-PUT 翻协议 → 通过——错误文案里
+	// 「先取消出口再改协议」的指引必须是可执行的真路径。(GET 必须发生在取消
+	// 之后:merge 快照里的 egress 值就是落库值,先取快照后取消会带着旧标记。)
+	if err := s.SetEgressKernel("flip1", false); err != nil {
+		t.Fatal(err)
+	}
+	row2, err := s.Get("flip1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	row2.ProtocolAnthropic = false
+	row2.ProtocolOpenAI = true
+	if err := s.Update(row2); err != nil {
+		t.Fatalf("flip after cancelling egress must pass, got %v", err)
+	}
+}
+
+// BumpCounters 窄缝(quality-fix Important 1,spec 二期 §9.1 不变量 6 修订):
+// 池模式下 403 等计数路径要求「计数列与 last_error 照记、只门控动作」——
+// 健康四列必须原样不动。预置健康态+出口标记的非默认值,整行相等断言排除
+// 一切漏守;两连跳证明 SQL 侧累加。
+func TestEndpointStore_BumpCountersNarrowWrite(t *testing.T) {
+	s := newTestStore(t)
+	newAnthropicEndpoint(t, s, "bc1")
+	if err := s.UpdateHealth("bc1", HealthUpdate{Status: "cooldown", Failures: 2,
+		CooldownUntil: 777, RateLimitedUntil: 888, LastErr: "old"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetEgressKernel("bc1", true); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.Get("bc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BumpCounters("bc1", 3, 1, "boom-403"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.Get("bc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 目标列:计数累加 + last_error 覆写。
+	if after.TotalRequests != 3 || after.FailedRequests != 1 {
+		t.Fatalf("counters must accumulate: total=%d failed=%d", after.TotalRequests, after.FailedRequests)
+	}
+	if after.LastError != "boom-403" {
+		t.Fatalf("last_error must be overwritten, got %q", after.LastError)
+	}
+	// 窄写契约:健康四列 + egress + config 列全不动(整行相等,updated_at
+	// 记账列与被写的三列除外)。
+	if after.HealthStatus != "cooldown" || after.ConsecutiveFailures != 2 ||
+		after.CooldownUntil != 777 || after.RateLimitedUntil != 888 {
+		t.Fatalf("health columns must be untouched: %+v", after)
+	}
+	b2, a2 := *before, *after
+	b2.TotalRequests, b2.FailedRequests, b2.LastError, b2.UpdatedAt = 0, 0, "", 0
+	a2.TotalRequests, a2.FailedRequests, a2.LastError, a2.UpdatedAt = 0, 0, "", 0
+	if b2 != a2 {
+		t.Fatalf("BumpCounters must only touch counters+last_error, row changed: %+v -> %+v", b2, a2)
+	}
+	// 二连跳:SQL 侧累加在原值之上。
+	if err := s.BumpCounters("bc1", 1, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	after2, err := s.Get("bc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after2.TotalRequests != 4 || after2.FailedRequests != 1 {
+		t.Fatalf("second bump must accumulate: total=%d failed=%d", after2.TotalRequests, after2.FailedRequests)
+	}
+}
+
+// DDL 实证:四条新列必须以 spec §4 的精确列名落表——gorm 蛇形纪律一期踩过
+// (ProtocolOpenAI → protocol_open_ai),显式 column tag 钉住后用真 DDL 收口,
+// 不赌 NamingStrategy。
+func TestEndpointStore_EgressColumnsDDL(t *testing.T) {
+	s := newTestStore(t)
+	rows, err := s.db.Raw("PRAGMA table_info(llm_endpoints)").Rows()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	cols := map[string]bool{}
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var dflt interface{}
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			t.Fatal(err)
+		}
+		cols[name] = true
+	}
+	for _, want := range []string{"egress_kernel", "last_used_at", "total_requests", "failed_requests"} {
+		if !cols[want] {
+			t.Fatalf("column %q missing from llm_endpoints DDL, got %v", want, cols)
+		}
 	}
 }

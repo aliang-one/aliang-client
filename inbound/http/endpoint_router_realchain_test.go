@@ -24,6 +24,7 @@ import (
 	stdhttp "net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -51,8 +52,11 @@ func realChainUpstream(t *testing.T) (*httptest.Server, *[]string) {
 }
 
 // realChainConn 建一对真实 TCP 连接并把一条 /v1/messages 请求写给服务端,
-// 返回 client 侧连接(HandleHttpConnection 的读写对象)。
-func realChainConn(t *testing.T, body string) net.Conn {
+// 返回 client 侧连接(HandleHttpConnection 的读写对象)与处理完成信号。done
+// 必须等待:测试 body 返回即触发 t.Cleanup 里的 SetAIEndpointSelector(nil),
+// 而 handler goroutine 还在读包级 aiSelector——不 join 就是数据竞争
+// (race detector 实证,401 锁存真链测试首发即中)。
+func realChainConn(t *testing.T, body string) (net.Conn, <-chan struct{}) {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -96,10 +100,22 @@ func realChainConn(t *testing.T, body string) net.Conn {
 		t.Fatalf("read request: %v", err)
 	}
 
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		inboundhttp.HandleHttpConnection(serverConn, reader, req)
 	}()
-	return client
+	return client, done
+}
+
+// waitHandler 等单条请求的 handler goroutine 退出(防与 Cleanup 竞争)。
+func waitHandler(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler goroutine did not finish")
+	}
 }
 
 // TestAIPathRealChainRetrySwitchesEndpoint — 真链:候选1 单次 5xx(未达阈值)
@@ -136,7 +152,7 @@ func TestAIPathRealChainRetrySwitchesEndpoint(t *testing.T) {
 	inboundhttp.SetAIEndpointSelector(services.NewAIEndpointSelectorAdapter(svc))
 	t.Cleanup(func() { inboundhttp.SetAIEndpointSelector(nil) })
 
-	client := realChainConn(t, `{"model":"glm-4.6","messages":[{"role":"user","content":"hi"}]}`)
+	client, done := realChainConn(t, `{"model":"glm-4.6","messages":[{"role":"user","content":"hi"}]}`)
 
 	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
 	resp, err := stdhttp.ReadResponse(bufio.NewReader(client), nil)
@@ -148,6 +164,7 @@ func TestAIPathRealChainRetrySwitchesEndpoint(t *testing.T) {
 	if resp.StatusCode != stdhttp.StatusOK {
 		t.Fatalf("status = %d body=%q, want 200(重试应命中候选2 成功)", resp.StatusCode, string(respBody))
 	}
+	waitHandler(t, done)
 
 	// 真切换断言:上游收到两枪,分别是候选1 与候选2 的 key(不是同 key 两枪)。
 	if len(*auths) != 2 {
@@ -177,4 +194,109 @@ func TestAIPathRealChainRetrySwitchesEndpoint(t *testing.T) {
 		t.Fatalf("候选2 应成功且健康, got %+v", got2)
 	}
 	_ = strings.TrimSpace("") // 保持 strings import(错误信息断言预留)
+}
+
+// TestAIPathRealChain401LatchesEndpointDisabled — 真链 401 锁存全链(二期 spec
+// §5.3+§6 必修 3):BYO 上游 401 → 路由层 ReportFailure(id, 401, …) → service
+// 锁存(disabled + cooldown_until=0 永不自愈)→ 重试 Select 排除该行命中候选2
+// → 客户端拿到 200。再发第二枪(全新请求、无 excludeID):被锁存行连 selectAuto
+// 的健康过滤都过不了,继续落到候选2——锁存不止单请求内的 exclude,是持久摘除。
+func TestAIPathRealChain401LatchesEndpointDisabled(t *testing.T) {
+	var mu sync.Mutex
+	var auths []string
+	srv := httptest.NewServer(stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+		mu.Lock()
+		n := len(auths) + 1
+		auths = append(auths, r.Header.Get("Authorization"))
+		mu.Unlock()
+		if n == 1 {
+			w.WriteHeader(stdhttp.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":{"type":"authentication_error","message":"invalid x-api-key"}}`)
+			return
+		}
+		w.WriteHeader(stdhttp.StatusOK)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	svc, err := services.NewEndpointServiceForTest()
+	if err != nil {
+		t.Fatalf("起测试 endpoint service: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.Close() })
+
+	for _, e := range []*config.LLMEndpoint{
+		{
+			ID: "ep-deadkey", Name: "deadkey", BaseURL: srv.URL, APIKey: "sk-dead-key",
+			ProtocolAnthropic: true, AutoGroup: true, Enabled: true, Priority: 10, Models: "[]",
+		},
+		{
+			ID: "ep-live", Name: "live", BaseURL: srv.URL, APIKey: "sk-live-key",
+			ProtocolAnthropic: true, AutoGroup: true, Enabled: true, Priority: 20, Models: "[]",
+		},
+	} {
+		if err := svc.CreateEndpoint(e); err != nil {
+			t.Fatalf("create %s: %v", e.ID, err)
+		}
+	}
+
+	inboundhttp.SetAIEndpointSelector(services.NewAIEndpointSelectorAdapter(svc))
+	t.Cleanup(func() { inboundhttp.SetAIEndpointSelector(nil) })
+
+	body := `{"model":"glm-4.6","messages":[{"role":"user","content":"hi"}]}`
+
+	// 第一枪:ep-deadkey 401 → 锁存 → 重试排除 → ep-live 200。
+	client, done1 := realChainConn(t, body)
+	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := stdhttp.ReadResponse(bufio.NewReader(client), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != stdhttp.StatusOK {
+		t.Fatalf("status = %d body=%q, want 200(401 行应被锁存并 failover 到 ep-live)", resp.StatusCode, string(respBody))
+	}
+	// 等 handler 退出:既防 Cleanup 竞争,也钉死第二枪的 auths 次序
+	// (第一枪的两发必须全部落库后再发第二枪)。
+	waitHandler(t, done1)
+
+	mu.Lock()
+	gotAuths := append([]string{}, auths...)
+	mu.Unlock()
+	if len(gotAuths) != 2 || gotAuths[0] != "Bearer sk-dead-key" || gotAuths[1] != "Bearer sk-live-key" {
+		t.Fatalf("auths = %v, want [Bearer sk-dead-key Bearer sk-live-key](第一枪 401、第二枪切候选)", gotAuths)
+	}
+
+	// service 侧锁存断言(spec §5.3):disabled + 无冷却不自愈。
+	got, err := svc.GetEndpoint("ep-deadkey")
+	if err != nil {
+		t.Fatalf("get ep-deadkey: %v", err)
+	}
+	if got.HealthStatus != "disabled" {
+		t.Fatalf("401 后 health_status = %q, want disabled(锁存)", got.HealthStatus)
+	}
+	if got.CooldownUntil != 0 {
+		t.Fatalf("401 后 cooldown_until = %d, want 0(锁存=无冷却不自愈)", got.CooldownUntil)
+	}
+
+	// 第二枪(全新请求,无 excludeID):锁存行被健康过滤天然摘除,仍落 ep-live。
+	client2, done2 := realChainConn(t, body)
+	_ = client2.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp2, err := stdhttp.ReadResponse(bufio.NewReader(client2), nil)
+	if err != nil {
+		t.Fatalf("read response 2: %v", err)
+	}
+	_, _ = io.ReadAll(resp2.Body)
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != stdhttp.StatusOK {
+		t.Fatalf("status 2 = %d, want 200(锁存行在后续请求也应被摘除)", resp2.StatusCode)
+	}
+	waitHandler(t, done2)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(auths) != 3 || auths[2] != "Bearer sk-live-key" {
+		t.Fatalf("auths = %v, want third shot on ep-live only(锁存行后续请求不再入选)", auths)
+	}
 }

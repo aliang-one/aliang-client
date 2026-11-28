@@ -229,6 +229,12 @@ type agentCoreSubagentBridge struct {
 	// 追加指令。nil=控制面不接线（既有测试路径），桥照常跑——控制是可选能力，
 	// 不是子 run 的前置条件。
 	control *agentCoreSubagentControl
+	// egressRow 是父 run 的单次解析出口行（spec 二期 §5.0/§5.3a，4b 评审遗留
+	// 4c 补线）：子 run 与主 run 同一 client 凭据出网，最终失败按同一行落
+	// OnRequestError 上报（401/402 锁存、429 冷却、5xx 计数）。nil=父 run 走
+	// 继承链或装配期未传行（缺省形态）→ reporter 返回 nil，缝不接——继承链/
+	// builtin 流量经 56432 回环代理由路由层观测，宿主再报会双计数。
+	egressRow *config.LLMEndpoint
 }
 
 // TimeoutHint 覆盖内核默认单工具窗口（agentcore.TimeoutHint）。
@@ -725,7 +731,7 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 		// （仪表盘 customer.agentcore.max_identical_tool_turns；0 走内核默认）。
 		MaxIdenticalToolTurns: config.GetGlobalConfig().EffectiveAgentCoreMaxIdenticalToolTurns(),
 		// Emit 刻意 nil（spec §3：子 run 不产出帧，防帧交错进父 delta 流）。
-		// Hooks 只接三个：
+		// Hooks 只接四个：
 		//   OnTurnEnd —— 子 run 的每回合 assistant 输出落 sidechain journal
 		//     （L2，2026-11-09）：崩溃后成果可查、中断重派能接上下文。
 		//   GetSteeringMessages —— per-task 追加指令队列（L3，2026-11-09）。
@@ -738,11 +744,16 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 		//     progress（lastTool 传空串——registry 只非空覆盖，不丢既有工具
 		//     名），watchdog 进度钟顺带被喂（subagentProgress），stale 判死
 		//     不再误伤长重试。
-		// 三个钩子都只碰 journal/自有队列/registry（各自带锁）。OnRetry 另经
-		// mirror 写 ai.subagent 状态帧（与内核帧同一 emit 管道，io.Pipe 串行化
-		// 保帧原子）——spec §3 约束的是子 run 的 Emit/delta 通道（Emit=nil，
-		// 见上），该约束不受影响。
+		//   OnRequestError —— 父 run 解析行的失败上报缝（spec 二期 §5.3a，4b
+		//     评审遗留 4c 补线）：子 run 与主 run 同一凭据出网，最终失败按同一
+		//     行上报；父行走继承链/builtin（egressRow nil/builtin）时缝不接，
+		//     该流量由路由层观测，宿主再报会双计数。
+		// 四个钩子都只碰 journal/自有队列/registry/上报缝（各自带锁）。OnRetry
+		// 另经 mirror 写 ai.subagent 状态帧（与内核帧同一 emit 管道，io.Pipe
+		// 串行化保帧原子）——spec §3 约束的是子 run 的 Emit/delta 通道（Emit=
+		// nil，见上），该约束不受影响。
 		Hooks: agentcore.LoopHooks{
+			OnRequestError: agentCoreRequestErrorReporter(b.egressRow),
 			OnTurnEnd: func(tr agentcore.TurnResult) {
 				if !tracked || b.mirror == nil {
 					return
@@ -819,8 +830,9 @@ func (m *agentAIManager) agentCoreSubagentTools(run agentAIRun,
 	logf func(string, ...interface{}),
 	mcpTools []agentcore.Tool,
 	mirror *agentCoreSubagentMirror,
-	control *agentCoreSubagentControl) []agentcore.Tool {
-	router := m.agentCoreSubagentTaskTool(run, client, env, approve, logf, mcpTools, mirror, control)
+	control *agentCoreSubagentControl,
+	egressRow ...*config.LLMEndpoint) []agentcore.Tool {
+	router := m.agentCoreSubagentTaskTool(run, client, env, approve, logf, mcpTools, mirror, control, egressRow...)
 	if router == nil {
 		return nil
 	}
@@ -918,14 +930,22 @@ func (r *agentCoreSubagentTaskRouter) Execute(ctx context.Context, input map[str
 	return b.Execute(ctx, input, env)
 }
 
+// egressRow 变参是父 run 的单次解析出口行（spec 二期 §5.3a：子 run 失败按同一
+// 行上报）。生产调用方（runAgentCore）必须传；缺省（不传）= 桥行 nil，失败
+// 上报缝不接——既有测试/装配期调用无需感知该参数。
 func (m *agentAIManager) agentCoreSubagentTaskTool(run agentAIRun,
 	client *agentcore.Client, env *agentcore.ToolEnv,
 	approve func(context.Context, agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error),
 	logf func(string, ...interface{}),
 	mcpTools []agentcore.Tool,
 	mirror *agentCoreSubagentMirror,
-	control *agentCoreSubagentControl) *agentCoreSubagentTaskRouter {
+	control *agentCoreSubagentControl,
+	egressRow ...*config.LLMEndpoint) *agentCoreSubagentTaskRouter {
 
+	var parentEgressRow *config.LLMEndpoint
+	if len(egressRow) > 0 {
+		parentEgressRow = egressRow[0]
+	}
 	defs := agentCoreSubagentMergedDefs()
 	if len(defs) == 0 {
 		return nil
@@ -995,6 +1015,7 @@ func (m *agentAIManager) agentCoreSubagentTaskTool(run agentAIRun,
 			skillsBlock:    skillsBlock,
 			mirror:         mirror,
 			control:        control,
+			egressRow:      parentEgressRow,
 		}
 		types = append(types, name)
 		descriptions[name] = desc

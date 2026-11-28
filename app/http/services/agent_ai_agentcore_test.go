@@ -360,15 +360,17 @@ func TestBuildAgentCoreApprovalRequestCarriesBoundaryReason(t *testing.T) {
 	}
 }
 
-// 内核读取链的显式层(customer.agentcore_llm)。
+// 旧内核端点层(customer.agentcore_llm)——spec 二期 §9 已硬退役。
 //
-// 优先级约定:显式设置 > 继承链(env → settings.json)> 回环闸/兜底。回环闸
-// 只拦**继承链**里意外带进来的远端地址;用户在仪表盘里显式填远端是知情行为,
-// 直接放行。显式 key 不进 token 缓存(改配置下一回合立即生效);显式端点没有
-// 「自愈」概念(POST /api/run/start 拉不活别人的进程),只做拨测。
+// 出网只认 endpoint registry 出口解析;本组测试里的
+// setTestGlobalConfigAgentCoreLLM 只负责把旧字段放进配置,断言一律是
+// 「被忽略」:即使 enabled+base_url/key 配齐,三解析点也走 registry/继承链,
+// 旧字段零影响。首次解析打一条幂等 Warn 告知用户(见
+// TestAgentCoreLegacyLLMWarnFiresOncePerProcess)。
 
 // setTestGlobalConfigAgentCoreLLM 临时替换带 AgentCoreLLM 的全局配置,还原走
 // t.Cleanup(形状对齐 agent_ai_child_env_test.go 的 setTestGlobalConfigCustomEnv)。
+// 旧字段已退役:设置它只为证明「被忽略」。
 func setTestGlobalConfigAgentCoreLLM(t *testing.T, llm *config.AgentCoreLLMConfig) {
 	t.Helper()
 	old := config.GetGlobalConfig()
@@ -387,14 +389,16 @@ func isolateAgentCoreBaseURL(t *testing.T) {
 	t.Setenv("ANTHROPIC_BASE_URL", "")
 }
 
-func TestAgentCoreBaseURLCustomOverridesAll(t *testing.T) {
+// 旧字段已退役:enabled+远端 base_url 配齐也不驱动出网,落继承链(env 回环
+// 原样采用——回环闸只拦继承链的语义不变)。
+func TestAgentCoreBaseURLLegacyFieldIgnoredFallsToInheritedChain(t *testing.T) {
 	isolateAgentCoreBaseURL(t)
 	t.Setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:9999") // 继承链给的回环值
 	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
 		Enabled: true, BaseURL: "https://gw.example.com", APIKey: "sk-x",
 	})
-	if got := agentCoreBaseURL(); got != "https://gw.example.com" {
-		t.Errorf("→ %q, want 显式远端地址(绕过回环闸)", got)
+	if got := agentCoreBaseURL(); got != "http://127.0.0.1:9999" {
+		t.Errorf("→ %q, want 继承链 env 回环值(旧字段被忽略)", got)
 	}
 }
 
@@ -407,57 +411,47 @@ func TestAgentCoreBaseURLCustomDisabledFallsToInheritedGate(t *testing.T) {
 	}
 }
 
-func TestAgentCoreAuthTokenCustomSkipsCacheAndFallback(t *testing.T) {
+// 旧字段已退役:显式 key(带或不带)都不再短路继承链——registry 未选中 BYO 行
+// 时落 env → user-center,旧 key 零影响。
+func TestAgentCoreAuthTokenLegacyFieldIgnoredFallsToInheritedChain(t *testing.T) {
 	isolateAgentCoreToken(t)
 	calls := stubAgentCoreUserAPIKeys(t, func() ([]auth.UserAPIKey, error) {
-		t.Error("显式 key 存在时不该打 user-center")
-		return nil, nil
+		return []auth.UserAPIKey{{Key: "sk-user", SecretAvailable: true, Status: "active"}}, nil
 	})
 	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
 		Enabled: true, BaseURL: "https://gw.example.com", APIKey: " sk-custom ",
 	})
-	if got := agentCoreAuthToken(); got != "sk-custom" {
-		t.Errorf("→ %q, want sk-custom(trim 后)", got)
+	if got := agentCoreAuthToken(); got != "sk-user" {
+		t.Errorf("→ %q, want sk-user(旧字段 key 被忽略,user-center 兜底)", got)
 	}
-	// 显式 key 不进缓存:改配置立即生效
+	// 回环+无 key 的旧形态同样被忽略,同一条继承链。
 	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
-		Enabled: true, BaseURL: "https://gw.example.com", APIKey: "sk-two",
-	})
-	if got := agentCoreAuthToken(); got != "sk-two" {
-		t.Errorf("→ %q, want sk-two(不走缓存)", got)
-	}
-	if *calls != 0 {
-		t.Errorf("user-center 被调用 %d 次,应为 0", *calls)
-	}
-}
-
-func TestAgentCoreAuthTokenCustomLoopbackNoKeyFallsThrough(t *testing.T) {
-	isolateAgentCoreToken(t)
-	stubAgentCoreUserAPIKeys(t, func() ([]auth.UserAPIKey, error) {
-		return []auth.UserAPIKey{{Key: "sk-user", SecretAvailable: true, Status: "active"}}, nil
-	})
-	t.Setenv("ANTHROPIC_AUTH_TOKEN", "") // 隔离 env 继承
-	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
-		Enabled: true, BaseURL: "http://127.0.0.1:8082", // 回环+无 key:合法,key 落继承链
+		Enabled: true, BaseURL: "http://127.0.0.1:8082",
 	})
 	if got := agentCoreAuthToken(); got != "sk-user" {
-		t.Errorf("→ %q, want sk-user(用户 API key 兜底)", got)
+		t.Errorf("→ %q, want sk-user(第二次取自缓存,结果一致)", got)
+	}
+	if *calls == 0 {
+		t.Error("user-center 应被调用至少一次(旧字段不再短路)")
 	}
 }
 
-// 自定义端点拨测:可达 → nil;不可达 → 明确报错(不碰 56432 自愈)。
-func TestAgentCoreEnsureUpstreamCustomEndpoint(t *testing.T) {
-	isolateAgentCoreBaseURL(t)
+// 旧字段已退役:registry BYO 行(活服务)被探测,旧字段(死端口)零影响;
+// registry 未选中 BYO 行时报错文案不变(「自定义 LLM 端点不可达」)。
+func TestAgentCoreEnsureUpstreamLegacyFieldIgnoredRegistryDrives(t *testing.T) {
+	isolateAgentCoreRegistryEnv(t)
+	store := newAgentCoreEndpointRegistryStore(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer srv.Close()
+	createEndpoint(t, store, byoEndpoint("ep-live", srv.URL, "sk-live"))
 	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{Enabled: true, BaseURL: srv.URL})
 	if err := agentCoreEnsureUpstream(context.Background()); err != nil {
-		t.Fatalf("可达端点不应报错: %v", err)
+		t.Fatalf("registry BYO 可达不应报错(旧字段零影响): %v", err)
 	}
 
-	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
-		Enabled: true, BaseURL: "http://127.0.0.1:1",
-	})
+	// registry 行死端口 → 同款可自查文案。
+	store2 := newAgentCoreEndpointRegistryStore(t)
+	createEndpoint(t, store2, byoEndpoint("ep-dead", "http://127.0.0.1:1", "sk-x"))
 	err := agentCoreEnsureUpstream(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "自定义 LLM 端点不可达") {
 		t.Errorf("→ %v, want 含「自定义 LLM 端点不可达」", err)

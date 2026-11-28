@@ -479,6 +479,9 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	// 映射见 HandleEndpointActivate。精确路径注册在 ServeMux 上优先于
 	// {id} 通配,method 前缀模式无双注册冲突。
 	register("POST /api/endpoints/activate", h.Endpoint.HandleEndpointActivate, http.MethodPost)
+	// 出口指定换绑(spec 2026-11-27 §8):事务换绑,全表至多一行=1;{id} 同族
+	// 方法前缀模式(防 ServeMux 双注册 panic)。
+	register("POST /api/endpoints/{id}/set-egress-kernel", h.Endpoint.HandleSetEgressKernel, http.MethodPost)
 	register("/api/endpoint-groups/auto/policy", h.Endpoint.HandlePolicy, http.MethodGet, http.MethodPut)
 
 	registerDocsRoutes(mux, catalog)

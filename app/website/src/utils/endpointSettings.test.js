@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   endpointToPayload,
+  egressIndicator,
+  formatClockTime,
+  formatLastUsedAt,
   formatModelsText,
   maskAPIKey,
   normalizeEndpointView,
@@ -219,6 +222,12 @@ describe('normalizeEndpointView 服务端载荷 → 组件展示形态', () => {
       health_status: 'ok',
       last_error: '',
       inflight: 3,
+      egress_kernel: true,
+      last_used_at: 1700000000,
+      total_requests: 42,
+      failed_requests: 2,
+      cooldown_until: 1700000600,
+      rate_limited_until: 1700000300,
       created_at: 1,
       updated_at: 2,
     });
@@ -239,6 +248,13 @@ describe('normalizeEndpointView 服务端载荷 → 组件展示形态', () => {
       healthStatus: 'ok',
       lastError: '',
       inflight: 3,
+      // 二期视图六字段(Task 6 REST 面;三词徽标/行尾计数/出口指示都吃它们):
+      egressKernel: true,
+      lastUsedAt: 1700000000,
+      totalRequests: 42,
+      failedRequests: 2,
+      cooldownUntil: 1700000600,
+      rateLimitedUntil: 1700000300,
     });
   });
 
@@ -258,6 +274,13 @@ describe('normalizeEndpointView 服务端载荷 → 组件展示形态', () => {
     expect(view.inflight).toBe(0);
     expect(view.priority).toBe(0);
     expect(view.maxConcurrency).toBe(0);
+    // 二期视图字段缺键回落:egress 否/计数 0/冷却窗 0(无限流无冷却)
+    expect(view.egressKernel).toBe(false);
+    expect(view.lastUsedAt).toBe(0);
+    expect(view.totalRequests).toBe(0);
+    expect(view.failedRequests).toBe(0);
+    expect(view.cooldownUntil).toBe(0);
+    expect(view.rateLimitedUntil).toBe(0);
   });
 });
 
@@ -285,7 +308,6 @@ describe('endpointToPayload 表单 → 服务端线格式', () => {
       priority: 10,
       max_concurrency: 5,
       models: '["glm-4.6","claude-3"]',
-      enabled: true,
     });
   });
 
@@ -353,11 +375,79 @@ describe('endpointToPayload 表单 → 服务端线格式', () => {
     expect(filled.models).toBe('["m1","m2"]');
   });
 
-  it('enabled 缺省为 true(POST 契约:enabled 缺省 true)', () => {
+  it('enabled 不进 payload(二期:表单勾选移除,行上开关走独立快速路径 PUT;POST 缺键服务端默认 true)', () => {
     const payload = endpointToPayload({
       name: 'p', baseUrl: '', apiKey: 'k', protocolAnthropic: true, protocolOpenAI: true,
-      autoGroup: true, priority: 0, maxConcurrency: 0, modelsText: '',
+      autoGroup: true, priority: 0, maxConcurrency: 0, modelsText: '', enabled: true,
     }, false);
-    expect(payload.enabled).toBe(true);
+    expect('enabled' in payload).toBe(false);
+  });
+});
+
+describe('formatClockTime / formatLastUsedAt 二期行尾徽标', () => {
+  // 固定「现在」:2026-11-28 12:34:56 本地时区的 unix 秒。HH:MM 断言用同一
+  // Date 折算,避免依赖测试机的时区。
+  const NOW = new Date(2026, 10, 28, 12, 34, 56).getTime();
+
+  it('formatClockTime:unix 秒 → 本地 HH:MM(补零),0/负/非数回落空串', () => {
+    const at = new Date(2026, 10, 28, 9, 5).getTime() / 1000;
+    expect(formatClockTime(at)).toBe('09:05');
+    const at2 = new Date(2026, 10, 28, 23, 59).getTime() / 1000;
+    expect(formatClockTime(at2)).toBe('23:59');
+    expect(formatClockTime(0)).toBe('');
+    expect(formatClockTime(-5)).toBe('');
+    expect(formatClockTime('not-a-number')).toBe('');
+  });
+
+  it('formatLastUsedAt:相对时间四档(刚刚/N 分钟/N 小时/N 天)', () => {
+    expect(formatLastUsedAt(0, NOW).key).toBe('endpointManager_lastUsedNever');
+    expect(formatLastUsedAt(NOW / 1000 - 30, NOW)).toEqual({
+      key: 'endpointManager_lastUsedJustNow', params: {},
+    });
+    expect(formatLastUsedAt(NOW / 1000 - 180, NOW)).toEqual({
+      key: 'endpointManager_lastUsedMinAgo', params: { n: 3 },
+    });
+    expect(formatLastUsedAt(NOW / 1000 - 3600 * 2, NOW)).toEqual({
+      key: 'endpointManager_lastUsedHourAgo', params: { n: 2 },
+    });
+    expect(formatLastUsedAt(NOW / 1000 - 3600 * 24 * 5, NOW)).toEqual({
+      key: 'endpointManager_lastUsedDayAgo', params: { n: 5 },
+    });
+  });
+
+  it('formatLastUsedAt:未来时间戳(时钟偏差)按「刚刚」兜底,不画负数', () => {
+    expect(formatLastUsedAt(NOW / 1000 + 60, NOW).key).toBe('endpointManager_lastUsedJustNow');
+  });
+});
+
+describe('egressIndicator 出口指示三态(spec 二期 §7.2)', () => {
+  // 输入契约是 GET /api/endpoints 的原始线格式行(getEndpoints 解包后的数组),
+  // 归一在 egressIndicator 内部做——不是已归一的 camelCase 视图。
+  const row = (over = {}) => ({
+    id: 'e1', name: 'prov-a', enabled: true, egress_kernel: true, health_status: 'ok', ...over,
+  });
+
+  it('egress 行存在且 enabled → active(带名)', () => {
+    expect(egressIndicator([row()])).toEqual({ mode: 'active', name: 'prov-a' });
+  });
+
+  it('egress 行 enabled=0 → paused(暂停保留,auto 调度中)', () => {
+    expect(egressIndicator([row({ enabled: false })])).toEqual({ mode: 'paused', name: 'prov-a' });
+  });
+
+  it('无 egress 行 → auto(未指定出口)', () => {
+    expect(egressIndicator([{ id: 'x', egress_kernel: false }]))
+      .toEqual({ mode: 'auto', name: '' });
+    expect(egressIndicator([])).toEqual({ mode: 'auto', name: '' });
+    expect(egressIndicator(null)).toEqual({ mode: 'auto', name: '' });
+  });
+
+  it('多行 egress(异常形态)取第一行,服务端事务保证至多一行,这里兜底不崩', () => {
+    const list = [row({ id: 'a', name: 'first' }), row({ id: 'b', name: 'second' })];
+    expect(egressIndicator(list)).toEqual({ mode: 'active', name: 'first' });
+  });
+
+  it('畸形行(null/非对象)被过滤,不影响判定', () => {
+    expect(egressIndicator([null, 'x', row()])).toEqual({ mode: 'active', name: 'prov-a' });
   });
 });
