@@ -1582,6 +1582,54 @@ const claudeStatusFreshnessWindow = 3 * time.Minute
 // deriving lastMessageAt in the codex reader (claude precedent :1906).
 const codexStatusFreshnessWindow = 3 * time.Minute
 
+// claudeBackgroundFreshnessWindow bounds how fresh a subagent lane transcript
+// write must be to display "background" (2026-11-28 批,对抗检查 rank5 的产品
+// 拍板形态). Same value as the main freshness window; separate constant so the
+// two can be tuned apart — widening this one past the decay discipline would
+// revive the zombie-family bugs the 11-18 reconcile was built to kill.
+const claudeBackgroundFreshnessWindow = 3 * time.Minute
+
+// claudeSubagentLaneActive reports whether any subagent lane transcript under
+// <projects>/<dir>/<sid>/subagents/ was written within
+// claudeBackgroundFreshnessWindow. Claude lays lanes out as a directory named
+// after the session, sibling of the session jsonl (live-verified layout). The
+// walk skips these directories entirely (45c63fab anti-crowding: subagent
+// jsonl once crowded 1263/1333 real transcripts out of the discovery window),
+// so lane activity is invisible to the main freshness signal — this helper
+// re-feeds it. ReadDir + stat only: file contents are never read.
+func claudeSubagentLaneActive(home, nativeSessionID string) bool {
+	transcript := ccPeerSessionJSONL(home, nativeSessionID)
+	if transcript == "" {
+		return false
+	}
+	laneDir := filepath.Join(filepath.Dir(transcript), nativeSessionID, "subagents")
+	entries, err := os.ReadDir(laneDir)
+	if err != nil {
+		return false
+	}
+	freshFloor := time.Now().Add(-claudeBackgroundFreshnessWindow)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if info, err := entry.Info(); err == nil && info.ModTime().After(freshFloor) {
+			return true
+		}
+	}
+	return false
+}
+
+// claudeLaneStatus maps an ENDED main turn to background/idle by lane
+// freshness: a live subagent lane shows the fine-grained "background" instead
+// of a misleading idle, and decays back to idle once the lane goes quiet. It
+// must never return "running" — the main-turn signals own that state.
+func claudeLaneStatus(home, nativeID string) string {
+	if claudeSubagentLaneActive(home, nativeID) {
+		return "background"
+	}
+	return "idle"
+}
+
 // claudeBusyReconcileTailBytes bounds the transcript tail read for the stale
 // busy reconcile: turn-end markers (system/turn_duration, written at turn end)
 // live at the file tail, so the last 64KB is always enough — never read whole
@@ -1722,16 +1770,25 @@ func applyClaudeRenameNames(sessions []models.AgentVibeSession, records map[stri
 				// (only the transcript turn_duration line lands), so the pid
 				// record freezes on busy and the list mirrors a zombie
 				// "running" forever. A CC-written turn-end marker timestamped
-				// AFTER the busy write is content proof the turn finished —
-				// display idle. Display-only: CC's files are never rewritten
-				// and no synthetic frames are emitted.
+				// AFTER the busy write is content proof the turn finished.
+				// Display-only: CC's files are never rewritten and no synthetic
+				// frames are emitted.
+				//
+				// An ended turn is NOT the end of the story (2026-11-28 批):
+				// in-process subagent lanes keep working after the main turn
+				// closes (live-verified: main transcript quiet at turn_duration
+				// while subagents/*.jsonl still appending). Show the
+				// fine-grained "background" instead of a misleading idle; the
+				// lane signal decays back to idle on its own.
 				if claudeBusyTurnEndedAfterRecord(home, nativeID, record.StatusUpdatedAt) {
-					sessions[index].Status = "idle"
+					sessions[index].Status = claudeLaneStatus(home, nativeID)
 				} else {
 					sessions[index].Status = "running"
 				}
 			case record.Status == "idle":
-				sessions[index].Status = "idle"
+				// CC-written idle also only proves the MAIN turn ended — the
+				// same lane rule applies.
+				sessions[index].Status = claudeLaneStatus(home, nativeID)
 			case time.Since(transcriptFreshness[nativeID]) < claudeStatusFreshnessWindow:
 				sessions[index].Status = "running"
 			default:
