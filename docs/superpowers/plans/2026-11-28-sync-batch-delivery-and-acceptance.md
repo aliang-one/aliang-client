@@ -217,3 +217,68 @@ aliang-agent.service aliang.service` → 替换 `/home/liang/aliang` → 依次 
 
 **未做。** DEBT-09 口令轮换需安排发布窗口。RUN-01 的手动续跑入口、RUN-04
 连续中断熔断未开始。
+
+## 6. C 批进展（2026-11-28 续）
+
+### 6.1 DEBT-05 第一步：跨端共享回归夹具
+
+行动方案的拆解是「先统一契约和回归夹具，验证后共享纯状态转换」。本批做
+第一步，并且顺带补上了一个真实的不对称。
+
+网页端 2026-11-10 起就按会话级 seq 排序（`useAliangChat` 的 `orderBySeqSlots`），
+注释里记了事故：数组序在「快照限幅截尾 + 本地草稿 + 详情分页」合并时会丢
+真实先后，timestamp 跨端写入会倒挂（云端 position 对实录 47095 反序）。seq
+由产生数据的那一端分配，是唯一可比的先后真值。
+
+手机端此前完全没有这层保护：`AgentMessage` 没有 seq 字段，wire 映射不读 seq，
+transcript 完全依赖服务端给的数组序。同一份数据在两端可能呈现不同顺序。
+
+契约（占位部分排序）：只重排带 seq 的元素，且只占用它们自己原来的下标位；
+无 seq 的条目原地不动；seq 相等时按原下标稳定排序。刻意不是普通 comparator
+——对不可比的一对返回 0 会破坏比较器传递性，JS 引擎对不一致比较器的行为
+是实现定义，可能把本地草稿甩到别处。
+
+10 个共享样例（权威源在 `docs/superpowers/fixtures/message-order-cases.json`，
+RN 仓放逐字节副本并 sha256 对拍）覆盖全序、本地气泡不动、新旧混合、seq 倒挂、
+重复投递、seq 相等、seq=0、单条、快照截尾、空列表。网页端 12 项、RN 侧 13 项
+测试，两端收敛结果一致。RN 接到 4 个从服务端取数的入口（会话快照、实时尾刷、
+tail 刷新、翻更早一页）。
+
+### 6.2 SYNC-02：上屏时序三端打通
+
+要验收「首段/后续文字从产出到可见的延迟 P95 ≤ 500ms」，而现有
+`ai_turn_timings` 只测到服务端这一侧，缺「发出 → 客户端上屏」最后一段。
+
+为什么独立建表 `ai_client_render_timings`：那张表在 run 终态时一次性落库且
+`ON CONFLICT DO NOTHING`，而客户端上屏打点往往晚于终态到达（网络往返 +
+渲染帧），没法合并进同一条记录。独立表按 `(session_id, run_id)` 关联。
+
+时钟口径：两端都用墙钟（`agent_emitted_at_ms` 与 `Date.now()`），可直接相减。
+跨设备时钟有偏差，但这是唯一的端到端口径，与 SYNC-01 服务端已用的
+`agent_emitted_at_ms` 同源；偏差是系统性偏移，不影响同一设备内的 P95 趋势。
+
+- 服务端：mobile handler 加 `client.timing` 上行分支，逐字段校验（会话须属
+  本连接用户，防跨用户写遥测；延迟须为 [0, 1h] 的有限数），只记不回，写失败
+  不冒泡。`client` 靠 `ws.scope` 区分（admin=网页，其余=手机）。admin 端点
+  `GET /api/admin/ai/client-render-timings` 按端 × 段位出 P50/P95。
+- 网页：有真实的 DOM 插入点（`ChatMarkdown` 的 onMounted/updated），比 RN
+  更贴近「用户看见」。打点默认开启，`__CHAT_TIMING__ = false` 可关。
+- 手机：用 rAF 回调近似「这一帧已交给 UI 线程」。只测当前正在看的会话且前台。
+- 两端都是首段每 run 一次、后续文字每 run 最多 5 次。
+
+线上验证：新表随 pod 启动建好（7 列，当前 0 行，等客户端上报）。
+
+### 6.3 顺带根治一个全量偶发
+
+RN `localService` 的 `discoverReachableBaseUrl prob` 约每 2 次全量出现 1 次
+失败。根因是 5 处 `mockHealthByChannel` 漏了第三通道 hk（`0c156a6` 引入），hk
+以 0ms 与 primary 并列时选择结果不稳定。此前只修过同文件另外两例。全补后
+304 套件 / 2796 用例 0 失败。
+
+### 6.4 C 批剩余
+
+- SYNC-14 弱网 10 分钟持续显示、三会话并行：未做。需要弱网注入环境。
+- DEBT-04 用协议替换对账：未做，是结构性重构。
+- DEBT-05 第二步「共享纯状态转换」：夹具已就绪，但 RN 的 `mergeAgentMessages`
+  按WeakMap 缓存与浅比较深度定制，网页端是另一种思路，直接抽共享函数风险大。
+  建议等夹具跑稳一段时间再评估。
