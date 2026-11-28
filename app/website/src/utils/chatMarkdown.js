@@ -149,7 +149,11 @@ function scanAliangOptionSpans(src) {
       // 独占行开栏（可带 ≤3 空格前缀散文——marker 后须纯空白）。行制扫描：
       // 嵌套保护（2026-11-21 审计三批 M4：示例/文档代码块里的 options 语法
       // 是内容不是开栏，误剥会吞示例并凭空多出静态卡）。
-      const start = offset + openIdx;
+      // start 回退到本行连续反引号的起点:4 反引号漂移时 indexOf 从第 2 个
+      // 反引号起匹配,不回退会把第 1 个反引号留在正文里(孤立的 ` 挂在卡前)。
+      let fenceStart = openIdx;
+      while (fenceStart > 0 && line[fenceStart - 1] === '`') fenceStart -= 1;
+      const start = offset + fenceStart;
       const bodyStart = offset + line.length + 1;
       let j = i + 1;
       let closedAt = -1;

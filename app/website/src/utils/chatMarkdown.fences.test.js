@@ -226,3 +226,46 @@ describe('M1-util 大内容自适应渲染间隔', () => {
     expect(chatMdRenderInterval(300000)).toBe(800);
   });
 });
+
+describe('aliang-options 四反引号围栏（2026-11-28 线上漂移）', () => {
+  // 模型偶尔把围栏写成 4 反引号。RN 与服务端的整段正则只认 3 个,会把第 4 个
+  // 反引号留在原处,JSON 转成审批标签后整段被 markdown 当成代码块外晒。
+  // 网页端是按行扫描:indexOf 从第 2 个反引号起匹配,开栏判定仍成立;闭合行
+  // 的 `{3,} 也接受 4 个。本组锁死这条路径不被回退。
+  const optionJson = JSON.stringify({
+    v: 2,
+    title: 'mermaid 支持的实现方案选型',
+    summary: '请选择实施方向。',
+    options: [
+      { id: 'inplace-auto', label: '方案A：自动渲染', description: '约1-2天' },
+      { id: 'spec-first', label: '先出设计文档', description: '评审后再实施' },
+    ],
+    allow_custom: true,
+    multi: false,
+  });
+
+  it('extractAliangOptions 能从 4 反引号围栏里取出卡', () => {
+    const src = '评估结论如下。\n\n````aliang-options\n' + optionJson + '\n````';
+    const out = extractAliangOptions(src);
+    expect(out).toHaveLength(1);
+    expect(out[0].title).toBe('mermaid 支持的实现方案选型');
+    expect(out[0].options).toHaveLength(2);
+  });
+
+  it('stripAliangOptions 剥掉整段,不把 JSON 留在正文', () => {
+    const src = '前文。\n\n````aliang-options\n' + optionJson + '\n````\n\n后文。';
+    const out = stripAliangOptions(src);
+    expect(out).not.toContain('"options"');
+    expect(out).not.toContain('inplace-auto');
+    expect(out).toContain('前文。');
+    expect(out).toContain('后文。');
+    // 不留孤立反引号:start 必须回退到本行连续反引号的起点,否则第 1 个
+    // 反引号会挂在卡前(4 反引号漂移的显示瑕疵)。
+    expect(out).not.toContain('`');
+  });
+
+  it('3 反引号围栏仍然正常（回归护栏）', () => {
+    const src = '```aliang-options\n' + optionJson + '\n```';
+    expect(extractAliangOptions(src)).toHaveLength(1);
+  });
+});
