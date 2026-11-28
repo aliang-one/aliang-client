@@ -66,6 +66,11 @@ func runPanel(cmd *cobra.Command, args []string) error {
 	// 回落 flag 值(缺省 560)。窗口出生即正确尺寸,点击瞬间的空白闪变消失
 	// (跨次内容高度变化的残余闪变由壳侧「首次上屏延迟到首次 resize 到位」
 	// 兜住,panelwin_darwin.m / panelwin_windows.go)。
+	//
+	// 判定语义明示(P2-2):判据是 persisted != DefaultPanelH 才覆盖——
+	// 持久值=560 与显式 --ph 700 同现时 flag 胜(持久值撞缺省值不可分辨,
+	// 宁取显式;load 侧无效回落 DefaultPanelH 的形态同走此分支回落 flag 值)。
+	// 接线形态由 cmd/panel_test.go TestPanelCmdPersistedHeightFirst 锚定。
 	if persisted := panelwin.LoadLastPanelHeight(); persisted != panelwin.DefaultPanelH {
 		panelH = persisted
 	}

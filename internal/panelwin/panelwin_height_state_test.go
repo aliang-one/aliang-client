@@ -3,6 +3,9 @@ package panelwin
 import (
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -128,4 +131,61 @@ func TestPanelHeightStateCorruptedFallsBack(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPanelHeightStateAtomicWrite —— 状态文件写原子化(P3 顺手):temp+rename
+// 防「读回侧读到半截数字」的撕裂窗口——读回(LoadLastPanelHeight)发生在
+// 下次面板启动的另一进程,直接 WriteFile 本体的写入窗口内若被读到,拿到的
+// 是截断文本(atoi 失败→回落缺省=持久化静默失效)。两面锚:
+//  1. 行为面:落盘后状态目录内无 .tmp 临时名残留(temp+rename 后临时名消失);
+//  2. 形态面:persistLastPanelHeight 必须写同目录临时名再 os.Rename,不得
+//     直接 os.WriteFile 到状态文件本体。
+func TestPanelHeightStateAtomicWrite(t *testing.T) {
+	path := withTempPanelHeightState(t)
+
+	persistLastPanelHeight(517)
+	if got := LoadLastPanelHeight(); got != 517 {
+		t.Fatalf("原子写落盘 517 后 LoadLastPanelHeight = %d, want 517", got)
+	}
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("读状态目录: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Fatalf("状态目录残留临时文件 %q(temp+rename 后不应留存)", e.Name())
+		}
+	}
+
+	// 形态面锚:persistLastPanelHeight 函数体内必须出现 os.Rename,且不得
+	// 直接 WriteFile 到状态文件本体(path)。
+	src := panelwinSource(t)
+	fnIdx := strings.Index(src, "func persistLastPanelHeight(")
+	if fnIdx < 0 {
+		t.Fatal("panelwin.go 缺 persistLastPanelHeight")
+	}
+	body := src[fnIdx:]
+	if end := strings.Index(body, "\n}\n"); end >= 0 {
+		body = body[:end]
+	}
+	if !strings.Contains(body, "os.Rename(") {
+		t.Fatalf("persistLastPanelHeight 缺 os.Rename(直接写状态文件本体=撕裂读窗口):\n%s", body)
+	}
+	if regexp.MustCompile(`os\.WriteFile\(\s*path,`).MatchString(body) {
+		t.Fatalf("persistLastPanelHeight 直接 os.WriteFile 到状态文件本体(撕裂读窗口,应写同目录临时名后 rename):\n%s", body)
+	}
+}
+
+// panelwinSource 读取 panelwin.go 源码(形态锚测试用)。
+func panelwinSource(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller: 无法定位测试文件")
+	}
+	src, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "panelwin.go"))
+	if err != nil {
+		t.Fatalf("读取 panelwin.go: %v", err)
+	}
+	return string(src)
 }

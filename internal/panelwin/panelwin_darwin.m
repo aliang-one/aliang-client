@@ -333,13 +333,16 @@ extern void panelwinGoHeightChanged(double height);
   // 自动再隐藏)——用户点面板内部一次后 becomeKey,失焦即退链随即激活。
   // 页面加载在等待期照常。
   self.awaitingFirstResize = YES;
-  // 兜底超时:1.2s 后若仍在等待(页面加载失败/resize 未到),按当前尺寸
-  // 直接上屏——面板不能永远不出现(正常路径 resize 先到,本块进来看到
-  // 位已清,零操作)。
+  // 兜底超时:1.2s 后若仍在等待(1.2s 内未收到 resize:rAF 挂起或页面
+  // 加载慢),按当前尺寸直接上屏——面板不能永远不出现(正常路径 resize
+  // 先到,本块进来看到位已清,零操作)。文案如实(P3):首报链路是
+  // nextTick→同步量高,不依赖 rAF;但旧版经 rAF 合帧时未上屏窗口 rAF 被
+  // WebKit 挂起、resize 永远发不出是该兜底的已知诱因之一,「页面加载失败?」
+  // 的单因猜测不实。
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                  dispatch_get_main_queue(), ^{
     if (self.awaitingFirstResize) {
-      NSLog(@"panelwin: 1.2s 兜底上屏(resize 未到,页面加载失败?)");
+      NSLog(@"panelwin: 1.2s 兜底上屏(1.2s 内未收到 resize:rAF 挂起或页面加载慢,按当前尺寸上屏)");
       [self showIfAwaitingFirstResize];
     }
   });

@@ -267,8 +267,11 @@ func TestPanelwinWindowsFirstFrameShow(t *testing.T) {
 		t.Fatalf("case wmAppPanelShow 未分派 panelShowWindow(兜底路径绕过唯一上屏入口):\n%s", src[caseIdx:caseIdx+200])
 	}
 
-	// ④ resize 分派:applyHeight 落窗之后 showNow 上屏 + persistLastPanelHeight
-	//    落盘(顺序锚——先改尺寸再上屏,首帧即正确尺寸)。
+	// ④ resize 分派:height 合法(≥280)时 applyHeight 落窗 + persistLastPanelHeight
+	//    落盘(先改尺寸再上屏,首帧即正确尺寸);showNow 在 height 闸【之外】
+	//    (P2-1 对齐 macOS:收到 resize 即页面已活,「畸形 height 也先上屏」
+	//    优于盲等 1.2s 兜底——macOS 侧 showIfAwaitingFirstResize 同样在
+	//    height 闸之外,见 panelwin_darwin.m resize 分支)。
 	dispIdx := strings.Index(src, `if typ == "resize" {`)
 	if dispIdx < 0 {
 		t.Fatal("panelwin_windows.go 缺 resize 分派")
@@ -277,12 +280,25 @@ func TestPanelwinWindowsFirstFrameShow(t *testing.T) {
 	if next := strings.Index(dispBody, "\n\t\t}"); next >= 0 {
 		dispBody = dispBody[:next]
 	}
+	guardIdx := strings.Index(dispBody, "if height >= 280 {")
 	applyIdx := strings.Index(dispBody, "applyHeight(height)")
 	persistIdx := strings.Index(dispBody, "persistLastPanelHeight(height)")
+	guardCloseIdx := strings.Index(dispBody, "\n\t\t\t}") // height 闸的收口(3 缩进)
 	showCallIdx := strings.Index(dispBody, "showNow(")
-	if applyIdx < 0 || persistIdx < 0 || showCallIdx < 0 {
-		t.Fatalf("resize 分派缺落窗/落盘/上屏链(applyHeight=%d persistLastPanelHeight=%d showNow=%d):\n%s", applyIdx, persistIdx, showCallIdx, dispBody)
+	if guardIdx < 0 || applyIdx < 0 || persistIdx < 0 || guardCloseIdx < 0 || showCallIdx < 0 {
+		t.Fatalf("resize 分派缺 height 闸/落窗/落盘/上屏链(guard=%d applyHeight=%d persistLastPanelHeight=%d 闸尾=%d showNow=%d):\n%s", guardIdx, applyIdx, persistIdx, guardCloseIdx, showCallIdx, dispBody)
 	}
+	// ④-a applyHeight/persistLastPanelHeight 在闸内:畸形/退化高度不落窗
+	//     不落盘(塌缩成一条线的窗高不予跟随,评审 Minor-7 兜底保留)。
+	if applyIdx < guardIdx || persistIdx < guardIdx || applyIdx > guardCloseIdx || persistIdx > guardCloseIdx {
+		t.Fatalf("applyHeight/persistLastPanelHeight 必须在 height≥280 闸内(畸形高度落窗/落盘=壳侧兜底失效):\n%s", dispBody)
+	}
+	// ④-b showNow 在闸外:畸形 height 的 resize 也触发上屏(页面已活,
+	//     盲等 1.2s 兜底不如先出现;真实高度随后续 resize 到位再跟随)。
+	if showCallIdx < guardCloseIdx {
+		t.Fatalf("showNow(%d) 必须在 height 闸尾(%d)之外(畸形 resize 也要上屏,P2-1 对齐 macOS):\n%s", showCallIdx, guardCloseIdx, dispBody)
+	}
+	// ④-c 顺序锚:合法高度先落窗再上屏(首帧即正确尺寸)。
 	if showCallIdx < applyIdx {
 		t.Fatalf("showNow(%d) 必须在 applyHeight(%d) 之后(先落窗再上屏,首帧即正确尺寸)", showCallIdx, applyIdx)
 	}

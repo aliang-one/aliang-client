@@ -13,6 +13,7 @@
 <script setup>
 import { computed, nextTick, onMounted, provide, ref, watch } from 'vue';
 import { postMessageHost } from './api';
+import { createHeightReporter } from './heightReport';
 import { useSummary } from './summary';
 import { derivePanelState } from './state';
 import Toast, { useToast } from './components/Toast.vue';
@@ -52,25 +53,15 @@ provide('panelToast', toast);
 // 不合适」,且 AI AGENT 区展开高度可变)。浏览器无宿主时 postMessageHost
 // 返回 false,静默跳过(无宿主模式高度即视口,不上报)。
 const panelEl = ref(null);
-let lastSentHeight = 0;
-function reportHeight() {
-  const el = panelEl.value;
-  if (!el) return;
-  const h = Math.ceil(el.scrollHeight);
-  if (Math.abs(h - lastSentHeight) <= 1) return; // ≤1px 抖动不上报(RO 路径同样生效)
-  if (postMessageHost({ type: 'resize', height: h })) {
-    lastSentHeight = h;
-  }
-}
-// rAF 合帧:RO 与 summary watch 双触发源共用,一帧最多一次量高与上报。
-let heightFrame = 0;
-function scheduleReportHeight() {
-  if (heightFrame) return;
-  heightFrame = requestAnimationFrame(() => {
-    heightFrame = 0;
-    reportHeight();
-  });
-}
+// 高度上报器(量高/合帧/≤1px 抖动门抽到 heightReport.js 可测单元):
+// 合帧【不用 rAF】——面板壳「先隐藏、首次 resize 到位才上屏」,未上屏窗口
+// 里 WebKit/Chromium 挂起 scripted animations,rAF 回调永不执行,首个
+// resize 会永远发不出、面板盲等 1.2s 兜底;定谳与取舍见 heightReport.js
+// 文件头(P1-1)。lastSent/pending 状态都在 reporter 内部,本组件零持有。
+const { report: reportHeight, schedule: scheduleReportHeight } = createHeightReporter({
+  measure: () => (panelEl.value ? panelEl.value.scrollHeight : null),
+  send: postMessageHost,
+});
 // 尺寸观察器(评审增益批,替换 MutationObserver 方案):AGENT 明细/ENDPOINT
 // 组的展开动画(max-height 0.25s)逐帧改中间高度——MutationObserver 单次
 // 回调量到的是中间态、终态漏报;ResizeObserver 对尺寸变化逐帧天然覆盖动画
@@ -90,7 +81,12 @@ function ensureHeightObserver() {
 onMounted(() => {
   nextTick(() => {
     ensureHeightObserver();
-    scheduleReportHeight();
+    // 首报直调 reportHeight(不经 schedule,同步强布局读取):RO 在未上屏
+    // 窗口对尺寸变化的回调行为存疑(可能同样受可见性影响),首报不能押在
+    // 它身上——直调保证至少一条链路必然发出 resize;schedule/RO 作后续
+    // 增量跟随的通道。外层 nextTick 等 DOM 刷完(onMounted 时根已挂载,
+    // nextTick 在隐藏窗照常执行)。
+    reportHeight();
   });
 });
 watch(summary, () => {

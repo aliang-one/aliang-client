@@ -214,7 +214,19 @@ func persistLastPanelHeight(height float64) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return
 	}
-	_ = os.WriteFile(path, []byte(strconv.Itoa(h)), 0o644)
+	// 原子写(P3):同目录临时名写入 + os.Rename 原子替换——读回侧
+	// (LoadLastPanelHeight)在下次面板启动的【另一进程】,直接 WriteFile
+	// 本体的写入窗口内若被读到,拿到的是半截数字文本(atoi 失败→回落缺省
+	// =持久化静默失效);rename 后读回侧要么见旧内容要么见完整新内容。
+	// os.Rename 在 Windows 上同样替换已存在目标(MOVEFILE_REPLACE_EXISTING
+	// 语义);rename 失败时清掉临时名不留垃圾,整体静默降级不阻断。
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(strconv.Itoa(h)), 0o644); err != nil {
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+	}
 }
 
 // AnchorToWindowPos —— 锚定纯函数(实现计划 Task 13 指定形态):

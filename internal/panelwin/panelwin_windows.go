@@ -404,19 +404,24 @@ func runPanelWindow(opts Options) error {
 		}
 		if typ == "resize" {
 			// height 缺失/非数值时 ParseHostMessage 返回 0,过不了受理闸;
-			// ≥280 才受理(评审 Minor-7:与 macOS clamp 下限 280 同口径,
+			// ≥280 才跟随(评审 Minor-7:与 macOS clamp 下限 280 同口径,
 			// 见 panelwin_darwin.m resize 分支的 newH < 280;正常内容高恒在
 			// 其上,这里是壳侧对畸形/退化值的兜底,塌缩成一条线的窗高不予
 			// 跟随;解算层另有 240×scale 的几何兜底,panelwin_resize.go)。
+			// 「applyHeight+落盘」与「上屏」解耦:height 闸只收窄落窗/落盘。
 			if height >= 280 {
 				applyHeight(height)
 				// 高度持久化(首帧尺寸修正 Part 2):稳态逻辑高度落盘,
 				// 下次启动 cmd/panel.go 读回作出生尺寸;失败静默降级。
 				persistLastPanelHeight(height)
-				// 首帧尺寸修正 Part 1:高度落窗后才上屏(首帧即正确尺寸,
-				// 不再闪缺省 560 高的空白);后续 resize 时位已清,零操作。
-				showNow("首次 resize 到位")
 			}
+			// 首帧尺寸修正 Part 1(P2-1 对齐 macOS):任何 known resize 消息
+			// 都触发上屏,height 闸不收窄——收到 resize 即页面已活,「畸形
+			// height 先按出生尺寸出现」优于盲等 1.2s 兜底;真实高度随后续
+			// resize 到位再跟随(同 panelwin_darwin.m:showIfAwaitingFirstResize
+			// 在 height 闸之外)。height 合法时已先落窗(上方 applyHeight),
+			// 首帧即正确尺寸;后续 resize 时位已清,零操作。
+			showNow("首次 resize 到位")
 			// resize 后驻留。
 		}
 	}
