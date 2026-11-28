@@ -16,7 +16,8 @@
 // FindWindowW+PostMessageW 投递)→ PostQuitMessage(0) 请求关闭;窗口随
 // 进程退出彻底消失,不存在任何驻留形态。页面 quit 消息 → 退出码 60;open
 // 消息 → ShellExecute 开默认浏览器后驻留;resize 消息 → applyHeight 跟随
-// 改窗高(高度自适应)。退出码契约见 panelwin.go(Task 14 launcher:
+// 改窗高(高度自适应),且【首次】resize 落窗后才上屏(首帧尺寸修正
+// Part 1,见 runPanelWindow 注释)。退出码契约见 panelwin.go(Task 14 launcher:
 // 0=正常关闭(点外/失焦/close 请求)、60=quit,其余=崩溃)。
 //
 // 前台交接:显示前必须 SetForegroundWindow——companion spawn 时的
@@ -27,6 +28,7 @@ package panelwin
 
 import (
 	"fmt"
+	"time"
 	"unsafe"
 
 	"aliang.one/nursorgate/common/logger"
@@ -57,8 +59,13 @@ const (
 	// toggle,2026-11-28 撤销方案 B 后不再做可见⇄隐藏切换)。WM_APP+1 =
 	// 0x8001;与投递侧常量跨文件对齐(app/tray 不能 import 本包,漂移由
 	// app/tray TestPanelM2CloseChannelContract 源码锚定把守)。
+	// wmAppPanelShow(WM_APP+2):壳内部自用——首帧尺寸修正 Part 1 的 1.2s
+	// 兜底上屏消息(AfterFunc goroutine 经它把「按当前尺寸显示」投递回消息
+	// 循环线程,wndProc 分派 panelShowWindow 执行;见 runPanelWindow 注释)。
+	// 不出本进程,无跨文件对齐面。
 	wmApp            = 0x8000
 	wmAppPanelToggle = wmApp + 1
+	wmAppPanelShow   = wmApp + 2
 
 	swShow        = 5
 	swpNoZOrder   = 0x0004
@@ -90,6 +97,7 @@ var (
 	procTranslateMessage          = user32.NewProc("TranslateMessage")
 	procDispatchMessageW          = user32.NewProc("DispatchMessageW")
 	procPostQuitMessage           = user32.NewProc("PostQuitMessage")
+	procPostMessageW              = user32.NewProc("PostMessageW")
 	procShowWindow                = user32.NewProc("ShowWindow")
 	procSetWindowPos              = user32.NewProc("SetWindowPos")
 	procSetForegroundWindow       = user32.NewProc("SetForegroundWindow")
@@ -160,6 +168,16 @@ func (nativeHost) Run(opts Options) int {
 
 // lastExitCode 由消息循环落定(GetMessageW 返回 0 时读 WM_QUIT 的 wParam)。
 var lastExitCode int
+
+// panelShowWindow 首帧尺寸修正 Part 1 的上屏动作注入口(runPanelWindow 装配
+// 为 showNow 闭包;wndProc 的 WM_APP+2 兜底分派消费)。进程内单窗口、消息
+// 循环单线程驱动,两处消费同线程无并发面;nil 守卫兜住「兜底消息早于装配」
+// 的极端窗口期。
+var panelShowWindow func(reason string)
+
+// panelFirstShowFallback 首帧兜底超时:页面加载失败/resize 未到时按当前
+// 尺寸上屏(面板不能永远不出现)。与 macOS 侧 1.2s 兜底同值(双侧同批)。
+const panelFirstShowFallback = 1200 * time.Millisecond
 
 func runPanelWindow(opts Options) error {
 	className, err := windows.UTF16PtrFromString("AliangPanelWindow")
@@ -264,6 +282,42 @@ func runPanelWindow(opts Options) error {
 		curX, curY, curW, curH = x, y, w, h
 	}
 
+	// ⑤ 首帧尺寸修正 Part 1(2026-11-28 用户反馈「点击瞬间出现大空白区域
+	// 再缩到目标尺寸」):窗口创建后【保持隐藏】,首次 resize 分派落窗后才
+	// 经 showNow 上屏——此前立即 ShowWindow 会把缺省 560 高的空窗先闪出来,
+	// 页面量高 resize 后才缩到实际高度,正是用户反馈的闪变形态。高度持久化
+	// (Part 2)已把上次稳态高度读回作出生尺寸,正常路径首帧即正确尺寸;
+	// 跨次内容高度变化的残余闪变由「先落窗再上屏」兜住。
+	//
+	// showNow 是唯一上屏入口(SetForegroundWindow/ShowWindow/chromium.Focus
+	// 三件全收在内——SetForegroundWindow 必须保留:AllowSetForegroundWindow
+	// 只授予资格,不调则 WM_ACTIVATE 激活不发、失焦即退整条失效;Focus 是
+	// 首帧键盘焦点补齐,pkg/edge 的 Focus() 无返回值,失败形态随 Task 16
+	// 实机探针收口)。两处触发:首次 resize 到位(MessageCallback)、1.2s
+	// 兜底;shown 位保证幂等(重复触发零操作)。定义先于 MessageCallback
+	// (闭包引用序);chromium 彼时可能尚未 Embed 赋值,但闭包只在回调期被
+	// 调,彼时 Embed 必已完成(同 applyHeight 的先声明后赋值形态)。
+	shown := false
+	showNow := func(reason string) {
+		if shown {
+			return
+		}
+		shown = true
+		procSetForegroundWindow.Call(hwnd)
+		procShowWindow.Call(hwnd, uintptr(swShow))
+		chromium.Focus()
+		logger.Info("panelwin: 面板上屏(" + reason + ")")
+	}
+	panelShowWindow = showNow
+	// 1.2s 兜底(与 macOS 侧同值,panelFirstShowFallback):页面加载失败/
+	// resize 未到时按当前尺寸上屏——面板不能永远不出现。AfterFunc goroutine
+	// 不能直接动窗口(Win32 窗口 API 单线程语义),经自定消息 WM_APP+2
+	// (wmAppPanelShow)投递回消息循环线程,wndProc 分派 panelShowWindow 执行
+	// 同一 showNow(位已清时零操作);正常路径 resize 先到,兜底空转。
+	time.AfterFunc(panelFirstShowFallback, func() {
+		procPostMessageW.Call(hwnd, uintptr(wmAppPanelShow), 0, 0)
+	})
+
 	// ③ 圆角 + 亚克力(Win11 22621+);低版本 DwmSetWindowAttribute 返回
 	// 失败,静默降级为纯半透明底(前端半透明底色仍是完整可用的形态)。
 	setDwmAttributeU32(hwnd, dwmwaWindowCornerPreference, dwmwcpRound)
@@ -356,6 +410,12 @@ func runPanelWindow(opts Options) error {
 			// 跟随;解算层另有 240×scale 的几何兜底,panelwin_resize.go)。
 			if height >= 280 {
 				applyHeight(height)
+				// 高度持久化(首帧尺寸修正 Part 2):稳态逻辑高度落盘,
+				// 下次启动 cmd/panel.go 读回作出生尺寸;失败静默降级。
+				persistLastPanelHeight(height)
+				// 首帧尺寸修正 Part 1:高度落窗后才上屏(首帧即正确尺寸,
+				// 不再闪缺省 560 高的空白);后续 resize 时位已清,零操作。
+				showNow("首次 resize 到位")
 			}
 			// resize 后驻留。
 		}
@@ -364,15 +424,6 @@ func runPanelWindow(opts Options) error {
 	// Navigate 无返回值(edge 内部直调 vtbl,失败静默);白名单闸已保证
 	// 非 白 origin 页面加载不进来。
 	chromium.Navigate(opts.URL)
-
-	// ⑤ 显示前 SetForegroundWindow(见文件头:AllowSetForegroundWindow 只
-	// 授予资格,不调则 WM_ACTIVATE 激活不发、失焦即退整条失效)。
-	procSetForegroundWindow.Call(hwnd)
-	procShowWindow.Call(hwnd, uintptr(swShow))
-	// 首帧键盘焦点:SetForegroundWindow 只把窗口推到前台,WebView2 内部
-	// 文档不一定拿到焦点(首帧键盘输入丢失);程序化 MoveFocus 补齐
-	// (pkg/edge 的 Focus() 无返回值,失败形态随 Task 16 实机探针收口)。
-	chromium.Focus()
 
 	// 自建消息循环:GetMessageW 返回 0 才是收到 WM_QUIT(wParam 即退出码:
 	// 60=quit;WM_ACTIVATE 失活/WM_DESTROY/close 请求都 PostQuitMessage(0))。
@@ -421,6 +472,14 @@ func panelWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		// 语义=请求关闭):PostQuitMessage(0) 正常关闭,窗口随进程退出
 		// 消失(launcher 记 code=0 正常关闭零惩罚)。
 		procPostQuitMessage.Call(uintptr(ExitFocusLoss))
+		return 0
+	case wmAppPanelShow:
+		// 1.2s 兜底上屏(首帧尺寸修正 Part 1):AfterFunc goroutine 经自定
+		// 消息投递到本线程执行同一 showNow(见 runPanelWindow 注释);正常
+		// 路径 resize 先到、位已清,showNow 内零操作。
+		if panelShowWindow != nil {
+			panelShowWindow("1.2s 兜底(resize 未到)")
+		}
 		return 0
 	case wmDestroy:
 		procPostQuitMessage.Call(uintptr(ExitFocusLoss))

@@ -348,6 +348,75 @@ func TestPanelwinDarwinResizeFollow(t *testing.T) {
 	}
 }
 
+// TestPanelwinDarwinFirstFrameShow — 首帧尺寸修正 Part 1(2026-11-28 用户
+// 反馈「点击瞬间出现大空白区域再缩到目标尺寸」)的 .m 结构断言,三件套:
+//
+//  1. awaitingFirstResize 在册:窗口创建后【不上屏】,置位等待;
+//  2. 首次 resize 到位才真正上屏(高度应用之后,首帧即正确尺寸);
+//  3. 1.2s 兜底:页面加载失败/resize 未到时按当前尺寸上屏(面板不能永远
+//     不出现)。
+//
+// 反向锚:launch 方法体不得再保留 150ms 早屏 dispatch_after(orderFrontRegardless)
+// ——它把缺省 560 高的空窗先闪出来,正是本次要消灭的形态(verifyOnscreenRetry
+// 内的 0.15 重试间隔是另一码事,不受本锚约束)。
+func TestPanelwinDarwinFirstFrameShow(t *testing.T) {
+	src := panelwinDarwinSource(t)
+
+	// ① awaitingFirstResize 在册:属性声明 + 启动置位。
+	if !strings.Contains(src, "@property (assign) BOOL awaitingFirstResize;") {
+		t.Fatal("panelwin_darwin.m 缺 awaitingFirstResize 属性(首次上屏等待位不存在,首帧尺寸闪变回归)")
+	}
+	launchBody := objcMethodBody(src, "- (void)applicationDidFinishLaunching:")
+	if !strings.Contains(launchBody, "awaitingFirstResize = YES") {
+		t.Fatalf("panelwin_darwin.m 启动未置 awaitingFirstResize(窗口会带着缺省 560 高直接上屏):\n%s", launchBody)
+	}
+
+	// ② 首次 resize 到位才上屏:resize 分派内调 showIfAwaitingFirstResize,
+	//    且在高度应用(applyFirstResize 锚)之后;helper 是唯一上屏入口,
+	//    内含 orderFrontRegardless + 合成自检重试。
+	resizeBody := objcMethodBody(src, `@"resize"`)
+	if !strings.Contains(resizeBody, "showIfAwaitingFirstResize") {
+		t.Fatalf("panelwin_darwin.m 的 resize 分派缺首次上屏调用(高度应用后才上屏的链路断裂):\n%s", resizeBody)
+	}
+	if !strings.Contains(resizeBody, "panelwinGoHeightChanged") {
+		t.Fatalf("panelwin_darwin.m 的 resize 分派缺 panelwinGoHeightChanged 落盘回调(高度持久化链断裂):\n%s", resizeBody)
+	}
+	// 实现体锚用带花括号的签名形态(@interface 声明与文件头注释里都有
+	// 裸名出现,objcMethodBody 从首个命中截断,裸名会截错位置)。
+	showBody := objcMethodBody(src, "- (void)showIfAwaitingFirstResize {")
+	for _, want := range []string{
+		"awaitingFirstResize = NO", // 清位:后续 resize/兜底零操作
+		"orderFrontRegardless",     // 上屏(不 makeKey)
+		"verifyOnscreenRetry:1",    // 合成自检重试挂到真正上屏之后
+	} {
+		if !strings.Contains(showBody, want) {
+			t.Fatalf("panelwin_darwin.m 的 showIfAwaitingFirstResize 缺 %q(首次上屏入口不完整):\n%s", want, showBody)
+		}
+	}
+
+	// ③ 1.2s 兜底:dispatch_after 1.2s 检查等待位后兜底上屏(页面加载失败/
+	//    resize 未到形态下面板不能永远不出现)。
+	if !strings.Contains(launchBody, "1.2 * NSEC_PER_SEC") {
+		t.Fatalf("panelwin_darwin.m 缺 1.2s 兜底 dispatch_after(resize 未到时面板永不出现):\n%s", launchBody)
+	}
+	if !strings.Contains(launchBody, "showIfAwaitingFirstResize") {
+		t.Fatalf("panelwin_darwin.m 的 1.2s 兜底未走 showIfAwaitingFirstResize(兜底路径绕过唯一上屏入口):\n%s", launchBody)
+	}
+
+	// ④ 反向锚:launch 方法体不得再保留 150ms 早屏——窗口带着缺省高直接
+	//    上屏,正是「点击瞬间大空白闪一下」的根源。对剥注释后的方法体断言
+	//    (注释里的机制说明不算实现)。
+	launchCode := stripObjcComments(launchBody)
+	if strings.Contains(launchCode, "0.15") {
+		t.Fatalf("panelwin_darwin.m 启动路径仍有 150ms 早屏(0.15)——首帧会先闪缺省 560 高的空白:\n%s", launchCode)
+	}
+	// 上屏动作必须只发生在 showIfAwaitingFirstResize:launch 方法体(剥注释)
+	// 不得直接 orderFrontRegardless。
+	if strings.Contains(launchCode, "orderFrontRegardless") {
+		t.Fatalf("panelwin_darwin.m 启动路径直接 orderFrontRegardless(首帧尺寸闪变回归,上屏须等首次 resize 到位):\n%s", launchCode)
+	}
+}
+
 // poolWrappedEntries — 会被 Go goroutine 所在线程直接调到的 C 入口:
 // 函数体必须整体包一层 @autoreleasepool(结构测试逐个校验)。panelwin_run
 // 是唯一 C 入口(close 请求不再经 cgo——handler goroutine 直接 exit(0),

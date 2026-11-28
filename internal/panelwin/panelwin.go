@@ -35,6 +35,9 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -141,6 +144,77 @@ func panelOrphanWatchdog(stop <-chan struct{}, getppid func() int, exit func(int
 			}
 		}
 	}
+}
+
+// —— 高度持久化(首帧尺寸修正 Part 2,2026-11-28 用户反馈「点击瞬间出现
+// 大空白区域再缩到目标尺寸」)——
+//
+// 机制:窗口出生=缺省高 560(--ph 缺省),页面渲染后量实际高 → resize 消息
+// → 窗口才缩放;560 与实际高的差值=点击瞬间的「大空白闪一下」。把上次会话
+// resize 落盘的稳态逻辑高度作为启动高度读回,窗口出生即正确尺寸,差值消失
+// (跨次内容高度变化仍会有的残余闪变由 Part 1「首次上屏延迟到首次 resize
+// 到位」兜住,见 panelwin_darwin.m / panelwin_windows.go)。
+//
+// 落盘路径:两侧壳在 resize 分派时回调本文件 persistLastPanelHeight(macOS
+// 经 cgo 导出 panelwinGoHeightChanged(panelwin_darwin.go),Windows 在
+// MessageCallback 直调),写 ~/.aliang/panel/last-height 纯数字逻辑高度文本。
+
+const (
+	// 高度有效窗(读回判据与落盘守卫同窗):下限 240 与解算层几何兜底
+	// resizeMinLogicalH(panelwin_resize.go)同口径;上限 2000 防脏值/防
+	// 异常屏形态,超出常见屏高的值没有回放意义。
+	panelHeightStateMin = 240
+	panelHeightStateMax = 2000
+)
+
+// panelHeightStatePath 状态文件路径注入口(生产形态 ~/.aliang/panel/last-height;
+// 测试覆写到临时目录,见 panelwin_height_state_test.go)。
+var panelHeightStatePath = func() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".aliang", "panel", "last-height"), nil
+}
+
+// LoadLastPanelHeight 读上次会话落盘的面板逻辑高度:存在且 240≤h≤2000 才
+// 生效;缺文件/损坏/越界一律回落缺省 DefaultPanelH。调用方(cmd/panel.go)
+// 以此覆盖 flag 值(launcher 恒传缺省 560,持久值不优先则机制是死代码)。
+// 读写失败静默降级,不阻断面板启动。
+func LoadLastPanelHeight() int {
+	path, err := panelHeightStatePath()
+	if err != nil {
+		return DefaultPanelH
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return DefaultPanelH
+	}
+	h, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || h < panelHeightStateMin || h > panelHeightStateMax {
+		return DefaultPanelH
+	}
+	return h
+}
+
+// persistLastPanelHeight 落盘本次 resize 的稳态逻辑高度(两侧壳在 resize
+// 分派时调用;小数高度截断取整——CSS 内容高常态即整数,截断误差无回放
+// 意义)。越界值不落盘(读回侧同窗拒收,写了也白写);目录不存在 MkdirAll
+// 兜建;写失败静默降级不阻断。运行在壳的 UI 线程(macOS 主线程/Windows
+// 消息循环线程),单文件小写入,不构成卡顿面。
+func persistLastPanelHeight(height float64) {
+	h := int(height)
+	if h < panelHeightStateMin || h > panelHeightStateMax {
+		return
+	}
+	path, err := panelHeightStatePath()
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(path, []byte(strconv.Itoa(h)), 0o644)
 }
 
 // AnchorToWindowPos —— 锚定纯函数(实现计划 Task 13 指定形态):

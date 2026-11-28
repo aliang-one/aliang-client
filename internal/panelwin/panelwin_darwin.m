@@ -10,7 +10,9 @@
 // 点面板外(global mouseDown)/失焦(resignKey)→ exit(0) 正常关闭;托盘
 // 图标的 close 请求(SIGUSR1,handler 在 panelwin_darwin.go)→ exit(0);
 // 页面 quit 消息 → exit(60);open 消息 → NSWorkspace openURL 开默认浏览器
-// 后驻留;resize 消息 → 跟随改窗高(高度自适应)。进程退出即窗口消失,
+// 后驻留;resize 消息 → 跟随改窗高(高度自适应),且【首次】resize 到位
+// 才真正上屏(首帧尺寸修正,见 applicationDidFinishLaunching/showIfAwaitingFirstResize)。
+// 进程退出即窗口消失,
 // 不存在任何驻留形态的残留窗口。
 //
 // ⚠️ 撤销方案 B 的实证依据(2026-11-28 实机走查三连败,同根=常驻的隐藏
@@ -50,6 +52,12 @@
 #import <Cocoa/Cocoa.h>
 #import <WebKit/WebKit.h>
 
+// panelwinGoHeightChanged — Go 侧高度落盘回调(cgo 导出,panelwin_darwin.go
+// //export 实现):resize 应用新高度后把稳态逻辑高度写 ~/.aliang/panel/last-height,
+// 下次启动 cmd/panel.go 读回作出生尺寸,窗口出生即正确尺寸(首帧尺寸修正
+// Part 2)。声明与 Go 导出签名逐字对齐,漂移=链接失败(fail loud)。
+extern void panelwinGoHeightChanged(double height);
+
 @interface PanelWindow : NSPanel
 @end
 
@@ -69,7 +77,14 @@
 @property (copy) NSString* launchURL;      // --url,panel.html 完整地址
 @property (assign) NSRect contentRect;     // AppKit 全局左下原点的窗口 frame
 @property (assign) BOOL everKeyed;         // 曾成为 key(见 resignKey 守卫)
+// awaitingFirstResize —— 首帧尺寸修正 Part 1(2026-11-28 用户反馈「点击
+// 瞬间出现大空白区域再缩到目标尺寸」):窗口创建后【不上屏】,置位等待
+// 页面首次 resize(量出的实际高度)应用后再上屏——首帧即正确尺寸,不再
+// 闪缺省 560 高的空白。1.2s 兜底(见 applicationDidFinishLaunching)保证
+// 页面加载失败时面板仍会出现。
+@property (assign) BOOL awaitingFirstResize;
 - (void)verifyOnscreenRetry:(NSInteger)attempt forPanel:(NSPanel *)panel;
+- (void)showIfAwaitingFirstResize;
 @end
 
 @implementation PanelAppDelegate
@@ -211,18 +226,28 @@
       if (maxH <= 0) {
         // newH 钳后 ≤0 的守卫(Minor-5):topY-8 ≤ 0——托盘在负坐标屏
         // (全局坐标系下移)形态时钳不出正高度,硬钳会把窗压没;保持原
-        // 矩形不动,NSLog 留痕(高度自适应在该形态下让位)。
+        // 矩形不动,NSLog 留痕(高度自适应在该形态下让位;不落盘——未
+        // 应用的高度没有回放意义)。
         NSLog(@"panelwin: resize 钳高上限非正 (topY=%f), 保持原矩形", topY);
-        return;
+      } else {
+        if (newH > maxH) {
+          newH = maxH;
+        }
+        // 顶边固定向下生长:origin.y = 顶边 - 新高,宽与 x 不动。
+        [self.panel setFrame:NSMakeRect(f.origin.x, topY - newH, f.size.width, newH)
+                     display:YES
+                      animate:NO];
+        // 高度持久化(Part 2):应用后的稳态逻辑高度落盘,下次启动读回作
+        // 出生尺寸(经 cgo 导出回调,Go 侧写文件;失败静默降级)。此前的
+        // maxH≤0 保持原矩形形态不落盘。
+        panelwinGoHeightChanged(newH);
       }
-      if (newH > maxH) {
-        newH = maxH;
-      }
-      // 顶边固定向下生长:origin.y = 顶边 - 新高,宽与 x 不动。
-      [self.panel setFrame:NSMakeRect(f.origin.x, topY - newH, f.size.width, newH)
-                   display:YES
-                    animate:NO];
     }
+    // 首帧尺寸修正 Part 1:检查等待位——收到 resize 即页面已活,首次时按
+    // 当前尺寸上屏(高度已应用则首帧即正确尺寸;height 畸形 heightNum=nil
+    // 时先按出生尺寸上屏,真实高度随后续 resize 到位再跟随——页面活着,
+    // 多等 1.2s 兜底不如先出现);后续 resize 时位已清,零操作。
+    [self showIfAwaitingFirstResize];
     // resize 后驻留(面板不退出)。
     return;
   }
@@ -295,21 +320,28 @@
     NSLog(@"panelwin: --url 解析为 nil,面板不加载内容(失焦即退链仍生效)");
   }
 
-  // 初始上屏(2026-11-28 二版):150ms 早屏 + 上屏自检重试。背景机制
-  // (2026-11-28 实机走查坐实的「悬挂窗口」):companion 在托盘点击处理中途
-  // spawn 子进程,首次 orderFront 撞进系统 key/space 切换未稳定期(震荡期
-  // 约 1s),窗口进入「已注册但永不合成」的悬挂态(CGWindowList onscreen
-  // 查无此窗,后续信号无效)。一版用 600ms 固定延迟硬躲——用户反馈「不跟手」。
-  // 二版改为【早屏+探测重试】:150ms 首次 orderFrontRegardless(多数点击
-  // 此刻已安全),随后 300/500/800/1200ms 自检「本窗是否真的合成到屏」
-  // (CGWindowList 按窗口号查 onscreen),未合成则再补一次 orderFrontRegardless
-  // ——震荡期结束后的重试必然成功。⚠️ 刻意不 makeKey(撤销方案 B 失败
-  // 模式③:makeKey 抢用户焦点→被夺回→resignKey 自动再隐藏)——用户点
-  // 面板内部一次后 becomeKey,失焦即退链随即激活。页面加载在等待期照常。
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+  // 初始上屏(首帧尺寸修正 Part 1,2026-11-28 三版):【延迟到首次 resize
+  // 到位】。背景:窗口出生=缺省高 560(--ph 缺省),页面渲染后量实际高度
+  // → resize → 窗口才缩放——此前 150ms 早屏会把 560 的空窗先闪出来再缩到
+  // 实际高度,用户反馈「点击瞬间出现大空白区域再缩到目标尺寸」。现改为
+  // 窗口创建后不上屏,置 awaitingFirstResize 等待;首次 resize 应用新高度
+  // (保持顶边固定)后经 showIfAwaitingFirstResize 真正上屏,首帧即正确
+  // 尺寸。上屏合成自检重试(verifyOnscreenRetry,二版机制见彼处注释:
+  // companion 托盘点击 spawn 撞系统 key/space 切换震荡期,orderFront 可能
+  // 落进「已注册但永不合成」的悬挂态)挂到真正上屏动作之后。⚠️ 刻意不
+  // makeKey(撤销方案 B 失败模式③:makeKey 抢用户焦点→被夺回→resignKey
+  // 自动再隐藏)——用户点面板内部一次后 becomeKey,失焦即退链随即激活。
+  // 页面加载在等待期照常。
+  self.awaitingFirstResize = YES;
+  // 兜底超时:1.2s 后若仍在等待(页面加载失败/resize 未到),按当前尺寸
+  // 直接上屏——面板不能永远不出现(正常路径 resize 先到,本块进来看到
+  // 位已清,零操作)。
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                  dispatch_get_main_queue(), ^{
-    [panel orderFrontRegardless];
-    [self verifyOnscreenRetry:1 forPanel:panel];
+    if (self.awaitingFirstResize) {
+      NSLog(@"panelwin: 1.2s 兜底上屏(resize 未到,页面加载失败?)");
+      [self showIfAwaitingFirstResize];
+    }
   });
 
   // 原生圆角(2026-11-28 用户反馈:CSS 的 --panel-radius 只作用内层 .panel
@@ -350,6 +382,23 @@
           (unsigned long)panel.occlusionState,
           panel.isKeyWindow ? 1 : 0);
   });
+}
+
+// showIfAwaitingFirstResize — 首次上屏的唯一入口(首帧尺寸修正 Part 1):
+// awaitingFirstResize 置位时 orderFrontRegardless 上屏+清位+合成自检重试
+// (verifyOnscreenRetry 挂到真正上屏动作之后);位已清(已上屏)零操作。
+// 两处调用:首次 resize 到位(resize 分派内,高度应用之后)、1.2s 兜底
+// 超时。⚠️ 刻意不 makeKey(见文件头激活面与初始上屏注释:抢用户焦点会被
+// 夺回,resignKey 自动再隐藏)。主线程专用(两处调用都在主 run loop),
+// 无并发面。
+- (void)showIfAwaitingFirstResize {
+  if (!self.awaitingFirstResize || !self.panel) {
+    return;
+  }
+  self.awaitingFirstResize = NO;
+  NSLog(@"panelwin: 首次上屏(等待位清,面板按当前高度出现)");
+  [self.panel orderFrontRegardless];
+  [self verifyOnscreenRetry:1 forPanel:self.panel];
 }
 
 // verifyOnscreenRetry:上屏合成自检+重试(「早屏+探测重试」二版;悬挂窗口

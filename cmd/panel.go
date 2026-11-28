@@ -59,6 +59,17 @@ func runPanel(cmd *cobra.Command, args []string) error {
 	openDashboard, _ := flags.GetString("open-dashboard")
 	openPeer, _ := flags.GetString("open-peer")
 
+	// 高度持久化(首帧尺寸修正 Part 2,2026-11-28 用户反馈「点击瞬间出现
+	// 大空白区域再缩到目标尺寸」):上次会话 resize 落盘的稳态逻辑高度优先
+	// 生效——launcher(app/tray/panel_bridge_m2.go)恒传缺省 560,--ph 恒
+	// 处于显式传入态,持久值不优先则机制是死代码;无效(缺文件/损坏/越界)
+	// 回落 flag 值(缺省 560)。窗口出生即正确尺寸,点击瞬间的空白闪变消失
+	// (跨次内容高度变化的残余闪变由壳侧「首次上屏延迟到首次 resize 到位」
+	// 兜住,panelwin_darwin.m / panelwin_windows.go)。
+	if persisted := panelwin.LoadLastPanelHeight(); persisted != panelwin.DefaultPanelH {
+		panelH = persisted
+	}
+
 	// 导航白名单锚点校验:--url 必须是回环 origin(非回环/解析失败直接
 	// 拒绝启动——面板等于无鉴权控制台,不得加载任何第三方内容,调研 §6.3
 	// 不变量)。origin 本体由壳内从 opts.URL 重新提取(两端壳各自 derive,

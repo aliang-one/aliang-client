@@ -44,6 +44,16 @@ import (
 	"aliang.one/nursorgate/common/logger"
 )
 
+// panelwinGoHeightChanged — 高度持久化的落盘回调(首帧尺寸修正 Part 2,
+// cgo 导出;.m 的 resize 分派在应用新高度后调用,声明见 panelwin_darwin.m
+// 文件头的 extern)。跑在 AppKit 主线程(cgo 回调自动注册线程),单文件
+// 小写入,不构成卡顿面;失败在 persistLastPanelHeight 内静默降级。
+//
+//export panelwinGoHeightChanged
+func panelwinGoHeightChanged(height C.double) {
+	persistLastPanelHeight(float64(height))
+}
+
 // AppKit 强约束:UI 事件循环必须在主线程。包 init 必然在主 goroutine 执行,
 // 钉住后 cgo 的 C.panelwin_run 跑在主线程——不钉则调度器可能把主 goroutine
 // 迁走,NSApp run 失效→windowDidResignKey 永不触发→失焦即退链死成僵尸

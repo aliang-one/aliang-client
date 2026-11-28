@@ -207,6 +207,92 @@ func TestPanelwinWindowsCloseOnDeactivate(t *testing.T) {
 	}
 }
 
+// TestPanelwinWindowsFirstFrameShow — 首帧尺寸修正(2026-11-28 用户反馈
+// 「点击瞬间出现大空白区域再缩到目标尺寸」)的 Windows 壳结构断言:
+//
+//  1. 主路径【不立即 ShowWindow】——窗口创建后保持隐藏,procShowWindow 全
+//     文件只在 showNow 闭包内出现一次(立即上屏会把缺省 560 高的空窗先闪
+//     出来,正是本次要消灭的形态);
+//  2. 首次 resize 分派 applyHeight 落窗后才经 showNow 上屏(首帧即正确尺寸),
+//     并同步 persistLastPanelHeight 落盘(高度持久化 Part 2);
+//  3. 1.2s 兜底:time.AfterFunc 经自定消息 WM_APP+2(wmAppPanelShow)投递回
+//     消息循环线程,wndProc 分派 panelShowWindow 执行同一 showNow(AfterFunc
+//     goroutine 不能直接动窗口,窗口 API 单线程语义)。
+//
+// GOOS 无关,只读源码文本(同上)。
+func TestPanelwinWindowsFirstFrameShow(t *testing.T) {
+	src := panelwinWindowsSource(t)
+
+	// ① showNow 闭包在册:唯一上屏入口(SetForegroundWindow/ShowWindow/
+	//    chromium.Focus 三件全在闭包内——焦点链不补齐则失焦即退失效)。
+	showIdx := strings.Index(src, "showNow := func(reason string) {")
+	if showIdx < 0 {
+		t.Fatal("panelwin_windows.go 缺 showNow 闭包(首次上屏入口不存在,首帧尺寸闪变回归)")
+	}
+	showBody := src[showIdx:]
+	if end := strings.Index(showBody, "\n\t}\n"); end >= 0 {
+		showBody = showBody[:end]
+	}
+	for _, want := range []string{
+		"procSetForegroundWindow.Call(hwnd)",
+		"procShowWindow.Call(hwnd, uintptr(swShow))",
+		"chromium.Focus()",
+	} {
+		if !strings.Contains(showBody, want) {
+			t.Fatalf("showNow 闭包缺 %q(上屏/焦点链不完整,失焦即退或键盘焦点回归):\n%s", want, showBody)
+		}
+	}
+
+	// ② 主路径不立即上屏:procShowWindow 全文件恰一次且都在 showNow 内;
+	//    上屏前的启动段(创建→Embed→Navigate)不得出现 ShowWindow。
+	if got := strings.Count(src, "procShowWindow.Call"); got != 1 {
+		t.Fatalf("procShowWindow.Call 出现 %d 次, want 恰 1 次(showNow 唯一入口——立即上屏=首帧闪缺省 560 高空白)", got)
+	}
+
+	// ③ 兜底链:WM_APP+2 常量 + AfterFunc 投递 + wndProc 分派 panelShowWindow。
+	if !regexp.MustCompile(`wmAppPanelShow\s+= wmApp \+ 2`).MatchString(src) {
+		t.Fatal("panelwin_windows.go 缺 wmAppPanelShow = wmApp+2 常量(兜底自定消息不存在)")
+	}
+	if !strings.Contains(src, "procPostMessageW.Call(hwnd, uintptr(wmAppPanelShow), 0, 0)") {
+		t.Fatal("panelwin_windows.go 缺兜底 PostMessageW 投递(AfterFunc goroutine 直接动窗口会跨线程)")
+	}
+	if !strings.Contains(src, "time.AfterFunc") {
+		t.Fatal("panelwin_windows.go 缺 1.2s 兜底 AfterFunc(resize 未到时面板永不出现)")
+	}
+	caseIdx := strings.Index(src, "case wmAppPanelShow:")
+	if caseIdx < 0 {
+		t.Fatal("panelwin_windows.go 缺 case wmAppPanelShow 分派(兜底消息无人消费)")
+	}
+	if !strings.Contains(src[caseIdx:], "panelShowWindow(") {
+		t.Fatalf("case wmAppPanelShow 未分派 panelShowWindow(兜底路径绕过唯一上屏入口):\n%s", src[caseIdx:caseIdx+200])
+	}
+
+	// ④ resize 分派:applyHeight 落窗之后 showNow 上屏 + persistLastPanelHeight
+	//    落盘(顺序锚——先改尺寸再上屏,首帧即正确尺寸)。
+	dispIdx := strings.Index(src, `if typ == "resize" {`)
+	if dispIdx < 0 {
+		t.Fatal("panelwin_windows.go 缺 resize 分派")
+	}
+	dispBody := src[dispIdx:]
+	if next := strings.Index(dispBody, "\n\t\t}"); next >= 0 {
+		dispBody = dispBody[:next]
+	}
+	applyIdx := strings.Index(dispBody, "applyHeight(height)")
+	persistIdx := strings.Index(dispBody, "persistLastPanelHeight(height)")
+	showCallIdx := strings.Index(dispBody, "showNow(")
+	if applyIdx < 0 || persistIdx < 0 || showCallIdx < 0 {
+		t.Fatalf("resize 分派缺落窗/落盘/上屏链(applyHeight=%d persistLastPanelHeight=%d showNow=%d):\n%s", applyIdx, persistIdx, showCallIdx, dispBody)
+	}
+	if showCallIdx < applyIdx {
+		t.Fatalf("showNow(%d) 必须在 applyHeight(%d) 之后(先落窗再上屏,首帧即正确尺寸)", showCallIdx, applyIdx)
+	}
+
+	// ⑤ panelShowWindow 注入口在册(wndProc 与 runPanelWindow 的接缝)。
+	if !strings.Contains(src, "var panelShowWindow func(reason string)") {
+		t.Fatal("panelwin_windows.go 缺 panelShowWindow 注入口(wndProc 兜底分派接不到 showNow)")
+	}
+}
+
 // panelwinWindowsSource 读取本包的 Windows 壳源码。
 func panelwinWindowsSource(t *testing.T) string {
 	t.Helper()
