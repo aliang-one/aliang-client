@@ -105,8 +105,14 @@
          [终端] = P1 xterm 现状。两 pane 恒挂载 v-show 显隐:xterm 不因切 Tab
          重初始化(保尺寸/保末屏),Replayer iframe 同理不被重建。 -->
     <div class="flex flex-1 flex-col overflow-hidden">
-      <!-- Tab 条:两粒小按钮,样式与顶栏按钮族一致 -->
-      <div class="flex shrink-0 items-center gap-1 border-b border-slate-800 bg-slate-900 px-2 py-1">
+      <!-- Tab 条:两粒小按钮,样式与顶栏按钮族一致。idle 态隐藏(P3 择一
+           定案):无会话时 [页面] 永远不会有画面可切,留着一个切过去只会看到
+           「等待画面同步」占位是误导;requested/active/ended 保留——requested
+           是「等审批」的常态形态,ended 遵循末屏保留口径。 -->
+      <div
+        v-if="state !== 'idle'"
+        class="flex shrink-0 items-center gap-1 border-b border-slate-800 bg-slate-900 px-2 py-1"
+      >
         <button
           type="button"
           :class="tabClass('page')"
@@ -180,14 +186,18 @@ import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 // rrweb Replayer(P2 Task 4):观看页把 admin 采集端中继来的 rrweb 事件流
 // 以 live 模式渲染进沙箱 iframe。v2.2.2 的规范入口就是主包 `rrweb`(其
-// export map "." → dist/rrweb.js 同时导出 record 与 Replayer),Replayer 的
-// 沙箱/鼠标轨迹样式在其 dist/style.css,需一并引入。
-import { Replayer } from 'rrweb';
+// export map "." → dist/rrweb.js 同时导出 record 与 Replayer)。
+// P3 懒加载:静态 import 会让 rrweb(+70KB gzip)进所有访问者的主包,而
+// 全站只有协助观看页用它——改为首次底座到达时动态 import(见 pageBoot 的
+// pendingBoot 缓冲,模块在途时底座/增量整段按序暂存,就绪后原序注入,语义
+// 与常驻模块一致)。dist/style.css 是独立 CSS 资产(沙箱/鼠标轨迹样式,
+// 不进 JS 主包),体积小,保留静态引入。
 import 'rrweb/dist/style.css';
 import { useI18n } from '../../i18n';
 import { useNavigation } from '../../composables/useNavigation';
 import { useEscLayer } from '../../composables/useEscStack';
 import { useAssist, assistEndReasonKey } from '../../composables/useAssist';
+import { applyPageMirrorLayout as applyPageMirrorLayoutTo } from '../../utils/assistPageMirror';
 
 const { t } = useI18n();
 const { showDashboard } = useNavigation();
@@ -226,6 +236,7 @@ const pageReady = ref(false);
 let term = null;
 let fit = null;
 let resizeObserver = null;
+let pageResizeObserver = null;
 let tickTimer = null;
 let startedAt = 0;
 let disposed = false;
@@ -238,10 +249,38 @@ let disposed = false;
 //     §帧族表:rr.event 事件增量「含 FullSnapshot 标记」,首连流量走这条);
 //   · 其余 rr.event 增量 → replayer 存在才 addEvent,无底座静默丢弃。
 let replayer = null;
+// rrweb 模块懒加载座(P3):动态 import 的结果缓存;null = 尚未就绪。
+let rrwebModule = null;
+// 在途 import promise(P3 评审 Fix 1):null = 无在途加载。失败置 null——
+// 首次 import 404(Vite 重新部署换 chunk hash 是现实触发器)不得把页面
+// 镜像永久闩死;并发双 import 无害(浏览器模块缓存去重),多余的
+// flushPendingBoot 对 !pendingBootEvents 空转 no-op。
+let rrwebLoading = null;
+// import 失败时刻(重试节流):续入路径的自动重试带 5s 冷却,防 404 以帧率
+// 打网络面板;新底座(用户可见的新页面)绕过冷却强制重试——恢复优先。
+let rrwebLoadFailedAt = 0;
+const RRWEB_RETRY_COOLDOWN = 5000;
+// 底座在途缓冲:rrweb 模块动态加载的窗口期内(通常几十 ms)到达的底座与
+// 增量整段按到达序暂存,模块就绪后(flushPendingBoot)原序注入——零丢帧,
+// 与模块常驻时的注入序列逐字节一致。非 null 即「有一次底座引导等模块」。
+// 有界(P3 评审 Fix 1):封顶 PENDING_BOOT_CAP 丢最老;裁掉底座(Meta+
+// FullSnapshot)则整段废弃回占位——无底座的半截缓冲灌进 Replayer 也渲染
+// 不出画面,留着只会吃内存。
+let pendingBootEvents = null;
+const PENDING_BOOT_CAP = 2000; // 与 frames 环形数组同量级
 // 底座前奏缓冲:Meta 事件(type 4)先行到达且尚无 Replayer 时暂存——Replayer
 // 的 iframe 尺寸由 Meta 定(handleResize 才把 iframe 从 display:none 放出来),
 // 缺 Meta 时以合成 Meta 兜底。
 let pendingPageMeta = null;
+// 最近一次注入的 Meta 视口尺寸(P3):Tab 切换/容器 resize 时据此恢复 iframe
+// 尺寸 + 按宽缩放(0×0 塌缩修复 + spec §9)。resetPageMirror 清。
+let pageMetaDims = null;
+// 镜像 sizer(P3 终审 Fix 2):pageHostEl 内常驻 div,rrweb 的 config.root 指
+// 向它(wrapper 长在里面),布局盒 = Meta×s + overflow hidden——裁剪边界必须
+// 住在不变换的层(见 assistPageMirror.js 头注的几何形状图),wrapper 自身
+// 保持 RAW Meta 布局 + 单层复合 transform。destroyReplayer 只摘 wrapper,
+// sizer 留着给下一次底座复用;组件卸载随 pageHostEl 一起没。
+let pageSizerEl = null;
 // rrweb 事件分型常量(EventType):Meta=4,FullSnapshot=2,增量=3。
 const RR_TYPE_FULL_SNAPSHOT = 2;
 const RR_TYPE_META = 4;
@@ -326,12 +365,32 @@ function initTerminal() {
     });
     resizeObserver.observe(hostEl.value);
   }
+  // 页面镜像容器观察(P3):v-show 显隐(display:none ↔ 实尺寸)与窗口
+  // resize 都会触发本 RO——一次观察同时覆盖「切回 [页面] 尺寸恢复」与
+  // 「窗口变化跟随缩放」两个时机。Tab 切换另有显式 nextTick 补一刀(watch
+  // activeTab),双保险:RO 回调与 v-show 生效的先后在个别浏览器有竞态,
+  // 显式时机保证确定性恢复(live E2E 实证塌缩的修复锚点)。
+  if (typeof ResizeObserver !== 'undefined' && pageHostEl.value) {
+    pageResizeObserver = new ResizeObserver(() => applyPageMirrorLayout());
+    pageResizeObserver.observe(pageHostEl.value);
+  }
+  // 窗口 resize 兜底:无 ResizeObserver 环境(jsdom/老内核)下仍跟随窗口
+  // 变化;有 RO 时与 RO 双触发,applyPageMirrorLayout 幂等,零副作用。
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', onWindowResizeForMirror);
+  }
+}
+
+function onWindowResizeForMirror() {
+  applyPageMirrorLayout();
 }
 
 // —— 页面镜像:rrweb Replayer ——
-// 载荷防御:rrweb 事件以 JSON 字符串坐 data 字段,坏 JSON / 非 object / 缺
-// 数值 type 一律跳过(记一条 warn),绝不向上抛——残帧连片到达时不能把整条
-// 帧流(含终端腿)拖死。
+// 载荷防御(P3 注释如实化):rrweb 事件以 JSON 字符串坐 data 字段。只有
+// 「字符串且非合法 JSON」这一种形态记 warn(可归因的坏帧,值得一条日志);
+// 非 object / 缺数值 type 直接静默 null——结构性残帧(如对象缺字段)连片
+// 到达时 warn 会刷屏,且无从归因。两条路都不向上抛:残帧不能把整条帧流
+// (含终端腿)拖死。
 function parseRrPayload(data) {
   let ev = data;
   if (typeof data === 'string') {
@@ -350,7 +409,11 @@ function synthMetaEvent() {
   return {
     type: RR_TYPE_META,
     timestamp: Date.now(),
-    data: { href: window.location.href, width: SYNTH_VIEWPORT.width, height: SYNTH_VIEWPORT.height },
+    // href 用 about:blank(P3 如实化):合成 Meta 的「页面」并不存在于任何
+    // URL——快照帧只带 FullSnapshot 不带 Meta 才走到这条兜底,抄观看页自身
+    // 的 location.href 会把「没 URL」伪造成「观看页 URL」,rrweb 的地址栏
+    // 展示件与后续按 href 的调试归因都会被误导。
+    data: { href: 'about:blank', width: SYNTH_VIEWPORT.width, height: SYNTH_VIEWPORT.height },
   };
 }
 
@@ -364,29 +427,108 @@ function destroyReplayer() {
   pageReady.value = false;
 }
 
-// 页面镜像整体重置:销毁 Replayer + 丢掉底座前奏缓冲。assist.nav(整页跳转,
-// admin 侧录制随文档生命周期中断、重建后重发全量快照)与新会话走这里。
+// 页面镜像整体重置:销毁 Replayer + 丢掉底座前奏缓冲与在途底座。assist.nav
+// (整页跳转,admin 侧录制随文档生命周期中断、重建后重发全量快照)与新会话
+// 走这里。rrweb 模块本体(已加载的动态 import)不卸载——重复 import 命中
+// 模块缓存,卸载没有收益。
 function resetPageMirror() {
   destroyReplayer();
   pendingPageMeta = null;
+  pendingBootEvents = null;
+  pageMetaDims = null;
+}
+
+// —— rrweb 懒加载(P3;失败恢复语义见评审 Fix 1)——
+// 首个底座到达时才动态 import。失败语义:catch 里置 rrwebLoading=null(在途
+// 标记复位)+ 记 rrwebLoadFailedAt(5s 重试冷却)——不闩死:缓冲续入路径每
+// 次(过冷却)都会 ensureRrwebLoading 重拉,新底座路径绕过冷却强拉。现实
+// 触发器:Vite 重新部署把旧 chunk hash 下架 → import 404。
+function ensureRrwebLoading(force = false) {
+  if (rrwebModule || disposed) return Promise.resolve(rrwebModule);
+  if (!rrwebLoading && (force || Date.now() - rrwebLoadFailedAt >= RRWEB_RETRY_COOLDOWN)) {
+    rrwebLoading = import('rrweb')
+      .then((mod) => {
+        rrwebModule = mod;
+        rrwebLoading = null;
+        return mod;
+      })
+      .catch((e) => {
+        rrwebLoading = null;
+        rrwebLoadFailedAt = Date.now();
+        console.warn('[assist-watch] rrweb 模块加载失败,页面镜像暂不可用(5s 冷却后随续入帧重试,新快照立即重试)', e);
+        return null;
+      });
+  }
+  return rrwebLoading || Promise.resolve(null);
+}
+
+// 缓冲封顶(P3 评审 Fix 1):超帽丢最老;裁掉底座(Meta+FullSnapshot 任一
+// 被裁掉)则整段废弃——半截缓冲无渲染价值,清空回占位,下一个新快照重新
+// 引导(并绕过冷却重试 import)。
+function trimPendingBoot() {
+  const buffer = pendingBootEvents;
+  if (!buffer || buffer.length <= PENDING_BOOT_CAP) return;
+  buffer.splice(0, buffer.length - PENDING_BOOT_CAP);
+  const hasBase = buffer.some((e) => e.type === RR_TYPE_META) &&
+    buffer.some((e) => e.type === RR_TYPE_FULL_SNAPSHOT);
+  if (!hasBase) pendingBootEvents = null;
+}
+
+// 在途底座续入:保序追加 + 封顶裁剪;模块仍未就绪且无在途加载(上次失败后
+// 过了冷却)时随本次续入重新拉起 import——失败不闩死的重试锚。forceRetry=
+// 续入的是带底座的新快照(终审 Minor-2):用户可见的新页面必须绕过冷却
+// 立即重试,与「新底座」路径(pageBoot 空开缓冲那一拍)同一意图。
+function appendPendingBoot(list, forceRetry = false) {
+  const buffer = pendingBootEvents;
+  if (!buffer) return;
+  buffer.push(...list);
+  trimPendingBoot();
+  if (pendingBootEvents && !rrwebModule) {
+    ensureRrwebLoading(forceRetry).then(flushPendingBoot);
+  }
+}
+
+// 模块就绪回调:把在途底座按原序灌进新建的 Replayer。pendingBootEvents 取空
+// 在前,bootWithModule 内部的 resetPageMirror 才不会把同一段缓冲再清一遍;
+// mod=null(import 失败)时保缓冲留给冷却后的续入重试。
+function flushPendingBoot(mod) {
+  if (disposed || !mod || !pendingBootEvents) return;
+  const list = pendingBootEvents;
+  pendingBootEvents = null;
+  bootWithModule(list);
 }
 
 // live 惯例建 Replayer(rrweb 文档口径):空事件数组初始化 → startLive(未来
-// baseline) → 之后一律 addEvent 注入。root 指进页面 pane 容器,wrapper/iframe
-// 都长在那。
+// baseline) → 之后一律 addEvent 注入。root 指向 sizer(不在变换的层上裁剪,
+// 几何形状见 assistPageMirror.js 头注),wrapper 长在 sizer 里。保持同步语义
+// (P3):调用方无一处需要 await——异步性被 pageBoot 的 pendingBoot 缓冲层
+// 吸收,ensureReplayer 只在模块已就绪时真正构造。
 // 两个非默认项(rrweb 2.2.2 本机实测,P2 冒烟定案):
 // ①useVirtualDom:false——默认 true 会把增量事件分流进永不挂载的虚拟树
 //   (Meta/FullSnapshot 走 rebuild 例外能渲染,增量画面恒不更新);
 // ②startLive(未来 baseline)——中继事件的时间戳来自 admin 采集时钟,若
 //   ≤ startLive 时刻会走 timer 排队按捕获时距延迟应用(慢数分钟),未来
 //   baseline 让一切事件走 isSync 同步分支,实时落地。
+function ensurePageSizer() {
+  if (disposed || !pageHostEl.value) return null;
+  if (!pageSizerEl || !pageSizerEl.isConnected) {
+    pageSizerEl = document.createElement('div');
+    pageSizerEl.setAttribute('data-testid', 'assist-watch-page-sizer');
+    pageHostEl.value.appendChild(pageSizerEl);
+  }
+  return pageSizerEl;
+}
+
 function ensureReplayer() {
-  if (replayer || disposed || !pageHostEl.value) return;
+  if (replayer || disposed || !pageHostEl.value || !rrwebModule) return;
+  const sizer = ensurePageSizer();
+  if (!sizer) return;
   try {
+    const { Replayer } = rrwebModule;
     replayer = new Replayer([], {
       liveMode: true,
       useVirtualDom: false,
-      root: pageHostEl.value,
+      root: sizer,
     });
     replayer.startLive(Date.now() + 3600_000);
     pageReady.value = true;
@@ -404,6 +546,7 @@ function addRrEvent(ev) {
     // timer 队列且 delay=NaN 永不应用(零报错)。真实 record 事件恒带戳;
     // 无戳事件(如调试注入)补当下,配合未来 baseline 走同步分支实时落地。
     if (!ev.timestamp) ev.timestamp = Date.now();
+    if (ev.type === RR_TYPE_META) noteMetaDims(ev); // Meta 尺寸跟踪(恢复+缩放真源)
     replayer.addEvent(ev);
     return true;
   } catch (e) {
@@ -412,23 +555,76 @@ function addRrEvent(ev) {
   }
 }
 
+// Meta 尺寸提取:非正数(残帧/未知形态)不覆盖旧值——恢复语义宁可用上一份
+// 已知好尺寸,也不要 0×0。
+function noteMetaDims(ev) {
+  const w = ev?.data?.width;
+  const h = ev?.data?.height;
+  if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
+    pageMetaDims = { width: w, height: h };
+  }
+}
+
+// 尺寸恢复 + 按宽缩放施加(P3):0×0 塌缩修复的主入口。调用时机=底座注入
+// 完成后、Tab 切到 [页面](nextTick 后)、页面容器 ResizeObserver、窗口
+// resize、会话中 Meta 更新(评审 Fix 3)——共同点是「pane 刚从隐藏/未知
+// 尺寸状态回来、容器变了、或尺寸真源变了」。pane 隐藏时 clientWidth=0,
+// scale 庇护回 1,但 Meta 尺寸恢复仍然执行——这正是塌缩修复的本体:0 宽
+// 容器里先把 iframe 撑回 Meta 尺寸,等容器再次可见时 RO 再补上缩放。
+function applyPageMirrorLayout() {
+  if (!replayer) return;
+  const host = pageHostEl.value;
+  const sizer = pageSizerEl;
+  if (!host || !sizer) return;
+  applyPageMirrorLayoutTo(replayer, sizer, host.clientWidth, pageMetaDims);
+}
+
 // 底座引导:按序注入 lead(可为空)+ 底座事件。底座集里缺 Meta 就补(缓冲的
 // 真 Meta 优先,合成兜底)——Meta 决定 iframe 尺寸,缺了画面恒不可见。
+// P3:rrweb 模块未就绪时整段(withMeta)转 pendingBoot 缓冲并触发加载,就绪
+// 后 flushPendingBoot 原序灌入。在途缓冲已存在时后续 pageBoot 只续尾(list
+// 原样追加)——引导逻辑(补 Meta/缺 FullSnapshot 拒收)只适用于「开一次新
+// 底座」,对已在途的底座套用会误拒增量续尾帧。绕冷却强拉的两拍(评审 Fix 1
+// + 终审 Minor-2,同一意图:用户可见的新页面,恢复优先):缓冲空开的新底座;
+// 缓冲在途(含失败残留)时续入的「Meta+FullSnapshot 成对」新快照。
 function pageBoot(events) {
   const list = Array.isArray(events) ? events.filter(Boolean) : [];
   if (!list.length) return;
+  if (pendingBootEvents) {
+    const freshBase = list.some((e) => e.type === RR_TYPE_META) &&
+      list.some((e) => e.type === RR_TYPE_FULL_SNAPSHOT);
+    appendPendingBoot(list, freshBase);
+    return;
+  }
   const hasMeta = list.some((e) => e.type === RR_TYPE_META);
   const withMeta = hasMeta ? list : [pendingPageMeta || synthMetaEvent(), ...list];
   if (!withMeta.some((e) => e.type === RR_TYPE_FULL_SNAPSHOT)) return; // 无底座渲染不出
+  if (!rrwebModule) {
+    pendingBootEvents = withMeta;
+    ensureRrwebLoading(true).then(flushPendingBoot);
+    return;
+  }
+  bootWithModule(withMeta);
+}
+
+function bootWithModule(withMeta) {
   resetPageMirror(); // 重建语义:旧 Replayer 销毁,从新底座长出新画面
   ensureReplayer();
   if (!replayer) return;
   for (const ev of withMeta) addRrEvent(ev);
+  applyPageMirrorLayout(); // 注入完立即按当前容器施加一次(首帧即正确尺寸/缩放)
 }
 
 function handleRrEvent(frame) {
   const ev = parseRrPayload(frame.data);
   if (!ev) return;
+  // 底座在途(模块加载窗口):一切 rr 事件按到达序续入缓冲(封顶+失败重试
+  // 锚都在 appendPendingBoot),保序零丢帧;此时「无 Replayer 丢增量」的老
+  // 语义不存在分歧面。
+  if (pendingBootEvents) {
+    appendPendingBoot([ev]);
+    return;
+  }
   if (ev.type === RR_TYPE_META && !replayer) {
     pendingPageMeta = ev; // 底座前奏,等 FullSnapshot 一同注入
     return;
@@ -437,7 +633,13 @@ function handleRrEvent(frame) {
     pageBoot([ev]); // spec 帧族表:FullSnapshot 可经 rr.event 走(首连流量)
     return;
   }
-  if (replayer) addRrEvent(ev); // 无底座的增量静默丢弃(等快照重建)
+  if (replayer) {
+    // Meta 更新(admin 侧窗口变了)→ noteMetaDims 已随 addRrEvent 刷新尺寸
+    // 真源,立即重施加一次布局(P3 评审 Fix 3:idempotent,不重施加会留
+    // 旧缩放比直到下一次 Tab 切换/resize)。
+    const injected = addRrEvent(ev);
+    if (injected && ev.type === RR_TYPE_META) applyPageMirrorLayout();
+  } // 无底座的增量静默丢弃(等快照重建)
 }
 
 // 快照载荷:单事件对象或事件数组均可,线上形态是 JSON 字符串——先整体
@@ -580,6 +782,12 @@ watch(state, (next) => {
     endConfirming.value = false;
     syncTimer(); // 停表,冻结在 ended 时的秒数
   }
+  if (next === 'idle') {
+    // idle + 用户正停在 [页面](P3 评审 Fix 4):Tab 条已随 idle 隐藏,
+    // activeTab 停在 page 会留下无退出口的占位 pane(只剩顶栏返回)——
+    // 拨回 [终端],idle 的「无进行中的协助」覆盖层在终端 pane 上,退路完整。
+    activeTab.value = 'terminal';
+  }
 });
 
 // 重连判定:曾 open 且再次 open = 新连接(服务端重发整段 ring 回放)。
@@ -595,11 +803,23 @@ watch(
   () => { processFrames(); },
 );
 
+// Tab 切到 [页面](P3):nextTick 后补一刀尺寸恢复+缩放。这是 0×0 塌缩的
+// 确定性修复锚——pane 隐藏期间 iframe 被浏览器塌缩,显式在显示生效后把
+// Meta 尺寸写回(live E2E 实证:手动重设尺寸立即恢复画面)。
+watch(activeTab, (next) => {
+  if (next !== 'page') return;
+  nextTick(applyPageMirrorLayout);
+});
+
 onUnmounted(() => {
   disposed = true;
   if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
   if (actionErrorTimer) { clearTimeout(actionErrorTimer); actionErrorTimer = null; }
   if (resizeObserver) { resizeObserver.disconnect(); resizeObserver = null; }
+  if (pageResizeObserver) { pageResizeObserver.disconnect(); pageResizeObserver = null; }
+  if (typeof window !== 'undefined' && window.removeEventListener) {
+    window.removeEventListener('resize', onWindowResizeForMirror);
+  }
   if (term) { term.dispose(); term = null; }
   destroyReplayer(); // 含沙箱 iframe 的整个 wrapper 随 destroy 移除
   stopPolling();
