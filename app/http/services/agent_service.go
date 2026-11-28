@@ -145,6 +145,11 @@ type agentState struct {
 	LastSyncStatus  string              `json:"last_sync_status,omitempty"`
 	LastSyncMessage string              `json:"last_sync_message,omitempty"`
 
+	// PendingRebindUser 非空表示:检测到登录身份与本机已绑定账号不一致,但换绑
+	// 被搁置等属主确认(NET-01 验收②:非本机属主的账号在仪表盘登录后不能把
+	// 设备换绑走)。值是「想换绑到的账号」的 user key。
+	PendingRebindUser string `json:"pending_rebind_user,omitempty"`
+
 	// ScanDirectories 限制上传到云端的扫描范围：开启后只有这些目录下的
 	// 项目和会话才会被扫描并上传。空或 ScanDirectoriesEnabled=false 表示不过滤。
 	ScanDirectories        []string `json:"scan_directories,omitempty"`
@@ -530,6 +535,58 @@ func (s *AgentService) SetScanDirectoriesConfig(dirs []string, enabled bool) ([]
 	return cleaned, enabled, err
 }
 
+// ConfirmRebind 让本机属主显式放行「换绑到另一个账号」。
+//
+// NET-01 验收②:非本机属主的账号在这台仪表盘登录后不能把设备换绑走。此前
+// ReRegisterIfUserIdentityChanged 检测到身份不一致就无条件清空注册状态并用
+// 新身份重新注册。现在它只记 PendingRebindUser 并断开远端,等这个方法放行。
+//
+// 调用方(agent handler)负责鉴权:必须是本机回环请求或有效的仪表盘会话。
+func (s *AgentService) ConfirmRebind() (models.AgentStatusResponse, error) {
+	s.mu.Lock()
+	authHeader, userKey, _ := s.resolveForwardedUserContextLocked("", "")
+	if authHeader == "" {
+		s.mu.Unlock()
+		return models.AgentStatusResponse{}, errors.New("log in before confirming a rebind")
+	}
+	currentUserKey := agentRegistrationUserKey(userKey, authHeader)
+	pending := strings.TrimSpace(s.state.PendingRebindUser)
+	if pending == "" {
+		// 没有待换绑:幂等,按当前身份正常启用。
+		s.mu.Unlock()
+		return s.enableWithUserContext(authHeader, userKey)
+	}
+	if pending != currentUserKey {
+		s.mu.Unlock()
+		return models.AgentStatusResponse{}, fmt.Errorf("pending rebind targets %q but current login is %q", pending, currentUserKey)
+	}
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] identity_changed rebind_confirmed registered_user=%s current_user=%s device_id=%s",
+		s.state.RegisteredUser, currentUserKey, s.state.DeviceID))
+	s.state.PendingRebindUser = ""
+	s.state.Device = nil
+	s.state.Registered = false
+	s.state.RemoteConnected = false
+	s.state.RegisteredUser = ""
+	_ = s.saveStateLocked()
+	s.mu.Unlock()
+	return s.enableWithUserContext(authHeader, userKey)
+}
+
+// RejectRebind 让属主拒绝换绑:清掉待换绑标记,保持原绑定。
+func (s *AgentService) RejectRebind() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.PendingRebindUser == "" {
+		return
+	}
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] identity_changed rebind_rejected keeping registered_user=%s",
+		s.state.RegisteredUser))
+	s.state.PendingRebindUser = ""
+	s.state.LastSyncStatus = "rebind_rejected"
+	s.state.LastSyncMessage = "Rebind to a different account was rejected on this device."
+	_ = s.saveStateLocked()
+}
+
 func (s *AgentService) Enable() (models.AgentStatusResponse, error) {
 	return s.EnableWithAuthorization("")
 }
@@ -780,12 +837,31 @@ func (s *AgentService) ReRegisterIfUserIdentityChanged() {
 	registered := s.state.Registered
 	mismatch := registered && registeredUser != "" && registeredUser != currentUserKey
 	if mismatch {
-		logger.Info(fmt.Sprintf("[AGENT-BOOT] identity_changed re-registering registered_user=%s current_user=%s device_id=%s",
+		// NET-01 验收②:换绑到不同账号必须经属主确认。此前无条件清空注册状态
+		// 并用新身份重新注册——任何能在这台仪表盘登录自己账号的人,都能把这台
+		// 设备绑走。现在只记录「待换绑」,等 /api/agent/confirm-rebind 放行。
+		// 同一账号内的身份修正(fallback 身份 → 真 JWT)仍即时生效,不受影响:
+		// 那类场景 currentUserKey 会等于 registeredUser 的规范化形式。
+		if s.state.PendingRebindUser == currentUserKey {
+			// 已记录过,不重复写盘。
+			s.mu.Unlock()
+			return
+		}
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] identity_changed rebind_pending registered_user=%s current_user=%s device_id=%s",
 			registeredUser, currentUserKey, s.state.DeviceID))
-		s.state.Device = nil
-		s.state.Registered = false
+		s.state.PendingRebindUser = currentUserKey
+		s.state.LastSyncStatus = "rebind_pending"
+		s.state.LastSyncMessage = "Login identity differs from the account this device is bound to. Confirm the rebind on this device to continue."
+		s.state.Enabled = false
 		s.state.RemoteConnected = false
-		s.state.RegisteredUser = ""
+		_ = s.saveStateLocked()
+		s.mu.Unlock()
+		s.forceDisconnectRemote("rebind_pending")
+		return
+	}
+	if s.state.PendingRebindUser != "" && !mismatch {
+		// 身份回到已绑定账号:清掉待换绑标记。
+		s.state.PendingRebindUser = ""
 		_ = s.saveStateLocked()
 	}
 	s.mu.Unlock()

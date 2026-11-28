@@ -306,6 +306,8 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/status", h.Agent.HandleStatus, http.MethodGet)
 	register("/api/agent/sync", h.Agent.HandleSync, http.MethodPost)
 	register("/api/agent/enable", h.Agent.HandleEnable, http.MethodPost)
+	register("/api/agent/confirm-rebind", h.Agent.HandleConfirmRebind, http.MethodPost)
+	register("/api/agent/reject-rebind", h.Agent.HandleRejectRebind, http.MethodPost)
 	register("/api/agent/auth-recover", h.Agent.HandleAuthRecover, http.MethodPost)
 	register("/api/agent/reconnect", h.Agent.HandleReconnect, http.MethodPost)
 	register("/api/agent/disable", h.Agent.HandleDisable, http.MethodPost)

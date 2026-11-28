@@ -531,6 +531,43 @@ func (h *AgentHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	common.Success(w, h.service.Status())
 }
 
+// HandleConfirmRebind 让本机属主放行「换绑到另一个账号」(NET-01 验收②)。
+// 鉴权:必须是本机回环请求,或持有效仪表盘会话——与其它管理面写操作同口径。
+func (h *AgentHandler) HandleConfirmRebind(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	if !middleware.IsLoopbackRequest(r) && !middleware.RequireDashboardSession(w, r) {
+		return
+	}
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	resp, err := h.service.ConfirmRebind()
+	if err != nil {
+		writeAgentServiceError(w, "Failed to confirm rebind", err)
+		return
+	}
+	common.Success(w, resp)
+}
+
+// HandleRejectRebind 让本机属主拒绝换绑,保持原绑定。
+func (h *AgentHandler) HandleRejectRebind(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	if !middleware.IsLoopbackRequest(r) && !middleware.RequireDashboardSession(w, r) {
+		return
+	}
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	h.service.RejectRebind()
+	common.Success(w, h.service.Status())
+}
+
 func (h *AgentHandler) HandleEnable(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)

@@ -177,6 +177,10 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	// 2026-10-21 liang-dev 同族）。
 	mux.Handle("/api/agent/auth-recover", wrapAgentBusyRoute(agentHandler.HandleAuthRecover))
 	mux.Handle("/api/agent/disable", wrapAgentBusyRoute(agentHandler.HandleDisable))
+	// NET-01 验收②:换绑放行/拒绝——与 core 侧同路由集合(route parity 测试守着)。
+	// 鉴权在 handler 内:本机回环或有效仪表盘会话。
+	mux.Handle("/api/agent/confirm-rebind", wrapAgentBusyRoute(agentHandler.HandleConfirmRebind))
+	mux.Handle("/api/agent/reject-rebind", wrapAgentBusyRoute(agentHandler.HandleRejectRebind))
 	mux.HandleFunc("/api/agent/reconnect", agentHandler.HandleReconnect)
 	mux.HandleFunc("/api/agent/session-event", agentHandler.HandleSessionEvent)
 	mux.HandleFunc("/api/agent/tools", agentHandler.HandleTools)
