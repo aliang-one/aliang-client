@@ -4,7 +4,7 @@ import { useNavigation } from './useNavigation';
 import { slashProviderFor } from '../utils/chatProvider';
 import { applyConversationTitle, canRenameConversation, normalizeConversationTitle } from '../utils/chatTitle';
 import { showErrorDialog } from './useErrorDialog';
-import { noteChatFirstText } from '../utils/chatTiming';
+import { noteChatFirstText, noteChatSubsequentText, configureChatTimingSender } from '../utils/chatTiming';
 import { useAuthStore } from '../stores/auth';
 import { uploadChatAttachment } from '../services/agentApi';
 
@@ -2760,7 +2760,10 @@ export function useAliangChat() {
             console.log('[aliang-chat] frame', parsed.type, parsed.type === 'ai.delta' ? `len=${(parsed.delta || '').length}` : '');
           }
         }
-        const timingReceipt = globalThis.__CHAT_TIMING__ === true &&
+        // SYNC-02:上屏打点默认开启(开销 = 每个 ai.delta 帧一次 performance.now()
+        // + 一次 WeakMap 读写),不再要求 __CHAT_TIMING__ 调试开关——P95 要在
+        // 真实使用中统计。显式设为 false 可关。
+        const timingReceipt = globalThis.__CHAT_TIMING__ !== false &&
           parsed?.type === 'ai.delta' && parsed.agent_emitted_at_ms !== undefined
           ? performance.now() : undefined;
         handleAIEvent(parsed, timingReceipt);
@@ -2884,6 +2887,10 @@ export function useAliangChat() {
     }
     return false;
   }
+  // SYNC-02:把上屏时序的上行通道接到 sendAI(utils 不反向依赖 composable)。
+  configureChatTimingSender(payload => {
+    sendAI(payload);
+  });
 
   // 断线终态画法：仅重连自愈失败/超限后调用。只把「本端发送在途」的活跃
   // 会话画成中断——管道真断在我们自己的请求上，错误可操作（重发即重试）。
@@ -4171,6 +4178,7 @@ export function useAliangChat() {
         conv.snapshotCatchupAt = 0;
         if (timingReceipt !== undefined && matchedById && conv.id === activeId.value) {
           noteChatFirstText(asst, e, timingReceipt);
+          noteChatSubsequentText(e);
         }
         asst.content += delta;
         scrollToBottom();
