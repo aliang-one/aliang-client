@@ -1457,8 +1457,9 @@ func (s *AgentService) remoteConnectionSnapshot() (remoteConnectionIdentity, boo
 func (s *AgentService) setRemoteConnectionState(connected bool, status string, message string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.setRemoteConnectionStateLocked(connected, status, message)
-	_ = s.saveStateLocked()
+	if s.setRemoteConnectionStateLocked(connected, status, message) {
+		_ = s.saveStateLocked()
+	}
 }
 
 // touchRemoteConnectionOnline 活性触达的免落盘变体(高频臂专用,rrweb 页面
@@ -1473,7 +1474,34 @@ func (s *AgentService) touchRemoteConnectionOnline() {
 	s.mu.Unlock()
 }
 
-func (s *AgentService) setRemoteConnectionStateLocked(connected bool, status string, message string) {
+// setRemoteConnectionStateLocked 应用连接状态迁移,返回 needsSave=是否发生了
+// 需要落盘的语义变化(P3 dirty-check)。
+//
+// 语义边界(读代码定案,勿凭直觉改):state 的**全部**字段——remote_connected/
+// registered/last_sync_at/last_sync_status/last_sync_message/device.status/
+// device.last_seen_at——都持久化在 agent_state.json,没有「天然不落盘」的字段;
+// dirty 判别的是「语义迁移」而非「字节差异」:
+//   - 判别式 = (RemoteConnected, LastSyncStatus, LastSyncMessage) 三元组变化
+//     ∨ (connected=true 时 Registered 尚未置位——置位是持久化语义,且
+//     touchRemoteConnectionOnline 免落盘臂可能先把 connected 置真而漏翻
+//     Registered,此时后续 setRemoteConnectionState 必须补一次落盘);
+//   - LastSyncAt / Device.LastSeenAt 是新鲜度戳:每次调用照常刷新**内存**
+//     (Status() 面实时),但只在语义变化时随落盘持久化——持久化的
+//     last_sync_at 自此口径为「最后一次语义迁移时间」,不再是「最后一条
+//     消息时间」。活性表达由 heartbeat + 内存快照承载(touch 臂同口径,
+//     先例在案);
+//   - Device.Status/LastSeenAt 跟随 connected 翻转,已被三元组的
+//     RemoteConnected 维度覆盖,无需单列。
+//
+// 家族级收益:handleRemoteAgentMessage 几乎每条下行帧(terminal.input 每击键、
+// rrweb 中继每帧、heartbeat/ack 每拍)都先调 setRemoteConnectionState——
+// 三元组稳定期(连接常态)整段流量零落盘,只有真实迁移(上线/掉线/错误)
+// 才写盘。
+func (s *AgentService) setRemoteConnectionStateLocked(connected bool, status string, message string) bool {
+	needsSave := s.state.RemoteConnected != connected ||
+		s.state.LastSyncStatus != status ||
+		s.state.LastSyncMessage != message ||
+		(connected && !s.state.Registered)
 	s.state.RemoteConnected = connected
 	if connected {
 		s.state.Registered = true
@@ -1490,6 +1518,7 @@ func (s *AgentService) setRemoteConnectionStateLocked(connected bool, status str
 		}
 		s.state.Device.LastSeenAt = s.state.LastSyncAt
 	}
+	return needsSave
 }
 
 func (s *AgentService) agentHelloPayload() map[string]interface{} {
