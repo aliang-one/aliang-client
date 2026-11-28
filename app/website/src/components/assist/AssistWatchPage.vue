@@ -400,6 +400,10 @@ function ensureReplayer() {
 function addRrEvent(ev) {
   if (!replayer) return false;
   try {
+    // 时间戳防御:rrweb live 的 isSync 判定读 event.timestamp,缺值会落进
+    // timer 队列且 delay=NaN 永不应用(零报错)。真实 record 事件恒带戳;
+    // 无戳事件(如调试注入)补当下,配合未来 baseline 走同步分支实时落地。
+    if (!ev.timestamp) ev.timestamp = Date.now();
     replayer.addEvent(ev);
     return true;
   } catch (e) {
