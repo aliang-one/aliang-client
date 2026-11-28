@@ -13,8 +13,9 @@ import (
 
 // panelCmd — 托盘面板原生壳子命令(实现计划 M2 Task 13)。由托盘
 // companion(Task 15 launcher)spawn,不作为用户入口(Hidden);进程即
-// 面板本身:失焦自退/quit 退出,退出码契约见 panelwin.go(0=失焦自退、
-// 60=quit,其余=崩溃→launcher 重拉/兜底)。
+// 面板本身:首次后常驻(方案 B 2026-11-28)——点击 toggle 可见⇄隐藏、
+// 失焦=隐藏、隐藏满 10 分钟空闲回收 exit(0)、quit 消息 exit(60),退出码
+// 契约见 panelwin.go(0=正常关闭、60=quit,其余=崩溃→launcher 重拉/兜底)。
 //
 // ⚠️ 依赖闭包纪律:本文件 darwin||windows 才编译,internal/panelwin 不得
 // 进入 Linux 上 ./cmd/aliang 的依赖闭包(cmd/linux_closure_test.go

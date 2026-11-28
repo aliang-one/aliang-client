@@ -16,8 +16,11 @@ import (
 // app/tray/systray_darwin_patch_test.go 先例——本包不依赖那个包,辅助函数
 // 就地复制)。钉住的是「壳的物理形态」四件事:
 //
-//  1. 失焦即退链路:windowDidResignKey → exit(0)(不激活则永不触发,所以
-//     激活面 makeKeyAndOrderFront + NSApp activate 也一并钉住);
+//  1. 生命周期链路(2026-11-28 用户拍板方案 B「首次后常驻」):
+//     windowDidResignKey → orderOut 隐藏(不再 exit(0));toggle 入口
+//     panelwin_toggle(dispatch_async 派发主线程)→ panelSetHidden 单一改口
+//     → 导出回调 panelwinGoVisibilityChanged 回传 Go(空闲回收计时);
+//     显示复活面 makeKeyAndOrderFront + NSApp activate 一并钉住;
 //  2. 毛玻璃归系统材质层:NSVisualEffectView(behindWindow)铺底 +
 //     WKWebView drawsBackground=false(KVC 私有面)+ NSPanel opaque=false
 //     ——前端 hosted 态只画半透明底(Task 7 评审固化),壳不透明底色会
@@ -32,7 +35,7 @@ import (
 //     与 PATCH_NOTES);全文件零裸 autorelease 消息(ARC 下对象生命周期
 //     确定性,面板进程存活即对象存活,不需要手工 autorelease);
 //  5. 主线程钉定:panelwin_darwin.go 必须 runtime.LockOSThread——AppKit
-//     UI 事件循环必须在主线程,不钉则 NSApp run 失效、失焦即退链死成僵尸;
+//     UI 事件循环必须在主线程,不钉则 NSApp run 失效、失焦隐藏链死成僵尸;
 //  6. 畸形 payload 守卫:type/kind 提取先过 isKindOfClass:[NSString class]
 //     闸({"type":123} 这类形态走「未知忽略」,不得 unrecognized selector 崩);
 //  7. 原生圆角(2026-11-28 用户反馈):contentView layer wantsLayer/
@@ -43,23 +46,52 @@ import (
 func TestPanelwinDarwinShellStructure(t *testing.T) {
 	src := panelwinDarwinSource(t)
 
-	t.Run("失焦即退与激活面", func(t *testing.T) {
+	t.Run("常驻生命周期与激活面", func(t *testing.T) {
 		for _, want := range []string{
 			"windowDidResignKey",                     // NSWindowDelegate 失焦回调
 			"exit(60)",                               // quit 消息退出码 60
-			"makeKeyAndOrderFront",                   // 不取焦点则失焦即退永不触发
+			"makeKeyAndOrderFront",                   // 显示复活面:不取焦点则次级失焦链永不触发
 			"activateIgnoringOtherApps:YES",          // 同上:程序化激活(12.0 可用,14 起弃用仍有效)
 			"NSWindowStyleMaskNonactivatingPanel",    // 不抢宿主焦点
 			"NSApplicationActivationPolicyAccessory", // 无 Dock 图标
 		} {
 			if !strings.Contains(src, want) {
-				t.Errorf("panelwin_darwin.m 缺少 %q(失焦即退/激活链路不完整)", want)
+				t.Errorf("panelwin_darwin.m 缺少 %q(常驻生命周期/激活链路不完整)", want)
 			}
 		}
-		// 失焦自退 exit(0) 用正则锚:精确字面量对空白变体(exit ( 0 ))会
-		// 误报缺失,钉的是「零参 exit 调用」这个形态本身。
-		if !regexp.MustCompile(`exit\s*\(\s*0\s*\)`).MatchString(src) {
-			t.Errorf("panelwin_darwin.m 缺少 exit(0)(失焦自退,退出码契约 0)")
+	})
+
+	t.Run("方案 B:失焦=隐藏+toggle+可见性回传", func(t *testing.T) {
+		// 失焦=隐藏(不再 exit(0)):resignKey 必须落 panelSetHidden:YES
+		// (orderOut 驻留),退出码 0 不再由失焦产生(空闲回收/孤儿自检在
+		// Go 侧)。可见性单一改口 panelSetHidden + 回传 Go 的导出回调 +
+		// toggle C 入口的 dispatch_async 派发,三件缺一即链断。
+		for _, want := range []string{
+			"panelSetHidden",                           // 可见性单一改口(toggle 与 resignKey 共用)
+			"[self panelSetHidden:YES]",                // resignKey → 隐藏(失焦=隐藏)
+			"orderOut",                                 // 隐藏动作(驻留不退出)
+			"panelwinGoVisibilityChanged",              // 可见性回传 Go(空闲回收计时入口)
+			"panelwin_toggle",                          // toggle C 入口(SIGUSR1 经此进主线程)
+			"dispatch_async(dispatch_get_main_queue()", // 信号 handler goroutine 不碰 UI,派发主线程
+		} {
+			if !strings.Contains(src, want) {
+				t.Errorf("panelwin_darwin.m 缺少 %q(方案 B 常驻链断裂)", want)
+			}
+		}
+		// 反向锚:失焦即退已废除——resignKey 方法体内不得再直接 exit
+		// (剥注释后断言,注释里的历史引述不算;方法体截到下一个 ObjC
+		// 方法声明为止)。
+		resignIdx := strings.Index(src, "windowDidResignKey:")
+		if resignIdx < 0 {
+			t.Fatal("panelwin_darwin.m 缺 windowDidResignKey")
+		}
+		resignBody := src[resignIdx:]
+		if next := strings.Index(src[resignIdx:], "\n- ("); next >= 0 {
+			resignBody = src[resignIdx : resignIdx+next]
+		}
+		code := stripObjcComments(resignBody)
+		if regexp.MustCompile(`exit\s*\(\s*0\s*\)`).MatchString(code) {
+			t.Errorf("panelwin_darwin.m 的 resignKey 仍在 exit(0)(方案 B:失焦=隐藏,不再退出):\n%s", resignBody)
 		}
 	})
 
@@ -196,10 +228,39 @@ func TestPanelwinDarwinShellStructure(t *testing.T) {
 		// AppKit 强约束:UI 事件循环必须在主线程。包 init 必然在主 goroutine
 		// 执行,runtime.LockOSThread 钉住后 cgo 的 C.panelwin_run 才跑在主
 		// 线程——不钉则调度器可能把主 goroutine 迁走,NSApp run 失效,
-		// 失焦即退整条链死成僵尸(非崩溃,launcher 崩溃计数看不见)。
+		// 失焦隐藏整条链死成僵尸(非崩溃,launcher 崩溃计数看不见)。
 		goSrc := panelwinDarwinGoSource(t)
 		if !strings.Contains(goSrc, "LockOSThread") {
-			t.Errorf("panelwin_darwin.go 缺少 runtime.LockOSThread(主 goroutine 未钉主线程,NSApp run 失效→失焦即退链死成僵尸)")
+			t.Errorf("panelwin_darwin.go 缺少 runtime.LockOSThread(主 goroutine 未钉主线程,NSApp run 失效→失焦链死成僵尸)")
+		}
+	})
+
+	t.Run("方案 B Go 侧接线:toggle 信号+空闲回收+孤儿自检", func(t *testing.T) {
+		goSrc := panelwinDarwinGoSource(t)
+		for _, want := range []string{
+			"signal.Notify(ch, syscall.SIGUSR1)",           // toggle 信号接收(SIGUSR1 专用契约见 app/tray 投递侧)
+			"C.panelwin_toggle()",                          // handler goroutine → cgo toggle(ObjC 内派发主线程)
+			"//export panelwinGoVisibilityChanged",         // ObjC → Go 可见性回传(空闲回收计时入口)
+			"panelIdle.SetHidden",                          // 回传喂控制器
+			"panelOrphanWatchdog(nil, os.Getppid, os.Exit", // 孤儿自检起跑(ppid==1 → exit 0)
+			"startPanelToggleHandler()",                    // Run 路径起跑(常驻形态首帧前就位)
+			"startPanelOrphanWatchdog()",
+		} {
+			if !strings.Contains(goSrc, want) {
+				t.Errorf("panelwin_darwin.go 缺少 %q(方案 B Go 侧接线断裂)", want)
+			}
+		}
+		// 信号 handler 只能在 Run(面板进程路径)注册:包级 init 会波及同
+		// 二进制的 companion(静默吞 SIGUSR1)。只扫 init 函数体(截到首个
+		// 顶层闭括号),不波及文件尾部 Run 路径的合法注册。
+		if idx := strings.Index(goSrc, "func init()"); idx >= 0 {
+			initBody := goSrc[idx:]
+			if end := strings.Index(initBody, "\n}"); end >= 0 {
+				initBody = initBody[:end]
+			}
+			if strings.Contains(initBody, "signal.Notify") {
+				t.Errorf("panelwin_darwin.go 的 init() 里注册了 SIGUSR1 handler(会波及同二进制 companion,须移到 Run 路径)")
+			}
 		}
 	})
 
@@ -264,8 +325,10 @@ func TestPanelwinDarwinResizeFollow(t *testing.T) {
 }
 
 // poolWrappedEntries — 会被 Go goroutine 所在线程直接调到的 C 入口:
-// 函数体必须整体包一层 @autoreleasepool(结构测试逐个校验)。
-var poolWrappedEntries = []string{"panelwin_run"}
+// 函数体必须整体包一层 @autoreleasepool(结构测试逐个校验)。panelwin_toggle
+// 是方案 B 的 toggle 入口(signal handler goroutine 直调,dispatch_async
+// 派发主线程——Go goroutine 线程无 pool,纪律见文件头)。
+var poolWrappedEntries = []string{"panelwin_run", "panelwin_toggle"}
 
 // noOwnPoolNeeded — 不需要自持 pool 的静态辅助函数:只被已包 pool 的
 // 入口内部调用,其 autoreleased 结果在调用方的 pool 里排空。

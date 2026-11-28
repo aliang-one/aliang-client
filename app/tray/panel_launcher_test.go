@@ -23,17 +23,26 @@ func (c *fakeClock) Now() time.Time { return c.now }
 func (c *fakeClock) Advance(d time.Duration) { c.now = c.now.Add(d) }
 
 // fakeChild ChildProcess 测试替身:Kill 只计数;Wait 返回永不触发的通道
-// (真实退出由测试直呼 childExited 走状态机,不经通道)。
+// (真实退出由测试直呼 childExited 走状态机,不经通道);Pid 返回自增流水号
+// (toggle 信号投递地址断言用,每次 newFakeChild 唯一)。
 type fakeChild struct {
+	pid   int
 	kills int
 	wait  chan int
 }
 
-func newFakeChild() *fakeChild { return &fakeChild{wait: make(chan int, 1)} }
+var fakeChildSeq int
+
+func newFakeChild() *fakeChild {
+	fakeChildSeq++
+	return &fakeChild{pid: 1000 + fakeChildSeq, wait: make(chan int, 1)}
+}
 
 func (c *fakeChild) Wait() <-chan int { return c.wait }
 
 func (c *fakeChild) Kill() { c.kills++ }
+
+func (c *fakeChild) Pid() int { return c.pid }
 
 // scheduledRetry 截获的一条重拉调度(delay 到期动作)。
 type scheduledRetry struct {
@@ -50,6 +59,8 @@ type launcherHarness struct {
 	spawnOpts   []SpawnOpts
 	liveChild   *fakeChild // 最近一次成功 spawn 的 child
 	spawnErr    error      // 非 nil = 下一次 spawn 返回该错误
+	toggledPids []int      // toggle 发送记录(成功与失败都记账)
+	toggleErr   error      // 非 nil = 下一次 toggle 发送返回该错误(子进程已死形态)
 	fallbacks   int
 	quits       int
 	focusCloses int
@@ -67,6 +78,13 @@ func newLauncherHarness() *launcherHarness {
 			}
 			h.liveChild = newFakeChild()
 			return h.liveChild, nil
+		},
+		toggle: func(pid int) error {
+			h.toggledPids = append(h.toggledPids, pid)
+			if h.toggleErr != nil {
+				return h.toggleErr
+			}
+			return nil
 		},
 		opts: func() SpawnOpts {
 			return SpawnOpts{URL: "http://127.0.0.1:56431/panel.html", PanelW: 340, PanelH: 560}
@@ -157,9 +175,11 @@ func TestPanelLauncherExitClassification(t *testing.T) {
 	}
 }
 
-// TestPanelLauncherNormalOpenClose 正常开合:未开→spawn;已开→Kill(标有意
-// 收起);有意收起退出后可再次打开,全程零惩罚。
-func TestPanelLauncherNormalOpenClose(t *testing.T) {
+// TestPanelLauncherClickOpenThenToggleSendsSignal 正常开合(方案 B「首次后
+// 常驻」):未开 → spawn;已开 → 发 toggle 信号(不 Kill,可见⇄隐藏由子进程
+// 自理,launcher 不跟踪可见性);toggle 成功不产生退出事件,子进程保持
+// 在册,后续点击继续 toggle(瞬时开合,不重复 spawn)。
+func TestPanelLauncherClickOpenThenToggleSendsSignal(t *testing.T) {
 	h := newLauncherHarness()
 	h.launcher.Click()
 	if h.spawnCalls != 1 {
@@ -168,30 +188,136 @@ func TestPanelLauncherNormalOpenClose(t *testing.T) {
 	if got := h.spawnOpts[0]; got.URL != "http://127.0.0.1:56431/panel.html" || got.PanelW != 340 || got.PanelH != 560 {
 		t.Fatalf("spawn 参数透传失真:%+v", got)
 	}
+	child := h.lastChild()
 
-	h.launcher.Click() // 再点 = 收起
-	if h.lastChild().kills != 1 {
-		t.Fatalf("已开状态点击未 Kill:kills=%d", h.lastChild().kills)
+	h.launcher.Click() // 再点 = toggle(隐藏)
+	if len(h.toggledPids) != 1 || h.toggledPids[0] != child.pid {
+		t.Fatalf("已开状态点击未发 toggle:pids=%v want [%d]", h.toggledPids, child.pid)
 	}
-	h.launcher.childExited(0, 5*time.Second, true) // 有意收起的退出
-	if len(h.scheduled) != 0 || h.fallbacks != 0 || h.focusCloses != 0 {
-		t.Fatalf("有意收起被惩罚:scheduled=%d fallback=%d focus=%d", len(h.scheduled), h.fallbacks, h.focusCloses)
+	if child.kills != 0 {
+		t.Fatalf("已开状态点击 Kill 了子进程(方案 B 禁止):kills=%d", child.kills)
+	}
+	if len(h.scheduled) != 0 || h.fallbacks != 0 || h.focusCloses != 0 || h.quits != 0 {
+		t.Fatalf("toggle 成功产生了退出事件:scheduled=%d fallback=%d focus=%d quit=%d",
+			len(h.scheduled), h.fallbacks, h.focusCloses, h.quits)
 	}
 
-	h.launcher.Click() // 收起后可再开
-	if h.spawnCalls != 2 {
-		t.Fatalf("收起后未重新 spawn:spawnCalls=%d", h.spawnCalls)
+	h.launcher.Click() // 再点 = toggle(显示):子进程仍在册
+	if len(h.toggledPids) != 2 || h.toggledPids[1] != child.pid {
+		t.Fatalf("子进程未保持跟踪(被误清/误换):pids=%v", h.toggledPids)
+	}
+	if h.spawnCalls != 1 {
+		t.Fatalf("toggle 点击误 spawn(重复面板):spawnCalls=%d", h.spawnCalls)
 	}
 }
 
-// TestPanelLauncherDoubleClickToggleNotCounted 快速双击 toggle 不计数:第二次
-// 点击落在已开态 → Kill 标有意收起,即便退出呈信号死亡形态(exit −1)也走
-// 正常关闭;随后两次真崩溃不触发兜底(若 toggle 被误计,即凑满 3 次失败)。
+// TestPanelLauncherToggleFailureFallsBackToSpawn toggle 发送失败(子进程已死
+// ——「崩溃已死未转投」探测之后死亡的窗口)→ 按无子处理:清跟踪状态 +
+// 立即 spawn,绝不 Kill(方案 B 主流程零 Kill)。回退后新子取得独立 pid,
+// 后续点击 toggle 新子。
+func TestPanelLauncherToggleFailureFallsBackToSpawn(t *testing.T) {
+	h := newLauncherHarness()
+	h.launcher.Click()
+	first := h.lastChild()
+
+	h.toggleErr = errors.New("os: process already finished")
+	h.launcher.Click() // toggle 发送失败:回退 spawn
+	if h.spawnCalls != 2 {
+		t.Fatalf("toggle 失败未回退 spawn:spawnCalls=%d", h.spawnCalls)
+	}
+	if first.kills != 0 {
+		t.Fatalf("toggle 失败路径 Kill 了死子进程:kills=%d", first.kills)
+	}
+	if len(h.scheduled) != 0 || h.fallbacks != 0 {
+		t.Fatalf("toggle 失败回退被惩罚:scheduled=%d fallback=%d", len(h.scheduled), h.fallbacks)
+	}
+
+	h.toggleErr = nil
+	h.launcher.Click() // 新子:toggle 用新 pid
+	if len(h.toggledPids) != 2 || h.toggledPids[1] != h.lastChild().pid {
+		t.Fatalf("回退后 toggle 未对准新子:pids=%v want 尾=%d", h.toggledPids, h.lastChild().pid)
+	}
+}
+
+// TestPanelLauncherStaleReportAfterToggleFailureYields 迟到的旧子报告让位:
+// toggle 失败回退 spawn 后新子已在册,旧子崩溃码此刻才经接线层送达——
+// childExitedIfCurrent 的身份闸必须让位:不清掉新子引用(否则下次点击误判
+// 「未开」重复 spawn 出双面板)、不把旧崩溃计入新会话(排重拉会被新子在册
+// 二次校验挡住,但 quit 码会误触发退出闸)。
+func TestPanelLauncherStaleReportAfterToggleFailureYields(t *testing.T) {
+	h := newLauncherHarness()
+	h.launcher.Click()
+	old := h.lastChild()
+
+	h.toggleErr = errors.New("os: process already finished")
+	h.launcher.Click() // 回退 spawn,新子在册
+	if h.spawnCalls != 2 {
+		t.Fatalf("前置回退未 spawn:spawnCalls=%d", h.spawnCalls)
+	}
+
+	old.wait <- 1 // 旧子崩溃码迟到送达(真实形态:转投 goroutine 一直阻塞在此)
+	h.launcher.childExitedIfCurrent(old, 1, time.Second, false)
+
+	if h.lastChild() == nil {
+		t.Fatal("迟到的旧子报告清掉了新子引用(下次点击会重复 spawn 双面板)")
+	}
+	if len(h.scheduled) != 0 {
+		t.Fatalf("迟到的旧子报告被计入新会话:scheduled=%d", len(h.scheduled))
+	}
+
+	h.toggleErr = nil
+	h.launcher.Click() // 新子仍在册:继续 toggle,不重复 spawn
+	if h.spawnCalls != 2 {
+		t.Fatalf("身份闸失效导致重复 spawn:spawnCalls=%d", h.spawnCalls)
+	}
+}
+
+// TestPanelLauncherIdleExitZeroRecycles 隐藏态空闲回收(方案 B):子进程
+// 隐藏满 10 分钟自退 exit(0) → launcher 记正常关闭零惩罚,子进程回收,
+// 下次 Click 重新 spawn(可见性状态不残留)。
+func TestPanelLauncherIdleExitZeroRecycles(t *testing.T) {
+	h := newLauncherHarness()
+	h.launcher.Click()
+	h.launcher.Click() // toggle 隐藏(成功,无退出事件)
+
+	h.launcher.childExited(0, 10*time.Minute, false) // idle 回收退出
+	if len(h.scheduled) != 0 || h.fallbacks != 0 {
+		t.Fatalf("idle 回收被惩罚:scheduled=%d fallback=%d", len(h.scheduled), h.fallbacks)
+	}
+
+	h.launcher.Click() // 回收后重新 spawn
+	if h.spawnCalls != 2 {
+		t.Fatalf("idle 回收后未重新 spawn:spawnCalls=%d", h.spawnCalls)
+	}
+}
+
+// TestPanelLauncherToggleNilYields toggle 未装配的缺陷守卫:让位不发信号
+// 不 spawn 不崩(与 spawnAttemptLocked 的 nil-spawn 守卫同风格);真实装配
+// 必装(newPanelLauncher 注入 panelToggleSender)。
+func TestPanelLauncherToggleNilYields(t *testing.T) {
+	h := newLauncherHarness()
+	h.launcher.toggle = nil
+	h.launcher.Click()
+	if h.spawnCalls != 1 {
+		t.Fatalf("首次点击未 spawn:spawnCalls=%d", h.spawnCalls)
+	}
+	h.launcher.Click() // toggle 未装配:让位
+	if h.spawnCalls != 1 || len(h.toggledPids) != 0 || h.lastChild().kills != 0 {
+		t.Fatalf("nil toggle 未让位:spawn=%d toggles=%d kills=%d",
+			h.spawnCalls, len(h.toggledPids), h.lastChild().kills)
+	}
+}
+
+// TestPanelLauncherDoubleClickToggleNotCounted 快速双击不计数:第二次点击落在
+// 已开态 → toggle 成功无退出事件;随后两次真崩溃不触发兜底(toggle 与回退
+// 均不计失败,若误计即凑满 3 次兜底)。
 func TestPanelLauncherDoubleClickToggleNotCounted(t *testing.T) {
 	h := newLauncherHarness()
 	h.launcher.Click()
-	h.launcher.Click() // 双击第二下 = 收起
-	h.launcher.childExited(-1, 120*time.Millisecond, true)
+	h.launcher.Click() // 双击第二下 = toggle(隐藏)
+	if len(h.scheduled) != 0 {
+		t.Fatalf("toggle 成功被误计:scheduled=%d", len(h.scheduled))
+	}
 
 	h.crashExit(1 * time.Second)
 	h.crashExit(1 * time.Second)
@@ -268,9 +394,12 @@ func TestPanelLauncherFallbackRetryRecovers(t *testing.T) {
 	if h.spawnCalls != 2 {
 		t.Fatalf("正常态 Retry 误 spawn:spawnCalls=%d", h.spawnCalls)
 	}
-	h.launcher.Click() // 回正常态:点击恢复 toggle 语义
-	if h.lastChild().kills != 1 {
-		t.Fatalf("恢复后点击未收起:kills=%d", h.lastChild().kills)
+	h.launcher.Click() // 回正常态:已开点击 = toggle(方案 B)
+	if len(h.toggledPids) == 0 || h.toggledPids[len(h.toggledPids)-1] != h.lastChild().pid {
+		t.Fatalf("恢复后点击未发 toggle:pids=%v", h.toggledPids)
+	}
+	if h.lastChild().kills != 0 {
+		t.Fatalf("恢复后点击 Kill 了子进程(方案 B 禁止):kills=%d", h.lastChild().kills)
 	}
 }
 
@@ -467,9 +596,9 @@ func TestPanelLauncherSpawnPanicBecomesCrash(t *testing.T) {
 	if h.spawnCalls != 2 || h.lastChild() == nil {
 		t.Fatalf("panic 后重拉未恢复开面板:calls=%d", h.spawnCalls)
 	}
-	h.launcher.Click() // 状态机未挂死:再点 = 收起
-	if h.lastChild().kills != 1 {
-		t.Fatalf("panic 后状态机挂死:kills=%d", h.lastChild().kills)
+	h.launcher.Click() // 状态机未挂死:再点 = toggle(方案 B)
+	if len(h.toggledPids) == 0 || h.toggledPids[len(h.toggledPids)-1] != h.lastChild().pid {
+		t.Fatalf("panic 后状态机挂死(未发 toggle):pids=%v", h.toggledPids)
 	}
 }
 
@@ -530,34 +659,6 @@ func TestPanelLauncherClickOnCrashedButUnforwardedChildSpawns(t *testing.T) {
 	h.firePendingRetry(t)
 	if h.spawnCalls != 2 {
 		t.Fatalf("已作废的重拉到期仍二次 spawn:calls=%d", h.spawnCalls)
-	}
-}
-
-// TestPanelLauncherClickWindowHonorsPriorKillFlag 窗口内代行收尸时
-// killedByUs 如实传递:前次点击已对存活面板 Kill(有意收起打标),面板信号
-// 死亡(exit −1)但退出码未转投——此窗内的下一次点击消费退出码代行收尸,
-// 分诊须携原标记(信号死亡归正常关闭零惩罚零重拉),随后本次点击按「开」
-// 语义 spawn。
-func TestPanelLauncherClickWindowHonorsPriorKillFlag(t *testing.T) {
-	h := newLauncherHarness()
-	h.launcher.Click()
-	child := h.lastChild()
-	h.launcher.Click() // 第一击:收起(killedByUs 打标 + Kill)
-	if child.kills != 1 {
-		t.Fatalf("前置收起未 Kill:kills=%d", child.kills)
-	}
-	child.wait <- -1 // 信号死亡,退出码落地未转投
-	if child.kills != 1 {
-		t.Fatalf("窗口内点击误 Kill 死进程:kills=%d", child.kills)
-	}
-
-	h.launcher.Click() // 收起未转投窗口内的点击:代行收尸 + 开
-	if h.spawnCalls != 2 {
-		t.Fatalf("崩溃窗口内点击未立即 spawn:calls=%d", h.spawnCalls)
-	}
-	if len(h.scheduled) != 0 || h.fallbacks != 0 || h.focusCloses != 0 || h.quits != 0 {
-		t.Fatalf("携原标记的有意收起被惩罚:scheduled=%d fallback=%d focus=%d quit=%d",
-			len(h.scheduled), h.fallbacks, h.focusCloses, h.quits)
 	}
 }
 

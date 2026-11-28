@@ -2,16 +2,21 @@ package tray
 
 // companion M2 面板接线(2026-11-26 托盘面板 M2 Task 15):托盘图标点击 →
 // launcher 状态机(Task 14)→ spawn 本机可执行文件的 panel 子命令(进程即
-// 面板:失焦自退 / quit 退出 / 崩溃,退出码契约见 internal/panelwin.go)。
+// 面板;退出码契约见 internal/panelwin.go:0=正常关闭、60=quit、其余=崩溃)。
+// 2026-11-28 用户拍板方案 B「首次后常驻」:首次点击 spawn,之后点击发
+// toggle 信号(可见⇄隐藏,进程不退);失焦=隐藏不再退出;隐藏满 10 分钟
+// 子进程 idle 回收 exit(0)。
 // M1 的浏览器形态(panel_bridge.go)被取代:面板模式点图标 = launcher.Click,
 // 不再开浏览器;openPanelURLInBrowser 与 installPanelBridge 保留(M1 行为不变,
 // 浏览器打开能力仍可被其它路径复用)。
 //
 // 平台差异收敛在 panel_spawn_darwin.go / panel_spawn_windows.go 两个 shim:
 //   - spawn:macOS 直接 exec(**无收割机制**,companion 先退时面板成孤儿,
-//     依赖失焦自退退出——计划评审次#13);Windows 三件套 CREATE_SUSPENDED →
-//     AllowSetForegroundWindow → Resume + Job KILL_ON_JOB_CLOSE(companion
-//     退出收割面板进程)。
+//     依赖壳内孤儿自检(ppid==1 → exit 0)退出——计划评审次#13 + 方案 B);
+//     Windows 三件套 CREATE_SUSPENDED → AllowSetForegroundWindow → Resume +
+//     Job KILL_ON_JOB_CLOSE(companion 退出收割面板进程)。
+//   - toggle 投递(方案 B):macOS=SIGUSR1(专用信号,其他组件不得占用);
+//     Windows=FindWindowW 面板窗口类名 + PostMessageW WM_APP+1。
 //   - 锚定:两平台共用本文件的判废纯函数(Task 4 探针硬要求:状态项窗口有
 //     约 800ms 占位期,占位矩形形态 (0,-33) 且 ok=true——**现取现用**(点击
 //     时取,launcher 每次 spawn 前经 opts 口重新采样),禁止启动早期缓存;
@@ -55,6 +60,12 @@ const (
 	// 2×11=22(与 cmd/panel.go 的 --w/--h flag 缺省 22 同值)。
 	panelCursorFallbackHalfSize = 11
 )
+
+// panelWindowClassName 面板壳窗口类名(companion 侧 FindWindowW 定位 toggle
+// 投递的唯一纽带,方案 B):与 internal/panelwin/panelwin_windows.go 的注册
+// 类名逐字一致(不 import,理由见 panel_launcher.go 文头闭包纪律;跨文件
+// 漂移由 TestPanelM2ToggleChannelContract 锚定把守)。
+const panelWindowClassName = "AliangPanelWindow"
 
 // —— 注入口(测试替身;缺省形态见各 var 注释)——
 
@@ -222,9 +233,14 @@ func (a *CompanionApp) newPanelLauncher() *PanelLauncher {
 			go a.forwardPanelExit(child)
 			return child, nil
 		},
-		opts: a.panelSpawnOpts,
-		// onFocusFallback 面板失焦自退(code=0)的可选项,最小实现:空。
-		// 零惩罚语义由状态机保证,无需额外可见面(面板模式本就由点击 toggle)。
+		// toggle 信号投递(方案 B「首次后常驻」):平台 shim(darwin=
+		// SIGUSR1 / windows=FindWindow+PostMessage WM_APP+1)。launcher
+		// 锁外调用,实现只做一次系统调用,无自锁面。
+		toggle: panelToggleSender,
+		opts:   a.panelSpawnOpts,
+		// onFocusFallback code=0 正常关闭(idle 回收)的可选项,最小实现:
+		// 空。零惩罚语义由状态机保证,无需额外可见面(面板模式本就由点击
+		// toggle)。
 		onFocusFallback: func() {},
 		onFallback:      a.enterPanelFallback,
 		onQuitRequested: func() { panelQuitInvoker(a) },
@@ -247,10 +263,11 @@ func (a *CompanionApp) installPanelLauncher() {
 }
 
 // forwardPanelExit 子进程退出转投(接线层契约,panel_launcher.go 文件头):
-// child.Wait() 的退出码 → exitReport(必须先于 childExited——childExited
-// 清 spawnedAt,错序则 alive 恒 0 静默失效)→ childExited(code, alive,
-// killedByUs)。跑在 spawn 闭包的裸 go goroutine 上(状态机不防御回调
-// panic),整体包 recover 留痕——转投链异常不得炸托盘 companion。
+// child.Wait() 的退出码 → exitReport(必须先于分诊——分诊清 spawnedAt,
+// 错序则 alive 恒 0 静默失效)→ childExitedIfCurrent(身份闸:toggled 失败
+// 回退后迟到的旧子报告让位,不清新子不误计;killedByUs 兼容通道恒 false)。
+// 跑在 spawn 闭包的裸 go goroutine 上(状态机不防御回调 panic),整体包
+// recover 留痕——转投链异常不得炸托盘 companion。
 func (a *CompanionApp) forwardPanelExit(child ChildProcess) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -259,7 +276,7 @@ func (a *CompanionApp) forwardPanelExit(child ChildProcess) {
 	}()
 	code := <-child.Wait()
 	alive, killedByUs := a.panelLauncher.exitReport()
-	a.panelLauncher.childExited(code, alive, killedByUs)
+	a.panelLauncher.childExitedIfCurrent(child, code, alive, killedByUs)
 }
 
 // —— 兜底切换与恢复 ——
@@ -308,15 +325,16 @@ func (a *CompanionApp) handlePanelOpenClick() {
 
 // osExecChild ChildProcess 的 os/exec 实现:Wait 返回退出码通道(进程退出后
 // 送达一次),Kill 杀进程(os.Process.Kill:darwin=SIGKILL 信号死亡 exit −1,
-// windows=TerminateProcess)。
+// windows=TerminateProcess;兼容保留——方案 B 主流程不再调用,launcher 零
+// Kill),Pid 取 toggle 信号投递地址。
 type osExecChild struct {
 	cmd  *exec.Cmd
 	wait chan int
 }
 
 // startPanelChild 启动命令并挂退出码 goroutine:ExitCode() 对信号死亡返回
-// −1(kill -9 有意收起的信号态亦落此,由 killedByUs 标记在状态机里兜成
-// 正常关闭,零惩罚);等待本身失败按崩溃码 1 处置。
+// −1(外部 kill -9 的信号态落此,按崩溃分诊——分类逻辑不变);等待本身
+// 失败按崩溃码 1 处置。
 func startPanelChild(cmd *exec.Cmd) (ChildProcess, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, err
@@ -337,9 +355,12 @@ func startPanelChild(cmd *exec.Cmd) (ChildProcess, error) {
 // Wait 退出码通道(契约:关闭/送达即进程退出;本实现恒送达一次)。
 func (c *osExecChild) Wait() <-chan int { return c.wait }
 
-// Kill 杀进程(点图标收起路径;退出码形态由 killedByUs 标记兜住)。
+// Kill 杀进程(兼容保留;方案 B 主流程零 Kill——点击 toggle 化)。
 func (c *osExecChild) Kill() {
 	if c.cmd.Process != nil {
 		_ = c.cmd.Process.Kill()
 	}
 }
+
+// Pid 子进程 pid(cmd.Start 成功后 Process 恒非 nil,toggle 投递地址)。
+func (c *osExecChild) Pid() int { return c.cmd.Process.Pid }

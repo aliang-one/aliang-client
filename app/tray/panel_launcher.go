@@ -8,15 +8,18 @@ import (
 
 // 面板 launcher 生命周期状态机(M1 计划 Task 14,纯逻辑)。
 //
-// 职责:托盘图标点击 → spawn 面板原生壳(cmd/panel,进程即面板:失焦自退 /
-// quit 退出 / 崩溃,退出码契约见 internal/panelwin.go 与 cmd/panel.go——
-// 0=失焦自退、60=quit、其余=崩溃),并按拍板 1「只兜崩溃」做失败判定:
+// 职责:托盘图标点击 → spawn 面板原生壳(cmd/panel,进程即面板),并按
+// 拍板 1「只兜崩溃」做失败判定。2026-11-28 用户拍板方案 B「首次后常驻」:
+// 首次点击 spawn,之后每次点击发 toggle 信号(可见⇄隐藏,进程不退,瞬时
+// 开合);失焦=隐藏(不再退出);隐藏满 10 分钟子进程自退 exit(0) 空闲
+// 回收。退出码契约见 internal/panelwin.go 与 cmd/panel.go——0=正常关闭
+// (现由 idle 回收与销毁收尾产生)、60=quit、其余=崩溃:
 //
-//   - 崩溃 = code != 0 && code != 60 且非主动 Kill(kill -9 的信号死亡
-//     exit −1 亦落入;spawn 本身 fork/exec 失败同罪)→ 记失败 1 次 +
-//     1s 后重拉;
-//   - code == 0(失焦自退,分派 onFocusFallback)与 killedByUs(点图标
-//     收起)= 正常关闭,零惩罚零重拉;
+//   - 崩溃 = code != 0 && code != 60 且非 killedByUs(外部 kill -9 的
+//     信号死亡 exit −1 亦落入;spawn 本身 fork/exec 失败同罪)→ 记失败
+//     1 次 + 1s 后重拉;
+//   - code == 0(idle 回收/销毁收尾,分派 onFocusFallback)与 killedByUs
+//     (兼容通道,主流程不再打标)= 正常关闭,零惩罚零重拉;
 //   - 10 分钟滑窗内 3 次崩溃 → onFallback()(菜单接回,Task 15)+ 停拉
 //     (进兜底态,Click 无效);
 //   - 存活 >60s 的成功会话清零失败滑窗;
@@ -24,6 +27,14 @@ import (
 //     既有 quit 闸);
 //   - 兜底态仅 RetryFromFallback 可退出(「打开面板」菜单项)并立即
 //     spawn 一次。
+//
+// toggle 语义(方案 B):Click 对「有子」不发 Kill,只经 toggle 注入口
+// 投递信号(darwin=SIGUSR1 / windows=FindWindow+PostMessage WM_APP+1,
+// 平台 shim 见 panel_spawn_darwin.go / panel_spawn_windows.go)。可见/隐藏
+// 状态由子进程自理,launcher 不跟踪;隐藏态子进程不再产生退出事件——
+// 「有子」判断与 toggle 发送失败回退是唯一状态源。发送失败(子进程已死)
+// → 按无子处理:清跟踪状态 + 立即 spawn;迟到的旧子退出报告经
+// childExitedIfCurrent 的身份闸让位(不得清掉新子、不得误计)。
 //
 // 【三条裁定】(计划未明说,本实现按此拍板并经测试锚定):
 //
@@ -44,16 +55,17 @@ import (
 //     注入同步/截获版手工触发到期动作;
 //   - 滑窗与存活起点经注入 now(缺省 time.Now);now 注入禁 panic(真实
 //     形态为缺省 time.Now/测试 fakeClock,不会 panic;自定义实现须遵守);
-//   - 子进程退出由接线层(Task 15)转投 childExited(code, alive,
-//     killedByUs),alive 用 time.Since(spawn 起点),killedByUs 取
-//     exitReport() 的有意收起标记;
+//   - toggle 经注入桩(缺省 nil=装配缺陷守卫让位,真实装配必装);
+//   - 子进程退出由接线层(Task 15)转投 childExitedIfCurrent(child,
+//     code, alive, killedByUs),alive 用 time.Since(spawn 起点),
+//     killedByUs 兼容通道恒 false(主流程不再 Kill);
 //   - 并发面:Click(托盘点击 goroutine)/ childExited(退出转投)/
 //     RetryFromFallback(菜单点击)互并发,mu 保护全部状态。spawn/opts
 //     在锁内调用、有意设计(消灭 Click/retryNow 双 spawn 间隙):装配层
 //     注入的实现禁同步回调本状态机任何方法(否则自锁——Go 非重入锁,含
 //     经日志等间接回呼状态机方法);本状态机对二者 panic 兜底转崩溃计数
-//     (见 spawnAttempt),不外漏。on* 回调与 scheduleRetry 钩子一律在
-//     锁外触发。
+//     (见 spawnAttempt),不外漏。on* 回调与 scheduleRetry/toggle 钩子
+//     一律在锁外触发。
 //
 // 纯逻辑、无构建标签、GOOS 无关:不 import internal/panelwin(其无 Linux
 // 形态,app/tray 引用会破 Linux 依赖闭包闸,见 cmd/panel.go 闭包纪律),
@@ -84,10 +96,16 @@ const (
 )
 
 // ChildProcess 面板子进程最小接口:Wait 返回退出码通道(关闭/送达即进程
-// 退出),Kill 杀进程。实现契约:两方法不得同步回调 PanelLauncher。
+// 退出),Kill 杀进程,Pid 取 toggle 信号投递地址。实现契约:三方法不得
+// 同步回调 PanelLauncher。Kill 保留兼容但 launcher 主流程不再调用(方案 B
+// toggle 化,零 Kill);外部 kill -9 的信号死亡仍按崩溃分诊(分类逻辑不变)。
 type ChildProcess interface {
 	Wait() <-chan int
 	Kill()
+	// Pid 子进程 pid:spawn 返回后即稳定可读。darwin toggle 走
+	// SIGUSR1(pid 投递);windows toggle 走 FindWindow+PostMessage(类名
+	// 定位,忽略 pid——签名统一为 func(pid int) error)。
+	Pid() int
 }
 
 // SpawnOpts 面板启动参数,字段名与 cmd/panel.go 的 flags 一一对应(Task 15
@@ -123,6 +141,10 @@ type PanelLauncher struct {
 
 	// spawn 面板进程注入口(Task 15 装配 exec;测试注入替身)。
 	spawn func(SpawnOpts) (ChildProcess, error)
+	// toggle 信号投递注入口(方案 B):对存活子进程发可见⇄隐藏 toggle。
+	// 缺省 nil = 装配缺陷守卫让位(真实装配必装 panelToggleSender);返回
+	// 非 nil 错误 = 投递失败(子进程已死),Click 按无子处理回退 spawn。
+	toggle func(pid int) error
 	// opts 启动参数现取口:每次 spawn 前调用(锚定坐标现取现用)。
 	opts func() SpawnOpts
 	// now 时钟注入口,缺省 time.Now(测试注入假钟)。
@@ -133,26 +155,29 @@ type PanelLauncher struct {
 
 	// onFallback 滑窗满 3 崩回调:菜单接回 + 「打开面板」恢复项(Task 15)。
 	onFallback func()
-	// onFocusFallback 面板失焦自退(code=0,非有意收起)回调:刷新「面板
-	// 已关」可见面。零惩罚,与崩溃兜底无关。
+	// onFocusFallback code=0 正常关闭回调(idle 回收/销毁收尾;方案 B 下
+	// 失焦=隐藏不再产生退出):刷新「面板已关」可见面。零惩罚,与崩溃
+	// 兜底无关。
 	onFocusFallback func()
 	// onQuitRequested 面板 quit 退出意图回调(Task 15 对到既有 quit 闸)。
 	onQuitRequested func()
 
 	// —— 状态(mu 保护)——
 	phase        panelLaunchPhase // 当前相
-	child        ChildProcess     // 存活面板(nil=未开/重拉窗/兜底)
+	child        ChildProcess     // 在册面板(nil=未开/重拉窗/兜底)。方案 B 下含隐藏态子进程(隐藏不退出),「有子」判断与 toggle 失败回退是唯一状态源
 	spawnedAt    time.Time        // 存活起点(接线层算 alive 用)
-	killedByUs   bool             // 点图标有意收起标记(Click 打标,exitReport 取走)
+	killedByUs   bool             // 有意收起标记(兼容通道:主流程不再打标,恒 false;分类逻辑保留防外部信号死亡误判归零惩罚)
 	pendingRetry func()           // 挂起的重拉到期动作真登记(调度重拉时置 retryNow);nil=无挂起,迟到的旧 fire 见 nil 即让位(作废=Click/兜底/Retry 置 nil)
 	crashTimes   []time.Time      // 崩溃滑窗(入窗即 prune)
 }
 
-// Click 托盘图标点击入口:未开 → spawn;已开 → Kill(标有意收起,退出走
-// 正常关闭零惩罚);兜底态无效(不发 spawn 不报错,仅 RetryFromFallback
-// 可恢复);重拉 1s 延迟窗内视为「未开」→ 立即 spawn 并作废挂起重拉
-// (裁定 2);「崩溃已死未转投」窗口内视为「未开」→ 消费退出码代行收尸
-// (原样分诊,崩溃照计)后立即 spawn。
+// Click 托盘图标点击入口(方案 B「首次后常驻」):未开 → spawn;已开 →
+// 发 toggle 信号(可见⇄隐藏,进程不退,可见性子进程自理,launcher 不 Kill
+// 不跟踪可见性);兜底态无效(不发 spawn 不报错,仅 RetryFromFallback 可
+// 恢复);重拉 1s 延迟窗内视为「未开」→ 立即 spawn 并作废挂起重拉(裁定 2);
+// 「崩溃已死未转投」窗口内视为「未开」→ 消费退出码代行收尸(原样分诊,
+// 崩溃照计)后立即 spawn;toggle 发送失败(子进程已死)→ 按无子处理:
+// 清跟踪状态 + 立即 spawn。
 func (l *PanelLauncher) Click() {
 	l.mu.Lock()
 	if l.phase == phaseFallback {
@@ -163,21 +188,20 @@ func (l *PanelLauncher) Click() {
 	if l.child != nil {
 		child := l.child
 		// 「崩溃已死未转投」窗口的非阻塞探测:面板已死但转投 goroutine
-		// 尚未跑到 childExited 的间隙里 child 仍非 nil——此窗内直接打
-		// killedByUs + Kill(对死进程 no-op)会让迟到的崩溃码被正常关闭
-		// 分支吞掉(崩溃漏计 + 「开」点击被反转为「收起」),须先探测。
+		// 尚未跑到分诊的间隙里 child 仍非 nil——此窗内直接 toggle 会让
+		// 迟到的崩溃码等在通道里无人消费(崩溃漏计 + toggle 发给死进程),
+		// 须先探测。
 		select {
 		case code := <-child.Wait():
-			// 退出码已送达 = 面板已死,本次点击是「开」不是「收起」,
-			// 不打 killedByUs。退出码已被本点击抢先消费,转投 goroutine
-			// 的 <-child.Wait() 按「送达一次」契约永不再送达,其收尸
-			// (exitReport+childExited)永不执行——收尸由本点击代行:
-			// 先 exitReport(取即清零契约照旧,须先于 childExited)再
-			// childExited 原样分诊(killedByUs 如实传递——前击已 Kill
-			// 的有意收起仍归零惩罚;崩溃照计;满 3 兜底由其自处),随后
-			// 按「开」语义作废挂起重拉立即 spawn(与重拉延迟窗的 Click
-			// 让位同型)。代价:转投 goroutine 永久阻塞泄漏一枚(窗口=
-			// 崩溃落地到转投执行之间,罕见且每窗至多一枚,接受)。
+			// 退出码已送达 = 面板已死,本次点击是「开」不是「toggle」。
+			// 退出码已被本点击抢先消费,转投 goroutine 的 <-child.Wait()
+			// 按「送达一次」契约永不再送达,其收尸(exitReport+分诊)永
+			// 不执行——收尸由本点击代行:先 exitReport(取即清零契约照旧,
+			// 须先于 childExited)再 childExited 原样分诊(killedByUs 如
+			// 实传递——兼容通道恒 false,崩溃照计;满 3 兜底由其自处),
+			// 随后按「开」语义作废挂起重拉立即 spawn(与重拉延迟窗的
+			// Click 让位同型)。代价:转投 goroutine 永久阻塞泄漏一枚
+			// (窗口=崩溃落地到转投执行之间,罕见且每窗至多一枚,接受)。
 			l.mu.Unlock()
 			alive, killedByUs := l.exitReport()
 			l.childExited(code, alive, killedByUs)
@@ -187,11 +211,29 @@ func (l *PanelLauncher) Click() {
 			l.spawnAttempt()
 			return
 		default:
-			// 存活 → 收起:Kill 并打标,退出经 killedByUs 走正常关闭
-			// (零惩罚)
-			l.killedByUs = true
+			// 存活 → 发 toggle(方案 B):nil toggle=装配缺陷守卫让位
+			// (不发信号不 spawn 不崩,与 spawnAttemptLocked 的 nil-spawn
+			// 守卫同风格,真实装配必装)。
+			toggle, pid := l.toggle, child.Pid()
 			l.mu.Unlock()
-			child.Kill()
+			if toggle == nil {
+				return
+			}
+			if err := toggle(pid); err != nil {
+				// 发送失败 = 子进程已死(探测后死亡的窗口):按无子处理
+				// ——清跟踪状态 + 立即 spawn。迟到的旧子退出报告由
+				// childExitedIfCurrent 的身份闸让位(新子已在册时不清
+				// 新子引用、不误计;spawn 也失败时旧报告照常分诊补排重拉)。
+				l.mu.Lock()
+				l.child = nil
+				l.spawnedAt = time.Time{}
+				l.pendingRetry = nil
+				l.mu.Unlock()
+				l.spawnAttempt()
+				return
+			}
+			// toggle 成功:无退出事件,可见⇄隐藏由子进程自理;child 保持
+			// 在册 = 下次点击继续 toggle(瞬时开合,不重复 spawn)。
 			return
 		}
 	}
@@ -203,9 +245,10 @@ func (l *PanelLauncher) Click() {
 }
 
 // childExited 子进程退出转投口(接线层把 child.Wait() 的退出码转投至此,
-// 签名即计划原文契约)。分诊:有意收起与 code=0 = 正常关闭(零惩罚;存活
+// 签名即计划原文契约)。分诊:兼容通道 killedByUs 与 code=0(idle 回收/
+// 销毁收尾,方案 B 下失焦=隐藏不再产生退出)= 正常关闭(零惩罚;存活
 // >60s 顺带清零滑窗);code=60 = quit 意图分派;其余 = 崩溃(计 1 次 +
-// 1s 重拉,滑窗满 3 → 兜底停拉)。
+// 1s 重拉,滑窗满 3 → 兜底停拉)。分类逻辑不变(防外部 SIGKILL 误伤)。
 func (l *PanelLauncher) childExited(code int, alive time.Duration, killedByUs bool) {
 	var (
 		retryDelay  time.Duration
@@ -220,9 +263,10 @@ func (l *PanelLauncher) childExited(code int, alive time.Duration, killedByUs bo
 	if l.phase != phaseFallback { // 兜底态:一切退出报告让位(停拉终态)
 		switch {
 		case killedByUs || code == 0:
-			// 正常关闭:点图标收起 / 失焦自退——零惩罚零重拉;存活 >60s
-			// 的成功会话清零失败滑窗(≤60s 的正常关闭不动滑窗,拍板 1
-			// 只按崩溃计数,普通关闭不奖不罚)
+			// 正常关闭:idle 回收 / 销毁收尾(方案 B 下失焦=隐藏不再产生
+			// 退出)——零惩罚零重拉;存活 >60s 的成功会话清零失败滑窗
+			// (≤60s 的正常关闭不动滑窗,拍板 1 只按崩溃计数,普通关闭
+			// 不奖不罚)
 			if alive > panelLongSessionClear {
 				l.crashTimes = nil
 			}
@@ -254,6 +298,23 @@ func (l *PanelLauncher) childExited(code int, alive time.Duration, killedByUs bo
 	}
 }
 
+// childExitedIfCurrent 接线层的身份闸转投口(方案 B):仅当 child 仍是
+// 在册面板(或已无在册面板)时才分诊——toggle 发送失败回退 spawn 后,旧子
+// 的崩溃码可能此刻才送达接线层;若放行,旧报告会无条件 child=nil 清掉新子
+// 引用(下次点击误判「未开」→ 重复 spawn 双面板),quit 码还会误触发退出
+// 闸。l.child==nil(回退后 spawn 也失败)时放行:旧报告是彼时唯一在册
+// 面板的退出,照常分诊(崩溃补排重拉)。普通路径(无回退竞态)child 恒
+// 匹配,行为与 childExited 全等。
+func (l *PanelLauncher) childExitedIfCurrent(child ChildProcess, code int, alive time.Duration, killedByUs bool) {
+	l.mu.Lock()
+	stale := l.child != nil && l.child != child
+	l.mu.Unlock()
+	if stale {
+		return // 迟到的旧子报告:新子在册,让位
+	}
+	l.childExited(code, alive, killedByUs)
+}
+
 // RetryFromFallback 兜底态恢复入口(「打开面板」菜单项):退出兜底态并
 // 立即 spawn 一次。spawn 失败走既有崩溃计数 + 1s 重拉路径,连败再满 3 次
 // 重新 onFallback(裁定 1);正常态重复调用幂等无效。
@@ -272,9 +333,9 @@ func (l *PanelLauncher) RetryFromFallback() {
 }
 
 // exitReport 供接线层在 child.Wait() 返回后取转投 childExited 所需的存活
-// 时长与有意收起标记(标记取即清零,防旧标记污染下一轮)。须先于
-// childExited 调用——childExited 会清 spawnedAt,错序则 alive 恒 0 静默
-// 失效。与 spawnAttempt 写入的 spawnedAt 同锁读取。
+// 时长与有意收起标记(兼容通道,恒 false;标记取即清零,防旧标记污染
+// 下一轮)。须先于 childExited 调用——childExited 会清 spawnedAt,错序则
+// alive 恒 0 静默失效。与 spawnAttempt 写入的 spawnedAt 同锁读取。
 func (l *PanelLauncher) exitReport() (alive time.Duration, killedByUs bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

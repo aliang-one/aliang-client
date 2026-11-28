@@ -3,6 +3,7 @@ package panelwin
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // 锚定纯函数表驱动(实现计划 Task 13):side=bottom → y=ay-panelH-8;side=top →
@@ -291,4 +292,155 @@ func TestOptionsFieldDocAnchors(t *testing.T) {
 	if !strings.HasPrefix(o.URL, "http://127.0.0.1") {
 		t.Fatal("unreachable")
 	}
+}
+
+// —— 空闲回收与孤儿自检(2026-11-28 用户拍板方案 B「首次后常驻」)——
+
+// TestPanelIdleController 空闲回收控制器的状态机表:隐藏启动计时 → 超时
+// exit(0);显示停止;再次隐藏重置;可见期不计时;未隐藏永不计时。expire 注入
+// 捕获,零真实退出;时窗留足裕量防慢 CI flake(短 ttl + 宽断言窗)。
+func TestPanelIdleController(t *testing.T) {
+	t.Run("隐藏启动计时,超时触发退出", func(t *testing.T) {
+		expired := make(chan struct{}, 1)
+		c := newPanelIdleController(50*time.Millisecond, func() {
+			select {
+			case expired <- struct{}{}:
+			default:
+			}
+		})
+		defer c.Stop()
+		c.SetHidden(true)
+		select {
+		case <-expired:
+		case <-time.After(2 * time.Second):
+			t.Fatal("隐藏超时未触发空闲退出")
+		}
+	})
+
+	t.Run("显示停止计时,可见期不计时", func(t *testing.T) {
+		expired := make(chan struct{}, 1)
+		c := newPanelIdleController(60*time.Millisecond, func() {
+			select {
+			case expired <- struct{}{}:
+			default:
+			}
+		})
+		defer c.Stop()
+		c.SetHidden(true)
+		time.Sleep(20 * time.Millisecond) // 隐藏不足 ttl
+		c.SetHidden(false)                // 显示:停止计时
+		select {
+		case <-expired:
+			t.Fatal("显示后仍触发了空闲退出(可见期被计时)")
+		case <-time.After(300 * time.Millisecond): // 远超 ttl 的倍数
+		}
+	})
+
+	t.Run("再次隐藏重置计时", func(t *testing.T) {
+		expired := make(chan struct{}, 1)
+		c := newPanelIdleController(80*time.Millisecond, func() {
+			select {
+			case expired <- struct{}{}:
+			default:
+			}
+		})
+		defer c.Stop()
+		c.SetHidden(true)
+		time.Sleep(50 * time.Millisecond) // 隐藏过半
+		c.SetHidden(false)
+		c.SetHidden(true) // 再次隐藏:重置(新计时器于 ~t0+130ms 到期)
+		select {
+		case <-expired:
+			t.Fatal("再次隐藏未重置计时(提前到期)")
+		case <-time.After(40 * time.Millisecond): // 距重置 40ms < ttl(距首次隐藏 90ms,不重置则已到期)
+		}
+		select {
+		case <-expired:
+		case <-time.After(2 * time.Second):
+			t.Fatal("重置后的计时未在新的 ttl 内到期")
+		}
+	})
+
+	t.Run("未隐藏永不计时", func(t *testing.T) {
+		expired := make(chan struct{}, 1)
+		c := newPanelIdleController(40*time.Millisecond, func() {
+			select {
+			case expired <- struct{}{}:
+			default:
+			}
+		})
+		defer c.Stop()
+		select {
+		case <-expired:
+			t.Fatal("从未隐藏却触发了空闲退出")
+		case <-time.After(300 * time.Millisecond):
+		}
+	})
+
+	t.Run("重复隐藏不双触发", func(t *testing.T) {
+		expired := make(chan struct{}, 1)
+		c := newPanelIdleController(40*time.Millisecond, func() {
+			select {
+			case expired <- struct{}{}:
+			default:
+			}
+		})
+		defer c.Stop()
+		c.SetHidden(true)
+		c.SetHidden(true) // 幂等重复:不得造出第二个计时器(如双触发即崩溃计数误伤面)
+		time.Sleep(300 * time.Millisecond)
+		if len(expired) != 1 {
+			t.Fatalf("空闲退出触发次数 = %d, want 1", len(expired))
+		}
+	})
+}
+
+// TestPanelIdleTTLConstant 空闲回收 TTL 契约(拍板:隐藏持续 10 分钟 →
+// exit 0,launcher 记正常关闭零惩罚)。字面量漂移即拍板行为漂移。
+func TestPanelIdleTTLConstant(t *testing.T) {
+	if panelIdleTTL != 10*time.Minute {
+		t.Fatalf("panelIdleTTL = %v, want 10m(方案 B 拍板值)", panelIdleTTL)
+	}
+}
+
+// TestPanelOrphanWatchdog 孤儿自检(方案 B §4,macOS):ppid==1(companion
+// 死后被 launchd 收养)→ exit(0);ppid 正常 → 不退出。stop 关闭即停(测试
+// 收尾;生产不传,goroutine 与进程同寿)。
+func TestPanelOrphanWatchdog(t *testing.T) {
+	t.Run("ppid==1 触发退出码0", func(t *testing.T) {
+		exitCodes := make(chan int, 1)
+		stop := make(chan struct{})
+		go panelOrphanWatchdog(stop, func() int { return 1 }, func(code int) {
+			select {
+			case exitCodes <- code:
+			default:
+			}
+		}, 10*time.Millisecond)
+		select {
+		case code := <-exitCodes:
+			if code != ExitFocusLoss {
+				t.Fatalf("孤儿退出码 = %d, want %d(正常关闭,launcher 零惩罚)", code, ExitFocusLoss)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("ppid==1 未触发孤儿退出")
+		}
+		close(stop)
+	})
+
+	t.Run("ppid 正常不退出", func(t *testing.T) {
+		exitCodes := make(chan int, 1)
+		stop := make(chan struct{})
+		go panelOrphanWatchdog(stop, func() int { return 4242 }, func(code int) {
+			select {
+			case exitCodes <- code:
+			default:
+			}
+		}, 10*time.Millisecond)
+		select {
+		case code := <-exitCodes:
+			t.Fatalf("companion 存活(ppid=%d)却触发孤儿退出:code=%d", 4242, code)
+		case <-time.After(100 * time.Millisecond): // ≥8 个检查周期
+		}
+		close(stop)
+	})
 }

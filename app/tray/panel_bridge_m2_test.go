@@ -26,11 +26,13 @@ func restorePanelM2Seams(t *testing.T) {
 	origVisor, origQuit := panelOpenItemVisor, panelQuitInvoker
 	origOpener, origNotifier := panelURLOpener, panelNotifier
 	origRegister, origMode := panelClickRegister, panelModeSetter
+	origToggle := panelToggleSender
 	t.Cleanup(func() {
 		panelAnchorSampler, panelProcessSpawner, panelExecutable = origSampler, origSpawner, origExe
 		panelOpenItemVisor, panelQuitInvoker = origVisor, origQuit
 		panelURLOpener, panelNotifier = origOpener, origNotifier
 		panelClickRegister, panelModeSetter = origRegister, origMode
+		panelToggleSender = origToggle
 	})
 }
 
@@ -195,8 +197,9 @@ func TestPanelM2SpawnArgsAssembly(t *testing.T) {
 }
 
 // TestPanelM2LauncherWiring 装配正确性:installPanelLauncher 注册的托盘点击
-// 回调必须是 launcher.Click(未开 spawn / 已开 Kill),spawn 经
-// panelProcessSpawner,opts 现取现用(每次 spawn 重新采样)。
+// 回调必须是 launcher.Click(未开 spawn / 已开发 toggle),spawn 经
+// panelProcessSpawner,opts 现取现用(每次 spawn 重新采样),toggle 经
+// panelToggleSender 投递且带子进程 pid(方案 B)。
 func TestPanelM2LauncherWiring(t *testing.T) {
 	restorePanelM2Seams(t)
 
@@ -213,6 +216,11 @@ func TestPanelM2LauncherWiring(t *testing.T) {
 		lastOpts = opts
 		liveChild = newFakeChild()
 		return liveChild, nil
+	}
+	toggled := make([]int, 0, 2)
+	panelToggleSender = func(pid int) error {
+		toggled = append(toggled, pid)
+		return nil
 	}
 	panelQuitInvoker = func(*CompanionApp) {}
 	panelOpenItemVisor = func(*systray.MenuItem, bool) {}
@@ -242,9 +250,12 @@ func TestPanelM2LauncherWiring(t *testing.T) {
 	if lastOpts.AnchorX != 100 || lastOpts.Side != panelSideBottom || lastOpts.URL != "http://127.0.0.1:56789/panel.html" {
 		t.Fatalf("spawn 参数组装失真(锚定现取现用):%+v", lastOpts)
 	}
-	registered() // 再点 = 收起
-	if liveChild.kills != 1 {
-		t.Fatalf("已开状态点击未 Kill:kills=%d", liveChild.kills)
+	registered() // 再点 = toggle(方案 B:进程不退)
+	if len(toggled) != 1 || toggled[0] != liveChild.pid {
+		t.Fatalf("已开状态点击未发 toggle:pids=%v want [%d]", toggled, liveChild.pid)
+	}
+	if liveChild.kills != 0 {
+		t.Fatalf("已开状态点击 Kill 了子进程(方案 B 禁止):kills=%d", liveChild.kills)
 	}
 }
 
@@ -263,6 +274,8 @@ func TestPanelM2FallbackToggle(t *testing.T) {
 		liveChild = newFakeChild()
 		return liveChild, nil
 	}
+	toggles := 0
+	panelToggleSender = func(int) error { toggles++; return nil }
 	panelQuitInvoker = func(*CompanionApp) {}
 	panelNotifier = func(string, string) {}
 
@@ -318,9 +331,9 @@ func TestPanelM2FallbackToggle(t *testing.T) {
 	if len(visorCalls) != 2 || visorCalls[1] {
 		t.Fatalf("恢复后「打开面板」项显隐调用 = %v, want 第二次 false(Hide)", visorCalls)
 	}
-	registered() // 恢复后点击语义回归 toggle
-	if liveChild.kills != 1 {
-		t.Fatalf("恢复后点击未收起:kills=%d", liveChild.kills)
+	registered() // 恢复后点击语义回归 toggle(方案 B)
+	if toggles != 1 || liveChild.kills != 0 {
+		t.Fatalf("恢复后点击未发 toggle(或误 Kill):toggles=%d kills=%d", toggles, liveChild.kills)
 	}
 }
 
@@ -544,13 +557,58 @@ func TestPanelM2PanelSizesMatchShell(t *testing.T) {
 }
 
 // TestPanelM2MacDarwinSpawnNoHarvestComment 结构锚定:macOS spawn shim 必须
-// 注明无收割机制、依赖失焦自退(计划评审次#13),防止后人照 Windows 侧
-// 误以为有 Job 等价物。
+// 注明无收割机制、依赖壳内孤儿自检(计划评审次#13 + 方案 B),防止后人照
+// Windows 侧误以为有 Job 等价物。
 func TestPanelM2MacDarwinSpawnNoHarvestComment(t *testing.T) {
 	src := trayFileSource(t, "panel_spawn_darwin.go")
-	for _, anchor := range []string{"无收割机制", "失焦自退"} {
+	for _, anchor := range []string{"无收割机制", "孤儿自检"} {
 		if !strings.Contains(src, anchor) {
 			t.Fatalf("panel_spawn_darwin.go 缺关键注释 %q:\n%s", anchor, src)
 		}
 	}
+}
+
+// TestPanelM2ToggleChannelContract toggle 投递通道契约(方案 B 2026-11-28
+// 拍板):两平台 shim 各钉各的投递原语,且类名/消息号与壳侧逐字对齐——
+// app/tray 不能 import internal/panelwin(闭包纪律),跨文件对齐走源码
+// 文本锚定(先例 TestPanelM2PanelSizesMatchShell)。
+//   - darwin:SIGUSR1(专用信号,注释写明其他组件不得占用);
+//   - windows:FindWindowW 按面板窗口类名定位 + PostMessageW WM_APP+1;
+//     壳侧必须同款常量(wmApp+1)与类名字面量。
+func TestPanelM2ToggleChannelContract(t *testing.T) {
+	darwinSrc := trayFileSource(t, "panel_spawn_darwin.go")
+	for _, anchor := range []string{"syscall.SIGUSR1", "专用于面板 toggle", "其他组件不得占用"} {
+		if !strings.Contains(darwinSrc, anchor) {
+			t.Fatalf("panel_spawn_darwin.go 缺 toggle 投递锚 %q(方案 B 通道断裂):\n%s", anchor, darwinSrc)
+		}
+	}
+
+	winSrc := trayFileSource(t, "panel_spawn_windows.go")
+	for _, anchor := range []string{"FindWindowW", "PostMessageW", "wmAppPanelToggle", "panelWindowClassName"} {
+		if !strings.Contains(winSrc, anchor) {
+			t.Fatalf("panel_spawn_windows.go 缺 toggle 投递锚 %q(方案 B 通道断裂):\n%s", anchor, winSrc)
+		}
+	}
+
+	// 跨仓对齐:壳侧窗口类名逐字一致(FindWindow 定位的唯一纽带)。
+	shellRaw, err := os.ReadFile(filepath.Join(filepath.Dir(trayTestFilePath(t)), "..", "..", "internal", "panelwin", "panelwin_windows.go"))
+	if err != nil {
+		t.Fatalf("读取 panelwin_windows.go: %v", err)
+	}
+	shellSrc := string(shellRaw)
+	for _, anchor := range []string{panelWindowClassName, "wmAppPanelToggle", "wmApp + 1"} {
+		if !strings.Contains(shellSrc, anchor) {
+			t.Fatalf("panelwin_windows.go 缺 toggle 接收锚 %q(类名/消息号漂移会让 toggle 静默丢消息):\n%s", anchor, shellSrc)
+		}
+	}
+}
+
+// trayTestFilePath 返回本测试文件绝对路径(跨包源码锚定辅助)。
+func trayTestFilePath(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(1)
+	if !ok {
+		t.Fatal("runtime.Caller: 无法定位测试文件")
+	}
+	return thisFile
 }

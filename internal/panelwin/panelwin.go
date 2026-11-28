@@ -21,9 +21,11 @@
 //     drawsBackground=false(macOS)/WebView2 透明背景(Windows)+ 系统材质层
 //     铺底,否则半透明面板底色失去意义、毛玻璃验收必挂。
 //
-// 退出码契约(实现计划 Task 14 launcher 据此分派):
+// 退出码契约(实现计划 Task 14 launcher 据此分派;2026-11-28 方案 B 修订):
 //
-//	0 = 失焦自退(正常关闭,零惩罚);60 = 页面 quit 消息(正常关闭);
+//	0 = 正常关闭,零惩罚——原「失焦自退」出口;方案 B 下失焦=隐藏不再
+//	    退出,0 现由空闲回收(隐藏满 10 分钟)与销毁收尾/孤儿自检产生;
+//	60 = 页面 quit 消息(正常关闭);
 //	其余非零 = 崩溃(launcher 记失败重拉,连崩 3 次转原生菜单兜底)。
 package panelwin
 
@@ -43,9 +45,10 @@ const (
 	SideBottom Side = "bottom"
 )
 
-// 退出码契约(Task 14 launcher 判据)。
+// 退出码契约(Task 14 launcher 判据;方案 B 下 0=正常关闭,由空闲回收与
+// 销毁收尾/孤儿自检产生——失焦=隐藏不再产生退出)。
 const (
-	ExitFocusLoss = 0  // 失焦自退
+	ExitFocusLoss = 0  // 正常关闭(历史名「失焦自退」;方案 B 起空闲回收复用此码)
 	ExitQuit      = 60 // 页面 quit 消息
 )
 
@@ -94,9 +97,10 @@ func (o Options) OpenTarget(kind string) string {
 
 // Host —— 平台壳的统一入口(Linux 无实现)。
 type Host interface {
-	// Run 阻塞展示面板,直到窗口关闭。返回退出码:0=失焦自退、60=quit。
-	// darwin 实现在失焦/quit 路径上经 .m 的 exit() 直接终止进程,通常
-	// 不返回;windows 实现经消息循环正常返回。
+	// Run 阻塞展示面板,直到进程退出。返回退出码:0=正常关闭(idle 回收/
+	// 销毁收尾;方案 B 下失焦=隐藏不再产生退出)、60=quit。
+	// darwin 实现在 quit/空闲回收/孤儿自检路径上经 .m 的 exit() 直接终止
+	// 进程,通常不返回;windows 实现经消息循环正常返回。
 	Run(opts Options) int
 }
 

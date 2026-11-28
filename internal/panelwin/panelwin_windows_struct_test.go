@@ -3,6 +3,7 @@ package panelwin
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -140,6 +141,74 @@ func TestPanelwinWindowsResizeFollowChain(t *testing.T) {
 	}
 	if strings.Index(src[embedIdx:], "chromium.Resize()") < 0 {
 		t.Fatal("panelwin_windows.go Embed 之后缺初始 chromium.Resize()(首帧 controller bounds 不对齐窗口尺寸)")
+	}
+}
+
+// TestPanelwinWindowsResidentLifecycle — 方案 B「首次后常驻」(2026-11-28
+// 用户拍板)的 Windows 壳结构断言:WM_ACTIVATE 失活 → ShowWindow(SW_HIDE)
+// 隐藏(不再 PostQuitMessage 退出)+ 喂空闲控制器;toggle 消息(wmApp+1)
+// → 可见⇄隐藏切换(显示路径 SetForegroundWindow+chromium.Focus 复活前台);
+// 可见性真源 panelHidden 幂等闸(隐藏态重复失活不得重置空闲计时)。
+// GOOS 无关,只读源码文本(同上)。
+func TestPanelwinWindowsResidentLifecycle(t *testing.T) {
+	src := panelwinWindowsSource(t)
+
+	// ① toggle 消息常量与接收分支在册(WM_APP+1;与 app/tray 投递侧跨文件
+	//    对齐由彼端 TestPanelM2ToggleChannelContract 锚定)。常量锚容忍
+	//    gofmt 对齐空格差异(正则)。
+	for _, want := range []string{
+		`wmApp\s+= 0x8000`,
+		`wmAppPanelToggle = wmApp \+ 1`,
+		"case wmAppPanelToggle:",
+	} {
+		if !regexp.MustCompile(want).MatchString(src) {
+			t.Fatalf("panelwin_windows.go 缺 %q(方案 B toggle 接收链断裂)", want)
+		}
+	}
+
+	// ② wmActivate 失活分支:走 hidePanelWindow(隐藏),不得再退出
+	//    (PostQuitMessage 已废除——方案 B:失焦=隐藏)。
+	actIdx := strings.Index(src, "case wmActivate:")
+	if actIdx < 0 {
+		t.Fatal("panelwin_windows.go 缺 case wmActivate 分支")
+	}
+	actBody := src[actIdx:]
+	// 截到下一个 case 分支(从本分支字面量之后起搜,避免命中自身的 "case ")。
+	if next := strings.Index(src[actIdx+len("case wmActivate:"):], "\tcase "); next >= 0 {
+		actBody = src[actIdx : actIdx+len("case wmActivate:")+next]
+	}
+	if !strings.Contains(actBody, "hidePanelWindow(hwnd)") {
+		t.Fatalf("wmActivate 失活分支未走 hidePanelWindow(失焦=隐藏链断裂):\n%s", actBody)
+	}
+	if strings.Contains(actBody, "PostQuitMessage") {
+		t.Fatalf("wmActivate 失活分支仍在退出(方案 B:失焦=隐藏,不再 PostQuitMessage):\n%s", actBody)
+	}
+
+	// ③ 隐藏/切换动作的完整形态:幂等闸(panelHidden)→ SW_HIDE → 喂空闲
+	//    控制器;toggle 显示路径 SetForegroundWindow + chromium.Focus
+	//    (前台复活,否则次级失焦链永不触发)。
+	for _, want := range []string{
+		"if panelHidden {\n\t\treturn // 已隐藏:零动作(尤其不得重置空闲计时)",
+		"procShowWindow.Call(hwnd, uintptr(swHide))",
+		"panelIdle.SetHidden(true)",
+		"procShowWindow.Call(hwnd, uintptr(swShow))",
+		"procSetForegroundWindow.Call(hwnd)",
+		"panelChromium.Focus()",
+		"panelIdle.SetHidden(false)",
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("panelwin_windows.go 缺 %q(方案 B 隐藏/复活动作不完整)", want)
+		}
+	}
+
+	// ④ 首帧可见态复位(panelHidden=false)在首次 ShowWindow 之前——状态机
+	//    起点错则首帧失活会被幂等闸吞掉(不喂计时器,空闲回收失联)。
+	showIdx := strings.Index(src, "procShowWindow.Call(hwnd, uintptr(swShow))")
+	if showIdx < 0 {
+		t.Fatal("panelwin_windows.go 缺首帧 ShowWindow")
+	}
+	if rst := strings.LastIndex(src[:showIdx], "panelHidden = false"); rst < 0 {
+		t.Fatal("首帧 ShowWindow 前缺 panelHidden=false 复位(方案 B 状态机起点)")
 	}
 }
 

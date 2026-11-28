@@ -19,9 +19,9 @@ import (
 // CREATE_SUSPENDED → AllowSetForegroundWindow(pid) → Job 入树 → Resume:
 //   - CREATE_SUSPENDED:挂起创建,前台资格在面板第一条指令跑起来之前授予
 //     (壳内 SetForegroundWindow 只认「已授予 AllowSetForegroundWindow 资格」
-//     的调用,时序差会让失焦即退整条链失效——panelwin_windows.go 文件头);
+//     的调用,时序差会让失焦隐藏整条链失效(方案 B)——panelwin_windows.go 文件头);
 //   - AllowSetForegroundWindow(pid):授予面板进程前台资格。best-effort,
-//     失败落 Warn(失败 = 失焦即退链失效:面板弹出不激活、点外部不自退,
+//     失败落 Warn(失败 = 失焦隐藏链失效:面板弹出不激活、点外部不隐藏,
 //     真机归因靠此日志;companion 在托盘点击瞬间未必持前台权,资格授予
 //     可能被拒;实测行为归 Task 16 实机探针);
 //   - Job(KILL_ON_JOB_CLOSE):面板进程入 companion 的收割树——companion
@@ -55,12 +55,45 @@ func spawnPanelProcess(opts SpawnOpts) (ChildProcess, error) {
 	return child, nil
 }
 
+// panelToggleSender Windows toggle 投递(方案 B「首次后常驻」):FindWindowW
+// 按面板窗口类名定位壳窗口 → PostMessageW 发 WM_APP+1,壳内 wndProc 分支
+// 完成可见⇄隐藏(ShowWindow/SetForegroundWindow/chromium.Focus)。找不到
+// 窗口(面板已死/尚未建窗)或投递失败 → 返回错误,launcher 按无子处理
+// 回退 spawn。pid 形参忽略:窗口类名是定位纽带,签名与 darwin 统一。
+var panelToggleSender = func(pid int) error {
+	if panelProcFindWindowW.Find() != nil || panelProcPostMessageW.Find() != nil {
+		return fmt.Errorf("toggle 投递 API 不可用")
+	}
+	cls, err := windows.UTF16PtrFromString(panelWindowClassName)
+	if err != nil {
+		return fmt.Errorf("面板窗口类名构造失败: %w", err)
+	}
+	hwnd, _, _ := panelProcFindWindowW.Call(
+		uintptr(unsafe.Pointer(cls)),
+		0, // lpWindowName:按类名定位即可
+	)
+	if hwnd == 0 {
+		return fmt.Errorf("面板窗口未找到(进程已死或窗口未建)")
+	}
+	if r, _, _ := panelProcPostMessageW.Call(hwnd, uintptr(wmAppPanelToggle), 0, 0); r == 0 {
+		return fmt.Errorf("PostMessageW(toggle) 失败(面板窗口已销毁)")
+	}
+	return nil
+}
+
+// wmAppPanelToggle = WM_APP+1(0x8001):companion → 面板壳的 toggle 消息
+// (方案 B「首次后常驻」)。与 internal/panelwin/panelwin_windows.go 壳侧
+// 常量(wmApp + 1)同值,跨文件漂移由 TestPanelM2ToggleChannelContract 锚定。
+const wmAppPanelToggle = 0x8000 + 1
+
 // —— user32 procs(复用 dpi_windows.go 的 user32DLL 变量)——
 
 var (
 	panelProcAllowSetForegroundWindow = user32DLL.NewProc("AllowSetForegroundWindow")
 	panelProcGetCursorPos             = user32DLL.NewProc("GetCursorPos")
 	panelProcGetSystemMetrics         = user32DLL.NewProc("GetSystemMetrics")
+	panelProcFindWindowW              = user32DLL.NewProc("FindWindowW")
+	panelProcPostMessageW             = user32DLL.NewProc("PostMessageW")
 )
 
 // trayPoint GetCursorPos 参数结构(POINT:LONG x,y;x/sys 不再提供,库内自备
@@ -108,7 +141,7 @@ func readPanelTrayAnchor() panelAnchorSample {
 }
 
 // allowSetForegroundWindow 前台资格授予(AllowSetForegroundWindow(pid))。
-// 失败 = 失焦即退链失效(面板弹出不激活、点外部不自退),落 Warn 供真机
+// 失败 = 失焦隐藏链失效(面板弹出不激活、点外部不隐藏),落 Warn 供真机
 // 归因(Task 16 探针清单挂账项)。
 func allowSetForegroundWindow(pid uint32) {
 	if panelProcAllowSetForegroundWindow.Find() != nil {
