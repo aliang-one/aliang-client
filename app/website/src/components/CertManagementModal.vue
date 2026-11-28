@@ -347,7 +347,11 @@ import { assistPrefix } from '../services/assistPrefix';
 import { useI18n } from '../i18n';
 
 // 远程协助 P2:镜像前缀挂载(/assist/service/)下证书族 API 也要过前缀。
-const API_BASE = assistPrefix() + '/api';
+// P3 请求时化:前缀每次请求现算(照 assistPrefix 的请求时语义)——模块级
+// 常量会在未来引入 URL 路由(路径变化不重载模块)时拿到陈旧前缀。
+function apiBase() {
+  return assistPrefix() + '/api';
+}
 const CERT_TYPE = 'mitm-ca';
 const AUDIT_KEY = 'cert-operation-audit-v1';
 
@@ -425,7 +429,7 @@ function clearResults() {
 async function apiCall(method, path, body) {
   const opts = { method, headers: { 'Content-Type': 'application/json', 'X-Aliang-Local-Request': '1' } };
   if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(`${API_BASE}${path}`, opts);
+  const res = await fetch(`${apiBase()}${path}`, opts);
   if (!res.ok) {
     let msg = t('cert_requestFailed', { status: res.status });
     let stage = '';
@@ -492,7 +496,7 @@ function buildImportFormData() {
 }
 
 async function importRequest(path) {
-  const response = await fetch(`${API_BASE}${path}`, {
+  const response = await fetch(`${apiBase()}${path}`, {
     method: 'POST',
     headers: { 'X-Aliang-Local-Request': '1' },
     body: buildImportFormData()
@@ -561,7 +565,7 @@ async function checkStatus() {
 async function downloadCertFile() {
   downloading.value = true;
   try {
-    const res = await fetch(`${API_BASE}/cert/download?cert_type=${encodeURIComponent(CERT_TYPE)}`);
+    const res = await fetch(`${apiBase()}/cert/download?cert_type=${encodeURIComponent(CERT_TYPE)}`);
     if (!res.ok) {
       let msg = t('cert_downloadFailed');
       const ct = res.headers.get('content-type') || '';
@@ -660,7 +664,7 @@ function setStepState(steps, index, state, message) {
 }
 
 function silentStatusPoll() {
-  return fetch(`${API_BASE}/cert/status?cert_type=${encodeURIComponent(CERT_TYPE)}`)
+  return fetch(`${apiBase()}/cert/status?cert_type=${encodeURIComponent(CERT_TYPE)}`)
     .then(r => r.ok ? r.json().then(j => j.data || j) : null)
     .catch(() => null);
 }
