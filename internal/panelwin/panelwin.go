@@ -21,10 +21,11 @@
 //     drawsBackground=false(macOS)/WebView2 透明背景(Windows)+ 系统材质层
 //     铺底,否则半透明面板底色失去意义、毛玻璃验收必挂。
 //
-// 退出码契约(实现计划 Task 14 launcher 据此分派;2026-11-28 方案 B 修订):
+// 退出码契约(实现计划 Task 14 launcher 据此分派;2026-11-28 撤销方案 B,
+// 回归「点击才拉起+关闭即退」):
 //
-//	0 = 正常关闭,零惩罚——原「失焦自退」出口;方案 B 下失焦=隐藏不再
-//	    退出,0 现由空闲回收(隐藏满 10 分钟)与销毁收尾/孤儿自检产生;
+//	0 = 正常关闭,零惩罚——点面板外/失焦/托盘图标请求关闭(close 请求)/
+//	    孤儿自检(macOS ppid 看门狗;Windows=Job KILL_ON_JOB_CLOSE 收割);
 //	60 = 页面 quit 消息(正常关闭);
 //	其余非零 = 崩溃(launcher 记失败重拉,连崩 3 次转原生菜单兜底)。
 package panelwin
@@ -35,6 +36,9 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"time"
+
+	"aliang.one/nursorgate/common/logger"
 )
 
 // Side —— 面板相对托盘图标弹出的一侧(CLI --side 字面量)。
@@ -45,10 +49,10 @@ const (
 	SideBottom Side = "bottom"
 )
 
-// 退出码契约(Task 14 launcher 判据;方案 B 下 0=正常关闭,由空闲回收与
-// 销毁收尾/孤儿自检产生——失焦=隐藏不再产生退出)。
+// 退出码契约(Task 14 launcher 判据;撤销方案 B 后 0=正常关闭,由点外/
+// 失焦/close 请求/孤儿自检产生)。
 const (
-	ExitFocusLoss = 0  // 正常关闭(历史名「失焦自退」;方案 B 起空闲回收复用此码)
+	ExitFocusLoss = 0  // 正常关闭(历史名「失焦自退」;点外/失焦/close 请求/孤儿自检共用此码)
 	ExitQuit      = 60 // 页面 quit 消息
 )
 
@@ -97,11 +101,46 @@ func (o Options) OpenTarget(kind string) string {
 
 // Host —— 平台壳的统一入口(Linux 无实现)。
 type Host interface {
-	// Run 阻塞展示面板,直到进程退出。返回退出码:0=正常关闭(idle 回收/
-	// 销毁收尾;方案 B 下失焦=隐藏不再产生退出)、60=quit。
-	// darwin 实现在 quit/空闲回收/孤儿自检路径上经 .m 的 exit() 直接终止
-	// 进程,通常不返回;windows 实现经消息循环正常返回。
+	// Run 阻塞展示面板,直到进程退出。返回退出码:0=正常关闭(点外/失焦/
+	// close 请求/孤儿自检)、60=quit。
+	// darwin 实现在 quit/点外/失焦/close 请求/孤儿自检路径上经 .m 的
+	// exit() 直接终止进程,通常不返回;windows 实现经消息循环正常返回。
 	Run(opts Options) int
+}
+
+// —— 孤儿自检(macOS;Windows 依赖 Job 收割,见 panel_spawn_windows.go)——
+//
+// companion 死后面板被 launchd 收养(ppid==1),壳内每 5s 自检 → exit(0)
+// (正常关闭,launcher 零惩罚回收)。残留窗口随进程退出彻底消失——
+// 「关闭即退」形态下不存在任何驻留窗口。
+
+// panelOrphanWatchInterval 孤儿自检周期(每 5s 查一次 ppid)。
+const panelOrphanWatchInterval = 5 * time.Second
+
+// panelOrphanWatchdog 孤儿自检(macOS;调用方 go 起跑):每 interval 查一次
+// getppid,==1 即 companion 死后面板被 launchd 收养 → exit(0)(正常关闭,
+// launcher 零惩罚回收)。getppid/exit 注入(测试替身);stop 非 nil 时关闭
+// 即停(测试收尾;生产传 nil,goroutine 与进程同寿)。Windows 不跑本看门狗:
+// Job KILL_ON_JOB_CLOSE 由内核收割(companion 进程死亡 → 句柄回收 → Job
+// 连带终止面板),见 panel_spawn_windows.go。
+func panelOrphanWatchdog(stop <-chan struct{}, getppid func() int, exit func(int), interval time.Duration) {
+	if interval <= 0 {
+		interval = panelOrphanWatchInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			if getppid() == 1 {
+				logger.Info("panelwin: ppid==1(companion 已退出,面板被收养),孤儿自检退出")
+				exit(ExitFocusLoss)
+				return
+			}
+		}
+	}
 }
 
 // AnchorToWindowPos —— 锚定纯函数(实现计划 Task 13 指定形态):

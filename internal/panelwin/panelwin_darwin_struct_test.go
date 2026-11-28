@@ -16,11 +16,11 @@ import (
 // app/tray/systray_darwin_patch_test.go 先例——本包不依赖那个包,辅助函数
 // 就地复制)。钉住的是「壳的物理形态」四件事:
 //
-//  1. 生命周期链路(2026-11-28 用户拍板方案 B「首次后常驻」):
-//     windowDidResignKey → orderOut 隐藏(不再 exit(0));toggle 入口
-//     panelwin_toggle(dispatch_async 派发主线程)→ panelSetHidden 单一改口
-//     → 导出回调 panelwinGoVisibilityChanged 回传 Go(空闲回收计时);
-//     显示复活面 makeKeyAndOrderFront + NSApp activate 一并钉住;
+//  1. 生命周期链路(2026-11-28 撤销方案 B「首次后常驻」,回归「点击才拉起
+//     +关闭即退」):点面板外(全局鼠标监听)/失焦(windowDidResignKey)
+//     → exit(0) 正常关闭;resignKey 带 everKeyed 守卫(spawn 期 key 抖动
+//     防误伤);初始上屏 orderFrontRegardless 且【不 makeKey】(失败模式③:
+//     makeKey 抢用户焦点被夺回后自动再隐藏);
 //  2. 毛玻璃归系统材质层:NSVisualEffectView(behindWindow)铺底 +
 //     WKWebView drawsBackground=false(KVC 私有面)+ NSPanel opaque=false
 //     ——前端 hosted 态只画半透明底(Task 7 评审固化),壳不透明底色会
@@ -35,7 +35,7 @@ import (
 //     与 PATCH_NOTES);全文件零裸 autorelease 消息(ARC 下对象生命周期
 //     确定性,面板进程存活即对象存活,不需要手工 autorelease);
 //  5. 主线程钉定:panelwin_darwin.go 必须 runtime.LockOSThread——AppKit
-//     UI 事件循环必须在主线程,不钉则 NSApp run 失效、失焦隐藏链死成僵尸;
+//     UI 事件循环必须在主线程,不钉则 NSApp run 失效、失焦即退链死成僵尸;
 //  6. 畸形 payload 守卫:type/kind 提取先过 isKindOfClass:[NSString class]
 //     闸({"type":123} 这类形态走「未知忽略」,不得 unrecognized selector 崩);
 //  7. 原生圆角(2026-11-28 用户反馈):contentView layer wantsLayer/
@@ -46,52 +46,69 @@ import (
 func TestPanelwinDarwinShellStructure(t *testing.T) {
 	src := panelwinDarwinSource(t)
 
-	t.Run("常驻生命周期与激活面", func(t *testing.T) {
+	t.Run("关闭即退生命周期与激活面", func(t *testing.T) {
 		for _, want := range []string{
 			"windowDidResignKey",                     // NSWindowDelegate 失焦回调
 			"exit(60)",                               // quit 消息退出码 60
-			"makeKeyAndOrderFront",                   // 显示复活面:不取焦点则次级失焦链永不触发
-			"activateIgnoringOtherApps:YES",          // 同上:程序化激活(12.0 可用,14 起弃用仍有效)
+			"orderFrontRegardless",                   // 初始上屏(新窗口首显实证可用;不 makeKey)
 			"NSWindowStyleMaskNonactivatingPanel",    // 不抢宿主焦点
 			"NSApplicationActivationPolicyAccessory", // 无 Dock 图标
 		} {
 			if !strings.Contains(src, want) {
-				t.Errorf("panelwin_darwin.m 缺少 %q(常驻生命周期/激活链路不完整)", want)
+				t.Errorf("panelwin_darwin.m 缺少 %q(关闭即退生命周期/激活链路不完整)", want)
 			}
+		}
+		// 反向锚:初始上屏【不 makeKey】——失败模式③(撤销方案 B 实机三连败
+		// 之一):显示路径 makeKey 抢用户焦点→被夺回→0.12s 内 resignKey 自动
+		// 再隐藏。全文件(剥注释后)不得出现 makeKeyAndOrderFront。
+		code := stripObjcComments(src)
+		if strings.Contains(code, "makeKeyAndOrderFront") {
+			t.Errorf("panelwin_darwin.m 出现 makeKeyAndOrderFront(初始上屏不得 makeKey:抢用户焦点会被夺回,resignKey 自动再隐藏=失败模式③)")
 		}
 	})
 
-	t.Run("方案 B:失焦=隐藏+toggle+可见性回传", func(t *testing.T) {
-		// 失焦=隐藏(不再 exit(0)):resignKey 必须落 panelSetHidden:YES
-		// (orderOut 驻留),退出码 0 不再由失焦产生(空闲回收/孤儿自检在
-		// Go 侧)。可见性单一改口 panelSetHidden + 回传 Go 的导出回调 +
-		// toggle C 入口的 dispatch_async 派发,三件缺一即链断。
-		for _, want := range []string{
-			"panelSetHidden",                           // 可见性单一改口(toggle 与 resignKey 共用)
-			"[self panelSetHidden:YES]",                // resignKey → 隐藏(失焦=隐藏)
-			"orderOut",                                 // 隐藏动作(驻留不退出)
-			"panelwinGoVisibilityChanged",              // 可见性回传 Go(空闲回收计时入口)
-			"panelwin_toggle",                          // toggle C 入口(SIGUSR1 经此进主线程)
-			"dispatch_async(dispatch_get_main_queue()", // 信号 handler goroutine 不碰 UI,派发主线程
-		} {
-			if !strings.Contains(src, want) {
-				t.Errorf("panelwin_darwin.m 缺少 %q(方案 B 常驻链断裂)", want)
+	t.Run("关闭即退:点外/失焦 exit(0)+everKeyed 守卫", func(t *testing.T) {
+		// resignKey → exit(0)(失焦即退),带 everKeyed 守卫(从未成为 key
+		// 不退出——spawn 期 key 抖动防误伤)。方法体截到下一个 ObjC 方法
+		// 声明为止,对剥注释后的代码断言(注释里的历史引述不算)。
+		resignBody := objcMethodBody(src, "windowDidResignKey:")
+		resignCode := stripObjcComments(resignBody)
+		if !strings.Contains(resignCode, "everKeyed") {
+			t.Errorf("panelwin_darwin.m 的 resignKey 缺 everKeyed 守卫(spawn 期 key 抖动会误伤:面板一出生就退)\n%s", resignBody)
+		}
+		if !regexp.MustCompile(`exit\s*\(\s*0\s*\)`).MatchString(resignCode) {
+			t.Errorf("panelwin_darwin.m 的 resignKey 未 exit(0)(失焦即退链断裂):\n%s", resignBody)
+		}
+		// 反向锚:隐藏驻留已废除(撤销方案 B)——resignKey 不得再走任何
+		// 隐藏/驻留动作。
+		for _, banned := range []string{"panelSetHidden", "orderOut", "alphaValue", "ignoresMouseEvents"} {
+			if strings.Contains(resignCode, banned) {
+				t.Errorf("panelwin_darwin.m 的 resignKey 仍在隐藏驻留(%q;撤销方案 B:失焦=exit 0 正常关闭):\n%s", banned, resignBody)
 			}
 		}
-		// 反向锚:失焦即退已废除——resignKey 方法体内不得再直接 exit
-		// (剥注释后断言,注释里的历史引述不算;方法体截到下一个 ObjC
-		// 方法声明为止)。
-		resignIdx := strings.Index(src, "windowDidResignKey:")
-		if resignIdx < 0 {
-			t.Fatal("panelwin_darwin.m 缺 windowDidResignKey")
+
+		// 点面板外即收:全局鼠标监听三件套(鼠标事件无需 TCC;菜单栏带
+		// y<40 排除——托盘图标自身的点击是 companion 的手势,不能被本监听
+		// 抢先关闭),且监听体内 exit(0) 正常关闭。
+		for _, want := range []string{
+			"addGlobalMonitorForEventsMatchingMask",
+			"NSEventMaskLeftMouseDown",
+			"loc.y < 40",
+		} {
+			if !strings.Contains(src, want) {
+				t.Errorf("panelwin_darwin.m 缺少 %q(点外部关闭链不完整)", want)
+			}
 		}
-		resignBody := src[resignIdx:]
-		if next := strings.Index(src[resignIdx:], "\n- ("); next >= 0 {
-			resignBody = src[resignIdx : resignIdx+next]
+		monIdx := strings.Index(src, "addGlobalMonitorForEventsMatchingMask")
+		if monIdx < 0 {
+			t.Fatal("panelwin_darwin.m 缺全局鼠标监听")
 		}
-		code := stripObjcComments(resignBody)
-		if regexp.MustCompile(`exit\s*\(\s*0\s*\)`).MatchString(code) {
-			t.Errorf("panelwin_darwin.m 的 resignKey 仍在 exit(0)(方案 B:失焦=隐藏,不再退出):\n%s", resignBody)
+		monBody := src[monIdx:]
+		if end := strings.Index(monBody, "\n  }];"); end >= 0 {
+			monBody = monBody[:end]
+		}
+		if !regexp.MustCompile(`exit\s*\(\s*0\s*\)`).MatchString(stripObjcComments(monBody)) {
+			t.Errorf("panelwin_darwin.m 的点面板外监听未 exit(0)(点外即退链断裂):\n%s", monBody)
 		}
 	})
 
@@ -114,26 +131,6 @@ func TestPanelwinDarwinShellStructure(t *testing.T) {
 		// 私有面,公证探针随 Task 16 同批)——不许写成属性点语法误装公有。
 		if !strings.Contains(src, `forKey:@"drawsBackground"`) {
 			t.Errorf("panelwin_darwin.m 的 drawsBackground 必须经 setValue:forKey:@NO 的 KVC 形态(私有 API 口径)")
-		}
-		// resignKey 抖动窗守卫:everKeyed 打标+300ms 窗+两处 makeKey 时间戳
-		for _, want := range []string{
-			"everKeyed",
-			"lastMakeKeyAt",
-			"CFAbsoluteTimeGetCurrent() - self.lastMakeKeyAt < 0.3",
-		} {
-			if !strings.Contains(src, want) {
-				t.Errorf("panelwin_darwin.m 缺少 %q(resignKey 抖动窗守卫不完整,spawn 期 key 抖动会一出生就隐藏)", want)
-			}
-		}
-		// 点面板外即收:全局鼠标监听三件套(鼠标事件无需 TCC;菜单栏带排除)
-		for _, want := range []string{
-			"addGlobalMonitorForEventsMatchingMask",
-			"NSEventMaskLeftMouseDown",
-			"loc.y < 40",
-		} {
-			if !strings.Contains(src, want) {
-				t.Errorf("panelwin_darwin.m 缺少 %q(点外部收起链不完整)", want)
-			}
 		}
 		// 材质层 frame 必须是 contentView 本地坐标(2026-11-28 实机走查坐实:
 		// 用 contentRectForFrameRect:panel.frame 的屏幕全局坐标 addSubview,
@@ -248,36 +245,43 @@ func TestPanelwinDarwinShellStructure(t *testing.T) {
 		// AppKit 强约束:UI 事件循环必须在主线程。包 init 必然在主 goroutine
 		// 执行,runtime.LockOSThread 钉住后 cgo 的 C.panelwin_run 才跑在主
 		// 线程——不钉则调度器可能把主 goroutine 迁走,NSApp run 失效,
-		// 失焦隐藏整条链死成僵尸(非崩溃,launcher 崩溃计数看不见)。
+		// 失焦即退整条链死成僵尸(非崩溃,launcher 崩溃计数看不见)。
 		goSrc := panelwinDarwinGoSource(t)
 		if !strings.Contains(goSrc, "LockOSThread") {
 			t.Errorf("panelwin_darwin.go 缺少 runtime.LockOSThread(主 goroutine 未钉主线程,NSApp run 失效→失焦链死成僵尸)")
 		}
 	})
 
-	t.Run("方案 B Go 侧接线:toggle 信号+空闲回收+孤儿自检", func(t *testing.T) {
+	t.Run("Go 侧接线:close 请求信号+孤儿自检", func(t *testing.T) {
 		goSrc := panelwinDarwinGoSource(t)
 		for _, want := range []string{
-			"signal.Notify(ch, syscall.SIGUSR1)",           // toggle 信号接收(SIGUSR1 专用契约见 app/tray 投递侧)
-			"C.panelwin_toggle()",                          // handler goroutine → cgo toggle(ObjC 内派发主线程)
-			"//export panelwinGoVisibilityChanged",         // ObjC → Go 可见性回传(空闲回收计时入口)
-			"panelIdle.SetHidden",                          // 回传喂控制器
+			"signal.Notify(ch, syscall.SIGUSR1)",           // close 请求接收(SIGUSR1 专用契约见 app/tray 投递侧)
+			"os.Exit(ExitFocusLoss)",                       // 收到请求即 exit(0) 正常关闭(handler 是「close 请求=exit(0)」契约承载点)
 			"panelOrphanWatchdog(nil, os.Getppid, os.Exit", // 孤儿自检起跑(ppid==1 → exit 0)
-			"startPanelToggleHandler()",                    // Run 路径起跑(常驻形态首帧前就位)
+			"startPanelCloseHandler()",                     // Run 路径起跑(close 请求首帧前就位)
 			"startPanelOrphanWatchdog()",
 		} {
 			if !strings.Contains(goSrc, want) {
-				t.Errorf("panelwin_darwin.go 缺少 %q(方案 B Go 侧接线断裂)", want)
+				t.Errorf("panelwin_darwin.go 缺少 %q(关闭即退 Go 侧接线断裂)", want)
+			}
+		}
+		// 反向锚:toggle 空闲回收链已删——Go 侧不得再引用已废除的符号。
+		for _, banned := range []string{"panelwin_toggle", "panelwinGoVisibilityChanged", "panelIdle", "ALIANG_PANEL_NO_ORPHAN"} {
+			if strings.Contains(goSrc, banned) {
+				t.Errorf("panelwin_darwin.go 仍引用已废除的方案 B 符号 %q(空闲回收/可见性回传/调试开关均已随撤销批删除)", banned)
 			}
 		}
 		// 信号 handler 只能在 Run(面板进程路径)注册:包级 init 会波及同
-		// 二进制的 companion(静默吞 SIGUSR1)。只扫 init 函数体(截到首个
-		// 顶层闭括号),不波及文件尾部 Run 路径的合法注册。
+		// 二进制的 companion(静默吞 SIGUSR1)。只扫 init 函数体(从首个
+		// '{' 到配对 '}',防止单行 init 之后的下一个函数体被误并进来),
+		// 不波及文件尾部 Run 路径的合法注册。
 		if idx := strings.Index(goSrc, "func init()"); idx >= 0 {
-			initBody := goSrc[idx:]
-			if end := strings.Index(initBody, "\n}"); end >= 0 {
-				initBody = initBody[:end]
+			open := strings.Index(goSrc[idx:], "{")
+			if open < 0 {
+				t.Fatal("panelwin_darwin.go 的 init() 缺函数体")
 			}
+			close := matchingGoBrace(goSrc[idx+open:])
+			initBody := goSrc[idx : idx+open+close+1]
 			if strings.Contains(initBody, "signal.Notify") {
 				t.Errorf("panelwin_darwin.go 的 init() 里注册了 SIGUSR1 handler(会波及同二进制 companion,须移到 Run 路径)")
 			}
@@ -345,14 +349,46 @@ func TestPanelwinDarwinResizeFollow(t *testing.T) {
 }
 
 // poolWrappedEntries — 会被 Go goroutine 所在线程直接调到的 C 入口:
-// 函数体必须整体包一层 @autoreleasepool(结构测试逐个校验)。panelwin_toggle
-// 是方案 B 的 toggle 入口(signal handler goroutine 直调,dispatch_async
-// 派发主线程——Go goroutine 线程无 pool,纪律见文件头)。
-var poolWrappedEntries = []string{"panelwin_run", "panelwin_toggle"}
+// 函数体必须整体包一层 @autoreleasepool(结构测试逐个校验)。panelwin_run
+// 是唯一 C 入口(close 请求不再经 cgo——handler goroutine 直接 exit(0),
+// 无 UI 操作面)。
+var poolWrappedEntries = []string{"panelwin_run"}
 
 // noOwnPoolNeeded — 不需要自持 pool 的静态辅助函数:只被已包 pool 的
 // 入口内部调用,其 autoreleased 结果在调用方的 pool 里排空。
 var noOwnPoolNeeded = []string{"originOfURL"}
+
+// objcMethodBody 返回 name 对应 ObjC 方法的正文(从方法声明起截到下一个
+// ObjC 方法声明为止;文件尾无下一方法时截到末尾)。
+func objcMethodBody(src, name string) string {
+	idx := strings.Index(src, name)
+	if idx < 0 {
+		return ""
+	}
+	body := src[idx:]
+	if next := strings.Index(src[idx:], "\n- ("); next >= 0 {
+		body = src[idx : idx+next]
+	}
+	return body
+}
+
+// matchingGoBrace 返回 s 开头 '{' 对配对 '}' 的偏移(花括号不闭合时返回 -1;
+// Go 源码断言用,与 ObjC 版 matchingBraceIdx 同构但下标语义不同)。
+func matchingGoBrace(s string) int {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
 
 // panelwinDarwinSource 读取本包的 ObjC 壳源码。
 func panelwinDarwinSource(t *testing.T) string {

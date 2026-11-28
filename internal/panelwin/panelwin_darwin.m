@@ -5,46 +5,50 @@
 // (drawsBackground=false 经 KVC 私有面;公证探针随 Task 16 同批)——
 // 毛玻璃归系统材质层,面板前端 hosted 态只画半透明底(Task 7 评审固化)。
 //
-// 生命周期(2026-11-28 用户拍板方案 B「首次后常驻」):进程常驻,窗口
-// 可见⇄隐藏由 toggle 驱动——companion 点图标发 SIGUSR1 → 壳内 signal handler
-// goroutine → panelwin_toggle()(dispatch_async 派发主线程)→ panelSetHidden:
-// 单一改口(orderOut 隐藏 / makeKeyAndOrderFront+activate 显示),并把新可见
-// 性回传 Go(导出回调,Go 侧管 10 分钟空闲回收计时);windowDidResignKey →
-// panelSetHidden:YES(失焦=隐藏,不再 exit(0))——点面板外=消失的同义词;
-// 页面 quit 消息 → exit(60);open 消息 → NSWorkspace openURL 开默认浏览器后
-// 驻留;resize 消息 → 跟随改窗高(高度自适应)。
+// 生命周期(2026-11-28 撤销方案 B「首次后常驻」,回归「点击才拉起+关闭
+// 即退」):companion 点图标 spawn 本进程,窗口随进程生、随进程死——
+// 点面板外(global mouseDown)/失焦(resignKey)→ exit(0) 正常关闭;托盘
+// 图标的 close 请求(SIGUSR1,handler 在 panelwin_darwin.go)→ exit(0);
+// 页面 quit 消息 → exit(60);open 消息 → NSWorkspace openURL 开默认浏览器
+// 后驻留;resize 消息 → 跟随改窗高(高度自适应)。进程退出即窗口消失,
+// 不存在任何驻留形态的残留窗口。
 //
-// 点面板外即收(2026-11-28 用户反馈,全局鼠标监听实现):global monitor 对
-// 鼠标事件【无需】TCC 授权(仅键盘事件需要 Input Monitoring)——面板未成为
-// key 也能收到「面板外」的点击。退出码契约:0=正常关闭(现由空闲回收与
-// 孤儿自检产生,失焦不再产生退出)、60=quit、其余=崩溃。
+// ⚠️ 撤销方案 B 的实证依据(2026-11-28 实机走查三连败,同根=常驻的隐藏
+// WKWebView 窗口在该 macOS 上不可靠):
+//  ① orderOut 后 makeKeyAndOrderFront/orderFrontRegardless 均被防抢焦点
+//     策略静默忽略(再也打不开);
+//  ② 重显后 WebKit 内容不回复绘制(空白框);
+//  ③ 显示路径 makeKey 抢用户焦点→被夺回→0.12s 内 resignKey 自动再隐藏。
+//
+// 点面板外即收(全局鼠标监听实现):global monitor 对鼠标事件【无需】TCC
+// 授权(仅键盘事件需要 Input Monitoring)——面板未成为 key 也能收到
+// 「面板外」的点击。菜单栏带 y<40 排除:托盘图标自身的点击是 companion 的
+// 手势(close 请求由它发),不能被本监听抢先关闭。
+//
+// 退出码契约:0=正常关闭(点面板外/失焦/图标请求关闭/孤儿自检)、60=quit、
+// 其余=崩溃。
 //
 // 进程是叶子进程,窗口/对象生命周期=进程存活,不做显式释放。
 //
 // 内存纪律(同 third_party/systray/systray_darwin.m 的教训,上游 #135):
-// 会被 Go goroutine 所在线程直接调到的 C 入口(panelwin_run / panelwin_toggle)
-// 函数体整体包一层 @autoreleasepool——Go 运行时线程没有 autorelease pool,
-// 入口内创建的任何 autoreleased 中间对象就地排空。ARC 负责所有权,全文件
-// 不手写 autorelease 消息;delegate/窗口对象存活到进程结束(叶子进程,
-// 不释放)。delegate 的 ObjC 方法(WKScriptMessageHandler / NSWindowDelegate /
+// 会被 Go goroutine 所在线程直接调到的 C 入口(panelwin_run)函数体整体
+// 包一层 @autoreleasepool——Go 运行时线程没有 autorelease pool,入口内
+// 创建的任何 autoreleased 中间对象就地排空。ARC 负责所有权,全文件不手写
+// autorelease 消息;delegate/窗口对象存活到进程结束(叶子进程,不释放)。
+// delegate 的 ObjC 方法(WKScriptMessageHandler / NSWindowDelegate /
 // WKNavigationDelegate)全部由 AppKit 主 run loop 调用,run loop 自带
 // 逐事件 pool,无需自管;dispatch_async 到主队列的块也由主 run loop 的
 // 逐事件 pool 排空。
 //
-// 激活面:显示路径 makeKeyAndOrderFront + [NSApp activateIgnoringOtherApps:YES]
-// 双保险——不取到焦点,windowDidResignKey 永不触发、失焦=隐藏整条失效
-// (见上方已知限制)。NSWindowStyleMaskNonactivatingPanel 让面板不抢走宿主
-// (托盘)的 key 状态;canBecomeKey 覆写为 YES 让面板内部可交互。
+// 激活面:初始上屏【刻意不 makeKey】(撤销方案 B 定谳的失败模式③:makeKey
+// 抢用户焦点→被夺回→resignKey 自动再隐藏)——用户点面板内部一次后
+// becomeKey,失焦即退链随即激活;此前点面板外由全局鼠标监听兜底关闭。
 //
 // ⚠️ 窗口创建时序(2026-11-28 实机走查坐实,见 applicationDidFinishLaunching):
 // 窗口必须在 app 完成启动后创建, Spaces 归属/key 资格才有正确语义。
 
 #import <Cocoa/Cocoa.h>
 #import <WebKit/WebKit.h>
-
-// Go 侧导出回调(panelwin_darwin.go //export):可见性事件回传 Go,
-// Go 侧凭此管理空闲回收计时。外部声明——//export 生成符号在链接期解析。
-extern void panelwinGoVisibilityChanged(int hidden);
 
 @interface PanelWindow : NSPanel
 @end
@@ -65,80 +69,30 @@ extern void panelwinGoVisibilityChanged(int hidden);
 @property (copy) NSString* launchURL;      // --url,panel.html 完整地址
 @property (assign) NSRect contentRect;     // AppKit 全局左下原点的窗口 frame
 @property (assign) BOOL everKeyed;         // 曾成为 key(见 resignKey 守卫)
-@property (assign) CFAbsoluteTime lastMakeKeyAt; // 最近一次 makeKey 时刻(resignKey 抖动窗守卫)
 @end
-
-// 面板 delegate 的进程级引用(panelwin_run 建立后恒非 nil):panelwin_toggle
-// (Go goroutine 直调的 C 入口)经它把 toggle 派发到主线程。进程是单窗
-// 叶子进程,无生命周期管理。
-static PanelAppDelegate* panelDelegate = nil;
-static volatile int panelPendingToggle = 0; // toggle 待执行标志(timer 泵读,见 didFinishLaunching)
 
 @implementation PanelAppDelegate
 
-// 可见性单一改口(方案 B):hide=YES → orderOut 隐藏(驻留不退出);NO →
-// makeKeyAndOrderFront+activate 显示。幂等:状态不变时零动作不回传(防重复
-// 事件重置 Go 侧空闲计时)。toggle 与 windowDidResignKey 都走这里,保证
-// 「失焦=隐藏」与「toggle 隐藏」在同一状态机上、Go 侧空闲回收只认这一处
-// 回传。可见性真源 = panel.isVisible。
-- (void)panelSetHidden:(BOOL)hide {
-  if (!self.panel) {
-    return;
-  }
-  BOOL isHidden = !self.panel.isVisible;
-  if (hide == isHidden) {
-    return; // 幂等:状态不变,零动作零回传
-  }
-  if (hide) {
-    [self.panel orderOut:nil];
-    NSLog(@"panelwin: orderOut 隐藏(驻留不退出;失焦=隐藏,方案 B)");
-  } else {
-    // 复活三保险(2026-11-28 实机走查坐实:orderOut 后的 makeKeyAndOrderFront
-    // 对未激活的后台 accessory 应用会被 macOS 静默忽略——首开能显示是因为
-    // 新窗口首次 orderFront 不受此限,orderOut 后重显被「防抢焦点」策略拦下,
-    // 用户视角「再也打不开」):
-    //   ① orderFrontRegardless——无视激活状态强制上屏(orderOut 复显的关键);
-    //   ② makeKeyAndOrderFront——恢复 key,武装次级失焦链;
-    //   ③ activateIgnoringOtherApps——尽力激活。
-    self.lastMakeKeyAt = CFAbsoluteTimeGetCurrent();
-    [self.panel orderFrontRegardless];
-    [self.panel makeKeyAndOrderFront:nil];
-    if (!self.panel.isVisible) {
-      NSLog(@"panelwin: 显示后仍不可见(orderFront 被系统拒绝),留 Task 16 探针");
-    }
-    [NSApp activateIgnoringOtherApps:YES];
-    NSLog(@"panelwin: toggle 显示 visible=%d", self.panel.isVisible ? 1 : 0);
-  }
-  // 回传 Go(导出回调):Go 侧据新可见性启动/重置/停止空闲回收计时
-  // (panelwin_darwin.go panelwinGoVisibilityChanged → panelIdle)。
-  panelwinGoVisibilityChanged(hide ? 1 : 0);
-}
-
-// 失焦 = 隐藏(方案 B,2026-11-28 拍板;原行为 exit(0) 已废除):面板点到
-// 外部/宿主切换即 orderOut,进程驻留,由 Go 侧空闲回收(10 分钟)或
-// companion toggle 复活。隐藏后窗口无 key,resignKey 不再触发。
-// ⚠️ 面板从未成为 key 之前本回调不存在(见文件头已知限制)。
+// 失焦 = 正常关闭(exit 0):面板点到外部/宿主切换即退出——窗口随进程
+// 消失,残留不可能存在(「关闭即退」)。退出码 0=正常关闭契约,launcher
+// 零惩罚零重拉。
+// ⚠️ everKeyed 守卫:从未成为过 key 的面板不响应失焦——spawn 发生在托盘
+// 点击的 key 处理中途,理论上一出生就被夺 key 的 resignKey 会误伤(面板
+// 一出生就退,用户视角「点击没反应」);初始上屏已不 makeKey(见文件头
+// 激活面),本守卫是 belt-and-suspenders。首次真实点击面板(becomeKey)后
+// 守卫放行,失焦即退链即活。
 - (void)windowDidResignKey:(NSNotification *)notification {
-  // ⚠️ everKeyed 守卫(2026-11-28 实机走查坐实):spawn 发生在托盘点击的
-  // key 处理中途,makeKey 抢到的 key 会被该点击的收尾瞬间夺走→resignKey
-  // 立即触发→面板一出生就 orderOut,用户视角「点击没反应」而子进程按
-  // 方案 B 常驻。从未成为过 key 的面板不响应失焦隐藏;首次真实点击面板
-  // (becomeKey)后,本守卫放行,次级失焦链即活。
-  // makeKey 后 300ms 内的 resignKey 一律视为托盘点击的 key 抖动(toggle
-  // 显示路径同样发生在点击处理中途),忽略;真失焦发生在用户切走时,距
-  // makeKey 必然 >300ms。everKeyed=从未成为 key 的兜底。
-  if (!self.everKeyed ||
-      CFAbsoluteTimeGetCurrent() - self.lastMakeKeyAt < 0.3) {
-    NSLog(@"panelwin: resignKey 忽略(从未成为 key,或 makeKey 后 300ms 抖动窗内)");
+  if (!self.everKeyed) {
+    NSLog(@"panelwin: resignKey 忽略(从未成为 key,spawn 期 key 抖动防误伤)");
     return;
   }
-  NSLog(@"panelwin: resignKey → orderOut 隐藏(失焦=隐藏,方案 B)");
-  [self panelSetHidden:YES];
+  NSLog(@"panelwin: resignKey → 正常关闭(失焦即退,exit 0)");
+  exit(0);
 }
 
 - (void)windowDidBecomeKey:(NSNotification *)notification {
   self.everKeyed = YES;
-  NSLog(@"panelwin: becomeKey(失焦链武装)");
+  NSLog(@"panelwin: becomeKey(失焦即退链武装)");
 }
 
 // 导航取证(Task 16 探针):页面加载成败一行日志,白名单误拦/网络失败不再哑。
@@ -331,25 +285,27 @@ static volatile int panelPendingToggle = 0; // toggle 待执行标志(timer 泵�
   [effect addSubview:web];
 
   // NSURL URLWithString 对畸形串返回 nil:NSLog 留痕(Task 16 取证用)且
-  // 不 loadRequest——面板空白但失焦链(NSApp run)仍活,宿主可正常关闭;
+  // 不 loadRequest——面板空白但失焦即退链(NSApp run)仍活,宿主可正常关闭;
   // 不做这层防御,requestWithURL:nil 属未定义形态。
   NSURL* pageURL = [NSURL URLWithString:self.launchURL];
   if (pageURL) {
     [web loadRequest:[NSURLRequest requestWithURL:pageURL]];
   } else {
-    NSLog(@"panelwin: --url 解析为 nil,面板不加载内容(失焦自退链仍生效)");
+    NSLog(@"panelwin: --url 解析为 nil,面板不加载内容(失焦即退链仍生效)");
   }
 
-  // 激活双保险:不取焦点则失焦即退永不触发。
-  // ⚠️ 首次上屏延迟 150ms(2026-11-28 实机走查坐实):spawn 在托盘点击的
-  // key 处理中途,立即 makeKey 会与该点击的 key 收尾相撞(见 resignKey
-  // 守卫)——让抖动先结束再上屏抢 key。toggle 复活路径(panelSetHidden:NO)
-  // 不经过此处,无延迟。
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+  // 初始上屏:600ms 延迟 + orderFrontRegardless(2026-11-28 实机走查坐实的
+  // 「悬挂窗口」机制:companion 在托盘点击处理中途 spawn 子进程,子进程的
+  // 首次 orderFront 动作撞进系统 key/space 切换未稳定期(托盘点击的震荡期
+  // 约 1s 内),窗口进入「已注册但永不合成」的悬挂态——CGWindowList onscreen
+  // 永远查无此窗,后续信号也无法让它上屏(实测 7 分钟后的信号无效);系统
+  // 平静期同代码每次都正常上屏)。600ms 避开震荡期上屏;页面加载在等待期
+  // 照常进行,上屏时内容已就绪(加载感由快照预热消化)。⚠️ 刻意不 makeKey
+  // (撤销方案 B 失败模式③:makeKey 抢用户焦点→被夺回→resignKey 自动再
+  // 隐藏)——用户点面板内部一次后 becomeKey,失焦即退链随即激活。
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
                  dispatch_get_main_queue(), ^{
-    self.lastMakeKeyAt = CFAbsoluteTimeGetCurrent();
-    [panel makeKeyAndOrderFront:nil];
-    [NSApp activateIgnoringOtherApps:YES];
+    [panel orderFrontRegardless];
   });
 
   // 原生圆角(2026-11-28 用户反馈:CSS 的 --panel-radius 只作用内层 .panel
@@ -363,10 +319,10 @@ static volatile int panelPendingToggle = 0; // toggle 待执行标志(timer 泵�
   panel.contentView.layer.masksToBounds = YES;
 
   // 点面板外即收:global mouseDown(本窗口内的点击走本地路径不进此监听,
-  // 故凡到达此处的点击必然在面板外)=隐藏;菜单栏带(y<40)排除——托盘图标
-  // 自身的点击是 companion 的 toggle 手势,若被本监听抢先隐藏,随后的
-  // toggle 显示会形成「点一次没反应」竞态。handler 在注册线程(主线程)
-  // 回调,仍走 dispatch_async 保险;幂等由 panelSetHidden 闸承担。
+  // 故凡到达此处的点击必然在面板外)=正常关闭 exit(0);菜单栏带(y<40)
+  // 排除——托盘图标自身的点击是 companion 的手势(close 请求由它发),
+  // 不能被本监听抢先关闭(否则形成「点一次没反应」竞态)。handler 在注册
+  // 线程(主线程)回调,仍走 dispatch_async 保险。
   [NSEvent addGlobalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown
                                          handler:^(NSEvent *event) {
     NSPoint loc = event.locationInWindow; // global monitor:屏幕全局坐标(左上原点)
@@ -374,51 +330,15 @@ static volatile int panelPendingToggle = 0; // toggle 待执行标志(timer 泵�
       return;
     }
     dispatch_async(dispatch_get_main_queue(), ^{
-      [self panelSetHidden:YES];
+      NSLog(@"panelwin: 点面板外 → 正常关闭(exit 0)");
+      exit(0);
     });
   }];
 
-  // TEMP-DOM(调试,提交前移除):每次 toggle 后读挂载实况
-  __block WKWebView *dbgWeb = nil;
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                 dispatch_get_main_queue(), ^{
-    for (NSView *v in panel.contentView.subviews) {
-      for (NSView *sv in v.subviews) {
-        if ([sv isKindOfClass:[WKWebView class]]) { dbgWeb = (WKWebView *)sv; }
-      }
-    }
-    if (!dbgWeb) { NSLog(@"panelwin: TEMP no webview"); return; }
-    [dbgWeb evaluateJavaScript:@"fetch('/assets/_plugin-vue_export-helper-Ds4qx6Dg.js').then(r=>{window.__h='helper:'+r.status;return r.text()}).then(t=>{window.__h+=' len:'+t.length}).catch(e=>{window.__h='ERR:'+String(e)});JSON.stringify({app:document.getElementById('app')?document.getElementById('app').childElementCount:-1,text:(document.body.innerText||'').slice(0,40),ready:document.readyState,perr:(window.__perr||[]).slice(0,3)})"
-         completionHandler:^(id r, NSError *e) {
-      NSLog(@"panelwin: TEMP-DOM err=%@ result=%@", e.localizedDescription ?: @"-", r ?: @"(nil)");
-      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                     dispatch_get_main_queue(), ^{
-        [dbgWeb evaluateJavaScript:@"window.__h||'(unset)'" completionHandler:^(id r2, NSError *e2) {
-          NSLog(@"panelwin: TEMP-HELPER err=%@ result=%@", e2.localizedDescription ?: @"-", r2 ?: @"(nil)");
-        }];
-      });
-    }];
-  });
-
-  // toggle 执行泵:主 run loop NSTimer 轮询 pending 标志(绕开 GCD 主队列
-  // 拖延;0.25s 间隔=可感知上限,实测本进程 timer 是否准时将入走查记录)。
-  [NSTimer scheduledTimerWithTimeInterval:0.25
-                                   repeats:YES
-                                     block:^(NSTimer *t) {
-    NSInteger fired = 0;
-    if (panelPendingToggle) {
-      panelPendingToggle = 0;
-      fired = 1;
-    }
-    if (fired && panelDelegate) {
-      NSLog(@"panelwin: timer 执行 toggle @ %@", [NSDate date]);
-      [panelDelegate panelSetHidden:!panelDelegate.panel.isVisible];
-    }
-  }];
-
-  // 上屏取证(Task 16 探针):0.5s 后回报 occlusion/key 状态——Space 事故
-  // (窗口在册但不在屏)在这里一行日志就能归因。
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+  // 上屏取证(Task 16 探针):1s 后回报 occlusion/key 状态——初始上屏延迟
+  // 600ms,探针随之挪到 1s 以观测上屏之后的状态;Space 事故(窗口在册但
+  // 不在屏/悬挂窗口)在这里一行日志就能归因。
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                  dispatch_get_main_queue(), ^{
     NSLog(@"panelwin: frame=%@ visible=%d occlusion=%lu key=%d",
           NSStringFromRect(panel.frame),
@@ -472,33 +392,17 @@ void panelwin_run(const char* url, int x, int yTop, int w, int h,
     delegate.peerURL = peerStr;
     delegate.launchURL = urlStr;
     delegate.contentRect = NSMakeRect((CGFloat)x, bottomLeftY, (CGFloat)w, (CGFloat)h);
-    panelDelegate = delegate; // panelwin_toggle 的主线程派发目标(见文件顶)
     [NSApp setDelegate:delegate];
 
     // ⚠️ 窗口创建必须等 applicationDidFinishLaunching(见上方委托方法)——
     // 2026-11-28 实机走查坐实:run loop 起来之前建窗口,Spaces 会把它钉在
     // 错误位置(窗口服务器在册、CGWindowList onscreen 有名,但【不在当前
     // Space 合成】且永不成为 key,失焦自退链死)。AppKit 惯例:窗口创建
-    // 不早于 app 完成启动。
-    [NSApp activateIgnoringOtherApps:YES];
+    // 不早于 app 完成启动。⚠️ 不调 activateIgnoringOtherApps——初始上屏
+    // 不 makeKey(见文件头激活面),程序化激活只会抢用户焦点。
 
-    // 不返回——退出只发生在 exit(60)(quit)/ exit(0)(空闲回收与孤儿
-    // 自检)两个出口上;失焦=隐藏不再产生退出。
+    // 不返回——退出只发生在 exit(0)(点面板外/失焦/close 请求/孤儿自检)
+    // 与 exit(60)(quit)两个出口上。
     [NSApp run];
   }
-}
-
-// panelwin_toggle — toggle 入口(Go 侧 signal handler goroutine 直调,方案 B):
-// companion 的 SIGUSR1 经壳内 handler goroutine 到这里。⚠️ 调用者不是主线程,
-// 不直接碰 UI——dispatch_async 派发主线程执行 panelSetHidden:(AppKit 主线程
-// 约束;块由主 run loop 逐事件 pool 排空)。可见性回传 Go 由 panelSetHidden
-// 内的导出回调完成,本函数即返回(void;实现自选:回传走单一回调通道,
-// 不经返回值)。函数体整体包 @autoreleasepool(Go goroutine 线程无 pool,
-// 纪律见文件头)。
-void panelwin_toggle(void) {
-  // 方案 B 实测定谳(2026-11-28):GCD 主队列块在本进程(未激活 accessory,
-  // 主 goroutine LockOSThread 停在 cgo)会被运行循环拖延数秒——toggle 改
-  // pending 标志 + 主 run loop NSTimer 轮询执行(见 didFinishLaunching)。
-  panelPendingToggle = 1;
-  NSLog(@"panelwin: toggle 收到(cgo 入口,置 pending)");
 }

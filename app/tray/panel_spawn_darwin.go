@@ -38,16 +38,17 @@ func spawnPanelProcess(opts SpawnOpts) (ChildProcess, error) {
 	return child, nil
 }
 
-// panelToggleSender darwin toggle 投递(方案 B「首次后常驻」):对存活面板
-// 子进程发 SIGUSR1,壳内(signal.Notify→handler goroutine→cgo toggle)完成
-// 可见⇄隐藏。发送失败(进程已死,kill 返回 ESRCH)→ launcher 按无子处理
-// 回退 spawn。
+// panelToggleSender darwin close 请求投递(2026-11-28 撤销方案 B,回归
+// 「关闭即退」):对在册面板子进程发 SIGUSR1=请求关闭——壳内(signal.Notify
+// →handler goroutine→exit(0))正常关闭,窗口随进程退出消失。发送失败
+// (进程已死,kill 返回 ESRCH)→ launcher 按无子处理回退 spawn。变量名
+// 保留历史名 toggle(语义已是「请求关闭」,不再做可见⇄隐藏切换)。
 //
-// ⚠️ SIGUSR1 专用于面板 toggle,其他组件不得占用(壳内 signal.Notify 接管
-// 后默认终止行为被替换;companion 自身进程不注册本信号,不影响托盘侧)。
-// 已知边界:标准信号不排队,µs 级合并窗口内连续两次点击可能丢一次 toggle
-// (用户感知=点一次没反应,再点即恢复;launcher 不跟踪可见性,零状态损坏,
-// 架构上刻意容忍,2026-11-28 架构评审定谳)。
+// ⚠️ SIGUSR1 专用于面板 close 请求,其他组件不得占用(壳内 signal.Notify
+// 接管后默认终止行为被替换;companion 自身进程不注册本信号,不影响托盘侧)。
+// 已知边界:标准信号不排队,µs 级合并窗口内连续两次点击可能丢一次 close
+// 请求(用户感知=多按一次图标;子进程仍在册时 launcher 幂等重发,零状态
+// 损坏,架构上刻意容忍,2026-11-28 架构评审定谳)。
 var panelToggleSender = func(pid int) error {
 	return syscall.Kill(pid, syscall.SIGUSR1)
 }

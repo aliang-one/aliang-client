@@ -144,17 +144,16 @@ func TestPanelwinWindowsResizeFollowChain(t *testing.T) {
 	}
 }
 
-// TestPanelwinWindowsResidentLifecycle — 方案 B「首次后常驻」(2026-11-28
-// 用户拍板)的 Windows 壳结构断言:WM_ACTIVATE 失活 → ShowWindow(SW_HIDE)
-// 隐藏(不再 PostQuitMessage 退出)+ 喂空闲控制器;toggle 消息(wmApp+1)
-// → 可见⇄隐藏切换(显示路径 SetForegroundWindow+chromium.Focus 复活前台);
-// 可见性真源 panelHidden 幂等闸(隐藏态重复失活不得重置空闲计时)。
+// TestPanelwinWindowsCloseOnDeactivate — 撤销方案 B「关闭即退」(2026-11-28)
+// 的 Windows 壳结构断言:WM_ACTIVATE 失活(点面板外/宿主切换)→
+// PostQuitMessage(0) 失焦即退;close 请求消息(wmApp+1)→ PostQuitMessage(0)
+// 请求关闭;两个出口都零驻留——窗口随进程退出彻底消失。
 // GOOS 无关,只读源码文本(同上)。
-func TestPanelwinWindowsResidentLifecycle(t *testing.T) {
+func TestPanelwinWindowsCloseOnDeactivate(t *testing.T) {
 	src := panelwinWindowsSource(t)
 
-	// ① toggle 消息常量与接收分支在册(WM_APP+1;与 app/tray 投递侧跨文件
-	//    对齐由彼端 TestPanelM2ToggleChannelContract 锚定)。常量锚容忍
+	// ① close 请求消息常量与接收分支在册(WM_APP+1;与 app/tray 投递侧跨
+	//    文件对齐由彼端 TestPanelM2CloseChannelContract 锚定)。常量锚容忍
 	//    gofmt 对齐空格差异(正则)。
 	for _, want := range []string{
 		`wmApp\s+= 0x8000`,
@@ -162,12 +161,12 @@ func TestPanelwinWindowsResidentLifecycle(t *testing.T) {
 		"case wmAppPanelToggle:",
 	} {
 		if !regexp.MustCompile(want).MatchString(src) {
-			t.Fatalf("panelwin_windows.go 缺 %q(方案 B toggle 接收链断裂)", want)
+			t.Fatalf("panelwin_windows.go 缺 %q(close 请求接收链断裂)", want)
 		}
 	}
 
-	// ② wmActivate 失活分支:走 hidePanelWindow(隐藏),不得再退出
-	//    (PostQuitMessage 已废除——方案 B:失焦=隐藏)。
+	// ② wmActivate 失活分支:PostQuitMessage(0) 失焦即退(不得再走任何
+	//    隐藏/驻留动作——方案 B 的 SW_HIDE 形态已废除)。
 	actIdx := strings.Index(src, "case wmActivate:")
 	if actIdx < 0 {
 		t.Fatal("panelwin_windows.go 缺 case wmActivate 分支")
@@ -177,38 +176,34 @@ func TestPanelwinWindowsResidentLifecycle(t *testing.T) {
 	if next := strings.Index(src[actIdx+len("case wmActivate:"):], "\tcase "); next >= 0 {
 		actBody = src[actIdx : actIdx+len("case wmActivate:")+next]
 	}
-	if !strings.Contains(actBody, "hidePanelWindow(hwnd)") {
-		t.Fatalf("wmActivate 失活分支未走 hidePanelWindow(失焦=隐藏链断裂):\n%s", actBody)
+	if !strings.Contains(actBody, "procPostQuitMessage.Call(uintptr(ExitFocusLoss))") {
+		t.Fatalf("wmActivate 失活分支未 PostQuitMessage(0)(失焦即退链断裂):\n%s", actBody)
 	}
-	if strings.Contains(actBody, "PostQuitMessage") {
-		t.Fatalf("wmActivate 失活分支仍在退出(方案 B:失焦=隐藏,不再 PostQuitMessage):\n%s", actBody)
-	}
-
-	// ③ 隐藏/切换动作的完整形态:幂等闸(panelHidden)→ SW_HIDE → 喂空闲
-	//    控制器;toggle 显示路径 SetForegroundWindow + chromium.Focus
-	//    (前台复活,否则次级失焦链永不触发)。
-	for _, want := range []string{
-		"if panelHidden {\n\t\treturn // 已隐藏:零动作(尤其不得重置空闲计时)",
-		"procShowWindow.Call(hwnd, uintptr(swHide))",
-		"panelIdle.SetHidden(true)",
-		"procShowWindow.Call(hwnd, uintptr(swShow))",
-		"procSetForegroundWindow.Call(hwnd)",
-		"panelChromium.Focus()",
-		"panelIdle.SetHidden(false)",
-	} {
-		if !strings.Contains(src, want) {
-			t.Fatalf("panelwin_windows.go 缺 %q(方案 B 隐藏/复活动作不完整)", want)
+	for _, banned := range []string{"hidePanelWindow", "swHide", "panelHidden", "panelIdle"} {
+		if strings.Contains(actBody, banned) {
+			t.Fatalf("wmActivate 失活分支仍在隐藏驻留(%q;撤销方案 B:失焦=PostQuitMessage(0)):\n%s", banned, actBody)
 		}
 	}
 
-	// ④ 首帧可见态复位(panelHidden=false)在首次 ShowWindow 之前——状态机
-	//    起点错则首帧失活会被幂等闸吞掉(不喂计时器,空闲回收失联)。
-	showIdx := strings.Index(src, "procShowWindow.Call(hwnd, uintptr(swShow))")
-	if showIdx < 0 {
-		t.Fatal("panelwin_windows.go 缺首帧 ShowWindow")
+	// ③ close 请求分支:PostQuitMessage(0) 请求关闭。
+	toggleIdx := strings.Index(src, "case wmAppPanelToggle:")
+	if toggleIdx < 0 {
+		t.Fatal("panelwin_windows.go 缺 case wmAppPanelToggle 分支")
 	}
-	if rst := strings.LastIndex(src[:showIdx], "panelHidden = false"); rst < 0 {
-		t.Fatal("首帧 ShowWindow 前缺 panelHidden=false 复位(方案 B 状态机起点)")
+	toggleBody := src[toggleIdx:]
+	if next := strings.Index(src[toggleIdx+len("case wmAppPanelToggle:"):], "\tcase "); next >= 0 {
+		toggleBody = src[toggleIdx : toggleIdx+len("case wmAppPanelToggle:")+next]
+	}
+	if !strings.Contains(toggleBody, "procPostQuitMessage.Call(uintptr(ExitFocusLoss))") {
+		t.Fatalf("close 请求分支未 PostQuitMessage(0)(请求关闭链断裂):\n%s", toggleBody)
+	}
+
+	// ④ 反向锚:方案 B 常驻态的进程级状态与隐藏/切换动作已删——全文件
+	//    不得再引用已废除的符号。
+	for _, banned := range []string{"hidePanelWindow", "togglePanelWindow", "panelChromium", "panelHidden", "panelIdle", "swHide"} {
+		if strings.Contains(src, banned) {
+			t.Fatalf("panelwin_windows.go 仍引用已废除的方案 B 符号 %q(隐藏驻留/空闲回收/toggle 切换均已随撤销批删除)", banned)
+		}
 	}
 }
 

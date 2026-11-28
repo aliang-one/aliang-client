@@ -9,19 +9,20 @@
 // 重要 4)。为什么不用 app/tray 的 DPI 声明:同名函数未导出,且 internal
 // 不得反向依赖 app 包(二审阻塞 2)——下方自含一份十几行的 DPI 声明。
 //
-// 生命周期(2026-11-28 用户拍板方案 B「首次后常驻」):WM_ACTIVATE 失活 →
-// ShowWindow(SW_HIDE) 隐藏(不再退出);companion 的 toggle 消息(WM_APP+1,
-// panel_spawn_windows.go FindWindowW+PostMessageW 投递)→ 可见⇄隐藏切换
-// (显示路径 SetForegroundWindow + chromium.Focus 复活前台);隐藏满 10 分钟
-// → exit(0) 空闲回收(panelwin_idle.go,wndProc 直接喂 panelIdle);页面
-// quit 消息 → 退出码 60;open 消息 → ShellExecute 开默认浏览器后驻留;
-// resize 消息 → applyHeight 跟随改窗高。退出码契约见 panelwin.go(Task 14
-// launcher:0=正常关闭(idle 回收/销毁收尾)、60=quit,其余=崩溃)。
+// 生命周期(2026-11-28 撤销方案 B「首次后常驻」,回归「点击才拉起+关闭
+// 即退」——常驻的隐藏 WebView2 窗口不可靠的教训同 macOS 三连败):
+// WM_ACTIVATE 失活(点面板外/宿主切换)→ PostQuitMessage(0) 失焦即退;
+// companion 的 close 请求消息(WM_APP+1,panel_spawn_windows.go
+// FindWindowW+PostMessageW 投递)→ PostQuitMessage(0) 请求关闭;窗口随
+// 进程退出彻底消失,不存在任何驻留形态。页面 quit 消息 → 退出码 60;open
+// 消息 → ShellExecute 开默认浏览器后驻留;resize 消息 → applyHeight 跟随
+// 改窗高(高度自适应)。退出码契约见 panelwin.go(Task 14 launcher:
+// 0=正常关闭(点外/失焦/close 请求)、60=quit,其余=崩溃)。
 //
 // 前台交接:显示前必须 SetForegroundWindow——companion spawn 时的
 // AllowSetForegroundWindow(pid)(Task 15)只授予资格,本进程不调
-// SetForegroundWindow 则 WM_ACTIVATE 激活事件不发,失活(=失焦隐藏)永不
-// 触发,整条失焦隐藏链失效(二审阻塞 3)。
+// SetForegroundWindow 则 WM_ACTIVATE 激活事件不发,失活(=失焦即退)永不
+// 触发,整条失焦即退链失效(二审阻塞 3)。
 package panelwin
 
 import (
@@ -51,15 +52,15 @@ const (
 	// 注:WM_QUIT(0x0012)不再声明常量——退出码协议已收进自建消息循环的
 	// WM_QUIT 分支(GetMessageW 返回 0 时直接读 wParam),见下方消息循环注释。
 
-	// wmApp/wmAppPanelToggle:companion → 面板壳的 toggle 消息(方案 B
-	// 「首次后常驻」,panel_spawn_windows.go FindWindowW+PostMessageW 投递)。
-	// WM_APP+1 = 0x8001;与投递侧常量跨文件对齐(app/tray 不能 import 本包,
-	// 漂移由 app/tray TestPanelM2ToggleChannelContract 源码锚定把守)。
+	// wmApp/wmAppPanelToggle:companion → 面板壳的 close 请求消息(语义=
+	// 请求关闭,panel_spawn_windows.go FindWindowW+PostMessageW 投递;历史名
+	// toggle,2026-11-28 撤销方案 B 后不再做可见⇄隐藏切换)。WM_APP+1 =
+	// 0x8001;与投递侧常量跨文件对齐(app/tray 不能 import 本包,漂移由
+	// app/tray TestPanelM2CloseChannelContract 源码锚定把守)。
 	wmApp            = 0x8000
 	wmAppPanelToggle = wmApp + 1
 
 	swShow        = 5
-	swHide        = 0
 	swpNoZOrder   = 0x0004
 	swpNoActivate = 0x0010
 
@@ -140,8 +141,8 @@ type pointW struct {
 	X, Y int32
 }
 
-// Run 阻塞展示面板,经消息循环正常返回退出码(0=正常关闭(idle 回收/
-// 销毁收尾;方案 B 下失焦=隐藏不再退出),60=quit)。
+// Run 阻塞展示面板,经消息循环正常返回退出码(0=正常关闭(点面板外/失焦/
+// close 请求/销毁收尾,「关闭即退」),60=quit)。
 func (nativeHost) Run(opts Options) int {
 	// ① 自含 DPI 声明,必须在任何窗口创建之前:非 DPI-aware 进程的窗口
 	// 在非 100% 缩放下会被 DPI 虚拟化,SetWindowPos 的物理坐标语义失真。
@@ -159,50 +160,6 @@ func (nativeHost) Run(opts Options) int {
 
 // lastExitCode 由消息循环落定(GetMessageW 返回 0 时读 WM_QUIT 的 wParam)。
 var lastExitCode int
-
-// —— 方案 B 常驻态的进程级状态 ——
-// 面板进程即单窗叶子进程;panelWndProc 是 windows.NewCallback 的包级回调
-// (无法捕获闭包),chromium 与可见性状态落包级。并发面:两变量只被消息
-// 循环主线程(wndProc/Run)读写,零锁;panelIdle 自带锁。
-var (
-	// panelChromium 壳的 WebView2 controller(Embed 成功后落定;toggle 显示
-	// 路径复 Focus 用——SetForegroundWindow 只推前台,WebView2 内部文档
-	// 不一定拿到键盘焦点,同首帧的 MoveFocus 语义)。
-	panelChromium *edge.Chromium
-	// panelHidden 当前可见性真源(WndProc 视角):false=可见/首帧前。
-	// 幂等闸:隐藏态重复收到失活消息(toggle 隐藏触发的 SW_HIDE 会再发
-	// WM_ACTIVATE 失活)不得二次喂 SetHidden(true)——那会重置空闲计时,
-	// 把「隐藏 10 分钟」拖成无限期。
-	panelHidden bool
-)
-
-// hidePanelWindow 失焦/toggle 的隐藏动作(方案 B:失焦=隐藏,不再退出):
-// SW_HIDE + 喂空闲控制器(启动/重置 10 分钟回收计时)。幂等闸见 panelHidden。
-func hidePanelWindow(hwnd uintptr) {
-	if panelHidden {
-		return // 已隐藏:零动作(尤其不得重置空闲计时)
-	}
-	panelHidden = true
-	procShowWindow.Call(hwnd, uintptr(swHide))
-	panelIdle.SetHidden(true)
-}
-
-// togglePanelWindow toggle 消息处理(方案 B):隐藏态 → 显示复活
-// (SW_SHOW + SetForegroundWindow + chromium.Focus,次级失焦链即活);
-// 可见态 → 隐藏。与 darwin 的 panelSetHidden 同一状态机口径。
-func togglePanelWindow(hwnd uintptr) {
-	if panelHidden {
-		panelHidden = false
-		procShowWindow.Call(hwnd, uintptr(swShow))
-		procSetForegroundWindow.Call(hwnd)
-		if panelChromium != nil {
-			panelChromium.Focus() // 首帧同款:程序化 MoveFocus 补键盘焦点
-		}
-		panelIdle.SetHidden(false)
-		return
-	}
-	hidePanelWindow(hwnd)
-}
 
 func runPanelWindow(opts Options) error {
 	className, err := windows.UTF16PtrFromString("AliangPanelWindow")
@@ -318,8 +275,6 @@ func runPanelWindow(opts Options) error {
 	if !chromium.Embed(hwnd) {
 		return fmt.Errorf("WebView2 初始化失败(运行时缺失或加载失败)")
 	}
-	// 落包级引用(toggle 显示路径的 chromium.Focus 用;见方案 B 状态注释)。
-	panelChromium = chromium
 	// Embed 后补一次初始 Resize(jchv webview.go L343 同款惯例):controller
 	// bounds 与窗口物理尺寸首帧对齐,不调则首帧内容停在 CreateWindowExW 的
 	// 临时尺寸上;高度自适应链的后续跟随同走 Resize。
@@ -411,8 +366,7 @@ func runPanelWindow(opts Options) error {
 	chromium.Navigate(opts.URL)
 
 	// ⑤ 显示前 SetForegroundWindow(见文件头:AllowSetForegroundWindow 只
-	// 授予资格,不调则 WM_ACTIVATE 激活不发、失焦=隐藏整条失效)。
-	panelHidden = false // 首帧可见态(方案 B 状态机起点;失活前不得误判已隐藏)
+	// 授予资格,不调则 WM_ACTIVATE 激活不发、失焦即退整条失效)。
 	procSetForegroundWindow.Call(hwnd)
 	procShowWindow.Call(hwnd, uintptr(swShow))
 	// 首帧键盘焦点:SetForegroundWindow 只把窗口推到前台,WebView2 内部
@@ -421,7 +375,7 @@ func runPanelWindow(opts Options) error {
 	chromium.Focus()
 
 	// 自建消息循环:GetMessageW 返回 0 才是收到 WM_QUIT(wParam 即退出码:
-	// 60=quit;WM_ACTIVATE 失活与 WM_DESTROY 都 PostQuitMessage(0))。
+	// 60=quit;WM_ACTIVATE 失活/WM_DESTROY/close 请求都 PostQuitMessage(0))。
 	var m msgW
 	gotQuit := false
 	for {
@@ -449,23 +403,24 @@ func runPanelWindow(opts Options) error {
 	return nil
 }
 
-// panelWndProc — 窗口过程:失焦=隐藏(⑦,方案 B)/ toggle 消息分派与销毁
-// 收尾,其余交 DefWindowProc。
+// panelWndProc — 窗口过程:失焦即退/close 请求分派与销毁收尾,其余交
+// DefWindowProc。三个出口都 PostQuitMessage(0)=正常关闭(退出码 0,launcher
+// 零惩罚)——窗口随进程退出彻底消失(「关闭即退」,2026-11-28 撤销方案 B)。
 func panelWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case wmActivate:
 		// wParam 低 16 位=激活状态;WA_INACTIVE=失活(点面板外/宿主切换)
-		// → 失焦=隐藏(方案 B,2026-11-28 拍板;原失焦即退出口已废除):
-		// SW_HIDE 驻留,空闲回收计时启动,复活通道=companion 的 toggle
-		// 消息(或再次点击)。幂等闸见 hidePanelWindow。
+		// → 失焦即退:PostQuitMessage(0) 正常关闭(撤销方案 B,2026-11-28
+		// 恢复原出口;方案 B 期间的 SW_HIDE 驻留形态已废除)。
 		if wParam&0xFFFF == waInactive {
-			hidePanelWindow(hwnd)
+			procPostQuitMessage.Call(uintptr(ExitFocusLoss))
 		}
 		return 0
 	case wmAppPanelToggle:
-		// companion 托盘点击的 toggle 投递(方案 B):可见⇄隐藏切换,
-		// 可见性状态机见 togglePanelWindow。
-		togglePanelWindow(hwnd)
+		// companion 托盘点击的 close 请求投递(变量名保留历史名 toggle,
+		// 语义=请求关闭):PostQuitMessage(0) 正常关闭,窗口随进程退出
+		// 消失(launcher 记 code=0 正常关闭零惩罚)。
+		procPostQuitMessage.Call(uintptr(ExitFocusLoss))
 		return 0
 	case wmDestroy:
 		procPostQuitMessage.Call(uintptr(ExitFocusLoss))

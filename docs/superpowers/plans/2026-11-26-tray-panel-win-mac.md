@@ -8,7 +8,7 @@
 
 **Architecture:** 托盘层保留内嵌 getlantern/systray v1.2.2 + 本仓补丁（点击回调 + 图标矩形）。面板页由 core 回环仪表盘伺服 `/panel.html`，数据走同源 `/api`。里程碑 1 的宿主动作 = 开浏览器（复用既有 openDashboard 模式）；里程碑 2 换成 `internal/panelwin` 独立辅助进程（同一 aliang 二进制的 `panel` 子命令，点击才拉起、失焦即退、崩溃自动重拉、连续失败接回原生菜单），宿主通信仅两个自定义 WebMessage（`quit` → exit 60 / `open` → 浏览器）。模式切换运行中禁用（不复刻 SwitchMode 停而不起）。
 
-> **架构修订（2026-11-28 用户拍板方案 B「首次后常驻」）**：原「点击才拉起、失焦即退」口径划改——首次点击 spawn 面板（一次加载感，不可避免），之后每次点击发 **toggle 信号**（darwin=SIGUSR1 / windows=`WM_APP+1`）做可见⇄隐藏瞬时开合，进程不退；**失焦=隐藏**（resignKey / WM_ACTIVATE 失活 → orderOut/SW_HIDE，不再 exit）；**空闲回收**：隐藏持续 10 分钟 → 子进程 exit(0)（launcher 记正常关闭零惩罚）；孤儿防护：macOS 壳内每 5s 查 `ppid==1` 自检退出，Windows 依赖既有 Job 收割。quit（exit 60）/崩溃分类/兜底语义全部不变。**已知限制（2026-11-28 深夜更新）：~~首开未点面板内部时点外部不隐藏~~ 已由「点面板外即收」全局鼠标监听补齐（global mouseDown 对鼠标事件无需 TCC；菜单栏带 y<40 排除防托盘 toggle 竞态；面板未成为 key 也能收到面板外点击）。**
+> **架构修订（2026-11-28 用户拍板方案 B「首次后常驻」）——⚠️ 已撤销（2026-11-28 实机三连败，见提交信息）**：方案 B 的常驻形态实测不可靠，同根=常驻的隐藏 WKWebView/WebView2 窗口在该 macOS 上不工作——①orderOut 后 makeKeyAndOrderFront/orderFrontRegardless 均被防抢焦点策略静默忽略（再也打不开）；②重显后 WebKit 内容不回复绘制（空白框）；③显示路径 makeKey 抢用户焦点→被夺回→0.12s 内 resignKey 自动再隐藏。**回归口径「点击才拉起+关闭即退」**：无子 → spawn（快照预热让打开瞬间即有上轮内容）；有子 → 发 **close 请求**（darwin=SIGUSR1 / windows=`WM_APP+1`，子进程 exit(0) 正常关闭，窗口随进程退出消失——双击保护语义变为「有子在册=点图标即请求关闭」）；点面板外（全局鼠标监听，菜单栏带 y<40 排除）/失焦（resignKey+everKeyed 守卫 / WM_ACTIVATE 失活）→ 子进程 exit(0)；孤儿防护保留（macOS ppid 看门狗 / Windows Job 收割）；**macOS 首次上屏延迟 150ms → 600ms**（避开托盘点击 key/space 震荡期的「悬挂窗口」态，见决策 6）。quit（exit 60）/崩溃分类/兜底语义全部不变；高度自适应（resize/RO 量高）与快照预热零触碰。~~原方案 B 口径：toggle 信号可见⇄隐藏 + 失焦=隐藏 + 隐藏 10 分钟空闲回收~~（全部随撤销批删除）。
 
 > **架构评审挂账（2026-11-28，Approved 随批）**：①launcher「Click 探测-代行收尸」路径与并发 Click 的基线同型亚微秒交叠（可清新子→双面板，实际不可观测；修法=代行收尸改 childExitedIfCurrent，需权衡漏计面）；②SIGUSR1 µs 级合并丢失面（点一次没反应，再点自愈，零状态损坏）已声明于 panel_spawn_darwin.go；③windows FindWindowW 类名全局定位双实例投错面已备忘于 panel_spawn_windows.go；④panelIdle timer fire 后未置 nil（生产不可达）。
 
@@ -21,7 +21,8 @@
 2. 模式切换 = 运行中禁用；停止态切换只影响下次启动。
 3. Linux 不做、库不换；窗口壳纯原生不引 Wails。
 4. 交付节奏 = 两步走：先浏览器版（M1），后加壳（M2）；前端两阶段完全复用。
-5. **方案 B「首次后常驻」（用户 2026-11-28）**：toggle 信号化（darwin=SIGUSR1 专用信号 / windows=`WM_APP+1`）+ 失焦=隐藏（不再 exit 0）+ 隐藏 10 分钟空闲回收（exit 0，launcher 记正常关闭零惩罚）；quit/崩溃分类/兜底语义不变；已知限制=未成为 key 前点外部不隐藏（见上方架构修订块）。
+5. ~~**方案 B「首次后常驻」（用户 2026-11-28）**：toggle 信号化 + 失焦=隐藏 + 隐藏 10 分钟空闲回收~~ **已撤销（2026-11-28 实机三连败，见决策 6 与顶部架构修订块）**，回归「点击才拉起+关闭即退」+ close 请求语义。
+6. **撤销方案 B 的定谳依据 + 悬挂窗口机制（2026-11-28 实机走查+CGWindowList 取证）**：常驻的隐藏 WKWebView 窗口在该 macOS 上三种失败模式——①orderOut 后 makeKeyAndOrderFront/orderFrontRegardless 均被防抢焦点策略静默忽略（再也打不开）；②重显后 WebKit 内容不回复绘制（空白框）；③显示路径 makeKey 抢用户焦点→被夺回→0.12s 内 resignKey 自动再隐藏。另坐实**「悬挂窗口」机制**：companion 在托盘点击处理中途 spawn 子进程，子进程的首次 orderFront 撞进系统 key/space 切换未稳定期（托盘点击震荡约 1s 内），窗口进入「已注册但永不合成」态——CGWindowList onscreen 永远查无此窗，后续信号也无法让它上屏（实测 7 分钟后的信号无效）；系统平静期同代码每次正常上屏。对策：初始上屏延迟 150ms → **600ms**（避开震荡期；页面加载在等待期照常进行，上屏时内容已就绪），初始上屏**不 makeKey**（避开失败模式③），resignKey 保留 everKeyed 守卫。
 
 **工作分支：** `fix/systray-darwin-autorelease-leak`（基点 e3b0dceb）。worktree：`/Users/mac/MyProgram/GoProgram/nursor/alianggate/.claude/worktrees/fix-systray-darwin-autorelease-leak`。
 
@@ -56,7 +57,7 @@ app/website/
 .github/workflows/tag-build-release.yml  改：matrix job 按 goos 插 go test 闸
 ```
 
-职责边界：companion（点击→M1 开浏览器 / M2 拉起面板进程 + toggle 投递；失败计数；兜底；退出码 60→既有 quit 闸）｜panel 进程【M2】（窗口、锚定、失焦隐藏（方案 B）、空闲回收与孤儿自检、消息→退出码/开浏览器）｜面板页（渲染 + /api）｜core（两个新端点）。
+职责边界：companion（点击→M1 开浏览器 / M2 拉起面板进程 + close 请求投递；失败计数；兜底；退出码 60→既有 quit 闸）｜panel 进程【M2】（窗口、锚定、点外/失焦/close 请求即退（撤销方案 B 后口径）、孤儿自检、消息→退出码/开浏览器）｜面板页（渲染 + /api）｜core（两个新端点）。
 
 **通信协议（面板页 → 宿主）**：页面 `postMessageHost` 发 JSON `{"type":"quit"}` / `{"type":"open","kind":"dashboard"}`。M1 浏览器无宿主 → `postMessageHost` 返回 false，页面按「无宿主模式」降级（退出键隐藏，见 Task 11）。M2 宿主处理：quit → exit 60；open → 按 kind 取对应 URL 开默认浏览器（v1 两 kind 均传仪表盘根 URL，评审次#8）。**零桥接框架、零自动注入运行时；消息 handler 名固定 `"panel"`（Task 13 结构测试断言）。**
 
@@ -323,8 +324,8 @@ Agent 区（§4.5）：标题「AI AGENT · 24H」；每内核一卡（🤖+名+
 
 行为（`aliang panel --url URL --ax X --ay Y --w 340 --h 560 --side top|bottom --open-dashboard URL --open-peer URL`）：
 - 锚定纯函数 `anchorToWindowPos(ax,ay,w,h,side,panelW,panelH)`：side=bottom → `y=ay-panelH-8`；side=top → `y=ay+h+4`；x 居中并钳边距 8。表驱动测试。
-- **Windows（panelwin_windows.go）**：①**自含 DPI 声明**（PerMonitorV2 `SetProcessDpiAwarenessContext` 十几行直接写在包内——`app/tray` 的同名函数未导出且 internal 不得反向依赖 app 包，二审阻塞 2）；②自建 `WS_POPUP` + `WS_EX_TOOLWINDOW|WS_EX_TOPMOST`；③`DWMWA_WINDOW_CORNER_PREFERENCE=ROUND` + `DWMSBT_TRANSIENTWINDOW`（22621+，低版本静默降级）；④WebView2 **必须用 `github.com/jchv/go-webview2/pkg/edge` 的 `Chromium`**：`Embed(自建HWND)` + `MessageCallback` 收 `{"type":...}` + 自建消息循环——**顶层 `WebView` 包装不可用**（其 Bind/JSON-RPC 会拦截 postMessage、无 WebMessageReceived 钩子，quit/open 链会静默断裂，二审重要 4）；⑤**显示前 `SetForegroundWindow(hwnd)`**（`AllowSetForegroundWindow` 只授予资格，不调则 `WM_ACTIVATE` 失活永不触发、失焦即退整条失效——二审阻塞 3）；⑥**尺寸 DPI 缩放**：创建后 `GetDpiForWindow` 取 scale，`SetWindowPos` 按 `W*scale/H*scale` 物理尺寸设置，CSS 视口维持 340 逻辑宽（二审重要 6：锚定坐标物理直通、尺寸逻辑×scale）；⑦`WM_ACTIVATE` 失活 → exit 0（~~已划改~~ **方案 B 2026-11-28：失活 → `ShowWindow(SW_HIDE)` 隐藏，不再退出**）；⑧导航白名单：`NavigationStarting` 仅放行 `--url` 的回环 origin（调研 §6.3 不变量）；⑨消息 handler：quit → exit 60；open → 按 kind 取 `--open-dashboard/--open-peer` URL 开默认浏览器（ShellExecute）后驻留。
-- **macOS（panelwin_darwin.m）**：NSPanel（borderless + `NSWindowStyleMaskNonactivatingPanel`，`canBecomeKey=YES`）+ **`NSVisualEffectView`（behindWindow）材质铺底 + WKWebView `drawsBackground=false` + NSPanel `opaque=false`**（spec §1/§7：毛玻璃归系统材质层，前端只画半透明底；`drawsBackground` 为私有 KVC 面——公证探针随 Task 16 亚克力探针同批，调研 §6.5）+ `windowDidResignKey` → exit 0（~~已划改~~ **方案 B 2026-11-28：resignKey → orderOut 隐藏，不再 exit；空闲回收/孤儿自检 exit 0 归 Go 侧**） + `WKUserContentController addScriptMessageHandler name:@"panel"`（**handler 名必须为 "panel"**，与前端 `messageHandlers.panel` 对齐，结构测试断言）+ `makeKeyAndOrderFront` + `NSApp activate`（不取焦点则失焦即退永不触发）+ open → `NSWorkspace openURL`。导航白名单：`decidePolicyFor` 仅放行回环 origin。
+- **Windows（panelwin_windows.go）**：①**自含 DPI 声明**（PerMonitorV2 `SetProcessDpiAwarenessContext` 十几行直接写在包内——`app/tray` 的同名函数未导出且 internal 不得反向依赖 app 包，二审阻塞 2）；②自建 `WS_POPUP` + `WS_EX_TOOLWINDOW|WS_EX_TOPMOST`；③`DWMWA_WINDOW_CORNER_PREFERENCE=ROUND` + `DWMSBT_TRANSIENTWINDOW`（22621+，低版本静默降级）；④WebView2 **必须用 `github.com/jchv/go-webview2/pkg/edge` 的 `Chromium`**：`Embed(自建HWND)` + `MessageCallback` 收 `{"type":...}` + 自建消息循环——**顶层 `WebView` 包装不可用**（其 Bind/JSON-RPC 会拦截 postMessage、无 WebMessageReceived 钩子，quit/open 链会静默断裂，二审重要 4）；⑤**显示前 `SetForegroundWindow(hwnd)`**（`AllowSetForegroundWindow` 只授予资格，不调则 `WM_ACTIVATE` 失活永不触发、失焦即退整条失效——二审阻塞 3）；⑥**尺寸 DPI 缩放**：创建后 `GetDpiForWindow` 取 scale，`SetWindowPos` 按 `W*scale/H*scale` 物理尺寸设置，CSS 视口维持 340 逻辑宽（二审重要 6：锚定坐标物理直通、尺寸逻辑×scale）；⑦`WM_ACTIVATE` 失活 → exit 0（~~方案 B 2026-11-28 曾划改为 `ShowWindow(SW_HIDE)` 隐藏~~ **2026-11-28 撤销方案 B 后恢复 exit 0 失焦即退**）；⑧导航白名单：`NavigationStarting` 仅放行 `--url` 的回环 origin（调研 §6.3 不变量）；⑨消息 handler：quit → exit 60；open → 按 kind 取 `--open-dashboard/--open-peer` URL 开默认浏览器（ShellExecute）后驻留。
+- **macOS（panelwin_darwin.m）**：NSPanel（borderless + `NSWindowStyleMaskNonactivatingPanel`，`canBecomeKey=YES`）+ **`NSVisualEffectView`（behindWindow）材质铺底 + WKWebView `drawsBackground=false` + NSPanel `opaque=false`**（spec §1/§7：毛玻璃归系统材质层，前端只画半透明底；`drawsBackground` 为私有 KVC 面——公证探针随 Task 16 亚克力探针同批，调研 §6.5）+ `windowDidResignKey` → exit 0（~~方案 B 2026-11-28 曾划改为 resignKey → orderOut 隐藏~~ **2026-11-28 撤销方案 B 后恢复 exit 0 失焦即退，带 everKeyed 守卫；孤儿自检 exit 0 仍在 Go 侧**） + `WKUserContentController addScriptMessageHandler name:@"panel"`（**handler 名必须为 "panel"**，与前端 `messageHandlers.panel` 对齐，结构测试断言）+ 初始上屏 `orderFrontRegardless`（600ms 延迟，**不 makeKey**——失败模式③与悬挂窗口机制见决策 6）+ open → `NSWorkspace openURL`。导航白名单：`decidePolicyFor` 仅放行回环 origin。
 - 结构测试（.m）：含 resignKey、`NSVisualEffectView`、`addScriptMessageHandler name:@"panel"`、全部 autoreleasepool、无裸 autorelease 创建点。
 
 - [x] 锚定测试红→绿；结构测试红→实现→绿；`go build ./cmd/...` + `GOOS=windows go build ./cmd/...` + `GOOS=linux go list -deps ./cmd/aliang | grep -cE "webview2|panelwin|wails"`（期望 0）。**实作备注（终审回填）**：实现=33209324 + 评审增益=5728a7f1（darwin 主线程钉定 + ObjC 畸形 payload 守卫 + fail-closed 退出路径）。
@@ -351,7 +352,7 @@ func (l *PanelLauncher) RetryFromFallback()
 
 失败判定（拍板 1「只兜崩溃」）：崩溃 = `code != 0 && code != 60` 且非主动 Kill（`kill -9` 的信号死亡 exit −1 亦落入）→ 记失败 + 1s 后重拉；`code == 0`（失焦自退）与 `killedByUs`（点图标收起）= 正常关闭，零惩罚零重拉；10 分钟滑窗 3 次崩溃 → `onFallback()` + 停拉；存活 >60s 清零；`code == 60` → OnQuitRequested；fallback 态 Click 无效，仅 RetryFromFallback 可退出。
 
-表驱动必测：正常开合；快速双击 toggle 不计数；失焦自退（code=0, alive<2s）不计数；连崩 3 次→fallback；fallback 后 Click 无效、Retry 恢复；60 分派；>60s 清零。
+表驱动必测：正常开合；快速双击 close 请求不计数（请求期间幂等）；close 请求 exit(0) 零惩罚；点外/失焦即退（code=0）不计数；连崩 3 次→fallback；fallback 后 Click 无效、Retry 恢复；60 分派；>60s 清零。
 
 - [x] 红→实现→绿→Commit（`新增:面板 launcher 状态机——崩溃兜底/正常关闭零惩罚`）。**实作备注（终审回填）**：实现=8e709082 + 评审增益=89d2a198（pendingRetry 真登记闭合幽灵重拉 + spawn panic 兜底转崩溃 + 注释契约修正）。
 
