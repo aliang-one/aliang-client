@@ -571,8 +571,10 @@ jobs:
           VERSION: ${{ github.ref_name }}
           GOARCH: ${{ matrix.goarch }}
         run: |
-          # Strip 'v' prefix from version for WiX compatibility
-          $msiVersion = $env:VERSION -replace '^v', ''
+          # Strip 'v' prefix and non-numeric suffix (-local 等) from version
+          # for WiX compatibility(candle 要求 ProductVersion 为纯数字 x.x.x;
+          # 二进制内嵌版本保持完整 VERSION 不受影响)
+          $msiVersion = $env:VERSION -replace '^v', '' -replace '-.*$', ''
           Write-Host "Building MSI version: $msiVersion"
 
           # Download nuget.exe if not present
