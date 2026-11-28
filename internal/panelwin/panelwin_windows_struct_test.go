@@ -172,8 +172,11 @@ func TestPanelwinWindowsCloseOnDeactivate(t *testing.T) {
 		t.Fatal("panelwin_windows.go 缺 case wmActivate 分支")
 	}
 	actBody := src[actIdx:]
-	// 截到下一个 case 分支(从本分支字面量之后起搜,避免命中自身的 "case ")。
-	if next := strings.Index(src[actIdx+len("case wmActivate:"):], "\tcase "); next >= 0 {
+	// 截到下一个【顶层】case 分支:wmActivate 分支内含 `switch wParam&0xFFFF`
+	// 的内层 case(缩进两层),不能用 "\tcase " 截(会命中内层首个 case)。
+	// 顶层 case 的下一分支以 "\n\tcase wm" 起头(本 wndProc 其余分支均为
+	// wm*/wmApp* 消息常量)。
+	if next := strings.Index(src[actIdx+len("case wmActivate:"):], "\n\tcase wm"); next >= 0 {
 		actBody = src[actIdx : actIdx+len("case wmActivate:")+next]
 	}
 	if !strings.Contains(actBody, "procPostQuitMessage.Call(uintptr(ExitFocusLoss))") {
@@ -183,6 +186,30 @@ func TestPanelwinWindowsCloseOnDeactivate(t *testing.T) {
 		if strings.Contains(actBody, banned) {
 			t.Fatalf("wmActivate 失活分支仍在隐藏驻留(%q;撤销方案 B:失焦=PostQuitMessage(0)):\n%s", banned, actBody)
 		}
+	}
+	// ②b everActivated 守卫(2026-11-28 评审修,镜像 macOS everKeyed):失活
+	//    即退只在首次激活(WA_ACTIVE/WA_CLICKACTIVE)之后武装。锚定:激活态
+	//    分支置位 panelEverActivated;WA_INACTIVE 分支先过 !panelEverActivated
+	//    守卫再 PostQuitMessage。无守卫形态(`if wParam&0xFFFF == waInactive`
+	//    直接 PostQuitMessage)是「面板从未出现且不计崩溃」的结构性盲区,不得
+	//    回归。
+	for _, want := range []string{
+		"case waActive, waClickActive:",
+		"panelEverActivated = true",
+		"case waInactive:",
+		"if !panelEverActivated {",
+	} {
+		if !strings.Contains(actBody, want) {
+			t.Fatalf("wmActivate 分支缺 %q(everActivated 守卫不完整):\n%s", want, actBody)
+		}
+	}
+	if guard := strings.Index(actBody, "if !panelEverActivated {"); guard >= 0 {
+		if pq := strings.Index(actBody[guard:], "procPostQuitMessage.Call(uintptr(ExitFocusLoss))"); pq < 0 {
+			t.Fatalf("wmActivate 的 WA_INACTIVE 分支在 !panelEverActivated 守卫之后未 PostQuitMessage(守卫后忘了退):\n%s", actBody[guard:])
+		}
+	}
+	if strings.Contains(actBody, "if wParam&0xFFFF == waInactive") {
+		t.Fatalf("wmActivate 退回无守卫形态(`if wParam&0xFFFF == waInactive` 直接退;初始化期焦点抖动会让面板一出生就退且不计崩溃):\n%s", actBody)
 	}
 
 	// ③ close 请求分支:PostQuitMessage(0) 请求关闭。
@@ -204,6 +231,161 @@ func TestPanelwinWindowsCloseOnDeactivate(t *testing.T) {
 		if strings.Contains(src, banned) {
 			t.Fatalf("panelwin_windows.go 仍引用已废除的方案 B 符号 %q(隐藏驻留/空闲回收/toggle 切换均已随撤销批删除)", banned)
 		}
+	}
+}
+
+// matchingGoBraceWin 返回 s 开头 '{' 对配对 '}' 的偏移(花括号不闭合时返回
+// -1)。与 darwin_struct_test.go 的 matchingGoBrace 同构——那个定义在
+// //go:build darwin 文件里,GOOS=windows 交叉 vet 本文件时不可见,故就地
+// 自备一份(本文件无 build tag,Windows/Linux runner 都要能跑)。
+func matchingGoBraceWin(s string) int {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// TestPanelwinWindowsProcDLLOwnership — Win32 proc 的 DLL 归属表(2026-11-28
+// Windows 实机走查:GetModuleHandleW 误挂 user32.dll,面板进程一启动即
+// panic「Failed to find GetModuleHandleW procedure in user32.dll」)。
+//
+// 为什么需要结构测试:windows.NewLazySystemDLL(...).NewProc(...) 是惰性
+// 查找——DLL 名写错要到真机 Call 那一刻才炸,交叉编译、go vet、Linux/macOS
+// 上的全部测试都抓不到。本表对照 Win32 文档(每个 API 的导出模块)逐条
+// 钉死 proc 声明行,改动 proc 或 DLL 变量名时同步改表。
+//
+// GOOS 无关,只读源码文本。
+func TestPanelwinWindowsProcDLLOwnership(t *testing.T) {
+	src := panelwinWindowsSource(t)
+
+	// 导出 DLL → 本文件声明的 DLL 变量名。
+	const (
+		k32 = "kernel32"
+		u32 = "user32"
+		shc = "shcore"
+		dwm = "dwmapi"
+		shl = "shell32"
+	)
+	// proc 变量名 → 必须挂载的 DLL 变量名(对照 Microsoft Learn 各 API 的
+	// Header/DLL 栏;全部为 Win32 文档明示的导出模块)。
+	want := map[string]string{
+		"procGetModuleHandleW":          k32, // kernel32.dll
+		"procRegisterClassExW":          u32, // user32.dll
+		"procCreateWindowExW":           u32,
+		"procDefWindowProcW":            u32,
+		"procGetMessageW":               u32,
+		"procTranslateMessage":          u32,
+		"procDispatchMessageW":          u32,
+		"procPostQuitMessage":           u32,
+		"procPostMessageW":              u32,
+		"procShowWindow":                u32,
+		"procSetWindowPos":              u32,
+		"procSetForegroundWindow":       u32,
+		"procGetDpiForWindow":           u32, // Win10 1607+
+		"procSetProcessDpiAwarenessCtx": u32, // Win10 1703+
+		"procSetProcessDPIAware":        u32,
+		"procSetProcessDpiAwareness":    shc, // shcore.dll,Win8.1+
+		"procGetSystemMetrics":          u32,
+		"procDwmSetWindowAttribute":     dwm, // dwmapi.dll
+		"procShellExecuteW":             shl, // shell32.dll
+	}
+	// DLL 变量 → 必须绑定的系统 DLL 文件名。
+	dllFiles := map[string]string{
+		k32: `"kernel32.dll"`, u32: `"user32.dll"`, shc: `"shcore.dll"`,
+		dwm: `"dwmapi.dll"`, shl: `"shell32.dll"`,
+	}
+	for varName, dll := range dllFiles {
+		if !regexp.MustCompile(`(?m)^\s*` + varName + `\s*=\s*windows\.NewLazySystemDLL\(` + regexp.QuoteMeta(dll) + `\)`).MatchString(src) {
+			t.Errorf("panelwin_windows.go 缺 DLL 变量声明 %s = windows.NewLazySystemDLL(%s)", varName, dll)
+		}
+	}
+	for proc, dll := range want {
+		re := regexp.MustCompile(`(?m)^\s*` + proc + `\s*=\s*(\w+)\.NewProc\("(\w+)"\)`)
+		m := re.FindStringSubmatch(src)
+		if m == nil {
+			t.Errorf("panelwin_windows.go 缺 proc 声明 %s(或形态不是 <dll>.NewProc(\"Name\"))", proc)
+			continue
+		}
+		if m[1] != dll {
+			t.Errorf("proc %s = %s.NewProc(%q):挂错 DLL——应为 %s.dll(实机启动即 panic「procedure could not be found」)", proc, m[1], m[2], dll)
+		}
+	}
+	// 完备性:文件里所有 <dll>.NewProc 声明都必须在表里(新加 proc 忘登记
+	// 即红,逼着改动者对照文档归属)。
+	declared := regexp.MustCompile(`(?m)^\s*(proc\w+)\s*=\s*\w+\.NewProc\(`).FindAllStringSubmatch(src, -1)
+	for _, m := range declared {
+		if _, ok := want[m[1]]; !ok {
+			t.Errorf("panelwin_windows.go 新增 proc %s 未登记进 DLL 归属表(请对照 Win32 文档补一行)", m[1])
+		}
+	}
+}
+
+// TestPanelwinWindowsOpenClosesPanel — open 消息分派后即退(2026-11-28 用户
+// 走查「点仪表盘开了浏览器,面板不消失」):此前 open 后刻意驻留,指望浏览器
+// 抢前台→WM_ACTIVATE(WA_INACTIVE) 走失焦即退链——但浏览器冷启动时前台
+// 切换可延迟数百 ms,期间 TOPMOST 面板悬在浏览器前;或浏览器以新标签打开
+// 时前台行为因浏览器而异。外部动作已完成,openInDefaultBrowser 成功
+// (ShellExecute >32)必须 PostQuitMessage(ExitFocusLoss=0,正常关闭,launcher
+// 零惩罚);失败(≤32)或未知 kind 驻留,用户可换键重试。
+//
+// GOOS 无关,只读源码文本。
+func TestPanelwinWindowsOpenClosesPanel(t *testing.T) {
+	src := panelwinWindowsSource(t)
+
+	// ① open 分支:openInDefaultBrowser 返回 bool,成功 → PostQuitMessage(0)。
+	//    锚定形态:openInDefaultBrowser(target) 在 if 闸内(失败不退),
+	//    PostQuitMessage(ExitFocusLoss) 在同一 if 块内。
+	openIdx := strings.Index(src, `if typ == "open" {`)
+	if openIdx < 0 {
+		t.Fatalf("panelwin_windows.go 缺 open 分支")
+	}
+	openBranch := src[openIdx:]
+	if next := strings.Index(openBranch, `if typ == "resize" {`); next >= 0 {
+		openBranch = openBranch[:next]
+	}
+	for _, want := range []string{
+		`if openInDefaultBrowser(target) {`, // 返回 bool 闸:失败不退
+		"procPostQuitMessage.Call(uintptr(ExitFocusLoss))",
+	} {
+		if !strings.Contains(openBranch, want) {
+			t.Fatalf("panelwin_windows.go open 分支缺 %q(open 后驻留回归或失败也退):\n%s", want, openBranch)
+		}
+	}
+	if !strings.Contains(openBranch, "return") {
+		t.Fatalf("panelwin_windows.go open 分支 PostQuitMessage 后缺 return(会继续落进 resize 分支):\n%s", openBranch)
+	}
+
+	// ② openInDefaultBrowser 必须返回 bool 且以 >32 判成功(ShellExecute
+	//    HINSTANCE 约定:≤32 是错误码)。旧签名 void 不再合法。
+	fnIdx := strings.Index(src, "func openInDefaultBrowser(target string) bool {")
+	if fnIdx < 0 {
+		t.Fatalf("panelwin_windows.go openInDefaultBrowser 签名须为 (target string) bool(失败/成功判定是 open 即退的前提)")
+	}
+	fnBody := src[fnIdx:]
+	if brace := strings.Index(fnBody, "{"); brace >= 0 {
+		if end := matchingGoBraceWin(fnBody[brace:]); end >= 0 {
+			fnBody = fnBody[:brace+end+1]
+		}
+	}
+	if !strings.Contains(fnBody, "int32(ret) > 32") {
+		t.Fatalf("panelwin_windows.go openInDefaultBrowser 缺 ShellExecute 成功判定(>32):\n%s", fnBody)
+	}
+	if !strings.Contains(fnBody, "return false") {
+		t.Fatalf("panelwin_windows.go openInDefaultBrowser 失败路径须 return false(不得退面板):\n%s", fnBody)
+	}
+
+	// ③ 反向锚:「open 后驻留」注释不得回归。
+	if strings.Contains(src, "open 后驻留") {
+		t.Fatalf("panelwin_windows.go 仍有「open 后驻留」注释(与 open 即退语义矛盾)")
 	}
 }
 
@@ -258,6 +440,26 @@ func TestPanelwinWindowsFirstFrameShow(t *testing.T) {
 	}
 	if !strings.Contains(src, "time.AfterFunc") {
 		t.Fatal("panelwin_windows.go 缺 1.2s 兜底 AfterFunc(resize 未到时面板永不出现)")
+	}
+	// ③b 时序锚(2026-11-28 评审修):panelShowWindow 装配与 AfterFunc 起跑必须
+	//    在 chromium.Navigate 之后——Embed 内部自泵消息,装配/计时若在 Embed
+	//    之前,WebView2 冷启动超 1.2s 时 WM_APP+2 会在 Embed 的泵里被分派,
+	//    把 WebView2 尚未挂上的空 HWND 显示出来(shown 位已置,后续首帧
+	//    resize 只落窗不再上屏→空白面板)。
+	navIdx := strings.Index(src, "chromium.Navigate(opts.URL)")
+	if navIdx < 0 {
+		t.Fatal("panelwin_windows.go 缺 chromium.Navigate(页面不加载)")
+	}
+	assignIdx := strings.Index(src, "panelShowWindow = showNow")
+	if assignIdx < 0 {
+		t.Fatal("panelwin_windows.go 缺 panelShowWindow = showNow 装配(wndProc 兜底分派接不到 showNow)")
+	}
+	afterIdx := strings.Index(src, "time.AfterFunc(panelFirstShowFallback")
+	if afterIdx < 0 {
+		t.Fatal("panelwin_windows.go 缺 time.AfterFunc(panelFirstShowFallback 起跑")
+	}
+	if assignIdx < navIdx || afterIdx < navIdx {
+		t.Fatalf("panelShowWindow 装配(%d)/AfterFunc 起跑(%d) 在 Navigate(%d) 之前——Embed 自泵期间兜底消息会把空 HWND 显示出来", assignIdx, afterIdx, navIdx)
 	}
 	caseIdx := strings.Index(src, "case wmAppPanelShow:")
 	if caseIdx < 0 {

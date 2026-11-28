@@ -15,7 +15,10 @@
 // companion 的 close 请求消息(WM_APP+1,panel_spawn_windows.go
 // FindWindowW+PostMessageW 投递)→ PostQuitMessage(0) 请求关闭;窗口随
 // 进程退出彻底消失,不存在任何驻留形态。页面 quit 消息 → 退出码 60;open
-// 消息 → ShellExecute 开默认浏览器后驻留;resize 消息 → applyHeight 跟随
+// 消息 → ShellExecute 开默认浏览器后 PostQuitMessage(0) 正常关闭(2026-11-28:
+// 此前驻留,指望浏览器抢前台走 WM_ACTIVATE 失活链,但冷启动前台切换延迟
+// 期间面板悬在浏览器前——用户走查坐实;ShellExecute 失败 ≤32 才驻留);
+// resize 消息 → applyHeight 跟随
 // 改窗高(高度自适应),且【首次】resize 落窗后才上屏(首帧尺寸修正
 // Part 1,见 runPanelWindow 注释)。退出码契约见 panelwin.go(Task 14 launcher:
 // 0=正常关闭(点外/失焦/close 请求)、60=quit,其余=崩溃)。
@@ -50,7 +53,10 @@ const (
 
 	wmActivate = 0x0006
 	waInactive = 0
-	wmDestroy  = 0x0002
+	waActive   = 1
+	// waClickActive = 2:鼠标点击激活(WM_ACTIVATE wParam 低字)。
+	waClickActive = 2
+	wmDestroy     = 0x0002
 	// 注:WM_QUIT(0x0012)不再声明常量——退出码协议已收进自建消息循环的
 	// WM_QUIT 分支(GetMessageW 返回 0 时直接读 wParam),见下方消息循环注释。
 
@@ -82,14 +88,22 @@ const (
 )
 
 // —— Win32 API(经 NewLazySystemDLL;跨编译纯检查无 cgo) —— //
+//
+// ⚠️ 每个 proc 必须挂在【导出它的】DLL 上(2026-11-28 Windows 实机走查:
+// GetModuleHandleW 曾误挂 user32.dll,启动即 panic「Failed to find
+// GetModuleHandleW procedure in user32.dll」——NewLazySystemDLL 只在 Call
+// 时查导出表,交叉编译与 go vet 都抓不到,只有真机能炸)。DLL 归属表由
+// TestPanelwinWindowsProcDLLOwnership 逐条钉死(对照 Win32 文档),改动
+// proc 时同步改测试。
 
 var (
-	user32  = windows.NewLazySystemDLL("user32.dll")
-	shcore  = windows.NewLazySystemDLL("shcore.dll")
-	dwmapi  = windows.NewLazySystemDLL("dwmapi.dll")
-	shell32 = windows.NewLazySystemDLL("shell32.dll")
+	kernel32 = windows.NewLazySystemDLL("kernel32.dll")
+	user32   = windows.NewLazySystemDLL("user32.dll")
+	shcore   = windows.NewLazySystemDLL("shcore.dll")
+	dwmapi   = windows.NewLazySystemDLL("dwmapi.dll")
+	shell32  = windows.NewLazySystemDLL("shell32.dll")
 
-	procGetModuleHandleW          = user32.NewProc("GetModuleHandleW")
+	procGetModuleHandleW          = kernel32.NewProc("GetModuleHandleW")
 	procRegisterClassExW          = user32.NewProc("RegisterClassExW")
 	procCreateWindowExW           = user32.NewProc("CreateWindowExW")
 	procDefWindowProcW            = user32.NewProc("DefWindowProcW")
@@ -174,6 +188,16 @@ var lastExitCode int
 // 循环单线程驱动,两处消费同线程无并发面;nil 守卫兜住「兜底消息早于装配」
 // 的极端窗口期。
 var panelShowWindow func(reason string)
+
+// panelEverActivated 曾成为前台窗口(WM_ACTIVATE 的 WA_ACTIVE/WA_CLICKACTIVE
+// 置位;2026-11-28 评审修,镜像 macOS 侧 everKeyed 守卫):失活即退链只在
+// 置位后才武装。未置位时收到 WA_INACTIVE 一律忽略——WebView2 controller
+// 初始化期间的内部焦点转移、SetForegroundWindow 被拒后的 ShowWindow 不激活
+// 形态,都可能让顶层 HWND 在「从未激活过」的状态下收到一次 WA_INACTIVE,
+// 无守卫会 PostQuitMessage(0)→退出码 0→launcher 记正常关闭→不计崩溃→
+// 用户感知「点了没反应,再点一次才出来」且永不触发兜底。首次真实激活后
+// 链即武装,点面板外/切窗口照常即退。消息循环单线程读写,无并发面。
+var panelEverActivated bool
 
 // panelFirstShowFallback 首帧兜底超时:页面加载失败/resize 未到时按当前
 // 尺寸上屏(面板不能永远不出现)。与 macOS 侧 1.2s 兜底同值(双侧同批)。
@@ -295,11 +319,23 @@ func runPanelWindow(opts Options) error {
 	// 首帧键盘焦点补齐,pkg/edge 的 Focus() 无返回值,失败形态随 Task 16
 	// 实机探针收口)。两处触发:首次 resize 到位(MessageCallback)、1.2s
 	// 兜底;shown 位保证幂等(重复触发零操作)。定义先于 MessageCallback
-	// (闭包引用序);chromium 彼时可能尚未 Embed 赋值,但闭包只在回调期被
-	// 调,彼时 Embed 必已完成(同 applyHeight 的先声明后赋值形态)。
+	// (闭包引用序)。
+	//
+	// ⚠️ 装配与兜底计时【必须在 Embed 之后】(2026-11-28 评审修):chromium.Embed
+	// 内部自泵消息(GetMessageW→DispatchMessageW)直到 controller 就绪,泵期间
+	// 本线程收到的任何消息都会被分派到 wndProc——若 1.2s 兜底 AfterFunc 在
+	// Embed 之前起跑,WebView2 冷启动(慢盘/首次运行)超 1.2s 时 WM_APP+2 会在
+	// Embed 的泵里被分派→showNow→ShowWindow 把一个 WebView2 尚未挂上的空
+	// HWND 显示出来,shown 位已置,后续真正的首帧 resize 再到也只是 applyHeight
+	// 落窗(showNow 幂等 return)——用户看到一段空白面板。兜底计时的语义本就
+	// 是「页面加载超时」,从 Navigate 起算才对,不是「进程启动超时」。
+	// panelShowWindow 的装配与 AfterFunc 起跑一并挪到 Navigate 之后(见下)。
 	shown := false
 	showNow := func(reason string) {
-		if shown {
+		if shown || chromium == nil {
+			// chromium 守卫:WM_APP+2 兜底消息理论上只在 Navigate 之后才会
+			// 被投递(装配已挪后),这里是对「Embed 失败返回前残留消息」的
+			// belt-and-suspenders——nil 时不上屏,等进程按初始化失败退出。
 			return
 		}
 		shown = true
@@ -308,15 +344,6 @@ func runPanelWindow(opts Options) error {
 		chromium.Focus()
 		logger.Info("panelwin: 面板上屏(" + reason + ")")
 	}
-	panelShowWindow = showNow
-	// 1.2s 兜底(与 macOS 侧同值,panelFirstShowFallback):页面加载失败/
-	// resize 未到时按当前尺寸上屏——面板不能永远不出现。AfterFunc goroutine
-	// 不能直接动窗口(Win32 窗口 API 单线程语义),经自定消息 WM_APP+2
-	// (wmAppPanelShow)投递回消息循环线程,wndProc 分派 panelShowWindow 执行
-	// 同一 showNow(位已清时零操作);正常路径 resize 先到,兜底空转。
-	time.AfterFunc(panelFirstShowFallback, func() {
-		procPostMessageW.Call(hwnd, uintptr(wmAppPanelShow), 0, 0)
-	})
 
 	// ③ 圆角 + 亚克力(Win11 22621+);低版本 DwmSetWindowAttribute 返回
 	// 失败,静默降级为纯半透明底(前端半透明底色仍是完整可用的形态)。
@@ -385,8 +412,9 @@ func runPanelWindow(opts Options) error {
 	}
 
 	// ⑨ 消息 handler:quit → 退出码 60;open → ShellExecute 开默认浏览器
-	// 后驻留;resize → applyHeight 跟随改窗高;未知类型默认忽略不崩(类型
-	// 白名单:quit/open/resize,新增需双侧同批)。
+	// 成功即 PostQuitMessage(0) 正常关闭(失败驻留);resize → applyHeight
+	// 跟随改窗高;未知类型默认忽略不崩(类型白名单:quit/open/resize,新增
+	// 需双侧同批)。
 	chromium.MessageCallback = func(payload string) {
 		typ, kind, height, known := ParseHostMessage(payload)
 		if !known {
@@ -398,9 +426,23 @@ func runPanelWindow(opts Options) error {
 		}
 		if typ == "open" {
 			if target := opts.OpenTarget(kind); target != "" {
-				openInDefaultBrowser(target)
+				if openInDefaultBrowser(target) {
+					// open 已分派 → 面板正常关闭(exit 0,2026-11-28 用户
+					// 反馈「点仪表盘开了浏览器,面板不消失」):此前刻意驻留,
+					// 指望浏览器抢前台→WM_ACTIVATE(WA_INACTIVE) 走失焦即
+					// 退链——但浏览器冷启动时前台切换可能延迟数百毫秒,
+					// 期间面板悬在浏览器前面(wsExTopmost);或者浏览器已在
+					// 跑且以新标签打开时前台切换行为因浏览器而异。外部
+					// 动作已完成,确定性退出,不押焦点副效应。退出码 0 走
+					// launcher 正常关闭路径,零惩罚零重拉;与 macOS 侧
+					// openURL 后 exit(0) 同语义。
+					logger.Info("panelwin: open 已分派(" + kind + "),面板正常关闭(exit 0)")
+					procPostQuitMessage.Call(uintptr(ExitFocusLoss))
+					return
+				}
 			}
-			// open 后驻留。
+			// ShellExecute 失败(≤32)或未知 kind:没有外部动作发生,面板
+			// 驻留(用户还可能换一个键再点),静默不动。
 		}
 		if typ == "resize" {
 			// height 缺失/非数值时 ParseHostMessage 返回 0,过不了受理闸;
@@ -429,6 +471,18 @@ func runPanelWindow(opts Options) error {
 	// Navigate 无返回值(edge 内部直调 vtbl,失败静默);白名单闸已保证
 	// 非 白 origin 页面加载不进来。
 	chromium.Navigate(opts.URL)
+
+	// 首帧兜底装配(Navigate 之后——见 showNow 定义处的时序理由):1.2s 内
+	// 页面未发 resize(加载失败/脚本异常)则按当前尺寸上屏,面板不能永远不
+	// 出现。AfterFunc goroutine 不能直接动窗口(Win32 窗口 API 单线程语义),
+	// 经自定消息 WM_APP+2(wmAppPanelShow)投递回消息循环线程,wndProc 分派
+	// panelShowWindow 执行同一 showNow(位已清时零操作);正常路径 resize 先
+	// 到,兜底空转。计时从 Navigate 起算:Embed 已完成、controller 已就绪,
+	// 此刻起 1.2s 是纯粹的「页面加载超时」,不再混入 WebView2 冷启动耗时。
+	panelShowWindow = showNow
+	time.AfterFunc(panelFirstShowFallback, func() {
+		procPostMessageW.Call(hwnd, uintptr(wmAppPanelShow), 0, 0)
+	})
 
 	// 自建消息循环:GetMessageW 返回 0 才是收到 WM_QUIT(wParam 即退出码:
 	// 60=quit;WM_ACTIVATE 失活/WM_DESTROY/close 请求都 PostQuitMessage(0))。
@@ -465,10 +519,21 @@ func runPanelWindow(opts Options) error {
 func panelWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case wmActivate:
-		// wParam 低 16 位=激活状态;WA_INACTIVE=失活(点面板外/宿主切换)
-		// → 失焦即退:PostQuitMessage(0) 正常关闭(撤销方案 B,2026-11-28
-		// 恢复原出口;方案 B 期间的 SW_HIDE 驻留形态已废除)。
-		if wParam&0xFFFF == waInactive {
+		// wParam 低 16 位=激活状态。
+		//   WA_ACTIVE(1)/WA_CLICKACTIVE(2):首次激活 → 武装失焦即退链
+		//     (panelEverActivated 置位;镜像 macOS everKeyed 守卫,2026-11-28
+		//     评审修——未武装前收到 WA_INACTIVE 一律忽略,见该变量注释);
+		//   WA_INACTIVE(0):点面板外/宿主切换 → 失焦即退:PostQuitMessage(0)
+		//     正常关闭(撤销方案 B,2026-11-28 恢复原出口;方案 B 期间的
+		//     SW_HIDE 驻留形态已废除)。
+		switch wParam & 0xFFFF {
+		case waActive, waClickActive:
+			panelEverActivated = true
+		case waInactive:
+			if !panelEverActivated {
+				logger.Debug("panelwin: WM_ACTIVATE(WA_INACTIVE) 忽略(从未激活过,初始化期焦点抖动防误伤)")
+				return 0
+			}
 			procPostQuitMessage.Call(uintptr(ExitFocusLoss))
 		}
 		return 0
@@ -522,17 +587,23 @@ func setDwmAttributeU32(hwnd uintptr, attr uint32, value uint32) {
 	procDwmSetWindowAttribute.Call(hwnd, uintptr(attr), uintptr(unsafe.Pointer(&value)), unsafe.Sizeof(value))
 }
 
-// openInDefaultBrowser — ShellExecute "open" 开默认浏览器(open 消息分派;
-// 面板驻留不退出)。
-func openInDefaultBrowser(target string) {
+// openInDefaultBrowser — ShellExecute "open" 开默认浏览器(open 消息分派)。
+// 返回 shell 是否接受了请求(HINSTANCE > 32 为成功;≤32 是 Win32 错误码,
+// 如 SE_ERR_NOASSOC 31=无关联程序、SE_ERR_FILE_NOT_FOUND 2)。失败时调用方
+// 保持面板驻留,用户可换键重试或手动打开。
+func openInDefaultBrowser(target string) bool {
 	u16, err := windows.UTF16PtrFromString(target)
 	if err != nil {
-		return
+		return false
 	}
 	openVerb, _ := windows.UTF16PtrFromString("open")
-	procShellExecuteW.Call(0, // hwnd:与面板窗口解绑,失败不影响面板
+	ret, _, _ := procShellExecuteW.Call(0, // hwnd:与面板窗口解绑,失败不影响面板
 		uintptr(unsafe.Pointer(openVerb)),
 		uintptr(unsafe.Pointer(u16)),
 		0, 0, uintptr(shellExecuteWSHownormal),
 	)
+	// ShellExecuteW 返回 HINSTANCE(64 位下高位有符号扩展;错误码 ≤32 的
+	// 形态下低 32 位即错误码)。只判「>32」不看具体错误码:失败形态统一
+	// 驻留,细分无额外动作可做。
+	return int32(ret) > 32
 }
