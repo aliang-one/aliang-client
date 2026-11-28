@@ -52,6 +52,7 @@ const (
 	wsExTopmost    = 0x00000008
 
 	wmActivate = 0x0006
+	wmSize     = 0x0005
 	waInactive = 0
 	waActive   = 1
 	// waClickActive = 2:鼠标点击激活(WM_ACTIVATE wParam 低字)。
@@ -353,6 +354,7 @@ func runPanelWindow(opts Options) error {
 	// ④ WebView2 必须用 pkg/edge 的 Chromium(见文件头),Embed 到自建
 	// HWND——Embed 内部自泵消息直到 controller 就绪。
 	chromium = edge.NewChromium()
+	panelChromium = chromium
 	if !chromium.Embed(hwnd) {
 		return fmt.Errorf("WebView2 初始化失败(运行时缺失或加载失败)")
 	}
@@ -516,6 +518,8 @@ func runPanelWindow(opts Options) error {
 // panelWndProc — 窗口过程:失焦即退/close 请求分派与销毁收尾,其余交
 // DefWindowProc。三个出口都 PostQuitMessage(0)=正常关闭(退出码 0,launcher
 // 零惩罚)——窗口随进程退出彻底消失(「关闭即退」,2026-11-28 撤销方案 B)。
+var panelChromium *edge.Chromium // 单面板单实例;WM_SIZE 时同步 WebView2 bounds(见 wndProc wmSize 分支注释)
+
 func panelWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case wmActivate:
@@ -537,6 +541,16 @@ func panelWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 			procPostQuitMessage.Call(uintptr(ExitFocusLoss))
 		}
 		return 0
+	case wmSize:
+		// 高度自适应 resize(SetWindowPos)改窗高时同步 WebView2 bounds——
+		// WebView2 的 PutBounds 不随 WM_SIZE 自动走,缺失则内容层停在旧
+		// 尺寸:窗口缩短后内容画到窗外=「浅色空白框」(2026-11-28 0.196
+		// 实机走查坐实)。同步后仍交 DefWindowProc 处理默认行为。
+		if panelChromium != nil {
+			panelChromium.Resize()
+		}
+		r, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wParam, lParam)
+		return r
 	case wmAppPanelToggle:
 		// companion 托盘点击的 close 请求投递(变量名保留历史名 toggle,
 		// 语义=请求关闭):PostQuitMessage(0) 正常关闭,窗口随进程退出
