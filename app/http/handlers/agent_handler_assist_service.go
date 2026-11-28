@@ -242,6 +242,10 @@ func (h *AgentHandler) proxyAssistService(w http.ResponseWriter, r *http.Request
 	// 契约恒非空:loopback 入腿→"1",cookie 入腿→cookie 哨兵;上游 mark 见
 	// 哨兵采信跳过重标,伪造面分析见 webTerminalLoopbackCookieMarker)。
 	req.Header.Set(WebTerminalLoopbackHeader, assistServiceEntryLoopbackMarker(r))
+	// 防御注记(P3 评审收口):marker 恒非空(上函数两腿各返回 "1" 或 cookie
+	// 哨兵,无第三形态),本 Set 不可能写入空值——上游入口 mark 永远见到
+	// 「明确背书」,不存在「空头=按本跳重标」的歧义路径;恒非空契约改链路时
+	// 由 assistServiceEntryLoopbackMarker 头注与 handler 测试共同把守。
 	// 透传腿 Origin 剥除:入腿同源闸已验过(assistSameOriginGuard),上游
 	// r.Host 是拨号目标(127.0.0.1:56431),浏览器 Origin 与之必然失配,
 	// 照搬会在上游同源闸(aiStreamHostAllowed 口径家族)误杀——同

@@ -4,7 +4,12 @@ import { assistPrefix } from '../services/assistPrefix';
 import { syncUnauthenticatedAuthState } from '../stores/auth';
 
 // 远程协助 P2:镜像前缀挂载(/assist/service/)下证书状态轮询也要过前缀。
-const API_BASE = assistPrefix() + '/api';
+// P3 请求时化:前缀在每次请求时现算(照 assistPrefix 的请求时语义),不再
+// 模块加载时定死——未来若引入 URL 路由(路径变化不重载模块),模块级常量
+// 会拿到陈旧前缀,函数化后无此陈旧面。
+function apiBase() {
+  return assistPrefix() + '/api';
+}
 const CERT_TYPE = 'mitm-ca';
 
 const certStatus = ref(null);
@@ -55,7 +60,7 @@ async function fetchStatus() {
   if (isFirstLoad) loading.value = true;
 
   try {
-    const res = await fetch(`${API_BASE}/cert/status?cert_type=${encodeURIComponent(CERT_TYPE)}`);
+    const res = await fetch(`${apiBase()}/cert/status?cert_type=${encodeURIComponent(CERT_TYPE)}`);
     const payload = await res.json().catch(() => ({}));
     handleAuthenticationFailure(res.status, payload, syncUnauthenticatedAuthState);
     if (!res.ok) {
