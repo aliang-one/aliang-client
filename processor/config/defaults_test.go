@@ -150,3 +150,10 @@ func resetServiceBindHost(t *testing.T) {
 		_ = SetServiceBindHost(DefaultServiceBindHost)
 	})
 }
+
+func TestManagementListenAddrEnvOverride(t *testing.T) {
+	t.Setenv("ALIANG_MANAGEMENT_ADDR", "127.0.0.1:56494")
+	if got := ManagementListenAddr(); got != "127.0.0.1:56494" {
+		t.Fatalf("ManagementListenAddr() with override = %q, want %q", got, "127.0.0.1:56494")
+	}
+}

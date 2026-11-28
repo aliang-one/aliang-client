@@ -62,7 +62,13 @@ func ServiceBindHost() string {
 }
 
 // ManagementListenAddr returns the management server's runtime listen address.
+// ALIANG_MANAGEMENT_ADDR 可整体覆写(host:port,照 ALIANG_USER_AGENT_ADDR 先例):
+// 供本机并跑第二实例的开发/测试场景绕开已装实例占用的 56431——只动拨号/监听,
+// 不触任何持久化状态。
 func ManagementListenAddr() string {
+	if addr := strings.TrimSpace(os.Getenv("ALIANG_MANAGEMENT_ADDR")); addr != "" {
+		return addr
+	}
 	return net.JoinHostPort(ServiceBindHost(), fmt.Sprintf("%d", DefaultManagementPort))
 }
 
