@@ -132,6 +132,12 @@ func StopLocalServer() error {
 		return nil
 	}
 
+	// RUN-03:先收口本进程托管的 AI 会话与终端 PTY,再关 HTTP。closeAll 会
+	// cancel 每个 run 的 ctx,newBackgroundCommandContext 的进程组组杀随之
+	// 触发——否则 claude/codex 子进程成为孤儿,继续写工作区。必须在 HTTP
+	// shutdown 之前:shutdown 最多等 5s,期间新请求仍可能派发 run。
+	services.GetSharedAgentService().Shutdown()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {

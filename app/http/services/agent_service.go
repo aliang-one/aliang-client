@@ -284,6 +284,30 @@ func GetSharedAgentService() *AgentService {
 	return sharedAgentService
 }
 
+// Shutdown 在 agent 进程退出前收口本进程托管的一切:AI 会话(含其派生的
+// CLI 子进程)与终端 PTY。
+//
+// RUN-03:agent 退出后不得留下仍会修改文件的旧回合进程。此前 StopLocalServer
+// 只做 HTTP shutdown + 停 usage/keepalive,从不调 closeAll——run 的 ctx 不被
+// cancel,newBackgroundCommandContext 的进程组组杀就不会触发,claude/codex
+// 子进程成为孤儿继续跑、继续写工作区。
+//
+// 终端 closeAll 刻意不等价于「断线」:transient WS 断线必须保留终端
+// (见 remoteLoopExitCleanup),但进程退出是真关停。
+//
+// 幂等:重复调用时两个 map 已空,直接返回。
+func (s *AgentService) Shutdown() {
+	if s == nil {
+		return
+	}
+	if s.ai != nil {
+		s.ai.closeAllWithReason("agent_shutdown")
+	}
+	if s.terminal != nil {
+		s.terminal.closeAll()
+	}
+}
+
 func NewAgentService() *AgentService {
 	// 多通道竞速(2026-11-21):进程级单飞;候选<2 空转(存量设备零变化)。
 	config.StartAgentServerRacerOnce()
