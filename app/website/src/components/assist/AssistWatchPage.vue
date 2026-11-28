@@ -371,13 +371,24 @@ function resetPageMirror() {
   pendingPageMeta = null;
 }
 
-// live 惯例建 Replayer(rrweb 文档口径):空事件数组初始化 → startLive →
-// 之后一律 addEvent 注入。root 指进页面 pane 容器,wrapper/iframe 都长在那。
+// live 惯例建 Replayer(rrweb 文档口径):空事件数组初始化 → startLive(未来
+// baseline) → 之后一律 addEvent 注入。root 指进页面 pane 容器,wrapper/iframe
+// 都长在那。
+// 两个非默认项(rrweb 2.2.2 本机实测,P2 冒烟定案):
+// ①useVirtualDom:false——默认 true 会把增量事件分流进永不挂载的虚拟树
+//   (Meta/FullSnapshot 走 rebuild 例外能渲染,增量画面恒不更新);
+// ②startLive(未来 baseline)——中继事件的时间戳来自 admin 采集时钟,若
+//   ≤ startLive 时刻会走 timer 排队按捕获时距延迟应用(慢数分钟),未来
+//   baseline 让一切事件走 isSync 同步分支,实时落地。
 function ensureReplayer() {
   if (replayer || disposed || !pageHostEl.value) return;
   try {
-    replayer = new Replayer([], { liveMode: true, root: pageHostEl.value });
-    replayer.startLive();
+    replayer = new Replayer([], {
+      liveMode: true,
+      useVirtualDom: false,
+      root: pageHostEl.value,
+    });
+    replayer.startLive(Date.now() + 3600_000);
     pageReady.value = true;
   } catch (e) {
     replayer = null;
