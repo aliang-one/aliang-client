@@ -30,7 +30,7 @@
 
 | 仓库 | 分支 | 提交 | 远端 |
 |---|---|---|---|
-| alianggate（Go agent + 网页） | master | `47f2c8d8` | 已推送；`v1.1.134` 含 RUN-03 进程退出收口 |
+| alianggate（Go agent + 网页） | master | `cdf44a24` | 已推送；`v1.1.134` 构建发布成功，含 RUN-03 |
 | AliangPhoneServer | main | `b5b5999` | 已推送；线上跑 `batch-b-r1`（重启裁决 + SUB-06/16 已启用） |
 | AliangVibeCodingPhone（RN） | main | `1b139df` | 已推送，iOS 1.0.10 (42) 已装到 iPhone 16 Pro |
 
@@ -200,10 +200,20 @@ usage/keepalive，从不调 `closeAll`——run 的 ctx 不被 cancel，进程�
 在 HTTP shutdown 之前调。测试起一个带生产同款 Setpgid+组杀的真实子进程，断言
 Shutdown 后 5s 内死亡；去掉 closeAll 后该测试准确失败。
 
-**设备升级。** `liang-dev`（222.1）升到 v1.1.133。升级后新版 core 自己托管
-agent，与 `aliang-agent.service` 抢 `~/.aliang/agent/agent.pid` 锁导致无限重启，
-已禁用该 unit。`0.196` 不在 aliangboard 台账，本机与 222.1 均无到它的密钥，
-未升级。本机按用户要求暂不动（其他会话在测试）。
+**设备升级。** `liang-dev`（222.1）升到 v1.1.134（含 RUN-03）。它用 user-level
+systemd 管两个 unit：`aliang.service`（core，`--host 0.0.0.0`）与
+`aliang-agent.service`（agent）。**正确的升级步骤**：`systemctl --user stop
+aliang-agent.service aliang.service` → 替换 `/home/liang/aliang` → 依次 start
+两个 unit。二进制运行中不能覆盖（Text file busy）。
+
+一处误判记下来：升级到 1.1.133 时，重启 unit 的瞬间 core 与 agent unit 短暂
+竞争 `~/.aliang/agent/agent.pid` 锁，日志出现 `another_instance_running`，我据此
+禁用了 `aliang-agent.service`。实际稳定后是 systemd 管的 agent 在跑，core 并不
+托管 agent。禁用后再重启 core，agent 就彻底没了，服务离线。已重新 enable。
+判断依据应是 `NRestarts` 与稳定后的进程树，不是重启瞬间的日志。
+
+`0.196` 不在 aliangboard 台账，本机与 222.1 均无到它的密钥，未升级。本机按
+用户要求暂不动（其他会话在测试）。
 
 **未做。** DEBT-09 口令轮换需安排发布窗口。RUN-01 的手动续跑入口、RUN-04
 连续中断熔断未开始。
