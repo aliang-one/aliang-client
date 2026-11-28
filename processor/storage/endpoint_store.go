@@ -352,6 +352,7 @@ var errEgressTargetChanged = errors.New("llm_endpoint: 出口目标行并发变�
 //     「egress=1⟸anthropic」在写时刻原子成立,0 行受影响回滚后重读折算精确
 //     错误(Validate 双层只守 Update 链,守不住这条竞态窗);
 //   - 「至多一行=1」不受任何并发影响:清旧与点亮在同一事务内。
+//
 // 存在性检查对 set=true/false 一致:不存在的 id 返回包了 gorm.ErrRecordNotFound
 // 的错误,handler 统一映射 404——取消一个拼错的 id 不该被静默吞掉。
 func (s *EndpointStore) SetEgressKernel(id string, set bool) error {

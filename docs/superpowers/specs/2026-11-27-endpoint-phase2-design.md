@@ -183,3 +183,44 @@ GET 列表/单条视图带 `egress_kernel/last_used_at/total_requests/failed_req
 15. 「忙」不是病：排队超时进 failover，不计失败不动健康。
 16. 三词分明：停用/熔断/限流在 UI 与日志中不混用。
 17. 旧 agentcore_llm 永不驱动出网。
+
+## 12. 升级与验收（rollout 增补，Task 9）
+
+### 12.1 不变量 11–17 清单（验收勾稽）
+
+| # | 不变量 | 实证位置 |
+|---|---|---|
+| 11 | enabled=0 对一切调度与路由完全不可见 | `endpoint_service.go selectAuto` 候选闸首条（`Enabled` 过滤）；测试 `TestEndpointService_SelectSkipsDisabledAndRateLimited`、`TestKernelEndpointResolverStickyRebindsWhenRowDisabled` |
+| 12 | 出口指定压过健康/模型/并发，唯尊重限流窗与用户停用 | `kernel_endpoint_resolver.go Resolve` 第 1 段；测试 `TestKernelEndpointResolverEgressEnabledOverridesAll`、`TestKernelEndpointResolverEgressPausedFallsBackToAuto`、`TestKernelEndpointResolverEgressRateLimitedLocalErrorNoFailover` |
+| 13 | 黏性是偏好不是钉子：候选闸不过即重黏并留日志 | `Resolve` 黏性段（重黏 + Info 日志）；测试 `TestKernelEndpointResolverStickyBeatsPriorityAndRefreshesTTL`、`TestKernelEndpointResolverStickyRebindsWhenRowDisabled`、`...RebindsWhenRowRateLimited` |
+| 14 | 401/402 锁存不自愈且绕过池模式门控 | `endpoint_service.go ReportFailure` 401/402 分支（`disabled` + `cooldown_until=0`，先于池模式分支）；测试 `TestEndpointService_ReportFailure401Latch/402Latch`、`TestEndpointService_ReportFailureLatchBypassesPoolMode`、`TestEndpointService_ResetHealthClearsLatch`（唯一用户恢复路径）、`TestEndpointService_ReportSuccessClearsLatch`（真实成功恢复）、inbound 真链 `TestAIPathRealChain401LatchesEndpointDisabled` |
+| 15 | 忙不是病：排队超时进 failover，不计失败不动健康 | `agent_ai_agentcore.go agentCoreRunEgress`（exclude 重选，不 ReportFailure）+ `inbound/http` 队满 failover；测试 `TestAIPathQueueTimeoutFailsOverToNextCandidate`、`TestAgentCoreRunEgressFullRowFallsToBuiltin`、`TestAgentCoreRunEgressAllFullHardFails` |
+| 16 | 三词分明：停用/熔断/限流不混用 | UI `endpointHealthBadge`（EndpointManagerSettings.vue 四态互斥）+ 抽屉 `egressIndicator` 三态 + REST `endpointView` 补出面 `cooldown_until`/`rate_limited_until`；测试 `EndpointManagerSettings.test.js`（badge 决策）、`endpoint_handler_test.go` Task 6 用例、`ChatInfoDrawer.test.js` |
+| 17 | 旧 agentcore_llm 永不驱动出网（不变量 9 废除后的接位） | `agentCoreBaseURLFromRow/AuthTokenFromRow/EnsureUpstreamForRow` 只认解析行；测试 `TestAgentCoreBaseURLOldFieldIgnoredRegistryDrives`、`TestAgentCoreAuthTokenOldFieldIgnoredRegistryDrives`、`TestAgentCoreEnsureUpstreamOldFieldIgnoredRegistryDrives`、`TestAgentCoreLegacyLLMWarnFiresOncePerProcess` |
+
+### 12.2 三项必修语义（升级后行为钉死）
+
+- **401/402 锁存绕池**：确定性凭据错误与「暂时性失败要不要自动摘除」正交——池模式（失败摘除关）下同样锁存摘除；行表现「熔断」红、无「恢复于」时刻（cooldown_until=0），恢复只有两条路：行上「重置健康」或一次真实成功。
+- **队满 failover**：并发排队超时不算失败不动健康；内核侧 exclude 该行重选（上限 4 次，全满含 builtin 满时终止 run 出「可用 endpoint 并发已满」文案）；56432 路由侧重试天然切下一候选，显式点名忙直接 503 不 failover。
+- **出口尊重限流**：出口行处于 429 窗（rate_limited_until 未到）时内核不发请求、不 failover，直接回「出口限流中，恢复于 HH:MM」本地错误——避免每 30s 戳 5h 限额窗。
+
+### 12.3 激活开关与出口指定使用说明
+
+- **行上开关即激活**：「LLM 端点管理」每行右侧「启用」开关直接决定该行是否参与 56432 调度与内核 auto 调度；关闭即完全不可见（对锁存/熔断行关闭再打开会走激活清零，健康重新计数）。停用出口行 = 出口「暂停保留」：标记不丢，内核临时回 auto 调度，重新打开自动恢复生效。
+- **设出口**：行上「设为 AliangCode 出口」（出口徽标按钮）把该 anthropic 行设为内核唯一定向出口，全表至多一行，事务换绑（原出口自动让位）。出口压过健康/模型/并发——即使该行已被锁存/熔断也照走（错误由上游真实返回）；唯一例外是 429 限流窗（见 12.2）。「取消出口」即恢复 auto 调度（黏性+优先级+层内最少负载，全空回落内置行）。
+- **拉模型**：行编辑表单「自动获取」按当前填写的 base_url 与 API Key 探测上游模型列表，确认后写入表单、点「保存」才落库；模型列表非空时该行只服务列表内模型（出口指定行不受此限）。
+
+### 12.4 旧 agentcore_llm 忽略提示（灰字位置）
+
+- 内核侧：存量 `customer.agentcore_llm` 配置不再驱动出网；进程内首次解析打一条幂等 Warn「旧内核端点配置已忽略，出网走 endpoint 管理」。字段本身无行为影响、清除入口已随卡片退役，Warn 会长期存在——已接受并文档化（§9）。
+- UI 侧：改名的「内核调优」卡（网络设置旁的 agent 设置页）底部有一行灰字提示——命中旧配置时显示「检测到旧版内核端点配置，已忽略；出网由 endpoint 管理接管」（`agentCore_legacyHint`），未命中不显示。该卡现只剩内核行为调优项，出网端点全部移交「LLM 端点管理」。
+
+### 12.5 装机冒烟清单（人工步骤，升级后逐条过）
+
+1. **行开关**：「网络设置 → LLM 端点管理」随便一行关掉「启用」→ 该行徽标变「已停用」灰字；开代理请求确认调度不再选它；重开开关徽标回「正常」。
+2. **设出口**：挑一个 anthropic 行点「设为 AliangCode 出口」→ 行头出现「出口」徽标，原出口（若有）徽标消失；对 AliangCode 发一句话，确认出网走该行（上游日志/计数「调用」+1）。
+3. **拉模型**：编辑该行 → 「自动获取」→ 弹出模型列表确认 → 「写入表单」→ 「保存」；行尾「调用/失败」计数与「最近调用」相对时间开始走动。
+4. **抽屉三态**：聊天页右侧滑出「会话信息」抽屉看「LLM 出口」行：设了出口且启用 → 「出口：{name}」；停用该行 → 「出口：{name}（已停用，auto 调度中）」；取消出口 → 「出口：auto 调度」（30s 内轮询刷新）。
+5. **内核调优卡灰字**：agent 设置页「内核调优」卡不再有端点表单；存量旧配置的机器卡底出现灰字「检测到旧版内核端点配置，已忽略…」，新装机器无此行。
+6. **网络设置改名**：设置侧栏与页签中「代理设置」已改叫「网络设置」，原代理/规则/出口功能不变。
+7. **（可选）锁存自证**：把某行 key 改错保存 → 对内核发一句话 → 该行变「熔断」红且无「恢复于」时刻 → 修正 key 后点「重置健康」或再发一句话（真实成功）→ 回「正常」。
